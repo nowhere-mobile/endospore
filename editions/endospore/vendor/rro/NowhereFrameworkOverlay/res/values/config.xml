@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Endospore framework config overlay (OS-tier: every Endospore device, no device-specific value).
+  Built as the NowhereFrameworkOverlay runtime overlay (see Android.bp beside this res/ for why not a static overlay).
+-->
+<resources>
+    <!--
+      NWP-20261004-01 (backlog L318, Chester 2026-10-04: "Ring via the gate"). Android 17 defaults this to true:
+      AlarmManager then RESTARTS a stopped user in the background about 30 s before its next alarm clock and keeps
+      it running for 600 s or longer. For a cold-locked session that is the at-rest property undone around every
+      alarm. Device-measured on lynx 2026-10-04: user 15 stopped at 16:13:52, restarted at 16:24:25
+      (UserController.startUser-15-bg-for-600s) for a 16:25 alarm, and its own clock rang behind the gate,
+      where nothing could reach it.
+
+      With this false the stopped user stays stopped and its alarms do not fire. The gate rings the session's
+      next alarm instead (#151): the session relays it after every seal, and the cold lock asks for it once more
+      just before the stop (the alarmrelay op), so an alarm set while offline still reaches the gate.
+      LineageOS 22.2 has no such flag, so Diaspore needs nothing here.
+    -->
+    <bool name="config_allowAlarmsOnStoppedUsers">false</bool>
+</resources>

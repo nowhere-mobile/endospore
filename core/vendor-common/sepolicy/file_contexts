@@ -1,0 +1,21 @@
+# Label the Nowhere binaries (entrypoints for the nowhere domain) and the ephemeral state dir.
+/system/bin/nowhere_agent           u:object_r:nowhere_exec:s0
+/system/bin/nowhere_login\.sh       u:object_r:nowhere_exec:s0
+# The launcher page-2 seeder. nowhere_exec DELIBERATELY, not system_file: that type is exec'able only by
+# the `nowhere` and `endospore_priv` domains (nowhere.te / endospore.te), so shell and every app domain are
+# excluded by construction and no NEW allow rule is needed. Labelling it system_file would have made it
+# runnable by anything holding system_file exec -- which is the capability we avoid by not shipping the
+# sqlite3 shell in the first place.
+/system/bin/nowhere_seed_home       u:object_r:nowhere_exec:s0
+/system/bin/nowhere_db_fix          u:object_r:nowhere_exec:s0
+# NWP-20260820-15 (#740 root cause): AOSP ships update_engine_client ONLY in PRODUCT_PACKAGES_DEBUG, so
+# nowhere_otad.sh's apply step was dead on every user build -- OTA apply had NEVER worked in the field.
+# We now ship it (both editions' .mk). Labelled nowhere_exec for the SAME reason as the binaries above:
+# exec'able only by the `nowhere` and `endospore_priv` domains, so shell and every app domain are excluded
+# by construction -- STRICTLY tighter than AOSP's default system_file, which is what shipping it would
+# otherwise have meant. endospore.te already allows that exec and the update_engine binder call both ways.
+/system/bin/update_engine_client    u:object_r:nowhere_exec:s0
+/data/nowhere(/.*)?                 u:object_r:nowhere_data_file:s0
+# The init-created blind-login socket. The .rc seclabel labels the socket OBJECT; this labels the
+# /dev/socket FILE so the chooser's unix_socket_connect sock_file-write applies (like /dev/socket/lmkd).
+/dev/socket/nowhere_login           u:object_r:nowhere_login_socket:s0

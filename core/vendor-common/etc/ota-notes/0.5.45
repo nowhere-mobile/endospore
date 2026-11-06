@@ -1,0 +1,8 @@
+version 0.5.45
+previous 0.5.44
+- On-demand apps set up faster, and Profile lets you choose how long setup holds backups: about 2, 10 or 30 minutes, or until it finishes.
+- Account sync settings, such as Gmail's, stay as you left them after you sign out, and an always-on VPN keeps its Block connections choice.
+- Text messages open in the app you chose for this profile; their notices say Messages and clear once you've read them.
+- A sign-out that gets stuck can now be ended without saving, or the phone restarted.
+- A plan bought while another is still running now shows on the Storage screen.
+- Profile has an Update row with Sign out & install, and an update we mark as required says why and by when.

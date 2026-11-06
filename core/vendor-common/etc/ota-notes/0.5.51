@@ -1,0 +1,8 @@
+version 0.5.51
+previous 0.5.50
+- Saves that change little finish much faster, a call during sign-in keeps the screen on, and signing out finishes its media cleanup sooner.
+- Location services in Profile now turn network location and geocoding on for your session, so apps that need your location can find it.
+- Help is built in: tap ? on the gate or open Help in Profile for short pages on signing in, saving, apps and storage.
+- Your apps says when Auto apps wait for Wi-Fi, nApps shows Download for an app you already have, and an app that needs Play Store asks first.
+- A new standby, install wait or Auto-wipe choice applies at once, and the phone reminds you 30 and 7 days before a storage plan ends.
+- Adding a hardware key no longer reports a failure when the key was added, and tapping a group of text notifications opens your messages.

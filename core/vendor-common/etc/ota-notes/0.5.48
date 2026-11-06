@@ -1,0 +1,8 @@
+version 0.5.48
+previous 0.5.47
+- Profile › Preferences adds Mobile data, Data roaming, Hotspot & tethering and Sign out of Google; the gate's owner settings add Mobile data and an About page.
+- Your apps has a search field and lists the apps you haven't kept from A to Z, and Restore a snapshot can now delete an older version.
+- Your time zone, accessibility services and usage access come back when you sign in, and a permission you revoked stays revoked when the app updates.
+- The Profile status line says when the last save failed, Back up now says what held it back, and photos you have already saved no longer show as changed.
+- With no network, Delete says at once that it can't reach your storage, and a sign-out that fails twice offers to end the session without saving.
+- Large apps install over a slow connection, an update set for a chosen time installs even if the phone was asleep, and a failed check no longer says Up to date.

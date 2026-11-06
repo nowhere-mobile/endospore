@@ -1,0 +1,26 @@
+    static void retryRefused(Context ctx) {
+        synchronized (LOCK) {
+            try {
+                final String self = ctx.getPackageName();
+                final String session = sessionId(ctx);
+                String[] m = parseMarker(read(ctx, MARKER), session);
+                if (m == null || !"fallback".equals(m[0])) return;
+                java.util.List<String> holders = null;
+                try {
+                    holders = ctx.getSystemService(android.app.role.RoleManager.class)
+                            .getRoleHolders(android.app.role.RoleManager.ROLE_SMS);
+                } catch (Throwable ignore) {}
+                String t = retryRefusedTarget(m, presence(ctx, m[2]), holders, MESSAGING);
+                if (t == null) return;
+                String r = ensureHolder(ctx, android.os.Process.myUserHandle(), t, true, self, ctx.getMainExecutor(), MESSAGING);
+                android.util.Log.i("NowhereChooser", "NWP-20261010-13 sms role: refused " + t + " retried -> " + r);
+                if ("held".equals(r)) {
+                    write(ctx, MARKER, markerText(session, "applied", t, t));
+                    // NWP-20261012-08: Messaging, the stand-in until now, was spared the six at login.
+                    PermDeclines.declineSmsRoleIfNotHolder(ctx, MESSAGING, null, true, "sms role taken over");
+                }
+            } catch (Throwable t) {
+                android.util.Log.w("NowhereChooser", "NWP-20261010-13 sms role retry", t);
+            }
+        }
+    }

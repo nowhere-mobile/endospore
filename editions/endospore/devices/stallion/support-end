@@ -1,0 +1,10 @@
+# editions/endospore/devices/stallion/support-end -- the last month stallion (Pixel 10a) has GrapheneOS full support.
+# Read by editions/endospore/build/support-end-guard.sh: build-device.sh builds no image of this device past it
+# (docs/product-decisions.md, 2026-11-03, h55 #2). Kept current in the monthly sitting that moves the tree.
+# Kept outside vendor/ on purpose: stage-vendor.sh rsyncs vendor/ into a shared etc/ (the #627 race).
+#
+# Format: '#' lines are comments. Exactly two data lines, in this order:
+#   last-supported <YYYY-MM or YYYY-MM-DD>   the last month (or day) of full support; past it = a later month (or day)
+#   source <text>                            the public page the date comes from
+last-supported 2033-03
+source Google's Pixel update page, 7 years of updates from first availability (https://support.google.com/pixelphone/answer/4457705), and its availability list, March 2026 (https://support.google.com/pixelphone/answer/15738422); checked 2026-11-04

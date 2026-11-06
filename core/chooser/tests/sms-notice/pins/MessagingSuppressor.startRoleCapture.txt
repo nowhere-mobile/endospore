@@ -1,0 +1,16 @@
+    private synchronized void startRoleCapture() {
+        stopRoleCapture();
+        final android.os.Handler h = clearHandler;
+        if (h == null) return;
+        h.post(() -> SmsRoleRoam.capture(this));
+        try {
+            roleListener = (roleName, user) -> {
+                if (android.app.role.RoleManager.ROLE_SMS.equals(roleName)) h.post(() -> SmsRoleRoam.capture(this));
+            };
+            getSystemService(android.app.role.RoleManager.class).addOnRoleHoldersChangedListenerAsUser(
+                    h::post, roleListener, android.os.Process.myUserHandle());
+        } catch (Throwable t) {
+            roleListener = null;
+            android.util.Log.w("NowhereChooser", "NWP-20261010-13 sms role listener", t);
+        }
+    }

@@ -1,0 +1,8 @@
+version 0.5.50
+previous 0.5.49
+- Apps that Auto, a tap or the Play Store installs get their data back in seconds again, so they no longer hang on "Getting your app" or come back signed out.
+- Saves keep going while the screen is off, and signing out stops a background save and saves once instead of waiting for it to finish.
+- "Backing up" and "That save captured" clear once a newer save lands, and Profile says a save is running only when one is.
+- Signing in loads your storage plan and waiting messages after you land in your profile, and a store download finishes before a background save starts.
+- The gate has a sun/moon for light and dark that its dialogs and Profile follow, and the sign-in fields clear when the screen turns off.
+- Reset passphrase shows the new passphrase's strength, picture messages in any text encoding arrive readable, and issue reports say why the phone last restarted.

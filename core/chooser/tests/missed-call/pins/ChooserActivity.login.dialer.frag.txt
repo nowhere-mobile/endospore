@@ -1,0 +1,2 @@
+                cedeSmsToMessagingInRoamedUser(fuid);
+                disableRoamedDialerComponents(fuid); // NWP-20261012-07: the missed-call receiver works only in user 0

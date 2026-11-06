@@ -1,0 +1,33 @@
+# The v2 SEAL-TEL wire contract (NWP-20261022-11): the request the chooser sends and the replies it reads.
+# BOTH suites read this one file, so an edit here is an edit to the wire:
+#   - Go:   core/agent/tel_wire_contract_test.go  (readSealTelV2, okArrivalReply, errNobodyReply)
+#   - Java: core/chooser/tests/tel-wire/TelWireCases.java  (TelArrival.telRequest, smsId, callId, parse, untilAnswered)
+# One case per line; fields are separated by a TAB and an empty field is a real empty value. Lines starting with # and
+# blank lines are ignored. Every field writes a backslash as \\, a newline as \n and a tab as \t (any other backslash
+# sequence is an error), so a value may hold any of them.
+#
+# REQ-TEL  type, case, aid, kind, sub, iccid, from, when, mono, body, callType, durSec, request
+#   aid      the arrival id: TelArrival.smsId(sub, when, from, body) for kind sms, TelArrival.callId(sub, when) for call
+#   from, body   the decoded values (the request carries them as base64)
+#   when     the arrival time in ms; mono the SystemClock.elapsedRealtime stamp (they differ, so a swap shows)
+#   request  the exact bytes TelArrival.telRequest sends, which readSealTelV2 must read back as the other columns
+# REPLY    type, case, line, kind, vis, label, sealed, liveUid, stripped, partial
+#   line     one reply line without its newline
+#   kind, vis, label (decoded), liveUid (-1 for none), stripped (0 or 1), partial (0 or 1)  what TelArrival.parse(line) must yield
+#   sealed   the count okArrivalReply is given for an OK line, - on any other line (it is also given stripped and partial)
+REQ-TEL	sms-newline-sender-unicode-body	be10dc3c4ac88930d63b26acb598e6be8d8e255002dfa872516960c162df39b2	sms	2	89440000000000000011	Bank\nAlerts	1760000000123	98765432	Café ☕ 🎉\tdone	0	0	SEAL-TEL\nv2\nbe10dc3c4ac88930d63b26acb598e6be8d8e255002dfa872516960c162df39b2\nsms\n2\n89440000000000000011\nQmFuawpBbGVydHM=\n1760000000123\n98765432\nQ2Fmw6kg4piVIPCfjokJZG9uZQ==\n0\n0\n
+REQ-TEL	call-empty-body	2e878d7388ca143fb913356752ee81945f4a67aeffb6e924cada7086b5984484	call	1	89440000000000000022	+15550100	1760000100456	98800000		3	47	SEAL-TEL\nv2\n2e878d7388ca143fb913356752ee81945f4a67aeffb6e924cada7086b5984484\ncall\n1\n89440000000000000022\nKzE1NTUwMTAw\n1760000100456\n98800000\n\n3\n47\n
+REQ-TEL	sms-empty-sender	be798295447944baf5f58dfa117d5594cbbb8e2dea99cb2ba1b8b233e3065c9e	sms	3	89440000000000000033		1760000200789	98900000	hi	0	0	SEAL-TEL\nv2\nbe798295447944baf5f58dfa117d5594cbbb8e2dea99cb2ba1b8b233e3065c9e\nsms\n3\n89440000000000000033\n\n1760000200789\n98900000\naGk=\n0\n0\n
+REPLY	ok-label-work	OK number V29yaw== 1	OK	number	Work	1	-1	0	0
+REPLY	ok-empty-label-live	OK private  0 LIVE 12	OK	private		0	12	0	0
+REPLY	ok-stripped-live	OK open TA== 2 STRIPPED LIVE 13	OK	open	L	2	13	1	0
+REPLY	ok-partial	OK open TA== 1 PARTIAL	OK	open	L	1	-1	0	1
+REPLY	ok-stripped-partial-live	OK open TA== 2 STRIPPED PARTIAL LIVE 13	OK	open	L	2	13	1	1
+REPLY	err-nobody-private	ERR nobody private	ERR	private		-	-1	0	0
+REPLY	err-request	ERR request	ERR			-	-1	0	0
+REPLY	unresolved	UNRESOLVED	UNRESOLVED			-	-1	0	0
+REPLY	removed	REMOVED	REMOVED			-	-1	0	0
+REPLY	owner	OWNER	OWNER			-	-1	0	0
+REPLY	full	FULL	FULL			-	-1	0	0
+REPLY	none	NONE	NONE			-	-1	0	0
+REPLY	unknown-token	MAYBE 1	NONE			-	-1	0	0

@@ -1,0 +1,24 @@
+<!-- The gate's SPLASH icon - the picture shown AFTER the boot animation, while the gate activity starts.
+     NWP-20260825-08 (Chester): this is the FOUR-dot brand mark, the one in front of "nowhere" on the
+     storefront nav and the same mark nApps uses. Geometry is copied VERBATIM from
+     core/napps/res/drawable/ic_napps_fg.xml so the two can never drift:
+       viewBox 0 0 20 20: 10,14.6 r3 | 5.4,8.4 r2 | 14.3,7.6 r2.2 | 10,4 r1.4
+     mapped onto this 108 canvas exactly as nApps maps it (cluster bbox 46 units, centred at 54).
+
+     It REPLACES the six-dot cluster that was here. The six-dot cluster is the GATE logo and it stays
+     everywhere else it is used - the gate's own SporeView header, ic_nowhere, the boot animation, the
+     FallbackHome boot-brand still. Those are deliberate and were NOT changed. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path android:fillColor="#4FD6AC"
+        android:pathData="M54.15,67.8 m-9.2,0 a9.2,9.2 0 1,0 18.4,0 a9.2,9.2 0 1,0 -18.4,0 Z" />
+    <path android:fillColor="#4FD6AC"
+        android:pathData="M40.05,48.79 m-6.13,0 a6.13,6.13 0 1,0 12.26,0 a6.13,6.13 0 1,0 -12.26,0 Z" />
+    <path android:fillColor="#4FD6AC"
+        android:pathData="M67.34,46.33 m-6.75,0 a6.75,6.75 0 1,0 13.5,0 a6.75,6.75 0 1,0 -13.5,0 Z" />
+    <path android:fillColor="#4FD6AC"
+        android:pathData="M54.15,35.29 m-4.29,0 a4.29,4.29 0 1,0 8.58,0 a4.29,4.29 0 1,0 -8.58,0 Z" />
+</vector>

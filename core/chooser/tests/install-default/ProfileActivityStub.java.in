@@ -1,0 +1,55 @@
+package com.nowhere.chooser;
+
+import java.util.ArrayList;
+import java.util.LinkedHashSet;
+import java.util.List;
+
+/** The stub half of ProfileActivity: the answers decide asks for, counted. run.sh splices the REAL
+ *  cfgKeyForInstaller and the constants it and decide read in at the marker. */
+final class ProfileActivity {
+  static String mode = "off";
+  static boolean bundled;
+  static final LinkedHashSet<String> off = new LinkedHashSet<>();
+  static int appDefaultCalls, bundledCalls, offCalls;
+  static final List<String> installerArgs = new ArrayList<>();
+  // NWP-20261122-06: the play.wanted value cfgStatic answers ("off" is its fallback for an absent key), whether the
+  // GrapheneOS App Store is installed (gosStorePresent), and every setPlayDep call, in order.
+  static String play = "off";
+  static boolean gos = true;
+  static final List<String> playDeps = new ArrayList<>();
+  static final List<String> cfgKeys = new ArrayList<>();
+
+  static void reset() {
+    mode = "off"; bundled = false; off.clear();
+    appDefaultCalls = 0; bundledCalls = 0; offCalls = 0; installerArgs.clear();
+    play = "off"; gos = true; playDeps.clear(); cfgKeys.clear();
+  }
+
+  static boolean gosStorePresent(android.content.Context ctx) {
+    return gos;
+  }
+
+  static String cfgStatic(android.content.Context ctx, String key) {
+    cfgKeys.add(key);
+    return PlayChoice.CFG_KEY.equals(key) ? play : "off";
+  }
+  static void setPlayDep(android.content.Context ctx, String pkg, boolean on) {
+    playDeps.add(pkg + "," + on);
+  }
+
+  static String appDefaultForInstaller(android.content.Context ctx, String installer) {
+    appDefaultCalls++;
+    installerArgs.add(installer);
+    return mode;
+  }
+  static boolean isBundledSystem(android.content.pm.PackageManager pm, String pkg) {
+    bundledCalls++;
+    return bundled;
+  }
+  static java.util.LinkedHashSet<String> explicitlyTurnedOff(android.content.Context ctx) {
+    offCalls++;
+    return new LinkedHashSet<>(off);
+  }
+
+// @@LIFTED@@
+}

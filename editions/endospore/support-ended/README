@@ -1,0 +1,25 @@
+Support ended -- which devices have left GrapheneOS's full support, so no release is built for them (NWP-20261124-19).
+
+Decision of record: docs/product-decisions.md, 2026-11-02 ("twenty-four answers to the open-decisions list ...", #23):
+"we do not ship releases for a device in GrapheneOS's extended support: releases stop when a device leaves full
+support". The 2026-10-26 entry ("a device's support ends when GrapheneOS's does ...") says why the date is GrapheneOS's.
+
+A device is supported unless a file here names it. When GrapheneOS announces that a device moves to extended support,
+Chester commits a file named for its device-tree codename (e.g. `lynx`), exactly two lines:
+
+    ended 2027-05-01
+    source GrapheneOS announcement 2027-05-01: <title or url>
+
+- `ended` is the day GrapheneOS moved the device to extended support, as YYYY-MM-DD.
+- `source` is free text, not empty: where the date comes from.
+- No third line, no blank line, no CR. A file that is not exactly this refuses too (fail closed).
+- Deleting the file, in a reviewed commit, is the only way back. There is no override flag: the decision admits no
+  extended-support release.
+
+What reads it: `editions/endospore/build/support-guard.sh <device>`, which refuses (exit 2) a device with a file here.
+`build-device.sh --release`, `sign-release.sh`, `e4-ota-publish.sh` and `e4-ota-promote.sh` call it. A dev build
+(`build-device.sh` without `--release`) is not a release and stays allowed. Not guarded yet: the installer page publish
+(nowhere-cloud `publish-installer.sh`) and the phone's own notice that it is out of support.
+
+No device file is committed today: no release device has left full support. Keep this README: the guard refuses when
+this directory is missing, because its absence means a wrong checkout. Pinned by test-support-guard.sh (--mutate).

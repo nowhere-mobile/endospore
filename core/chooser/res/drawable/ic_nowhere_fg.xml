@@ -1,0 +1,24 @@
+<!-- Profile adaptive-icon FOREGROUND (DIA-20260817-02): the dispersing-spore dots alone - the dark disc
+     moved to the background layer (mipmap-anydpi-v26/ic_nowhere.xml). Same reasoning and sizing rule as
+     ic_napps_fg: cluster bounding box 46 units of the 108 canvas, centred at 54, ~64% of the launcher's
+     visible circle to match Clock's measured 63%. Furthest dot edge 26.8 units from centre, inside the
+     33-unit safe zone. Colours match the legacy core drawable (teal accent + ink white); editions/endospore
+     overrides this file with the gray GrapheneOS-theme variant, exactly as it does the legacy drawable. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path android:fillColor="#4FD6AC"
+        android:pathData="M51.95,69.94 m-7.06,0 a7.06,7.06 0 1,0 14.12,0 a7.06,7.06 0 1,0 -14.12,0 Z" />
+    <path android:fillColor="#EAF1EE"
+        android:pathData="M39.26,55.83 m-4.23,0 a4.23,4.23 0 1,0 8.46,0 a4.23,4.23 0 1,0 -8.46,0 Z" />
+    <path android:fillColor="#4FD6AC"
+        android:pathData="M65.36,51.6 m-4.94,0 a4.94,4.94 0 1,0 9.88,0 a4.94,4.94 0 1,0 -9.88,0 Z" />
+    <path android:fillColor="#4FD6AC"
+        android:pathData="M35.02,41.72 m-2.96,0 a2.96,2.96 0 1,0 5.92,0 a2.96,2.96 0 1,0 -5.92,0 Z" />
+    <path android:fillColor="#EAF1EE"
+        android:pathData="M73.12,39.61 m-2.82,0 a2.82,2.82 0 1,0 5.64,0 a2.82,2.82 0 1,0 -5.64,0 Z" />
+    <path android:fillColor="#4FD6AC"
+        android:pathData="M56.19,33.26 m-2.26,0 a2.26,2.26 0 1,0 4.52,0 a2.26,2.26 0 1,0 -4.52,0 Z" />
+</vector>

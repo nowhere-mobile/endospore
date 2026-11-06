@@ -1,0 +1,8 @@
+version 0.5.52
+previous 0.5.51
+- Restore a snapshot now keeps five days of automatic saves, and photos taken in one session open again after you sign out and back in.
+- Create asks whether a new profile uses Google Play apps, and its Apps screen in Profile can turn Google Play on or off later.
+- Profile's Update card shows what is in the update, and a sign-in that would end a locked session warns first about its unsaved changes.
+- Help in Profile shows step-by-step cards, the gate's ? opens its own pages, and What's using space lists each top-level folder.
+- Apps added from nApps show download progress, returning Auto apps are announced once, and standby can wait for installs or audio first.
+- A setting that could not be saved now says so, a new profile starts in the gate's light or dark look, and call notices are named Phone.

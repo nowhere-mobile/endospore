@@ -1,0 +1,22 @@
+<!-- #i monochrome NOTIFICATION glyph: a small icon is flattened by Android to one tinted color (alpha only),
+     so the full ic_nowhere (dark disc + colors) reads as a filled ring. This is just the dispersing-spore
+     motif from ic_nowhere (the six dots as white shapes on a transparent field, no disc), so tinted it reads
+     as our mark. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path android:fillColor="#FFFFFFFF"
+        android:pathData="M52,76 m-10,0 a10,10 0 1,0 20,0 a10,10 0 1,0 -20,0 Z" />
+    <path android:fillColor="#FFFFFFFF"
+        android:pathData="M34,56 m-6,0 a6,6 0 1,0 12,0 a6,6 0 1,0 -12,0 Z" />
+    <path android:fillColor="#FFFFFFFF"
+        android:pathData="M71,50 m-7,0 a7,7 0 1,0 14,0 a7,7 0 1,0 -14,0 Z" />
+    <path android:fillColor="#FFFFFFFF"
+        android:pathData="M28,36 m-4.2,0 a4.2,4.2 0 1,0 8.4,0 a4.2,4.2 0 1,0 -8.4,0 Z" />
+    <path android:fillColor="#FFFFFFFF"
+        android:pathData="M82,33 m-4,0 a4,4 0 1,0 8,0 a4,4 0 1,0 -8,0 Z" />
+    <path android:fillColor="#FFFFFFFF"
+        android:pathData="M58,24 m-3.2,0 a3.2,3.2 0 1,0 6.4,0 a3.2,3.2 0 1,0 -6.4,0 Z" />
+</vector>

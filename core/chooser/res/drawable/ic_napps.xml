@@ -1,0 +1,42 @@
+<!-- nApps launcher icon (DIA-20260816-20; enlarged DIA-20260816-22). The FOUR-DOT brand mark — the one that
+     sits in front of the "nowhere" wordmark in the site nav (nc-storefront cmd/storefront/templates/nav.html,
+     `.brand-mark`), NOT the six-dot logo used as the page logo and NOT the three-dot favicon. All four dots
+     are solid teal there: styles.html fills every `.brand-mark circle` with the site's teal custom property,
+     #4FD6AC, and applies no per-dot opacity. (The CSS token is spelled with two leading hyphens, which cannot
+     be written inside an XML comment.)
+
+     Source, viewBox 0 0 20 20:
+         circle 10,14.6 r3 | 5.4,8.4 r2 | 14.3,7.6 r2.2 | 10,4 r1.4
+
+     SIZING RULE (shared with ic_nowhere, keep them in step): the glyph's bounding box fills 75% of the
+     100-unit disc on its larger dimension, centred on the disc. Measured here: 66% x 75%, furthest dot edge
+     at 37.5 = 75% of the radius, so it never crowds the rim.
+
+     The first cut mapped the source at x'=12+4.2x and came out 55% x 63% — Chester read it as "the icon is
+     50% of the full circle" against Clock's ~75%, which was accurate: it looked like a small mark adrift on
+     a large disc rather than an icon. Scaled x1.190 about the glyph's own bbox centre and recentred.
+
+     Deliberately DISTINCT from ic_nowhere: that icon is the dispersing-spore motif and belongs to Profile.
+     Before this pair existed, AppStoreActivity reused ic_nowhere, so "Get apps" and "Profile" were the same
+     picture with different words — two drawer entries a user could only tell apart by reading. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- dark disc background (brand canvas #0B0F14), identical to ic_nowhere -->
+    <path android:fillColor="#0B0F14"
+        android:pathData="M54,54 m-50,0 a50,50 0 1,0 100,0 a50,50 0 1,0 -100,0 Z" />
+    <!-- 10,14.6 r3 -> the anchor dot -->
+    <path android:fillColor="#4FD6AC"
+        android:pathData="M54.25,76.5 m-15,0 a15,15 0 1,0 30,0 a15,15 0 1,0 -30,0 Z" />
+    <!-- 5.4,8.4 r2 -->
+    <path android:fillColor="#4FD6AC"
+        android:pathData="M31.25,45.5 m-10,0 a10,10 0 1,0 20,0 a10,10 0 1,0 -20,0 Z" />
+    <!-- 14.3,7.6 r2.2 -->
+    <path android:fillColor="#4FD6AC"
+        android:pathData="M75.75,41.5 m-11,0 a11,11 0 1,0 22,0 a11,11 0 1,0 -22,0 Z" />
+    <!-- 10,4 r1.4 -->
+    <path android:fillColor="#4FD6AC"
+        android:pathData="M54.25,23.5 m-7,0 a7,7 0 1,0 14,0 a7,7 0 1,0 -14,0 Z" />
+</vector>

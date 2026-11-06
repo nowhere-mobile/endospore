@@ -1,0 +1,8 @@
+version 0.5.53
+previous 0.5.52
+- On-demand apps that aren't downloaded stay in the app drawer when you sign in again, and one you install during a save gets its data back after the save.
+- A Welcome back card at sign-in updates as each Auto app comes back, and an app's blue ring no longer stays on its icon once its files have downloaded.
+- Saves after the first in a session finish sooner as unchanged apps aren't copied again, and with the managed store each sign-in step starts sooner.
+- Presets move from Preferences to a card on Profile's home screen, Store settings moves to the gate's Owner settings, and Help in Profile shows where to tap.
+- What's using space can free a downloaded On-demand app, Your data now counts deleted files, and an app in use on your other phone can name that phone.
+- Paste works in Profile's Start or extend a plan and Report an issue, the gate's Wi-Fi list loads sooner, and Your apps stops calling missing apps sideloaded.

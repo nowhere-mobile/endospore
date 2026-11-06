@@ -1,0 +1,20 @@
+    private void repairSmsRoleLater(int uid, String why) {
+        final long serial = userSerial(uid);
+        new Thread(() -> {
+            try { Thread.sleep(SmsRoleRoam.SMS_REPAIR_DELAY_MS); } catch (InterruptedException ie) { return; }
+            // A repair that slept through a logoff must not fire into the NEXT session's sign-in apply, even when the
+            // new user reuses the id: the serial says whether this is still the user it was scheduled for.
+            if (!SmsRoleRoam.repairStillValid(serial, userSerial(uid))) {
+                android.util.Log.i("NowhereChooser", "#148 SMS repair (" + why + ") for " + uid + " skipped: that session ended");
+                return;
+            }
+            ensureRoamedSmsRole(uid);
+            // A sign-in apply the profile's own SMS app REFUSED (the #131 fresh-user window) left the session on
+            // Messaging: the roamed user's chooser retries it once now (SmsRoleRoam.retryRefused, a no-op otherwise).
+            try {
+                final android.content.Context app = getApplicationContext();
+                app.startServiceAsUser(new android.content.Intent(app, CredentialService.class).putExtra("smsretry", true),
+                        android.os.UserHandle.of(uid));
+            } catch (Throwable t) { android.util.Log.w("NowhereChooser", "#148 sms retry kick", t); }
+        }, "nowhere-sms-repair-" + why).start();
+    }

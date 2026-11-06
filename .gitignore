@@ -1,0 +1,79 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Rust / Node (future tooling)
+/target/
+**/target/
+node_modules/
+
+# Build & emulator artifacts
+*.img
+*.squashfs
+*.erofs
+out/
+*.log
+
+# Phase 0 local store data
+store-data/
+**/store-data/
+
+# Secrets / keys — never commit (this project is full of them)
+*.pem
+*.key
+*.priv
+*.age
+# Binary key stores (Android's .pk8 release keys, PKCS#12, Java and BouncyCastle key stores): no text scan can
+# read them, so ci/publish-source.sh also refuses one by name (NWP-20261017-40).
+*.pk8
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.bks
+keys/
+secrets/
+
+# Dev adb pre-auth key (DIA-20260623-25): the build builder's adb PUBLIC key, baked to /adb_keys on
+# userdebug/eng builds so adbd trusts the dev host with no prompt (the kiosk hides the RSA dialog). It is
+# the public half only, but it's per-builder + machine-specific, so provision it out-of-band rather than
+# commit it: copy your ~/.android/adbkey.pub to core/vendor-common/dev-adb_keys on the build host (stage-
+# vendor stages it to vendor/diaspore/dev-adb_keys, which diaspore.mk's PRODUCT_ADB_KEYS bakes in).
+core/vendor-common/dev-adb_keys
+
+# Store config (S3/Filebase endpoint + access/secret keys) - provisioned
+# out-of-band into the image, never committed. Its home is core/vendor-common/etc/nowhere.conf (AGENTS.md);
+# diaspore.conf is its pre-rename name. Only nowhere.conf.example is tracked.
+**/diaspore.conf
+**/nowhere.conf
+
+# Discovery config (DISCO_* endpoint + access/secret keys). Only the *.example template is
+# tracked; a REAL discovery.conf (used to bake a turnkey default into /system) carries creds and
+# must never be committed. A clean checkout has none -> builds an un-enrolled OS.
+**/discovery.conf
+
+# Default-app APKs (DIA-20260617-06) are NOT committed (~277MB; Fennec alone is 120MB). They're fetched
+# from F-Droid at the versions pinned in prebuilts/default-apps.manifest by prebuilts/fetch-default-apps.sh.
+# FDroid.apk predates this and stays tracked.
+core/vendor-common/prebuilts/*.apk
+!core/vendor-common/prebuilts/FDroid.apk
+# #159 Slice 1: WireGuard is NOT on the main F-Droid repo (fetch-default-apps can't get it), so
+# commit its official APK directly, like FDroid.apk. Add WireGuard to JNI_APPS at build prep to extract libwg-go.so.
+!core/vendor-common/prebuilts/WireGuard.apk
+
+# Native JNI libs extracted from those APKs + the generated copy-files fragment (DIA-20260618-01).
+# Both are produced by fetch-default-apps.sh from the (uncommitted) APKs; never committed.
+core/vendor-common/prebuilts/jni/
+core/vendor-common/prebuilts/default-apps-jni.mk
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# Agent binary is cross-compiled from core/agent at stage time (stage-vendor.sh), never committed.
+core/vendor-common/bin/nowhere_agent
+
+# Agent-farm working files (plans, transcripts, logs): never commit them.
+.agent/

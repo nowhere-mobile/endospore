@@ -1,0 +1,8 @@
+    private synchronized void stopRoleCapture() {
+        if (roleListener == null) return;
+        try {
+            getSystemService(android.app.role.RoleManager.class).removeOnRoleHoldersChangedListenerAsUser(
+                    roleListener, android.os.Process.myUserHandle());
+        } catch (Throwable ignore) {}
+        roleListener = null;
+    }

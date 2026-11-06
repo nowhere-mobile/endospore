@@ -1,0 +1,8 @@
+static void cancelFrameworkMissedCall(Context app) {
+        android.telecom.TelecomManager tm = app.getSystemService(android.telecom.TelecomManager.class);
+        if (tm == null) return;
+        for (int i = 0; i < 4; i++) {
+            try { tm.cancelMissedCallsNotification(); } catch (Throwable ignore) {}
+            try { Thread.sleep(400); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); return; }
+        }
+    }

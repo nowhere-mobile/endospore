@@ -1,0 +1,18 @@
+    private void sweepReadNotices() {
+        boolean event;
+        synchronized (this) {
+            event = sweepForEvent;
+            sweepForEvent = false;
+            sweepPendingSince = 0;
+        }
+        int[] r = {0, 0};
+        try { r = TelIngest.clearReadNotices(this); } catch (Throwable t) {
+            android.util.Log.w("NowhereChooser", "NWP-20261010-13 read clear", t);
+        }
+        long next;
+        synchronized (this) {
+            idleResweeps = nextIdleResweeps(event, r[1], idleResweeps);
+            next = resweepDelay(r[0], idleResweeps);
+        }
+        if (next >= 0) scheduleResweep(next);
+    }

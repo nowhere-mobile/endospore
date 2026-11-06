@@ -1,0 +1,5 @@
+    private synchronized void scheduleResweep(long delayMs) {
+        if (clearHandler == null || sweepForEvent) return;
+        clearHandler.removeCallbacks(sweep);
+        clearHandler.postDelayed(sweep, delayMs);
+    }

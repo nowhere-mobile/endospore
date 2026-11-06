@@ -1,0 +1,7 @@
+# ring-record.tsv -- which store ring a build bakes (NWP-20261104-01, Q006 in docs/product-decisions.md).
+# Columns, TAB separated: <device|*>  <release|dev>  <ring|none>.
+# An exact device row beats the * row for the same kind, whatever the row order. "none" bakes no ring at all.
+# Read by ring-for-build.sh; a build that names a different NOWHERE_RING is refused unless NOWHERE_RING_OVERRIDE=1.
+*	release	beta-setup
+lynx	dev	beta
+*	dev	beta-setup

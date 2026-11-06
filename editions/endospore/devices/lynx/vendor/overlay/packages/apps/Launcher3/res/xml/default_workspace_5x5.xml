@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Endospore default home layout for the Pixel 7a (lynx), 5x5 grid (E.5d, DIA-20260710).
+  lynx is forced onto the 5x5 grid (5 columns, 5-icon dock) by
+  editions/endospore/devices/lynx/patches/launcher3-grid.sh. Overlaid into com.android.launcher3 at build
+  time via PRODUCT_PACKAGE_OVERLAYS.
+
+  Two-page home, IDENTICAL to the Diaspore FP3: land on an empty wallpaper + dock page (screen 0), swipe
+  right to the app page. This file defines ONLY the dock + the empty landing:
+    - Empty landing (screen 0): kept from collapsing by QSB_ON_FIRST_SCREEN=true
+      (launcher3-qsb-firstscreen.sh); GrapheneOS ships no Google search widget, so nothing is drawn on it.
+    - The PAGE-2 apps are NOT here: this AOSP/GrapheneOS Launcher3 default-layout importer drops multi-screen
+      desktop items (only the dock imports), unlike the FP3's Trebuchet. So page 2 is seeded into the fresh
+      profile's launcher.db by nowhere_roamd.sh seed_home() from /system/etc/nowhere/default-home instead.
+  The per-profile arrangement roams (launcher.db); this is only the fresh-profile default. Dock swaps from
+  the FP3: browser = Vanadium (not Fennec), camera = GrapheneOS Camera (not LineageOS Aperture).
+-->
+<favorites xmlns:launcher="http://schemas.android.com/apk/res-auto/com.android.launcher3">
+
+    <!-- Hotseat (dock), 5 slots: Phone, Messages, Vanadium, Camera, Profile -->
+    <favorite launcher:container="-101" launcher:screen="0" launcher:x="0" launcher:y="0"
+        launcher:packageName="com.android.dialer" launcher:className="com.android.dialer.main.impl.MainActivity" />
+    <favorite launcher:container="-101" launcher:screen="1" launcher:x="1" launcher:y="0"
+        launcher:packageName="com.android.messaging" launcher:className="com.android.messaging.ui.conversationlist.ConversationListActivity" />
+    <favorite launcher:container="-101" launcher:screen="2" launcher:x="2" launcher:y="0"
+        launcher:packageName="app.vanadium.browser" launcher:className="com.google.android.apps.chrome.Main" />
+    <favorite launcher:container="-101" launcher:screen="3" launcher:x="3" launcher:y="0"
+        launcher:packageName="app.grapheneos.camera" launcher:className="app.grapheneos.camera.ui.activities.MainActivity" />
+    <favorite launcher:container="-101" launcher:screen="4" launcher:x="4" launcher:y="0"
+        launcher:packageName="com.nowhere.chooser" launcher:className="com.nowhere.chooser.ProfileActivity" />
+
+    <!-- Screen 0 (landing) intentionally empty: wallpaper + dock. Page 2 is seeded by roamd (see header). -->
+
+</favorites>

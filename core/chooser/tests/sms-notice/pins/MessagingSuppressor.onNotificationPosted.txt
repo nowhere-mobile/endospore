@@ -1,0 +1,7 @@
+    @Override public void onNotificationPosted(StatusBarNotification sbn) {
+        cancelIfBugleMessage(sbn);
+        // NWP-20261010-13: our own message notice just went up -> sweep, which starts the re-sweep while it is unread.
+        if (sbn != null && getPackageName().equals(sbn.getPackageName()) && TelIngest.noticeRow(sbn.getTag()) != null) {
+            scheduleEventSweep();
+        }
+    }

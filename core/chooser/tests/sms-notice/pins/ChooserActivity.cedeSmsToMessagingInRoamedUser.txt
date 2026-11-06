@@ -1,0 +1,21 @@
+    private void cedeSmsToMessagingInRoamedUser(int uid) {
+        try {
+            android.content.Context uc = createContextAsUser(android.os.UserHandle.of(uid), 0);
+            for (String c : roamedSmsComponents()) {
+                try {
+                    uc.getPackageManager().setComponentEnabledSetting(
+                            new android.content.ComponentName(getPackageName(), getPackageName() + c),
+                            android.content.pm.PackageManager.COMPONENT_ENABLED_STATE_DISABLED,
+                            android.content.pm.PackageManager.DONT_KILL_APP);
+                } catch (Throwable t) { android.util.Log.w("NowhereChooser", "#148 disable chooser SMS component " + c, t); }
+            }
+            // NWP-20261010-13: the sign-in apply runs IN the roamed user, which can read the profile's record.
+            try {
+                final android.content.Context app = getApplicationContext();
+                app.startServiceAsUser(new android.content.Intent(app, CredentialService.class).putExtra("smsrole", true),
+                        android.os.UserHandle.of(uid));
+            } catch (Throwable t) { android.util.Log.w("NowhereChooser", "#148 sms role kick", t); }
+            repairSmsRoleLater(uid, "cede");
+            grantMessagingRestrictedRead(uc); // #150: also grant now for the common case where the role is already held (idempotent)
+        } catch (Throwable t) { android.util.Log.w("NowhereChooser", "#148 cedeSmsToMessagingInRoamedUser", t); }
+    }

@@ -1,0 +1,22 @@
+<!-- Endospore override of the Profile adaptive-icon foreground (DIA-20260817-02): identical geometry to
+     core's ic_nowhere_fg.xml, in the neutral GrapheneOS-theme GRAY instead of Nowhere teal - the same
+     colour swap this edition already applies to the legacy drawable. Overlaid by stage-vendor. Keep the
+     geometry byte-identical with core; they differ in COLOUR only. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path android:fillColor="#9AA0A6"
+        android:pathData="M51.95,69.94 m-7.06,0 a7.06,7.06 0 1,0 14.12,0 a7.06,7.06 0 1,0 -14.12,0 Z" />
+    <path android:fillColor="#EAF1EE"
+        android:pathData="M39.26,55.83 m-4.23,0 a4.23,4.23 0 1,0 8.46,0 a4.23,4.23 0 1,0 -8.46,0 Z" />
+    <path android:fillColor="#9AA0A6"
+        android:pathData="M65.36,51.6 m-4.94,0 a4.94,4.94 0 1,0 9.88,0 a4.94,4.94 0 1,0 -9.88,0 Z" />
+    <path android:fillColor="#9AA0A6"
+        android:pathData="M35.02,41.72 m-2.96,0 a2.96,2.96 0 1,0 5.92,0 a2.96,2.96 0 1,0 -5.92,0 Z" />
+    <path android:fillColor="#EAF1EE"
+        android:pathData="M73.12,39.61 m-2.82,0 a2.82,2.82 0 1,0 5.64,0 a2.82,2.82 0 1,0 -5.64,0 Z" />
+    <path android:fillColor="#9AA0A6"
+        android:pathData="M56.19,33.26 m-2.26,0 a2.26,2.26 0 1,0 4.52,0 a2.26,2.26 0 1,0 -4.52,0 Z" />
+</vector>

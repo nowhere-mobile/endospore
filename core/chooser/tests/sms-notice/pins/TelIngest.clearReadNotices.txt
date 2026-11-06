@@ -1,0 +1,45 @@
+    static int[] clearReadNotices(Context ctx) {
+        android.app.NotificationManager nm = ctx.getSystemService(android.app.NotificationManager.class);
+        if (nm == null) return new int[]{0, 0};
+        android.service.notification.StatusBarNotification[] active;
+        try { active = nm.getActiveNotifications(); } catch (Throwable t) { return new int[]{0, 0}; }
+        if (active == null) return new int[]{0, 0};
+        final long now = System.currentTimeMillis();
+        final java.util.Map<String, Long> posted = new java.util.HashMap<>();
+        java.util.List<String> tags = new java.util.ArrayList<>();
+        for (android.service.notification.StatusBarNotification sbn : active) {
+            if (noticeRow(sbn.getTag()) == null) continue;
+            tags.add(sbn.getTag());
+            posted.put(sbn.getTag(), sbn.getPostTime());
+        }
+        if (tags.isEmpty()) return new int[]{0, 0};
+        final boolean canRead = canReadMessages(ctx);
+        final java.util.Set<String> gone = new java.util.HashSet<>(); // the rowQuery args answered ROW_GONE
+        java.util.Map<String, Integer> act = noticeActions(tags, tag -> now - posted.get(tag), q -> {
+            int st = readState(ctx, q, canRead);
+            if (st == ROW_GONE) gone.add(q[0] + "|" + q[2]);
+            return st;
+        });
+        int poll = 0, cleared = 0, clearedGone = 0;
+        for (android.service.notification.StatusBarNotification sbn : active) {
+            Integer a = act.get(sbn.getTag());
+            if (a == null) continue;
+            if (a == NOTICE_CLEAR) {
+                try { nm.cancel(sbn.getTag(), sbn.getId()); cleared++; } catch (Throwable ignore) {}
+                String[] q = rowQuery(noticeRow(sbn.getTag()));
+                if (gone.contains(q[0] + "|" + q[2])) clearedGone++;
+            } else if (a == NOTICE_POLL) {
+                poll++;
+            }
+        }
+        // Counts only, never a number, a body or a time. GONE cannot tell a conversation the user deleted from a row
+        // that vanished after its insert (the provider settling at sign-in, see deliver()), so a gone clear is counted
+        // apart: a vanished text leaves this trace even though its notice goes.
+        if (cleared > 0) {
+            android.util.Log.i("NowhereChooser", "NWP-20261010-13 cleared " + cleared + " message notice(s), "
+                    + clearedGone + " of them for a row that is gone (deleted, or vanished after its insert)");
+        }
+        if (cleared > 0) syncMessageSummary(ctx); // NWP-20261118-16: the summary goes with the group's last notice
+        if (!canRead) android.util.Log.w("NowhereChooser", "NWP-20261010-13 cannot read Messages: notices kept, not polled");
+        return new int[]{poll, cleared};
+    }

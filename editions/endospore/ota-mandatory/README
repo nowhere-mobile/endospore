@@ -1,0 +1,32 @@
+Mandatory updates -- which releases a phone must install, why, and by when (NWP-20261011-05).
+
+Decision of record: docs/product-decisions.md, 2026-10-10 ("a mandatory update is whatever we flag as one"). A release
+is ordinary unless a file here names it. To flag one, commit a file named for its version (e.g. `0.5.45`) before the
+release is built, exactly four lines:
+
+    version 0.5.45
+    severity mandatory
+    reason Saves now go through a new check on our servers, and this phone needs the new version to pass it.
+    consequence Once the servers require the check, this phone cannot save your changes or sign out.
+
+- `severity` is `mandatory` (due 30 days after publication) or `critical` (due 7 days after). Each phone counts from the
+  later of the signed publication date and the day it first sees the release (UTC days; recorded on
+  /data/nowhere/ota-seen, so a reboot does not restart it). A ring promoted later, or a phone that was off, gets
+  the full window.
+- `reason` and `consequence` are one line each, at most 200 characters. The phone shows them as written, so Chester
+  writes or edits them. Same wording rule as the OTA notes: no privacy or security claims (docs/privacy-claims.md), so
+  words like "security", "secure", "privacy", "protects" or "safe" are refused. Say what changed and what stops working.
+- The phone never installs on its own because of this file. It shows the reason, adds the deadline, and after the
+  deadline it reminds more often.
+
+How it reaches a phone (all in docs/release-runbook.md):
+
+1. `make-web-package.sh` (run by `build-device.sh --release`) copies the file into the installer manifest's `"ota"`
+   object, with `"published"` set to the UTC date it runs (`NOWHERE_OTA_PUBLISHED=YYYY-MM-DD` overrides). An ordinary
+   release gets `"severity": "none"`.
+2. The operator signs that manifest with the release key, as for every release (`release sign`).
+3. `e4-ota-publish.sh` checks the signed manifest with the phone's own code and key (`nowhere_agent ota-release-check`),
+   refuses it if it disagrees with this file, and publishes it at `ota/<dev>/release-<version>` before the marker.
+
+Rules enforced by `nowhere_agent ota-mandatory-check`, by core/agent/ota_mandatory_test.go over every file here, by
+ota-release-fields.sh (before the manifest is signed), and by e4-ota-publish.sh.

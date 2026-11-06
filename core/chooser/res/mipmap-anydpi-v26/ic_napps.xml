@@ -1,0 +1,8 @@
+<!-- Adaptive launcher icon for nApps (DIA-20260817-02) - see mipmap-anydpi-v26/ic_nowhere.xml for the full
+     story: legacy icons get shrunk to 52% of the mask on a generated white circle; adaptive backgrounds
+     render full-bleed like Clock's. The legacy res/drawable/ic_napps.xml stays as the pre-26 fallback and
+     for any direct in-app use. -->
+<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+    <background android:drawable="@color/nowhere_icon_bg" />
+    <foreground android:drawable="@drawable/ic_napps_fg" />
+</adaptive-icon>

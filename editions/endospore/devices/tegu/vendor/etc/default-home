@@ -1,0 +1,31 @@
+# Endospore default home -- page-2 (screen 1) apps, seeded into a FRESH roamed profile's launcher.db by
+# nowhere_roamd.sh seed_home() (E.5d, DIA-20260710). WHY a seed and not just the launcher overlay: the
+# GrapheneOS/AOSP Launcher3 default-layout importer only imports the DOCK (hotseat) from default_workspace;
+# it silently drops multi-screen DESKTOP items (proven on lynx -- LineageOS/Trebuchet on the FP3 imports both,
+# so the FP3 needs no seed and this file is Endospore-only). So the empty landing + dock come from the
+# launcher overlay (default_workspace_5x5.xml) and these page-2 apps are injected after the first login.
+#
+# Format: screen|cellX|cellY|packageName|className   (container = desktop, itemType = app; '#' = comment).
+# Layout mirrors the FP3 two-page home (editions/diaspore/devices/fp3/.../default_workspace_5x5.xml); the
+# browser (Vanadium) and camera (GrapheneOS Camera) edition swaps live in the dock, not this page.
+#
+# Row 0: maps / weather / comms / media
+1|0|0|app.organicmaps|app.organicmaps.DownloadResourcesActivity
+1|1|0|org.breezyweather|org.breezyweather.ui.main.MainActivity
+1|2|0|eu.siacs.conversations|eu.siacs.conversations.ui.ConversationActivity
+1|3|0|org.schabi.newpipe|org.schabi.newpipe.MainActivity
+1|4|0|de.danoeh.antennapod|de.danoeh.antennapod.activity.SplashActivity
+# Row 1: security / wallet / notes / files / app store
+1|0|1|com.beemdevelopment.aegis|com.beemdevelopment.aegis.ui.MainActivity
+1|1|1|me.hackerchick.catima|protect.card_locker.MainActivity
+1|2|1|com.omgodse.notally|com.omgodse.notally.activities.MainActivity
+1|3|1|com.android.documentsui|com.android.documentsui.LauncherActivity
+1|4|1|com.aurora.store|com.aurora.store.MainActivity
+# Row 2: system + nApps
+1|0|2|com.android.settings|com.android.settings.Settings
+1|1|2|com.android.deskclock|com.android.deskclock.DeskClock
+# DIA-20260816-20: nApps -- the Nowhere app store. Placed in the free row-2 cell rather than replacing Aurora
+# at 1|4|1: they are different stores (Aurora fronts Play, nApps serves our signed catalog) and dropping one
+# for the other is a product decision, not a placement one. DIA-20260818-09: this is now the REAL nApps app
+# which relaunches ProfileActivity on its store screen.
+1|2|2|com.nowhere.napps|com.nowhere.napps.StoreActivity

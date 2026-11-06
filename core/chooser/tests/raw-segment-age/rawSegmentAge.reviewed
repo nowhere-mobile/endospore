@@ -1,0 +1,48 @@
+    private static void rawSegmentAge(Context ctx) {
+        if (android.os.UserHandle.myUserId() != 0) return;
+        synchronized (RAW_AGE_LOCK) {
+            try {
+                final android.content.ContentResolver cr = ctx.getContentResolver();
+                final java.io.File rec = new java.io.File(ctx.getFilesDir(), "nowhere-rawseen");
+                String old = "";
+                if (rec.exists()) {
+                    old = new String(java.nio.file.Files.readAllBytes(rec.toPath()), java.nio.charset.StandardCharsets.UTF_8);
+                }
+                final java.util.List<RawSegmentAge.Row> rows = new java.util.ArrayList<>();
+                final String[] cols = { "_id", "address", "reference_number", "count", "sequence", "destination_port" };
+                try (android.database.Cursor c = cr.query(SMS_RAW, cols, "deleted = 0", null, null)) {
+                    if (c == null) return;
+                    while (c.moveToNext()) {
+                        rows.add(new RawSegmentAge.Row(c.getLong(0), c.isNull(1) ? null : c.getString(1),
+                                c.isNull(2) ? null : c.getInt(2), c.isNull(3) ? null : c.getInt(3),
+                                c.isNull(4) ? null : c.getInt(4), c.isNull(5) ? null : c.getInt(5)));
+                    }
+                }
+                final java.util.List<Long> waiting = RawSegmentAge.orphans(rows);
+                final RawSegmentAge.Plan p = RawSegmentAge.plan(RawSegmentAge.parse(old), waiting, System.currentTimeMillis());
+                int removed = 0;
+                for (long id : p.remove) {
+                    try {
+                        removed += cr.delete(SMS_RAW_PERMANENT, "_id = ? AND deleted = 0", new String[] { Long.toString(id) });
+                    } catch (Throwable ignore) {}
+                }
+                final String now = RawSegmentAge.format(p.record);
+                if (!now.equals(old)) {
+                    final java.io.File tmp = new java.io.File(rec.getParentFile(), rec.getName() + ".tmp");
+                    boolean ok = false;
+                    try (java.io.FileOutputStream out = new java.io.FileOutputStream(tmp)) {
+                        out.write(now.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                        out.getFD().sync();
+                        ok = true;
+                    } catch (java.io.IOException ignore) {}
+                    if (!ok || !tmp.renameTo(rec)) tmp.delete();
+                }
+                if (!rows.isEmpty() || removed > 0) {
+                    Log.i("NowhereChooser", "rawseen: waiting=" + waiting.size() + " complete=" + (rows.size() - waiting.size())
+                            + " stamped=" + p.stamped + " removed=" + removed);
+                }
+            } catch (Throwable t) {
+                Log.i("NowhereChooser", "rawseen: skipped " + t.getClass().getSimpleName());
+            }
+        }
+    }

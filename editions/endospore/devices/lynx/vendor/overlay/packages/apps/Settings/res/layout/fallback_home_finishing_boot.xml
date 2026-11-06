@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Endospore boot-brand overlay (task #160). FallbackHome fades this view in via setContentView() if user-0
+  unlock exceeds config_progressTimeoutFallbackHome. Stock it is a 50%-black scrim + "Starting Android" text
+  + an indeterminate ProgressBar: unbranded churn over our branded window. Stripped to a transparent no-op
+  so the endospore windowBackground (see @style/FallbackHome override) stays fully visible instead. Root type
+  (FrameLayout) is preserved; FallbackHome.java only setContentView()s it and never findViewById()s into it,
+  so an empty transparent root is safe.
+-->
+<FrameLayout
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@android:color/transparent"
+    android:forceHasOverlappingRendering="false" />

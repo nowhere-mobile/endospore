@@ -1,0 +1,33 @@
+<?xml version='1.0' encoding='utf-8' standalone='yes' ?>
+<!--
+  Nowhere (NWP-20260827-23): pre-grant the calendar RUNTIME permissions to Etar (ws.xsoh.etar), the
+  bundled calendar app.
+
+  WHY THIS IS NEEDED: Nowhere mints a FRESH Android user on every login, and runtime grants are
+  per-(package, user). Without a default-permissions exception, Etar starts every single login with
+  READ_CALENDAR denied, so the calendar the first-login ingest just wrote into CalendarProvider renders
+  EMPTY until the user grants it again, and grants it again on the next login, and the one after that.
+  That is the exact failure Etar was bundled to fix (NWP-20260827-22): before Etar there was no calendar
+  UI at all, so imported .ics events landed correctly in the provider and were invisible. An ungranted
+  Etar reproduces the same symptom with an extra step.
+
+  Same mechanism and same reasoning as the geotz location grant (nowhere-geotz-location.xml): a first-boot
+  `pm grant` only ever covers user 0, whereas a default-permissions exception applies at EVERY user's
+  creation, which is where a roamed session actually runs. Etar is a SYSTEM package (/product/app/Etar),
+  so the exception applies to it.
+
+  WHAT IS DELIBERATELY NOT HERE. Etar also requests READ_CONTACTS (attendee autocomplete) and
+  GET_ACCOUNTS (account-backed calendars). Both are left on demand: they reach OUTSIDE the calendar into
+  other user data, and neither is needed to display or edit a local roamed calendar. Only the permissions
+  the app needs to do its own job on its own data are pre-granted.
+
+  fixed="false" leaves every grant user-revocable, matching the other exceptions in this directory.
+  -->
+<exceptions>
+    <exception package="ws.xsoh.etar">
+        <permission name="android.permission.READ_CALENDAR" fixed="false"/>
+        <permission name="android.permission.WRITE_CALENDAR" fixed="false"/>
+        <!-- Event reminders are a core calendar behaviour; without this every login silently drops them. -->
+        <permission name="android.permission.POST_NOTIFICATIONS" fixed="false"/>
+    </exception>
+</exceptions>

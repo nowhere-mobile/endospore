@@ -1,0 +1,37 @@
+<?xml version='1.0' encoding='utf-8' standalone='yes' ?>
+<!--
+  Nowhere (#135 B3): pre-grant RECEIVE_SMS to the chooser so it can receive SMS_DELIVER as user-0's default
+  SMS app and seal the message to its bound profile (docs/telephony-owner-mode.md).
+
+  The default-SMS-app role already auto-grants the SMS runtime perms when the role is set, but that grant is
+  tied to holding the role; pre-granting here (like the READ_PHONE_STATE + POST_NOTIFICATIONS grants) makes
+  the perm present from user-0 creation, so the receiver works even in the brief window before
+  ensureDefaultSmsRole() sets the role on a fresh device. RECEIVE_SMS is DANGEROUS (runtime), so
+  privapp-permissions does not cover it. fixed="false" leaves it user-revocable.
+
+  #150: RECEIVE_MMS is likewise pre-granted. com.android.phone sends the MMS WAP_PUSH_DELIVER ordered
+  broadcast with a required RECEIVE receiver permission of RECEIVE_MMS; without the grant the broadcast is
+  "skipped by policy at enqueue: Permission Denial ... requires RECEIVE_MMS" and WapPushDeliverReceiver never
+  runs. (Note SMS_DELIVER imposes no such receiver perm, which is why RECEIVE_SMS delivery worked without
+  this class of failure; the MMS path is asymmetric.) Also DANGEROUS/runtime; fixed="false".
+
+  #150 (2026-07-16): RECEIVE_WAP_PUSH is the ACTUAL op that gates inbound-MMS delivery, and was the real reason
+  MMS never arrived (misdiagnosed earlier as the cede's exclusive-op revoke). OP_RECEIVE_WAP_PUSH is a
+  permission-backed app-op whose mode is DERIVED from this runtime permission: without the chooser holding it,
+  the op is forced "ignore" (un-settable, even for the sole default SMS app), so the M-Notification.ind WAP push
+  is dropped before WapPushDeliverReceiver runs. Pre-grant it here (belt-and-suspenders with the SMS-role grant,
+  now that the manifest declares it). DANGEROUS/runtime; fixed="false".
+  -->
+<exceptions>
+    <exception package="com.nowhere.chooser">
+        <permission name="android.permission.RECEIVE_SMS" fixed="false"/>
+        <permission name="android.permission.RECEIVE_MMS" fixed="false"/>
+        <permission name="android.permission.RECEIVE_WAP_PUSH" fixed="false"/>
+        <!-- 637: owner-mode transmit. SEND_SMS lets owner mode send a text on an unbound SIM (the owner's line) from
+             user 0. This XML grants it only at FRESH user-0 creation; on an existing user 0 (a flash or an OTA)
+             neither it nor the already-held SMS role grants it (seen on lynx 2026100101, 2026-10-01), so
+             ChooserActivity.ensureTransmitPerms self-grants it as device owner, and that grant is policy-fixed.
+             DANGEROUS/runtime. -->
+        <permission name="android.permission.SEND_SMS" fixed="false"/>
+    </exception>
+</exceptions>

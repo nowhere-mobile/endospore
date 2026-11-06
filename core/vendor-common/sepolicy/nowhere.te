@@ -1,0 +1,438 @@
+# Nowhere confined SELinux domain (P4.2c) — replaces the `seclabel u:r:su:s0` placeholder on the
+# nowhere init services (the agent login-daemon + nowhere_login.sh) that ran as unconfined root.
+#
+# Brought up PERMISSIVE (userdebug only) so the services keep working while we collect the real
+# denial set from audit logs, then this `permissive` line is removed to ENFORCE. The allows below
+# are a first cut; refine from `audit2allow` output.
+type nowhere, domain, coredomain;
+type nowhere_exec, exec_type, file_type, system_file_type;
+type nowhere_data_file, file_type, data_file_type, core_data_file_type;
+
+# init launches the (shell-script) services in this domain via `seclabel u:r:nowhere:s0`.
+# init_daemon_domain sets up the init<->nowhere process perms + entrypoint on nowhere_exec.
+init_daemon_domain(nowhere)
+
+# Arc-2 ROAM bridge (now ENFORCING; was permissive during M3 bring-up). The daemon execs `setprop`
+# twice -- `ctl.start nowhere_roamd` to spawn the su:s0 data worker, and on logout `sys.powerctl
+# reboot` to wipe the ephemeral user (the chooser can't reboot from a secondary user). The setprop
+# exec itself is granted in the exec section below (toolbox_exec execute_no_trans); these are the two
+# property sets (set_prop also covers the property_socket write + connectto-init the audit showed).
+# Start and stop ONLY the data worker: ctl.start$nowhere_roamd carries its own label (see property_contexts),
+# so this is least-privilege rather than the broad ctl.start$. NWP-20261120-01: the daemon also sends
+# `ctl.stop nowhere_roamd` for an odrestore it gave up on; ctl.stop$nowhere_roamd carries the same label, so
+# this one set_prop covers start and stop. Declared like AOSP's ctl_bootanim_prop
+# (system_internal_prop gives it system_property_type so a coredomain may set it + read its prop file;
+# a bare `type ... property_type` trips the property.te owner neverallows).
+system_internal_prop(ctl_nowhere_roamd_prop)
+set_prop(nowhere, ctl_nowhere_roamd_prop)
+# Self-service OTA (DIA-20260618-03): on a user-confirmed install the daemon kicks the su:s0 updater the
+# same way -- `ctl.start nowhere_otad` -- so grant just that one labelled control prop (least-privilege).
+system_internal_prop(ctl_nowhere_otad_prop)
+set_prop(nowhere, ctl_nowhere_otad_prop)
+# Logout auto-reboot. No neverallow restricts powerctl_prop (init/vold/system_server/shell/... set it).
+set_prop(nowhere, powerctl_prop)
+
+# Bring-up (permissive) showed the only audited capability denial was CAP_NET_RAW: the Go agent
+# probes a raw socket but never needs it for its actual TCP/TLS (S3) + UDP (DNS) work -- both the
+# on-boot restore and the sync cycles succeed without it. So suppress that noise rather than grant
+# a sensitive capability to a network client.
+dontaudit nowhere self:capability net_raw;
+# The Go runtime sends SIGURG to its own threads for async preemption; it falls back to cooperative
+# preemption if denied, so this is benign -- suppress rather than grant the sensitive CAP_KILL.
+dontaudit nowhere self:capability kill;
+
+# --- #media scope: the login daemon must be able to WALK the shared media tree to seal it ---
+# The bring-up note above ("the only audited capability denial was CAP_NET_RAW") predates the EXTERNAL
+# #media scope (#172): the seal now walks /data/media/<N> directly, which the CE-only bring-up never
+# exercised. That tree is media_rw:media_rw (0750 on /data/media, 2770 below), and the agent runs as ROOT
+# in this domain -- so traversal depends entirely on CAP_DAC_READ_SEARCH, which was never granted here.
+# Result, root-caused on lynx 2026-07-28: opendir("/data/media") returned EACCES on the first call, the
+# seal walk ended instantly, and #media offered a 2-chunk manifest against a 304-chunk head on EVERY seal
+# for a day. (The agent's OTHER incarnations run as endospore_priv, which does hold these -- see
+# editions/endospore/vendor/sepolicy/endospore.te -- which is why this only bit the login-daemon path.)
+#
+# dac_read_search only: the seal READS this tree. The restore/import side writes it from the roamd
+# workers (endospore_priv), so dac_override stays ungranted here -- keep the write bypass out of a domain
+# that only needs to read. The paired agent-side fix makes a blind walk REFUSE to publish rather than
+# seal a short manifest, so a future gap of this shape fails loudly instead of silently.
+allow nowhere self:capability dac_read_search;
+allow nowhere media_userdir_file:dir r_dir_perms;
+allow nowhere media_rw_data_file:dir r_dir_perms;
+allow nowhere media_rw_data_file:file r_file_perms;
+allow nowhere media_rw_data_file:lnk_file r_file_perms; # NWP-20260821-06: same lnk_file blind-seal guard on the media tree
+# LAYER 2, root-caused on lynx 2026-07-28 AFTER the dac_read_search grant above took effect and the walk got
+# further: `avc denied { search } comm=nowhere_agent name=com.nowhere.chooser tcontext=app_data_file`. The
+# #84 media daemon hides the real app media behind overlays and parks the backing under
+# com.nowhere.chooser/files/.nowhere-media(-ext)/.under/ -- which is app_data_file. The #media seal reads those
+# .under binds to capture the real media, so it MUST traverse the chooser's app_data_file dir to reach them.
+# This denial is present on BOTH the periodic AND the logoff seal (sweepmedia unmounts the binds but the
+# .nowhere-media cache dirs stay on disk, and mediaUndersFn still points the walk at them), so tearing overlays
+# down does not avoid it. endospore_priv already holds equivalent app-data access; the nowhere login-daemon
+# domain did not. r_dir_perms/r_file_perms only -- the seal READS.
+# ⚠ REVIEW: this grants nowhere READ over ALL app_data_file, which is broad. The tighter fix is a dedicated
+# type for the .nowhere-media backing (label it nowhere_media_file like the FUSE mount, or a new
+# nowhere_mediacache_file) so the grant scopes to exactly that subtree. Deferred: it needs a file_contexts +
+# restorecon pass on the cache dirs. The broad grant unblocks #media now; the nowhere domain is already a root
+# daemon that walks /data/user/<N> wholesale, so the marginal exposure is small.
+allow nowhere app_data_file:dir r_dir_perms;
+allow nowhere app_data_file:file r_file_perms;
+# NWP-20260821-06 (NW-b8b659735124): lnk_file READ too -- the seal walk lstat's every entry, and an
+# app that symlinks inside its data (AliExpress's U4 WebView v8_cache is the first) else denies
+# { getattr } tclass=lnk_file -> the path counts BLIND -> every logoff REFUSED. Read only: the seal
+# SKIPS links (never carries them) and the restore never creates them, so no create/write is needed.
+allow nowhere app_data_file:lnk_file r_file_perms;
+
+# --- exec allows (the services are /system/bin/sh scripts that exec the agent + toolbox applets, and
+#     the daemon execs setprop; all run in-domain, so each exec type needs execute_no_trans) ---
+allow nowhere shell_exec:file rx_file_perms;
+allow nowhere shell_exec:file execute_no_trans;
+allow nowhere toolbox_exec:file rx_file_perms;
+allow nowhere toolbox_exec:file execute_no_trans;   # setprop / tar / sed / ... run in-domain
+allow nowhere nowhere_exec:file rx_file_perms;
+allow nowhere nowhere_exec:file execute_no_trans;  # boot/sync/shutdown scripts re-exec nowhere_agent
+
+# Ephemeral roaming state under /data/nowhere.
+allow nowhere nowhere_data_file:dir create_dir_perms;
+allow nowhere nowhere_data_file:file create_file_perms;
+
+# #210 p2 keystore carry: roamd stages a carried key bundle where keystore2 can consume it.
+#
+# roamd (endospore_priv) owns the HANDOFF, keystore2 (the `keystore` user) owns the keys. roamd must therefore
+# manage /data/misc/keystore/{nowhere-import,nowhere-keep-uids}: mkdir the import dir, chmod 0755 + chown it to
+# keystore:keystore so keystore2 can traverse AND rewrite bundles as its create-hook consumes each alias, move
+# each <ns>.keys in, and restorecon it. Without these the carry cannot work on an ENFORCING build at all.
+#
+# ⚠ These were harvested as permissive=1 in July and recorded as "required before any enforcing build", then
+# never added. They are now firing for real on lynx at permissive=0:
+#   avc: denied { setattr } comm="chmod" name="nowhere-import" tcontext=keystore_data_file tclass=dir
+#   avc: denied { setattr } comm="chown" name="nowhere-import" tcontext=keystore_data_file tclass=dir
+# lynx only still works because the directory kept the right mode/owner from an earlier permissive run. On a
+# fresh frankel/stallion the staging fails and the carry silently never happens.
+#
+# DIA-20260813-04 (#132): `create` was the ONE perm this set still lacked -- mkdir of nowhere-import itself.
+# The #632 grants covered every op on an EXISTING dir, so the carry worked wherever a permissive-era dir
+# survived and was dead anywhere it had to be created: proven live on lynx 2026-08-13 (odtest11 user 16):
+#   avc: denied { create } comm="mkdir" name="nowhere-import" tcontext=keystore_data_file tclass=dir permissive=0
+# with the restored bundle stranded in keystore-in and Amazon signed out. The full staging chain was swept
+# against live policy via /sys/fs/selinux/access: every other perm (dir setattr/add_name/remove_name/write,
+# all file ops, both relabels, CAP_CHOWN, keystore2's read side) already allows -- `create` is the whole fix.
+allow endospore_priv keystore_data_file:dir { create search getattr setattr add_name remove_name write };
+allow endospore_priv keystore_data_file:file { create getattr setattr open read write rename unlink relabelto };
+# `mv` from /data/nowhere/keystore-in keeps the source label, so the restorecon that follows relabels a
+# nowhere_data_file -> keystore_data_file and needs the FROM side too:
+#   avc: denied { relabelfrom } comm="restorecon" name="1610221.keys" tcontext=nowhere_data_file tclass=file
+allow endospore_priv nowhere_data_file:file relabelfrom;
+
+# Read the baked store config + CA roots under /system/etc.
+allow nowhere system_file:dir r_dir_perms;
+allow nowhere system_file:file r_file_perms;
+
+# Network: the agent does S3 over TLS (TCP) + DNS (UDP) to roam state to/from the store.
+net_domain(nowhere)
+
+# init mounts /data/nowhere/state as tmpfs (RAM-backed amnesiac roaming state; see nowhere.rc).
+# context=nowhere_data_file makes the mounted fs that type, so the domain's existing rw covers it.
+allow init nowhere_data_file:dir mounton;
+# `context=` mount: init relabels the tmpfs superblock to nowhere_data_file (the mountpoint's own type),
+# and nowhere_data_file inodes must associate with that fs. Needs relabelfrom+relabelto + associate.
+allow init nowhere_data_file:filesystem { mount relabelfrom relabelto };
+allow nowhere_data_file self:filesystem associate;
+
+# --- #84 on-demand media FUSE (store-backed deferred media) ---
+# nowhere_mediad (an init service running `nowhere_agent mediad`) mounts a FUSE fs,
+# context=nowhere_media_file, over a roamed app's deferred-media dir: large media (maps/photos) is left out
+# of the login-gating restore and served lazily from the store on first open. The served files carry OUR type
+# (NOT app_data_file -> no AOSP app-data neverallow risk) + mlstrustedobject so ANY app MLS category (s0:cN)
+# can read this s0 file -- the same MLS-bridge trick as nowhere_login_socket below. Apps read their maps
+# straight through the mount; this block is the whole app-facing enforcement surface, proven on-device
+# (enforcing) in the Phase-0 spike.
+#
+# The DAEMON side runs `seclabel u:r:su:s0` like its sibling privileged workers (nowhere_roamd/otad): AOSP's
+# app-sandbox neverallow (`neverallow { domain -adbd -appdomain ... -zygote } { privapp_data_file
+# app_data_file }:dir *`, private/domain.te) forbids ANY new coredomain every dir permission on app data --
+# so a confined mediad domain could never mounton the app's dir or read it for passthrough. We keep AOSP's
+# sandbox guarantee intact (it's part of the security model) rather than carve an exception.
+#
+# E.5x (DIA-20260808-03) -- THAT FOLLOW-ON HAS LANDED, for Endospore only. su:s0 is not an option on a user
+# build (GrapheneOS neuters it), so mediad there runs in its own confined domain, endospore_mediad, with the
+# mount chain and CAP_SYS_ADMIN scoped to it alone; endospore_priv keeps neither. See
+# editions/endospore/vendor/sepolicy/endospore_mediad.te. The "every dir permission" reading of the
+# neverallow above looks too strong on the GrapheneOS base: endospore_priv has carried
+# `app_data_file_type:dir create_dir_perms` for the roam restore since E.2c and the policy builds clean, so
+# a second coredomain with the same shape should build too. That is an inference from a sibling domain, not
+# a checked fact about `mounton` -- the sepolicy build is the arbiter and fails early and by name if wrong.
+# LineageOS/FP3 keeps su:s0 regardless: there is no user build there to force the issue.
+# nowhere_media_file is declared as a PLATFORM type (`type nowhere_media_file, file_type, mlstrustedobject;`
+# in system/sepolicy/public/file.te) by the out-of-repo patch
+# editions/diaspore/build/patches/sepolicy-app-media-manage.sh. It MUST live platform-side so the app
+# create/unlink neverallow exemption that patch adds to system/sepolicy/private/app_neverallows.te can name it:
+# a PLATFORM neverallow is verified against a platform-only policy (sepolicy_neverallows), which can't see a
+# SYSTEM_EXT_PRIVATE type -- so a custom vendor type there fails with `unknown type`. mlstrustedobject (set in
+# the platform decl) bridges MLS so any app category (s0:cN) can read/delete this s0 file. The labeling
+# (context= mount) + every app/daemon allow stay HERE in vendor.
+allow nowhere_media_file self:filesystem associate;
+allow appdomain nowhere_media_file:dir r_dir_perms;
+allow appdomain nowhere_media_file:file r_file_perms;
+# #84 DELETION: an app may DELETE a deferred media file it owns -- e.g. Organic Maps updates a map by
+# unlinking the old <region>.mwm before writing the new one. The mediad FUSE Unlink handler tombstones the
+# stub (dropped at the next seal), but under enforcing SELinux the app's unlink(2) also needs remove_name +
+# write on the (context=nowhere_media_file) dir and unlink on the file -- read_perms alone -> EPERM. These
+# two allows are only legal because the sepolicy-app-media-manage.sh patch exempts nowhere_media_file from the
+# platform app create/unlink neverallow (app_neverallows.te); without it the policy won't compile. Scoped to
+# deletion; WRITE-BACK (add_name/create/write to materialize a new file) is a separate, later grant.
+allow appdomain nowhere_media_file:dir { remove_name write };
+allow appdomain nowhere_media_file:file unlink;
+# #84 WRITE-BACK: an app may CREATE/WRITE/RENAME an updated media file it owns -- e.g. Organic Maps writes the
+# new <region>.mwm (downloads to a temp then renames over the old, or overwrites in place). The mediad overlay
+# lands the real bytes in the passthrough dir (.under) and tombstones the superseded stub. Needs add_name
+# (create/rename INTO the dir; remove_name+write already granted for deletion) + create/write/append/setattr/
+# rename on the file (r_file_perms above already covers open/read/getattr/lock/map). Legal only because
+# sepolicy-app-media-manage.sh exempts nowhere_media_file from the platform app CREATE/unlink neverallow.
+allow appdomain nowhere_media_file:dir add_name;
+allow appdomain nowhere_media_file:file { create write append setattr rename };
+# NWP-20260831-12 STATFS: an app may ask how much space the volume has. The `filesystem` class is a DIFFERENT
+# object class from dir/file, so every grant above -- read, delete, write-back -- left statfs(2) denied, and a
+# denied statfs does not fail loudly: the caller gets zeros.
+#
+# ⚠ WHAT THAT COSTS, device-proven on lynx 2026-08-31 (odtest35, user 12): Chester could not download ANYTHING
+# into Download once it carried deferred media. Vanadium's download UI read "Using 0.00 KB of 0.00 KB" and
+# failed every attempt at 0.00 KB / 118 MB -- eight tries -- because it statfs'd the destination first, was
+# denied, and believed the volume was full. The device had 99 GB free. MediaProvider was denied the same
+# permission on the same mount, so its `.pending-…` create failed too.
+#
+# ⚠ AND IT WAS INVISIBLE TO ROOT PROBING: `su` is permissive for this (the same denial logs permissive=1 for
+# su:s0), so `stat -f` from an adb root shell returned the HONEST 99 GB while apps got zeros. Two contradictory
+# measurements of the same path, and the root one is the lie -- worth remembering the next time a storage
+# report disagrees with what an app reports.
+#
+# Read-only and safe: getattr on a filesystem is a size query, granted to appdomain for every ordinary volume
+# (sdcard_type, media_rw_data_file) already; this only says our overlay is not special.
+allow appdomain nowhere_media_file:filesystem getattr;
+
+# NWP-20260901-03: the SEAL side of the fuse relabel. NWP-20260901-01 moved the overlay mount off
+# context=nowhere_media_file to plain fuse so that apps could CREATE in it; every domain that WALKS these
+# trees then needed its access carried onto the new type, and this is the login daemon's half (endospore_priv
+# gets the matching pair in endospore.te; mediad got its own in NWP-20260901-02).
+#
+# The walk lstats and opens the overlay MOUNTPOINT itself -- the media-unders map redirects where CONTENT is
+# read from, it does not stop the stat -- so without this the periodic seal counts those paths blind and the
+# guard refuses: "the walk could not read 3 path(s) under /data/user/N". Read-only, and this domain already
+# holds exactly this on app_data_file and media_rw_data_file, which are the SAME trees either side of the
+# mount; nothing new is reachable.
+#
+# ⚠ HONEST SCOPE: the periodic seal is logged by logind but I could not establish from the device whether the
+# failing push ran in THIS domain or in a spawned worker (endospore_priv), which is why both are granted. If
+# it is ever proven that only the worker seals, this pair can go -- it is belt-and-braces, not a measured
+# denial, and the file's own history (line 70) shows the value of saying which is which.
+allow nowhere fuse:dir r_dir_perms;
+allow nowhere fuse:file r_file_perms;
+# The confined login daemon starts/stops the mediad worker around the session (mount after the essential
+# restore, unmount at logoff/cold-lock) via its own labelled control prop -- least-privilege, exactly like
+# ctl_nowhere_roamd_prop above (ctl.stop$ carries the same label as ctl.start$, see property_contexts).
+system_internal_prop(ctl_nowhere_mediad_prop)
+set_prop(nowhere, ctl_nowhere_mediad_prop)
+
+# --- P3.1 blind-login chooser handoff socket ---
+# init creates /dev/socket/nowhere_login for the nowhere_login service (the daemon is
+# `nowhere_agent login-daemon`, also u:r:nowhere:s0). The NowhereChooser app (platform-signed ->
+# platform_app) connects and sends name+pass; the daemon restores in-process. Modeled on lmkd_socket.
+type nowhere_login_socket, file_type, coredomain_socket;
+# mlstrustedobject so an app domain (which runs at s0:cN) can write this s0 socket -- MLS otherwise
+# forbids the write-down. THIS, not a system_ext/core partition issue, is why the chooser was denied.
+typeattribute nowhere_login_socket mlstrustedobject;
+allow nowhere nowhere_login_socket:sock_file { read write };
+# Daemon serves on the inherited socket. The LISTENING socket (created by init) carries the
+# nowhere_login_socket label, and accept()ed connections inherit it -- so target that type, not self.
+# Explicit perms (NOT create_*_socket_perms, which include `ioctl` -- neverallow'd on unix sockets).
+allow nowhere nowhere_login_socket:unix_stream_socket { listen accept read write getattr getopt setopt shutdown };
+allow nowhere self:unix_stream_socket { read write getattr getopt setopt shutdown };
+# init creates + binds + listens on the socket, labels it nowhere_login_socket, then passes the fd.
+allow init nowhere_login_socket:unix_stream_socket { create bind listen setopt getopt getattr };
+allow init nowhere_login_socket:unix_dgram_socket { create bind };
+allow init nowhere_login_socket:sock_file { create setattr unlink getattr };
+
+# Dedicated confined app domain for the chooser (the platform-signed blind-login app on /system). It IS a
+# coredomain: the GrapheneOS/AOSP treble-labeling test (enforced at BOARD_API_LEVEL >= 202604, i.e. the
+# Endospore base) requires every PLATFORM app to run in a coredomain, and a /system app correctly is one.
+# Safe to add: nowhere_chooser is an app_domain (so it's exempt from the coredomain app_data_file:dir
+# neverallow, which targets non-app coredomains like the mediad daemon above), and it touches only
+# coredomain-compatible types -- nowhere_login_socket (coredomain_socket), nowhere_brand_prop
+# (system_public_prop), and standard framework services. LineageOS/FP3 doesn't run the treble-labeling test
+# but coredomain is the correct label there too. (Mapped to the app via the seapp_contexts in this dir.)
+type nowhere_chooser, domain, coredomain;
+app_domain(nowhere_chooser)
+unix_socket_connect(nowhere_chooser, nowhere_login, nowhere)
+# The chooser opens + reads/writes the connection (which carries the nowhere_login_socket label).
+allow nowhere_chooser nowhere_login_socket:sock_file getattr;
+# connectto targets the SOCKET's label (nowhere_login_socket, set by the .rc seclabel), not the daemon
+# domain -- so unix_socket_connect's connectto-on-nowhere doesn't apply; grant it on the socket type.
+allow nowhere_chooser nowhere_login_socket:unix_stream_socket { connectto read write getattr getopt setopt shutdown };
+# Framework services the chooser's Activity touches (collected from the permissive bring-up on HW).
+allow nowhere_chooser {
+    activity_service
+    activity_task_service
+    audio_service
+    autofill_service
+    cameraserver_service
+    connectivity_service
+    content_capture_service
+    device_policy_service
+    gpu_service
+    netstats_service
+    nfc_service
+    radio_service
+    role_service
+    sensitive_content_protection_service
+    statusbar_service
+    telecom_service
+    textservices_service
+    voiceinteraction_service
+    wifi_service
+}:service_manager find;
+# #150 inbound MMS gate-download: SmsManager.downloadMultimediaMessage looks up the "imms" service
+# (MmsServiceBroker in system_server) to hand off the M-Retrieve.conf fetch. Without this find the lookup is
+# denied and downloadMultimediaMessage SILENTLY no-ops -- no error, no callback (ServiceManager.getService
+# returns null). PROVEN on lynx: `avc denied { find } name=imms imms_service` fired at the exact ms the
+# download was kicked. The broker runs as system uid and does the actual bind+download+URI-grant, so only the
+# service_manager find is needed here (binder_call into system_server is already covered by app_domain).
+allow nowhere_chooser imms_service:service_manager find;
+# NWP-20260909-04: the cold-lock ABORT needs TrustManager, and this find is why it never once worked.
+# KeyguardManager's constructor does ServiceManager.getServiceOrThrow(TRUST_SERVICE) -- so WITHOUT this find
+# the constructor throws ServiceNotFoundException and getSystemService(KeyguardManager.class) returns NULL.
+# Not an exception the caller sees: null. Every isDeviceSecure() call then reads as "not secure", which is
+# exactly the same silent-no-op shape as the imms/vibrator/nfc finds above.
+# MEASURED COST: 161 of 161 abort attempts across every issue report ever filed read `secure=0`, on every
+# profile and both handsets, from the day NWP-20260902-04 shipped -- so the revoke that stops a committed
+# cold lock landing in the user's hand had never executed. Device-proven on lynx 2026-09-09 (build
+# 2026090901): `W SystemServiceRegistry: No service published for: trust` from the chooser pid at the exact
+# millisecond of each `abort skip ... probe=3` trace.
+# WHY IT WAS INVISIBLE FOR A MONTH: the denial was DONTAUDIT'd on 2026-07-11 (#135 B6 harvest) as a
+# "framework startup probe the gate does not use" -- true then, false from 2026-09-02. A dontaudit does not
+# make a denial harmless, it makes it silent; the grant is removed from that dontaudit in endospore.te.
+allow nowhere_chooser trust_service:service_manager find;
+# Gate telephony-notice buzz (task_70db95af): SmsDeliverReceiver.alertGateArrival vibrates on a new gate message
+# (the chime plays via a direct Ringtone; the buzz is a direct Vibrator.vibrate). VibratorManager lives in
+# system_server, so ServiceManager.getService("vibrator_manager") needs this find -- WITHOUT it getVibratorIds()
+# returns EMPTY -> hasVibrator()=false -> vibrate() SILENTLY no-ops (no exception). This is exactly why telecom's
+# ring + the keyboard's haptics buzz (system domains) but our app domain can't. PROVEN on the 10a 2026-07-19:
+# `avc: denied { find } name=vibrator_manager vibrator_manager_service` fired at each SMS + the chooser logged
+# "hasVibrator=false" across app/display/device contexts. binder_call into system_server rides app_domain.
+allow nowhere_chooser vibrator_manager_service:service_manager find;
+# NWP-20260912-06: the per-app CLAIM producer asks UsageStatsManager which apps the user has opened, and
+# without this find `ctx.getSystemService(UsageStatsManager.class)` returns NULL -- so every query returns
+# an empty map and this handset claims NOTHING, for ever, while every layer reports success.
+#
+# ⚠ THIS IS THE FOURTH GRANT IN THIS FILE WITH THE SAME SHAPE, and the pattern is now worth naming:
+# `nowhere_chooser` is its own domain built with app_domain() alone, and app_domain() grants NO
+# service_manager find of any kind -- AOSP writes those per domain (priv_app, platform_app, untrusted_app,
+# gmscore_app, nfc, radio, ...) and nowhere_chooser is none of them. So EVERY system service this app
+# touches has to be granted here by hand, and the failure when one is missing is always the same: a null
+# from ServiceManager, a feature that silently does nothing, and no exception to catch. imms (#150) lost an
+# MMS download, trust (NWP-20260902-04) lost 161 of 161 cold-lock aborts, vibrator_manager lost the gate
+# buzz, and this one lost the entire claim record.
+#
+# MEASURED on lynx 2026-09-12 (build 2026091204, enforcing, chooser in u:r:nowhere_chooser:s0): the
+# instrumented producer logged `appheld: usage rows=0 past floor=0` while root's `dumpsys usagestats`
+# showed, for the SAME roamed user, `com.omgodse.notally totalTimeUsed="00:30" lastTimeUsed="12:35:15"`.
+# The app held PACKAGE_USAGE_STATS granted=true, QUERY_ALL_PACKAGES granted=true and the GET_USAGE_STATS
+# appop at `allow` -- so it was never a permission problem and never a roamed-user problem. The platform
+# path has no current-user gate and includes the in-memory bucket; it was simply never reached.
+#
+# ⚠ NO avc DENIAL IS IN THE BUFFER, and that is expected rather than contradictory: the audit log records
+# only the FIRST denial of a given tuple, which fired long before anyone looked. Do not read its absence as
+# evidence against this -- the same trap is recorded in the trust_service grant above, where a dontaudit
+# had made a live denial silent for a month.
+#
+# usagestats_service is app_api_service + system_server_service, and binder_call(appdomain,
+# binderservicedomain) already covers the call itself, so the find IS the entire delta.
+allow nowhere_chooser usagestats_service:service_manager find;
+# NWP-20261001-05: the Doze allow-list for sandboxed Play services. ChooserActivity.ensurePushDozeExemption builds a
+# PowerExemptionManager, whose constructor fetches DeviceIdleManager; without this find the fetch returns null and
+# the constructor throws a NullPointerException, so the method failed on EVERY call. Its `pushdoze err` line in
+# login.log was the only sign. PROVEN on lynx 2026100105 (enforcing): 9 denials of { find } on deviceidle_service
+# from nowhere_chooser, and the NPE caught in logcat on a gate restart. As for usagestats_service above, the call
+# itself is already covered by binder_call(appdomain, binderservicedomain), so the find is the whole delta; the
+# service enforces DEVICE_POWER on the writes, which the platform-signed chooser holds.
+allow nowhere_chooser deviceidle_service:service_manager find;
+# NWP-20261113-07: TetheringManager's connector. HotspotService starts and stops every Wi-Fi hotspot, USB and
+# Bluetooth tethering for a signed-in profile through TetheringManager, which looks up the "tethering" service
+# (served by com.android.networkstack.process). Without this find the connector never arrives: TetheringManager
+# queues every call and retries silently, no onTetheringStarted/onTetheringFailed ever fires, START answers
+# `ERR-HS timeout` after 10 s, the TetheringEventCallback never registers (so STATE reads unknown as on), and the
+# retry logs a denial every ~200 ms, online or offline, that evicts the whole main log buffer. SEEN on frankel
+# 0.5.48 (build 2026102202) 2026-10-22, the 10 s timeout with no callback, and on lynx 2026102201 (enforcing):
+# `avc: denied { find } ... name=tethering scontext=u:r:nowhere_chooser:s0 tcontext=u:object_r:tethering_service:s0
+# ... permissive=0`. The same silent class as the finds above, BUT unlike them the service is not in system_server:
+# the binder calls go to network_stack, and binder_call(appdomain, binderservicedomain) is NOT proven to cover that.
+# The binder side is UNPROVEN; a following binder_call denial towards network_stack is the next device check.
+allow nowhere_chooser tethering_service:service_manager find;
+# NWP-20261127-14 (Q041, decided 2026-10-20): paste in the Profile app's report and claim-code boxes. Without this
+# find getSystemService(ClipboardManager.class) returns NULL, so SafeEdit.withPaste -- the ONLY paste surface, used
+# by those two boxes and nowhere else -- never offers paste, and the claim screen tells a buyer to paste a code they
+# cannot paste. The gate's fields stay paste-free: every other SafeEdit is built without withPaste and refuses
+# paste, cut and copy whatever this grant allows. clipboard_service is an app_api_service in system_server, and
+# binder_call(appdomain, binderservicedomain) already covers the call, so the find is the whole delta.
+# NOT device-proven: the check is a code pasted into the claim box on an enforcing handset (a system_ext flash).
+allow nowhere_chooser clipboard_service:service_manager find;
+# NWP-20261127-14: the gate's Wi-Fi scan. ChooserActivity.scanWifi reads getSystemService(LOCATION_SERVICE), which a
+# denied find turns into NULL, so its verify loop never sees isLocationEnabled() and sleeps all ten 300 ms ticks
+# (3 s more on every scan), and canScanOut[0] is always false, so every empty list says "can't scan for networks
+# yet" instead of "no networks found". The scan itself works (setLocationEnabled and getScanResults are
+# server-side), which hid it. SEEN on lynx 2026102201 (2026-10-22, the S0 run): `avc: denied { find } for
+# service=location_service scontext=u:r:nowhere_chooser:s0`. The service is in system_server, so as above the find
+# is the whole delta. NOT device-proven: the check is the Wi-Fi screen on an enforcing handset (a system_ext flash).
+allow nowhere_chooser location_service:service_manager find;
+# #151 gate alarm: GateAlarmActivity plays the alarm sound ITSELF (RingtoneManager -> MediaPlayer). Unlike the
+# incoming-call ring -- where telecom's system ringer makes the sound -- this is the first chooser-owned audio
+# playback, and MediaPlayer needs the media stack: audio_flinger/audio_policy (audioserver_service),
+# media.player/resource_manager (mediaserver_service), media.extractor (decodes the ringtone), media.metrics.
+# Without the find, getService<IAudioFlingerService> WAITS FOREVER on a cv (libaudiobase retries; no exception)
+# -- on the main thread that ANR'd the whole gate the moment the alarm fired. PROVEN on lynx 2026-07-17:
+# `avc: denied { find } name=media.audio_flinger ... tcontext=audioserver_service` at the alarm fire, trace
+# anr_2026-07-17-16-55-05. Granted as a SET because the denials only surface one-at-a-time.
+# (binder_call to audioserver/mediaserver rides the stock appdomain rules, like cameraserver above.)
+allow nowhere_chooser {
+    audioserver_service
+    mediaserver_service
+    mediaextractor_service
+    mediametrics_service
+}:service_manager find;
+# QR scanner (Add-credits flow): QrScanActivity uses Camera2, which goes through cameraserver. Without the
+# service-lookup (above) + binder path, the camera-service find is denied and the scanner silently cancels
+# ("camera doesn't open"). cameraserver mediates the HAL, so the app needs no direct camera_device access.
+# (DIA-20260630-38.)
+binder_call(nowhere_chooser, cameraserver)
+# #81 item 5: FIDO2 over NFC. NfcAdapter.getDefaultAdapter() looks up nfc_service (find, above); reader mode
+# then binder-calls the nfc app (setReaderMode / IsoDep.transceive), and the nfc service dispatches a tapped
+# tag by calling BACK into our ReaderCallback -- so binder_call is needed BOTH ways. Without the find, the
+# adapter is null and the "Tap an NFC key" affordance never appears (proven: avc denied find nfc_service).
+binder_call(nowhere_chooser, nfc)
+binder_call(nfc, nowhere_chooser)
+# #136 A3.b owner-mode SIM binding: activeSims() -> SubscriptionManager.getActiveSubscriptionInfoList looks up
+# the isub service (labelled radio_service, above). Without the find the SIM list comes up "No SIM detected"
+# under enforcing -- even with READ_PHONE_STATE/READ_PRIVILEGED_PHONE_STATE granted -- forcing the manual-ICCID
+# fallback (proven on lynx: avc denied { find } name=isub radio_service). ISub is hosted in system_server, whose
+# binder_call is already covered by app_domain, so only the service_manager find is needed.
+# #135 B4/B6 gate telephony (HARVESTED on userdebug-ENFORCING lynx, 2026-07-11): as user 0's default
+# DIALER the chooser looks up TelecomManager (Context.TELECOM_SERVICE -> telecom_service) so the framework
+# can bind our NowhereInCallService (PROVEN on HW: Telecom bound + unbound the service across a live call)
+# and we can answer/reject/mute/route. Telecom is hosted in system_server (binder_call via app_domain), and
+# the framework binds our InCallService via the standard system_server->app callback path -- no extra rule
+# needed (no bind/callback denial in the harvest). role_service: RoleManager.addRoleHolderAsUser
+# (ensureDefaultDialer/SmsRole) looks up the "role" service; WITHOUT this find the chooser cannot self-assign
+# the default DIALER/SMS role and telephony never routes to us (THE harvested blocker -- avc denied find
+# name=role role_service). The CallLog/SMS provider scrubs (WRITE_CALL_LOG delete + content://sms delete)
+# and the daemon-socket seal produced NO denial -- they ride the existing app_domain binder macros + the
+# already-granted nowhere_login_socket. app_function_service/trust_service are framework startup probes the
+# app tolerates -> dontaudit'd in endospore.te. (telecom_service was the pre-model; the harvest confirmed
+# role_service is the functional add. Same analog as the radio_service ISub fix, PR #352.)
+# The app framework probes default_prop at startup; apps are neverallowed to read it (and tolerate
+# the failure), so suppress the noise rather than grant it.
+dontaudit nowhere_chooser default_prop:file { read open getattr map };
+
+# Per-edition brand (ro.nowhere.brand, set in <edition>.mk -> endospore/diaspore): the gate renders it as
+# the wordmark + the owner name. ro.* props default to default_prop, which apps are neverallowed to read
+# (above), so the gate read silently fell back to "nowhere". Give the brand its OWN app-readable prop type
+# (system_public_prop) + grant the confined gate domain read. See property_contexts (ro.nowhere.brand).
+system_public_prop(nowhere_brand_prop)
+allow nowhere_chooser nowhere_brand_prop:file { read open getattr map };

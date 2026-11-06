@@ -1,0 +1,5 @@
+    @Override public void onDestroy() {
+        stopRoleCapture();
+        stopReadClear();
+        super.onDestroy();
+    }

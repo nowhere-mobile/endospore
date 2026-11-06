@@ -1,0 +1,31 @@
+<?xml version='1.0' encoding='utf-8' standalone='yes' ?>
+<!--
+  Nowhere (#135 B4): pre-grant ANSWER_PHONE_CALLS to the chooser so its InCallService can answer / reject
+  an incoming call on user 0 as the default dialer (docs/telephony-owner-mode.md).
+
+  The default-dialer role already auto-grants the call runtime perms when the role is set, but that grant is
+  tied to holding the role; pre-granting here (like the RECEIVE_SMS + READ_PHONE_STATE grants) makes the perm
+  present from user-0 creation so Call.answer()/Call.reject() are honored even in the brief window before
+  ensureDefaultDialerRole() sets the role on a fresh device. ANSWER_PHONE_CALLS is DANGEROUS (runtime), so
+  privapp-permissions does not cover it. fixed="false" leaves it user-revocable.
+  -->
+<exceptions>
+    <exception package="com.nowhere.chooser">
+        <permission name="android.permission.ANSWER_PHONE_CALLS" fixed="false"/>
+        <!-- B4.b: scrub user 0's auto-written CallLog row on call end. Pre-granted (not the on-demand model
+             READ_CALL_LOG uses) because the scrub runs internally on every call end, with no user present to
+             grant it, in the window before roles settle. fixed="false" leaves it user-revocable. -->
+        <permission name="android.permission.WRITE_CALL_LOG" fixed="false"/>
+        <!-- #135 delivery v2: TelIngest (in the ROAMED user) inserts the profile's delivered call record and
+             VERIFIES it with a query-back; the read needs READ_CALL_LOG, which no role reliably grants
+             there (the roamed chooser holds the SMS role, not DIALER). Default-permissions apply per-user at
+             user creation, so every fresh roamed user gets it. fixed="false" leaves it user-revocable. -->
+        <permission name="android.permission.READ_CALL_LOG" fixed="false"/>
+        <!-- 637: owner-mode transmit. CALL_PHONE lets owner mode place a call on an unbound SIM (the owner's line)
+             from user 0. This XML grants it only at FRESH user-0 creation; on an existing user 0 (a flash or an OTA)
+             neither it nor the already-held dialer role grants it (seen on lynx 2026100101, 2026-10-01), so
+             ChooserActivity.ensureTransmitPerms self-grants it as device owner, and that grant is policy-fixed.
+             DANGEROUS/runtime. -->
+        <permission name="android.permission.CALL_PHONE" fixed="false"/>
+    </exception>
+</exceptions>

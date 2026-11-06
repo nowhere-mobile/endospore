@@ -1,0 +1,200 @@
+# Endospore sepolicy: endospore_mediad -- the on-demand media daemon (#84) in its own confined domain (E.5x).
+# NOTE: SELinux .te comments use hash, NOT C-style double-slash; and avoid backtick + apostrophe chars in
+# comments here -- the build runs .te through m4 (those two are m4 quote delimiters), then checkpolicy.
+#
+# ---- WHY THIS DOMAIN EXISTS (DIA-20260808-03) ----
+# mediad mounts twice per deferred-media dir: an MS_BIND of the real dir onto a hidden .under path, then a
+# context=nowhere_media_file FUSE overlay OVER the real dir, with the loopback passthrough rooted at the bind.
+# mount(2) and umount(2) require CAP_SYS_ADMIN unconditionally -- Android ships no fusermount helper, which is
+# why go-fuse is driven in DirectMount mode and there is no unprivileged path.
+#
+# Until now mediad shared endospore_priv. That domain does not hold sys_admin, deliberately (endospore.te,
+# DIA-20260806-09: a roam worker has no business holding it), and it also dontaudit-ed it -- so the mount
+# failed AND the failure was silenced. On-demand media has therefore been dead on every enforcing build we
+# have shipped, including frankel and stallion. The only visible trace was one mounton denial on the .under
+# bind, and only because the code aborts there, six checks before the end of the chain. Verified on lynx
+# 2026-08-08 by querying the live policy through the selinuxfs access node (the same security_compute_av the
+# kernel uses), which reports latent denials the audit log can never show:
+#   DENY dir:mounton app_data_file / DENY chr_file:{open read write ioctl} fuse_device
+#   DENY filesystem:{mount unmount relabelto} nowhere_media_file / DENY filesystem:relabelfrom fuse
+#   DENY capability:sys_admin
+# (nowhere_media_file self:filesystem associate was already ALLOW -- no rule needed for it.)
+#
+# So the capability lives HERE, with the one service that must mount, and endospore_priv keeps none of it.
+# The enabling change is in roamd: stop_mediad used to umount the leftovers inline -- the only mount or umount
+# caller anywhere outside this daemon -- and now kicks this daemon in sweep-only mode instead.
+#
+# core/vendor-common/sepolicy/nowhere.te records the LineageOS/FP3 position, which is to keep mediad at su:s0
+# rather than confine it, because a confined coredomain touching app data risks the AOSP app-sandbox
+# neverallow. That option does not exist on a USER build, where GrapheneOS neuters su. endospore_priv already
+# carries the same app_data_file_type dir and file grants for the roam restore and builds clean, so the same
+# shape is used here; if a neverallow does bite, the sepolicy build fails early and names it.
+
+type endospore_mediad, domain, coredomain;
+# Dedicated exec type, same reasoning as endospore_priv_exec: entering via a specific core entrypoint rather
+# than the broad system_file keeps this a clean core-only domain and does not trip the Treble/coredomain
+# sepolicy_test. stage-vendor derives the file_contexts entry from the seclabel in nowhere.rc.
+type endospore_mediad_exec, exec_type, file_type, system_file_type;
+
+# PERMISSIVE IS NOT DECLARED HERE, AND MUST NOT BE ADDED HERE. The harvest-only permissive line lives in
+# editions/endospore/build/harvest/, which stage-vendor copies in ONLY under NOWHERE_SEPOLICY_HARVEST=1 and
+# deletes otherwise -- so an ordinary build cannot contain it even by accident. That is deliberate: this file
+# already records two cases (endospore.te lines 19-36 and 178-190) where a suppression that was true on a dev
+# device and false everywhere else shipped and cost a release.
+
+init_daemon_domain(endospore_mediad)
+allow endospore_mediad system_file:file { rx_file_perms execute_no_trans };
+allow endospore_mediad { toolbox_exec shell_exec }:file { rx_file_perms execute_no_trans };
+allow endospore_mediad nowhere_exec:file { rx_file_perms execute_no_trans };
+allow endospore_mediad self:process { fork sigchld signal };
+
+# Request marker, sweep marker and the mediad log under /data/nowhere (state is the RAM tmpfs).
+allow endospore_mediad nowhere_data_file:dir create_dir_perms;
+allow endospore_mediad nowhere_data_file:file create_file_perms;
+
+# The whole point of the daemon: fetch deferred media from the store on first open. TLS over TCP + DNS.
+net_domain(endospore_mediad)
+get_prop(endospore_mediad, net_dns_prop)
+
+# MLS bridge. It reads, writes and chowns per-app data across every app MCS category, exactly like the roam
+# worker. Stated by reasoning, NOT harvested: permissive silently waives MLS constraints without logging
+# anything, so a harvest can never reveal this rule is missing -- the trap endospore.te records at line 22.
+typeattribute endospore_mediad mlstrustedsubject;
+
+# ---- THE MOUNT CHAIN, in the order the kernel checks it (all seven DEVICE-PROVEN above) ----
+# sys_admin: mount(2) and umount(2), both the MS_BIND and the FUSE overlay, plus the sweep.
+allow endospore_mediad self:capability sys_admin;
+# go-fuse opens /dev/fuse and passes the fd in the mount options (DirectMount).
+allow endospore_mediad fuse_device:chr_file rw_file_perms;
+# mounton the bind target (.under, under the chooser package dir) and the FUSE target (the real app dir),
+# plus the #129 EXTERNAL-media scope, whose targets are real dirs under /data/media/N.
+#
+# NAMED TYPES, NOT app_data_file_type -- MEASURED, not guessed. The attribute reaches SIX types on this tree
+# (queried through the selinuxfs access node, lynx 2026-08-08): the three app-data ones below plus
+# shell_data_file, bluetooth_data_file and radio_data_file. Those last three are not per-app data dirs under
+# /data/user/N and can never be a mount target here, and mounton SHADOWS a directory -- granting it over the
+# Bluetooth bond store, of all things, is the opposite of what #154 spent a week making amnesia-correct.
+# The mount targets observed in the harvest run were exactly app_data_file (the .under bind, under the chooser
+# package dir) and media_rw_data_file (/data/media/N and its two /mnt/pass_through views). privapp_data_file
+# and system_app_data_file are included because the CE scope mounts over /data/user/N/<pkg>/<dir> for an
+# ARBITRARY package, and a priv-app or system app holding deferred media is the same code path -- it simply
+# had none in this profile. The read/write grants below stay on the attribute, matching endospore_priv.
+allow endospore_mediad { app_data_file privapp_data_file system_app_data_file }:dir mounton;
+allow endospore_mediad media_rw_data_file:dir mounton;
+# A context= mount relabels the superblock: relabelfrom on the fs as mounted, relabelto on what we name.
+allow endospore_mediad fuse:filesystem relabelfrom;
+allow endospore_mediad nowhere_media_file:filesystem { mount unmount relabelto };
+# NWP-20260901-01: the mount no longer carries context= AT ALL -- it stays plain `fuse` (genfscon), the way
+# stock /storage labels. The fixed nowhere_media_file context made file CREATE impossible for every app: the
+# platform MLS constraint for create honours only mlstrustedsubject (no mlstrustedobject clause, unlike
+# read/write/unlink), and a context= mount forces even the create-time object to the fixed s0 level, so an app
+# at s0:cNNN could never satisfy `eq l1 l2`. Root-caused on lynx 2026-08-31 after every TE allow was proven
+# present in the loaded policy and downloads still died at 0 bytes. So mediad now mounts and unmounts a
+# fuse-labelled superblock; app access needs NOTHING from us (appdomain minus isolated/ephemeral/sandbox holds
+# full create/write/unlink on `fuse` in the platform policy, verified on-device). The three rules above are
+# KEPT: they are exactly what the NOWHERE_MEDIA_MOUNT_CONTEXT kill-switch needs to restore the old behaviour.
+allow endospore_mediad fuse:filesystem { mount unmount };
+
+# ---- PASSTHROUGH + FETCH CACHE (modeled, then CONFIRMED by the harvest below: not one denial on these) ----
+# It reads the real files through the .under bind, writes fetched bytes and write-back into the cache and the
+# .under dir, and chowns/relabels what it creates to the owner of the app (mediafs.go newFile/Chown, and the
+# launcher handing files/ back to the app with chown + chcon).
+allow endospore_mediad app_data_file_type:dir { create_dir_perms relabelfrom relabelto };
+allow endospore_mediad app_data_file_type:file { create_file_perms relabelfrom relabelto };
+allow endospore_mediad media_rw_data_file:dir { create_dir_perms relabelfrom relabelto };
+allow endospore_mediad media_rw_data_file:file { create_file_perms relabelfrom relabelto };
+allow endospore_mediad self:capability { chown dac_override dac_read_search fowner fsetid setgid setuid };
+# restorecon on a recreated deferred dir reads the contexts and asks the kernel to compute the label.
+allow endospore_mediad file_contexts_file:file r_file_perms;
+allow endospore_mediad selinuxfs:dir r_dir_perms;
+allow endospore_mediad selinuxfs:file r_file_perms;
+# The stale-mount sweep and media_seal both read /proc/self/mounts.
+allow endospore_mediad self:file r_file_perms;
+
+# roamd (endospore_priv) starts and stops this service, and now also kicks the sweep, through the control
+# property it already holds (ctl_nowhere_mediad_prop, typed in core nowhere.te). No new rule is needed for
+# that direction, and none is added in the other: endospore_priv gets nothing from this domain.
+
+# ---- THE HARVEST (lynx 2026-08-08, permissive run, PR #598 round 1) ----
+# One real session: login -> mediad mounted 5 deferred maps over the organicmaps external-media dir -> served
+# them -> logoff sweep. 185 avc lines, ten distinct tuples, every one of them below.
+#
+# The DNS-discovery chain. The agent resolver reads net.dns* first, then falls back to dumpsys connectivity;
+# that needs the servicemanager lookup, the call into the service, and the fd pair for the output pipe.
+binder_use(endospore_mediad)
+allow endospore_mediad connectivity_service:service_manager find;
+# THE TWO-LINE IDIOM, BOTH LINES. dumpsys hands its stdout PIPE to system_server over binder: fd use lets
+# system_server HOLD the descriptor, fifo_file write lets it write the dump in. Only the first was audited
+# (145 times, comm=dumpsys) because the kernel reports the first failure and system_server is NOT the
+# permissive domain here -- so the write never happened and never got logged. The access node confirmed the
+# second is DENY and latent. This is the third time this pair has come up (nowhere, endospore_priv, and
+# DIA-20260807-10, where -08 shipped one line of the two and cost a build round). Both, or neither.
+allow system_server endospore_mediad:fd use;
+allow system_server endospore_mediad:fifo_file write;
+# The Go runtime sizes its pipe buffers from /proc/sys/fs/pipe-max-size.
+allow endospore_mediad proc_pipe_conf:file r_file_perms;
+# mediad reads back through its OWN overlay (the eviction + prefetch bookkeeping walks the served tree), and
+# tearing a mount down relabels the superblock away from nowhere_media_file, so relabelfrom joins the
+# mount/unmount/relabelto already granted above.
+allow endospore_mediad nowhere_media_file:dir r_dir_perms;
+allow endospore_mediad nowhere_media_file:file r_file_perms;
+allow endospore_mediad nowhere_media_file:filesystem relabelfrom;
+# NWP-20260901-02: THE SAME READ-BACK SET ON THE fuse TYPE, because NWP-20260901-01 moved the mount to that
+# label and carried only the filesystem class across. Consequence, device-proven on lynx within one flash:
+# go-fuse validates the mountpoint immediately after mount(2), that touch is a dir search on the fuse root, it
+# was denied, DirectMount reported plain "permission denied", and EVERY overlay failed to mount -- so mediad
+# hit "nothing mounted -> exiting" and the previous boot left stale entries in /proc/mounts reading ENOTCONN.
+# The user-visible shape was NOT a denial message but Vanadium saying "No available download locations", i.e.
+# a dead Download folder. The lesson worth keeping: when a mount changes label, the access held by the DAEMON
+# has to move with it -- the app side was fine because the platform already grants appdomain everything on the
+# fuse type, which is exactly what made this gap invisible in review.
+allow endospore_mediad fuse:dir r_dir_perms;
+allow endospore_mediad fuse:file r_file_perms;
+allow endospore_mediad fuse:filesystem getattr;
+
+# ---- DIA-20260808-08: the SWEEP could not detach the .under BINDS, only the overlays ----
+# Caught by the ERR-MEDIA-SWEEP check added in DIA-20260808-03, on the first logoff that had a sandboxed-Play
+# appcode bind live:
+#   ERR-MEDIA-SWEEP: 2 media mount(s) survive 2 sweep attempt(s)
+#     still mounted: /data/user/10/...=/.under/com.nowhere.chooser_files_.appcode_com.google.android.gms
+#     still mounted: /data_mirror/data_ce/null/10/...same...
+#   rm: com.nowhere.chooser_files_.appcode_com.google.android.gms: Device or resource busy
+# and the reap could then not delete /data/user/10, because you cannot rm through a live mountpoint.
+#
+# TWO DIFFERENT FILESYSTEM OBJECTS, which is the whole subtlety. The FUSE overlay is a context= mount, so its
+# superblock carries nowhere_media_file and the unmount already granted above covers it -- those detached
+# cleanly (fuse.nowheremedia went to 0). A .under entry is an MS_BIND of the real dir, so it shares the /data
+# f2fs SUPERBLOCK, whose SID is labeledfs. umount checks filesystem:unmount on the superblock, not on the
+# path, so the binds needed a rule the overlays never did.
+# NB the breadth is real and unavoidable: labeledfs is the /data superblock itself, so this permits unmounting
+# /data. There is no per-bind type to name instead. It is bounded by mediad being a single-purpose daemon that
+# already holds CAP_SYS_ADMIN -- anything able to mount was already able to do this much damage.
+allow endospore_mediad labeledfs:filesystem unmount;
+# ...and the peers. A bind under /data/user/N is mirrored into /data_mirror and /mnt/pass_through, and the
+# sweep must traverse to each mountpoint to detach it. Traverse only -- search, not read: it walks to a path
+# it created, it does not enumerate those trees.
+allow endospore_mediad mirror_data_file:dir search;
+allow endospore_mediad mnt_pass_through_file:dir search;
+
+# ---- DIA-20260808-09 (#50): a KNOWN, DELIBERATELY UNGRANTED denial. Do not "fix" this. ----
+# Every sweep logs two of these:
+#   avc: denied { search } for comm="umount" name="block" scontext=u:r:endospore_mediad:s0
+#        tcontext=u:object_r:block_device:s0 tclass=dir
+# toybox umount resolves the DEVICE column of /proc/mounts (for a bind that is /dev/block/dm-12, the /data
+# f2fs device, labelled dm_device) for its own bookkeeping. That is not how the unmount happens: the sweep
+# always passes umount a PATH, and the path-based umount2 is what does the work.
+#
+# NOT GRANTED, on purpose, for two reasons that were measured rather than assumed:
+#   1. The OUTCOME is already correct without it. The very logoff that produced these two denials also
+#      produced "media mounts clear" with 0 binds and 0 fuse.nowheremedia remaining.
+#   2. Granting block_device:dir search ALONE would only move the wall -- dm_device:blk_file getattr is DENY
+#      immediately behind it (checked through the selinuxfs access node, the same way the rename -> reparent
+#      chain in endospore.te was found). So the true cost is two rules, the second letting a media daemon
+#      stat the raw userdata block device. That is not worth silencing a log line.
+#
+# AND NOT dontaudit-ed EITHER. A dontaudit is a claim that a denial is expected AND harmless, and this file
+# plus endospore.te already record two occasions where that claim held for one caller and was false for the
+# next -- the CAP_SYS_ADMIN suppression that hid a dead mount(2) on every shipped enforcing build being the
+# expensive one. Leaving this visible costs two log lines per logoff; suppressing it costs the ability to
+# notice if the reason it is benign ever stops holding. If this tuple appears with a comm OTHER than umount,
+# that is new information: investigate it, do not wave it through.

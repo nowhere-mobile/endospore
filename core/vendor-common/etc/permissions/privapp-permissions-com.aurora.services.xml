@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- AuroraServices (com.aurora.services): the privileged silent installer companion to Aurora Store
+     (DIA-20260731, Chester's "Option 2"). Grants the two PRIVILEGED (signature|privileged) install permissions
+     its PrivilegedService needs to install / remove a Play app WITHOUT the per-app system "install this app?"
+     dialog. Must live on the SAME partition as the priv-app (/product); PackageManager rejects a privapp
+     allow-list on a different partition. The app's other declared perms (QUERY_ALL_PACKAGES, REQUEST_INSTALL /
+     DELETE_PACKAGES, *_EXTERNAL_STORAGE) are normal / appop perms and are deliberately NOT granted here. -->
+<permissions>
+    <privapp-permissions package="com.aurora.services">
+        <permission name="android.permission.INSTALL_PACKAGES"/>
+        <permission name="android.permission.DELETE_PACKAGES"/>
+    </privapp-permissions>
+</permissions>

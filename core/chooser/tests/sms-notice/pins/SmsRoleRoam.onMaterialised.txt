@@ -1,0 +1,39 @@
+    static void onMaterialised(Context ctx, String pkg) {
+        new Thread(() -> {
+            synchronized (LOCK) {
+                try {
+                    final String self = ctx.getPackageName();
+                    final String session = sessionId(ctx);
+                    String[] m = parseMarker(read(ctx, MARKER), session);
+                    // NWP-20261012-08: on EVERY path that does not end with pkg holding the role, pkg gets its recorded
+                    // declines of the six: in session, so only what the user has not answered (an update must not
+                    // revoke a grant or harden a mid-session answer). The helper re-reads the holders and does nothing
+                    // when they are unreadable or pkg is the holder.
+                    if (m == null || "applied".equals(m[0]) || !m[2].equals(pkg)) { // not the app we wait for
+                        PermDeclines.declineSmsRoleIfNotHolder(ctx, pkg, null, true, "sms role on materialise");
+                        return;
+                    }
+                    java.util.List<String> holders = null;
+                    try {
+                        holders = ctx.getSystemService(android.app.role.RoleManager.class)
+                                .getRoleHolders(android.app.role.RoleManager.ROLE_SMS);
+                    } catch (Throwable ignore) {}
+                    if (materialiseTarget(m, pkg, holders, self) == null) {
+                        android.util.Log.i("NowhereChooser", "NWP-20261010-13 sms role: " + pkg
+                                + " materialised, but another app holds the role -> left");
+                        PermDeclines.declineSmsRoleIfNotHolder(ctx, pkg, holders, true, "sms role on materialise");
+                        return;
+                    }
+                    String r = ensureHolder(ctx, android.os.Process.myUserHandle(), pkg, true, self, ctx.getMainExecutor(), m[1]);
+                    android.util.Log.i("NowhereChooser", "NWP-20261010-13 sms role: " + pkg + " materialised -> " + r);
+                    if ("held".equals(r)) {
+                        write(ctx, MARKER, markerText(session, "applied", pkg, pkg));
+                        // NWP-20261012-08: the stand-in that held the role until now was spared the six at login.
+                        PermDeclines.declineSmsRoleIfNotHolder(ctx, m[1], null, true, "sms role taken over");
+                    } else PermDeclines.declineSmsRoleIfNotHolder(ctx, pkg, null, true, "sms role on materialise");
+                } catch (Throwable t) {
+                    android.util.Log.w("NowhereChooser", "NWP-20261010-13 sms role on materialise", t);
+                }
+            }
+        }, "nowhere-sms-materialised").start();
+    }

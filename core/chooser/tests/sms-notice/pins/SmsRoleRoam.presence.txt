@@ -1,0 +1,16 @@
+    static String presence(Context ctx, String pkg) {
+        final android.content.pm.PackageManager pm = ctx.getPackageManager();
+        try {
+            android.content.pm.ApplicationInfo ai = pm.getApplicationInfo(pkg, 0);
+            if (ai != null && ai.sourceDir != null && !ai.sourceDir.isEmpty()) return "installed";
+        } catch (android.content.pm.PackageManager.NameNotFoundException nf) {
+            // not installed with code: the archive check decides
+        } catch (Throwable t) {
+            return "unknown";
+        }
+        try {
+            return pm.getArchivedPackage(pkg) != null ? "archived" : "absent";
+        } catch (Throwable t) {
+            return "unknown";
+        }
+    }

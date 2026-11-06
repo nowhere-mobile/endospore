@@ -1,0 +1,14 @@
+    private synchronized void stopReadClear() {
+        if (clearObserver != null) {
+            try { getContentResolver().unregisterContentObserver(clearObserver); } catch (Throwable ignore) {}
+            clearObserver = null;
+        }
+        if (clearThread != null) {
+            clearThread.quitSafely();
+            clearThread = null;
+        }
+        clearHandler = null;
+        sweepPendingSince = 0;
+        sweepForEvent = false;
+        idleResweeps = 0;
+    }

@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- A device owner may use any policy, but DevicePolicyManagerService still checks some calls against a declared
+     uses-policy and refuses an undeclared one even for the device owner. The entries below are the ones the
+     chooser needs. -->
+<device-admin xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-policies>
+        <!-- L4: enables onPasswordFailed/onPasswordSucceeded + getCurrentFailedPasswordAttempts so the
+             failed-attempt auto-logoff backstop can fire. A device owner may use any policy. -->
+        <watch-login />
+        <!-- setMaximumTimeToLock (the idle auto-lock timer, armIdleWatcher) REQUIRES this policy even for a
+             device owner. Without it DevicePolicyManagerService throws SecurityException("did not specify
+             uses-policy for: force-lock") and the call silently no-ops (caught + logged), so the idle timeout
+             was never actually applied. Declaring it makes the idle lock take effect. (nfctest logs, 2026-07-05) -->
+        <force-lock />
+        <!-- NWP-20261114-12: setKeyguardDisabledFeatures (KEYGUARD_DISABLE_BIOMETRICS on user 0, the gate, in
+             ChooserActivity.onCreate) is checked against this policy. The force-lock precedent above shows that
+             an undeclared policy throws SecurityException even for the device owner. The chooser's try/catch
+             swallows it, so without this entry the call is a silent no-op. -->
+        <disable-keyguard-features />
+    </uses-policies>
+</device-admin>

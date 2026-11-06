@@ -1,0 +1,18 @@
+<!-- NWP-20261010-13: the telephony notices' small icon: an envelope, white on a transparent field, because a small
+     icon is flattened to one tinted colour (alpha only). It replaces android.R.drawable.sym_action_email, a legacy
+     full-colour glyph the status bar and the lock screen drew as a blot. A 2-unit frame (the inner rectangle cut out
+     by evenOdd) and the flap as one V-shaped band. It is the message notices' icon only: TelIngest's in-session message
+     notices and the gate's message notices in SmsDeliverReceiver. Since NWP-20261123-24 the gate's call notices
+     ("Incoming call", "Missed call", and their "may not have been saved" forms) and the session's missed call
+     (TelIngest.postMissedCallNotice) draw the handset ic_notif_call. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path android:fillColor="#FFFFFFFF"
+        android:fillType="evenOdd"
+        android:pathData="M2,4 H22 V20 H2 Z M4,6 V18 H20 V6 Z" />
+    <path android:fillColor="#FFFFFFFF"
+        android:pathData="M4,6 L12,11 L20,6 L20,8.4 L12,13.4 L4,8.4 Z" />
+</vector>

@@ -1,0 +1,5 @@
+        new Thread(() -> {
+            final android.content.Context app = getApplicationContext();
+            TelScrub.all(app);
+            NowhereInCallService.cancelFrameworkMissedCall(app);
+        }, "nowhere-scrub-gate").start();

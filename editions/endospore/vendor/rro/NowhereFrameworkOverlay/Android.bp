@@ -1,0 +1,13 @@
+// NWP-20261004-01: Endospore framework config, shipped as an explicit runtime resource overlay on product.
+//
+// ⚠ NOT through PRODUCT_PACKAGE_OVERLAYS. GrapheneOS enforces RROs, so a static framework-res overlay becomes a module
+// named framework-res__<device>__auto_generated_rro_product -- and adevtool already generates a module of exactly that
+// name from the Pixel's own overlays (vendor/google_devices/<device>/overlays). Soong then refuses the product image:
+// "packaging conflict at overlay/framework-res__lynx__auto_generated_rro_product.apk" (lynx, 2026-10-04). A named
+// module of our own cannot collide.
+runtime_resource_overlay {
+    name: "NowhereFrameworkOverlay",
+    product_specific: true,
+    // Platform-signed so idmap's signature policy covers framework resources that are not declared overlayable.
+    certificate: "platform",
+}

@@ -1,0 +1,37 @@
+# Nowhere default apps (DIA-20260617-06) — pinned F-Droid versions.
+#
+# These APKs are NOT committed (~277 MB; Fennec alone is 120 MB) -- except WireGuard (see its row). fetch-default-apps.sh
+# downloads them from F-Droid into this dir before a build; the Android.bp android_app_import modules then bake them into
+# /product/app (presigned: F-Droid's own signature is kept, so F-Droid can update them in place later).
+# ⚠ That in-place update works on Diaspore (LineageOS) ONLY. On Endospore GrapheneOS refuses every update of a
+# system app that does not come from its first-party app source, so a bundled app there moves only when these
+# pins move with a release (DECIDED 2026-09-24, NWP-20260924-05; docs/bundled-app-updates.md).
+# Run `bash fetch-default-apps.sh` once on a fresh tree before `m systemimage`. (The committed FDroid.apk
+# this line used to mention was removed in DIA-20260801-37.)
+#
+# Columns:  Name  Package  VersionCode  SHA256  [manual]
+# A 5th column `manual` marks an APK that is NOT on F-Droid at its pin (NWP-20261011-22): fetch-default-apps.sh
+# never builds an F-Droid URL for it. Present with the pinned sha -> skipped; absent or any other sha -> the fetch
+# FAILS, printing the comment above the row, which must name where the APK comes from.
+OrganicMaps   app.organicmaps          26092932  654a736d43317084f13560281fe7013f869800610e9d6036b6789d9c9e07f8bc
+Conversations eu.siacs.conversations   4218299   c9121ef96ae6f57509935d289ffe2ed0eb7942b05b41dea7bc1b4ed2551a898a
+BreezyWeather org.breezyweather        60202     1369d817d426498715f8ccb6750baff19dadd78e85f707088e9bca43977570c0
+Fennec        org.mozilla.fennec_fdroid 1510320  839dabff37e2641307e89b8d98108e6692787c2d8bef7f8ff9d1ee98c09870fa
+Aegis         com.beemdevelopment.aegis 82       0eecec45de0da3ff1358004b51e2960d9178551643a6ed44f6496ea9ec999c19
+NewPipe       org.schabi.newpipe       1015      1d66d19eedbab969b1be2e44e0ea35f5f8921cbe83b5c5ac810767ca1a84b7e8
+AntennaPod    de.danoeh.antennapod     3120395   6e79f28f69cef1a8b2e4f5f88c9c3cf3c3d7c51356f01394ac23b0dc5d56a00b
+Catima        me.hackerchick.catima    1005      64ac340eab65e9a965d6088c3ca918ac9ad9c706ff4fe8601bcc4bcbb4fe2a7b
+Notally       com.omgodse.notally      57        545050cd6da0d5ab2b6a3c7c73e8ca26b4de8225db948fa6eb630512ffb0eb56
+Etar          ws.xsoh.etar             57        dae01d93c8920aa63845868db2190bcc4aa6ff8410b1289de1ce27b1bb89c599
+Thunderbird   net.thunderbird.android  33        473b33da5963d0a4261a834c845aaf8e3878309565e9f40e61f6e5def21565e5
+AuroraStore   com.aurora.store         76        fd9c75d90d0f4a7c132b9b4a5a2cf1992a45e03b8d8ff988b7dcfbc0db2c4d11
+# AuroraServices (AuroraOSS v1.1.1) -- NOT on F-Droid (unlike AuroraStore): place the APK manually as
+# AuroraServices.apk (fetch-default-apps.sh then skips it, sha matched). Privileged silent installer.
+AuroraServices com.aurora.services      11        f03f3768f1955907ec313ae497cfd92b4f6f58ee1c01b6b38bd0b6a2a9a50593 manual
+# WireGuard (official build, versionName 1.0.20260315; #159 Slice 1, DIA-20260721-05) -- NOT on the main F-Droid
+# repo, so it is COMMITTED in-repo as core/vendor-common/prebuilts/WireGuard.apk (un-ignored in .gitignore).
+# Both stage-vendor.sh scripts copy every git-tracked prebuilts/*.apk into the staged tree after their rsync, and
+# fetch-default-apps.sh then skips it, sha matched. Its native libs are stored uncompressed, so it needs no JNI
+# extraction. To move the pin, replace the committed APK and update this row's VersionCode and SHA256 together;
+# test-prebuilt-pins.sh fails while the row and the tracked blob disagree.
+WireGuard     com.wireguard.android    519       f92971bc804f4c448e8845ae97e426095eab06ec09a2473a3fa2cfe7288e3298 manual

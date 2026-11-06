@@ -1,0 +1,9 @@
+    private static String read(Context ctx, String name) {
+        java.io.File f = new java.io.File(ctx.getFilesDir(), name);
+        if (!f.isFile() || f.length() > 4096) return null;
+        try {
+            return new String(java.nio.file.Files.readAllBytes(f.toPath()), java.nio.charset.StandardCharsets.UTF_8);
+        } catch (Throwable t) {
+            return null;
+        }
+    }

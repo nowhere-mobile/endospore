@@ -1,0 +1,20 @@
+OTA notes -- what is in each release, shown on the gate's Software update screen (NWP-20261006-12).
+
+One file per released version, named for it (e.g. `0.5.43`):
+
+    version 0.5.43
+    previous 0.5.42
+    - One user-facing point per line.
+    - At most 6 points, 160 characters each, 2 KB in all.
+
+`previous` is the version released before it. A phone walks that chain back from the version it is offered to the
+one it runs, so it can show every change in between.
+
+Rules (enforced by `nowhere_agent ota-notes-check`, by core/agent/ota_notes_test.go over every file here, and by
+e4-ota-publish.sh, which refuses a release without them):
+
+- Features and fixes only. No privacy or security claims -- those need counsel review (docs/privacy-claims.md), so
+  words like "privacy", "secure", "encrypted", "protects" or "safe" are refused. Say what changed, not what it guards.
+- Drafted from the merged PRs at release time, then edited by Chester before the release is built.
+- The build bakes the file for the image's own stamp to /system/etc/nowhere-ota-notes; publishing puts it beside
+  the marker at ota/<dev>/notes-<version>. The whole release procedure is in docs/release-runbook.md.

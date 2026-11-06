@@ -1,0 +1,25 @@
+    private static void postMissedCallNotice(Context ctx, String number, long when) {
+        try {
+            android.app.NotificationManager nm = ctx.getSystemService(android.app.NotificationManager.class);
+            if (nm == null) return;
+            SmsDeliverReceiver.ensureTelChannel(nm); // HIGH + explicit sound + vibrate -> the roamed session alerts
+            String who = (number == null || number.isEmpty()) ? "Unknown caller" : number;
+            android.content.Intent view = new android.content.Intent(android.content.Intent.ACTION_VIEW)
+                    .setType(android.provider.CallLog.Calls.CONTENT_TYPE)
+                    .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK);
+            android.app.PendingIntent pi = android.app.PendingIntent.getActivity(
+                    ctx, (int) when, view, android.app.PendingIntent.FLAG_IMMUTABLE);
+            android.os.Bundle named = new android.os.Bundle(); // NWP-20261123-24: named "Phone", not the chooser's label
+            named.putString(SmsDeliverReceiver.EXTRA_SUBST_APP_NAME, SmsDeliverReceiver.substituteAppName("call"));
+            android.app.Notification.Builder b = new android.app.Notification.Builder(ctx, TEL_CHANNEL)
+                    .setSmallIcon(R.drawable.ic_notif_call)
+                    .addExtras(named)
+                    .setContentTitle("Missed call")
+                    .setContentText(who)
+                    .setContentIntent(pi)
+                    .setAutoCancel(true);
+            nm.notify("nowhere_missed_call", (int) when, b.build());
+        } catch (Throwable t) {
+            android.util.Log.w("NowhereChooser", "telingest missed-call notice", t);
+        }
+    }

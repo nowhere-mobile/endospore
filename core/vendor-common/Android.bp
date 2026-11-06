@@ -1,0 +1,341 @@
+// Nowhere system-side components (P4.2). Kept in /system for GSI-portability (docs/portability.md).
+// TODO(P4.2c): a proper sepolicy domain instead of su:s0.
+// TODO(P4.2b): chooser-driven profile + passphrase + store config (docs/enrollment.md).
+
+cc_prebuilt_binary {
+    name: "nowhere_agent",
+    srcs: ["bin/nowhere_agent"],
+    compile_multilib: "64",
+    check_elf_files: false, // static Go binary: no dynamic deps to check
+    strip: { none: true },
+    system_shared_libs: [],
+}
+
+// Seeds a fresh roamed profile's launcher page 2 (see src/nowhere_seed_home.c).
+//
+// EXISTS BECAUSE /system/bin/sqlite3 IS USERDEBUG-ONLY. roamd used to shell out to it, so on every `user`
+// build all three queries returned empty and seeding silently never ran -- page 2 was missing on every
+// release device while working on lynx, the one device we build userdebug.
+//
+// A purpose-built tool rather than shipping the sqlite3 shell: a general SQL shell is a capability we do
+// not want present in a hardened release image at all, whatever its file mode says. This takes no SQL from
+// its caller, and file_contexts labels it so only endospore_priv may exec it.
+cc_binary {
+    name: "nowhere_seed_home",
+    srcs: ["src/nowhere_seed_home.c"],
+    compile_multilib: "64",
+    cflags: [
+        "-Wall",
+        "-Werror",
+    ],
+    // host_supported so the LOGIC can be exercised against a synthetic launcher.db on the build machine.
+    // The device variant is what ships; the host variant exists purely so this never goes out having only
+    // been COMPILED. libsqlite is itself host_supported, so both variants link the same library.
+    host_supported: true,
+    shared_libs: ["libsqlite"],
+}
+
+// The fixed db repairs roamd + the gate shelled out to sqlite3 for (#732 / DIA-20260817-01) -- see
+// src/nowhere_db_fix.c for the full story. Same contract and label as nowhere_seed_home: fixed statements,
+// no SQL from callers, nowhere_exec. host_supported for the same reason seed_home is: so the logic can be
+// exercised against a synthetic db on the build machine and never ships having only been compiled.
+cc_binary {
+    name: "nowhere_db_fix",
+    srcs: ["src/nowhere_db_fix.c"],
+    compile_multilib: "64",
+    cflags: [
+        "-Wall",
+        "-Werror",
+    ],
+    host_supported: true,
+    shared_libs: ["libsqlite"],
+}
+
+sh_binary {
+    name: "nowhere_login.sh",
+    src: "bin/nowhere_login.sh",
+}
+
+sh_binary {
+    name: "nowhere_provision.sh",
+    src: "bin/nowhere_provision.sh",
+}
+
+sh_binary {
+    name: "nowhere_roamd.sh",
+    src: "bin/nowhere_roamd.sh",
+}
+
+sh_binary {
+    name: "nowhere_otad.sh",
+    src: "bin/nowhere_otad.sh",
+}
+
+sh_binary {
+    name: "nowhere_mediad.sh",
+    src: "bin/nowhere_mediad.sh",
+}
+
+sh_binary {
+    name: "nowhere_gate.sh",
+    src: "bin/nowhere_gate.sh",
+}
+
+prebuilt_etc {
+    name: "nowhere.rc",
+    src: "etc/nowhere.rc",
+    sub_dir: "init",
+}
+
+// Blind-login chooser (P3.1): the boot-time front door. Hands name+passphrase to the root
+// `nowhere_agent login-daemon` over /dev/socket/nowhere_login (the privilege boundary -- an app
+// can't write the root-owned tmpfs / read creds / do S3). No resources (UI built in code).
+// Platform-signed so it lands in a system-app domain we can grant the socket connectto (see sepolicy).
+// ZXing core (Apache-2.0, pure Java) — offline QR decode for the Add-credits scanner. No GApps means no
+// ML Kit barcode scanner, so we bundle the de-facto offline decoder as a prebuilt jar (DIA-20260630-16).
+java_import {
+    name: "nowhere-zxing-core",
+    jars: ["chooser/libs/zxing-core.jar"],
+    sdk_version: "current",
+}
+
+android_app {
+    name: "NowhereChooser",
+    // chooser/mms: vendored AOSP com.google.android.mms PDU parser (#150), compiled against the platform
+    // classpath (platform_apis) exactly like it is inside Bluetooth. Parser-ONLY: PduPersister + the DRM/
+    // cache util/ classes are deliberately NOT vendored -- the gate never persists MMS via the AOSP path
+    // (it seals for the owner), so nothing here can write to the user-0 telephony provider. Vendored (not the
+    // Bluetooth-only framework-mms-shared-srcs filegroup) so it ports to the diaspore/FP3 tree unchanged.
+    srcs: [
+        "chooser/src/**/*.java",
+        "chooser/mms/**/*.java",
+        // #747: StoreService implements this; NowhereApps compiles the SAME file, so the two agree by
+        // construction rather than by two hand-kept copies drifting apart.
+        "chooser/aidl/**/*.aidl",
+    ],
+    aidl: { local_include_dirs: ["chooser/aidl"] },
+    manifest: "chooser/AndroidManifest.xml",
+    resource_dirs: ["chooser/res"], // only the device-admin policy XML (Lock Task kiosk on the gate)
+    static_libs: ["nowhere-zxing-core"], // QR scanner (QrScanActivity)
+    platform_apis: true,
+    certificate: "platform",
+    optimize: { enabled: false },
+}
+
+// NowhereApps (#747, DIA-20260818-08): the nApps storefront as its OWN package, so it appears in
+// Settings > Apps as its own app -- Settings enumerates packages, so an activity inside the chooser never
+// could. Holds NO authority: no INTERNET, no login socket, no install permission. It binds the chooser's
+// StoreService (signature-permission) and asks, so the daemon still pins exactly ONE package on its socket
+// (audit #2, DIA-20260618-08) and the install still runs where the privileged permission already lives.
+// Shares only the AIDL with the chooser -- data, not code.
+android_app {
+    name: "NowhereApps",
+    srcs: [
+        "napps/src/**/*.java",
+        "chooser/aidl/**/*.aidl",
+    ],
+    aidl: { local_include_dirs: ["chooser/aidl"] },
+    manifest: "napps/AndroidManifest.xml",
+    resource_dirs: ["napps/res"],
+    platform_apis: true,
+    certificate: "platform",
+    optimize: { enabled: false },
+}
+
+// NowherePush (#157): a UnifiedPush distributor. Apps register with it; it mints an endpoint at our gateway
+// (POST /push/register) and holds an SSE stream (POST /push/stream; GET only as the fallback for an older gateway) so a push is delivered to the app as a
+// MESSAGE broadcast -- push without FCM/Play Services. Platform-signed (platform_app domain -> plain HTTPS
+// out to the gateway; no privileged perms). Not launchable; provisioned into roamed users by its distributor
+// receiver intent (ChooserActivity.provisionRoamedApps, like the #164 cell-broadcast receiver). No resources
+// (UI-less background service). See docs/157-apps-push.md.
+android_app {
+    name: "NowherePush",
+    srcs: ["pushd/src/**/*.java"],
+    manifest: "pushd/AndroidManifest.xml",
+    platform_apis: true,
+    certificate: "platform",
+    optimize: { enabled: false },
+}
+
+// Curated default apps (DIA-20260617-06): a small, privacy-first, NO-GApps set from F-Droid, shipped on
+// /product/app so the device is useful out of the box. Updates land in-place via the Nowhere store (the
+// bundled F-Droid client was removed in DIA-20260801 -- Aurora Store + the Nowhere store replace it).
+// ⚠ The in-place update holds on Diaspore ONLY: on Endospore GrapheneOS refuses every system-app update that does
+// not come from its first-party app source, so a bundled app moves only with the image (NWP-20260924-05).
+// presigned + preprocessed pattern: keep each app's own F-Droid v2/v3 signature verbatim.
+// Apps: Organic Maps (offline OSM), Conversations (XMPP), Breezy Weather, Fennec (Firefox), Aegis (TOTP),
+// NewPipe (media), AntennaPod (podcasts), Catima (loyalty/membership-card wallet), Notally (notes),
+// Etar (calendar — GrapheneOS ships the provider but no calendar app),
+// Thunderbird (email — defined below, near WireGuard, since it ships JNI libs).
+android_app_import {
+    name: "OrganicMaps",
+    apk: "prebuilts/OrganicMaps.apk",
+    presigned: true,
+    preprocessed: true,
+    // F-Droid ships extractNativeLibs=true (compressed .so, extracted at install). Re-zipping to uncompress
+    // would break its v2/v3 signature, so skip the preprocessed compressed-JNI check and install verbatim.
+    skip_preprocessed_apk_checks: true,
+    dex_preopt: { enabled: false },
+    product_specific: true,
+}
+
+android_app_import {
+    name: "Conversations",
+    apk: "prebuilts/Conversations.apk",
+    presigned: true,
+    preprocessed: true,
+    dex_preopt: { enabled: false },
+    product_specific: true,
+}
+
+android_app_import {
+    name: "BreezyWeather",
+    apk: "prebuilts/BreezyWeather.apk",
+    presigned: true,
+    preprocessed: true,
+    dex_preopt: { enabled: false },
+    product_specific: true,
+}
+
+android_app_import {
+    name: "Fennec",
+    apk: "prebuilts/Fennec.apk",
+    presigned: true,
+    preprocessed: true,
+    skip_preprocessed_apk_checks: true, // compressed JNI libs (extractNativeLibs=true); keep the F-Droid signature
+    dex_preopt: { enabled: false },
+    product_specific: true,
+}
+
+android_app_import {
+    name: "Aegis",
+    apk: "prebuilts/Aegis.apk",
+    presigned: true,
+    preprocessed: true,
+    dex_preopt: { enabled: false },
+    product_specific: true,
+}
+
+android_app_import {
+    name: "NewPipe",
+    apk: "prebuilts/NewPipe.apk",
+    presigned: true,
+    preprocessed: true,
+    // Since 0.29.1 (1015) its native libs ship uncompressed and aligned (extractNativeLibs=false), so the presigned-apk
+    // check passes it clean and soong rejects a skip_preprocessed_apk_checks; no JNI extraction (NWP-20261029-26).
+    dex_preopt: { enabled: false },
+    product_specific: true,
+}
+
+android_app_import {
+    name: "AntennaPod",
+    apk: "prebuilts/AntennaPod.apk",
+    presigned: true,
+    preprocessed: true,
+    // Since 3.12.3 (3120395) its native libs ship uncompressed and aligned (extractNativeLibs=false), so the presigned-apk
+    // check passes it clean and soong rejects a skip_preprocessed_apk_checks; no JNI extraction (NWP-20261029-26).
+    dex_preopt: { enabled: false },
+    product_specific: true,
+}
+
+android_app_import {
+    name: "Catima",
+    apk: "prebuilts/Catima.apk",
+    presigned: true,
+    preprocessed: true,
+    dex_preopt: { enabled: false },
+    product_specific: true,
+}
+
+android_app_import {
+    name: "Notally",
+    apk: "prebuilts/Notally.apk",
+    presigned: true,
+    preprocessed: true,
+    dex_preopt: { enabled: false },
+    product_specific: true,
+}
+
+// Etar (ws.xsoh.etar): the calendar app. GrapheneOS ships a CalendarPROVIDER but no calendar UI, and
+// neither did we -- so an imported .ics landed correctly in the provider and was invisible, with nothing
+// on the device able to display it (found on lynx, NWP-20260827-20/-21). Etar is the AOSP Calendar fork
+// and reads the platform CalendarContract directly, which is exactly where the first-login ingest writes,
+// so it needs no account and shows imported events as ordinary ones. Verified before pinning: it declares
+// READ_CALENDAR/WRITE_CALENDAR and references com.android.calendar, and it ships ZERO native libs -- so
+// it needs none of the .so extraction the JNI apps do (fetch-default-apps.sh's trap).
+android_app_import {
+    name: "Etar",
+    apk: "prebuilts/Etar.apk",
+    presigned: true,
+    preprocessed: true,
+    dex_preopt: { enabled: false },
+    product_specific: true,
+}
+
+// Thunderbird for Android (net.thunderbird.android, the K-9 Mail successor): the default email client --
+// there was no mail app in the curated set. IMAP/JMAP over standard accounts fits the amnesiac model
+// (mail lives server-side; a power-off wipe just re-syncs on next login). Unlike Fennec, its native libs
+// (DataStore counter + CameraX for the desktop-import QR scanner + graphics-path) ship UNCOMPRESSED +
+// aligned, so a verbatim (presigned) system app loads them from the APK directly -- NO
+// skip_preprocessed_apk_checks and NO JNI extraction (the presigned-apk check rejects the skip flag when
+// it isn't needed, and Thunderbird is NOT in the JNI_APPS list in fetch-default-apps.sh).
+android_app_import {
+    name: "Thunderbird",
+    apk: "prebuilts/Thunderbird.apk",
+    presigned: true,
+    preprocessed: true,
+    dex_preopt: { enabled: false },
+    product_specific: true,
+}
+
+// #159 Slice 1: bundle WireGuard as the default always-on VPN app (presigned, verbatim) -> /product/app,
+// where baseApps() picks it up and install-existing's it into each roamed user. The user configures a tunnel
+// + turns it on once; that + the always-on setting (roamd re-applies via IVpnManager) survives roam.
+android_app_import {
+    name: "WireGuard",
+    apk: "prebuilts/WireGuard.apk",
+    presigned: true,
+    preprocessed: true,
+    // WireGuard ships extractNativeLibs=true (libwg-go.so compressed); the APK stays verbatim (F-Droid signature)
+    // and fetch-default-apps.sh's JNI extraction copies the arm64 .so into /product/app/WireGuard/lib. Unlike the
+    // OrganicMaps/NewPipe/AntennaPod APKs this one passes the presigned-apk check clean, so soong rejects a
+    // redundant skip_preprocessed_apk_checks -- omit it.
+    dex_preopt: { enabled: false },
+    product_specific: true,
+}
+
+// Aurora Store (#157): the anonymous Play-app distributor -- how a roamed profile re-downloads Play apps
+// (app-model.md; F-Droid covers open apps). Runs anonymous (shared session, no Google account, no GSF);
+// push stays entirely on UnifiedPush (NowherePush). Its one native lib (libandroidx.graphics.path.so)
+// ships uncompressed + extractNativeLibs=false, so -- like Thunderbird -- it loads from the verbatim APK:
+// NO skip_preprocessed_apk_checks and NO JNI extraction. Regular /product/app; installs via AuroraServices
+// (below) when present, else the session installer.
+android_app_import {
+    name: "AuroraStore",
+    apk: "prebuilts/AuroraStore.apk",
+    presigned: true,
+    preprocessed: true,
+    dex_preopt: { enabled: false },
+    product_specific: true,
+}
+
+// AuroraServices (com.aurora.services v1.1.1, AuroraOSS): the PRIVILEGED silent installer companion to Aurora
+// Store, so a Play app installs WITHOUT the per-app system "install this app?" dialog (DIA-20260731, Chester's
+// "Option 2"). Bundled to /product/priv-app (privileged: true) + granted INSTALL_PACKAGES/DELETE_PACKAGES via a
+// /product/etc/permissions privapp-permissions allow-list (wired in editions/*/*.mk). Aurora binds its exported
+// com.aurora.services.IPrivilegedService (PrivilegedService) to hand off the install. Roaming is UNCHANGED: the
+// installed app still seals into #apps and roams via our store (Model A) -- AuroraServices only removes the
+// install prompt, it does NOT re-fetch from Play.
+android_app_import {
+    name: "AuroraServices",
+    apk: "prebuilts/AuroraServices.apk",
+    presigned: true,
+    preprocessed: true,
+    privileged: true,
+    // This presigned (v2-signed) APK ships COMPRESSED dex, which the priv-app-dex check rejects and which we
+    // can't uncompress without invalidating the signature. dexpreopt is LEFT ENABLED (unlike AuroraStore) so the
+    // app runs from its preopted odex -- the compressed APK dex is never mmap'd at runtime -- and
+    // skip_preprocessed_apk_checks bypasses the now-moot compile-time uncompressed-dex assertion.
+    skip_preprocessed_apk_checks: true,
+    product_specific: true,
+}

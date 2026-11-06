@@ -1,0 +1,23 @@
+// NWP-20261010-15: roamd's two uid-0 app_process helpers, built FROM SOURCE into /system_ext/framework. See README.md.
+//
+// Until this slice nowhere-vpnao.jar was a hand-built dex prebuilt committed under core/vendor-common/prebuilts and
+// copied by PRODUCT_COPY_FILES: nothing tied its bytes to VpnAlwaysOn.java, which is the stale-prebuilt class the
+// agent binary left in DIA-20260629-26. Built here, a source change cannot ship without the image carrying it, and a
+// compile error fails the build instead of shipping the old helper.
+//
+// No sdk_version: both use the private platform API (android.os.ServiceManager, the I*Service interfaces), the way
+// the platform's own app_process commands do. Both are in PRODUCT_PACKAGES from endospore.mk. The install paths are
+// what nowhere_roamd.sh tests for and puts on CLASSPATH, so a module renamed here must be renamed there too.
+java_library {
+    name: "nowhere-vpnao",
+    srcs: ["np/VpnAlwaysOn.java"],
+    installable: true,
+    system_ext_specific: true,
+}
+
+java_library {
+    name: "nowhere-syncroam",
+    srcs: ["np/SyncRoam.java"],
+    installable: true,
+    system_ext_specific: true,
+}

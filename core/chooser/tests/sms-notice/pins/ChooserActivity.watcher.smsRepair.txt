@@ -1,0 +1,7 @@
+                // NWP-20261010-13: the same for the SMS role, as a REPAIR only (repairSmsRoleLater): Messaging when
+                // nobody or the chooser holds the role, never over an app the profile chose -- which matters because
+                // this latch is per process and per uid, so it fires again mid-session after a gate restart.
+                if (uid != smsAssertedUid) {
+                    smsAssertedUid = uid;
+                    repairSmsRoleLater(uid, "watcher");
+                }

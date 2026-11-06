@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- NWP-20261004-01: static, always-on overlay of the framework (android) for every Endospore device. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.nowhere.overlay.framework">
+    <overlay android:targetPackage="android" android:isStatic="true" />
+    <application android:hasCode="false" />
+</manifest>

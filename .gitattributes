@@ -1,0 +1,16 @@
+# Normalize line endings. Shell scripts MUST be LF so they run on Linux/Android.
+* text=auto eol=lf
+*.sh text eol=lf
+*.py text eol=lf
+*.md text eol=lf
+
+# Treat image/binary artifacts as binary (also gitignored, belt-and-suspenders)
+# Detached signatures are 64 RAW BYTES, not text. Without this they match `* text=auto eol=lf` above and
+# git decides by a NUL-byte heuristic -- so a signature that happens to contain no NUL is treated as TEXT,
+# and one that also contains the pair 0D 0A has the 0D silently stripped on commit. The corrupted sig then
+# fails verification in a way that reads as "wrong key", which has already cost a release round trip once.
+# ~1-in-1000 per signature: rare enough to survive by luck for a year, which is exactly the problem.
+*.sig    binary
+*.img    binary
+*.squashfs binary
+*.erofs  binary

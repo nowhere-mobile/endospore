@@ -1,0 +1,8 @@
+version 0.5.44
+previous 0.5.43
+- Tie now covers a profile's app data, settings, app sign-ins, photos, files and apps, and the Tie screen shows how far it has got.
+- If signing in can't reach the store, you're offered Try again, not Restore last good version.
+- Offline media opens for a tied profile, and a failure to read it is shown as an error.
+- An alarm set in a session is no longer lost when you sign out or lock while a backup is running.
+- Signing out without opening a Play app no longer says your Google account couldn't be saved.
+- An export that only partly finishes now says which part didn't.

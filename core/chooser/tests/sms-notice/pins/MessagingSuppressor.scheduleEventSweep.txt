@@ -1,0 +1,8 @@
+    private synchronized void scheduleEventSweep() {
+        if (clearHandler == null) return;
+        long now = android.os.SystemClock.uptimeMillis();
+        if (sweepPendingSince == 0) sweepPendingSince = now;
+        sweepForEvent = true;
+        clearHandler.removeCallbacks(sweep);
+        clearHandler.postDelayed(sweep, sweepDelay(now, sweepPendingSince));
+    }

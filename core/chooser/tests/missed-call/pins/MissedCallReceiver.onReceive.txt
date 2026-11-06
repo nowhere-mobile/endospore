@@ -1,0 +1,22 @@
+public void onReceive(Context ctx, Intent intent) {
+        final int count = intent == null ? -1 : intent.getIntExtra(EXTRA_COUNT, -1);
+        final int plan = plan(intent == null ? null : intent.getAction(),
+                android.os.Process.myUserHandle().getIdentifier(), count);
+        // No number, no name: the extras carry the caller's number, and this log line must not.
+        android.util.Log.i("NowhereChooser", "missed-call broadcast count=" + count + " -> "
+                + (plan == SCRUB_RESET ? "scrub" : "drop"));
+        if (plan != SCRUB_RESET) return;
+        final Context app = ctx.getApplicationContext();
+        final PendingResult pr = goAsync();
+        new Thread(() -> {
+            try {
+                TelScrub.callLog(app);
+                android.telecom.TelecomManager tm = app.getSystemService(android.telecom.TelecomManager.class);
+                if (tm != null) tm.cancelMissedCallsNotification();
+            } catch (Throwable t) {
+                android.util.Log.w("NowhereChooser", "missed-call scrub", t);
+            } finally {
+                pr.finish();
+            }
+        }, "nowhere-scrub-missed").start();
+    }

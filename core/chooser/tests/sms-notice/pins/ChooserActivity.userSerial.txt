@@ -1,0 +1,7 @@
+    private long userSerial(int uid) {
+        try {
+            return getSystemService(android.os.UserManager.class).getSerialNumberForUser(android.os.UserHandle.of(uid));
+        } catch (Throwable t) {
+            return -1;
+        }
+    }

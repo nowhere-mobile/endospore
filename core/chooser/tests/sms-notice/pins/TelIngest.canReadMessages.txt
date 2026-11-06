@@ -1,0 +1,11 @@
+    private static boolean canReadMessages(Context ctx) {
+        try {
+            if (ctx.checkSelfPermission(android.Manifest.permission.READ_SMS)
+                    != android.content.pm.PackageManager.PERMISSION_GRANTED) return false;
+            android.app.AppOpsManager ao = ctx.getSystemService(android.app.AppOpsManager.class);
+            return ao != null && ao.unsafeCheckOpNoThrow(android.app.AppOpsManager.OPSTR_READ_SMS,
+                    android.os.Process.myUid(), ctx.getPackageName()) == android.app.AppOpsManager.MODE_ALLOWED;
+        } catch (Throwable t) {
+            return false;
+        }
+    }

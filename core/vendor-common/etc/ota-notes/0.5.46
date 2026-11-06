@@ -1,0 +1,3 @@
+version 0.5.46
+previous 0.5.45
+- Signing in to a large profile no longer fails partway through with "Couldn't load your data".

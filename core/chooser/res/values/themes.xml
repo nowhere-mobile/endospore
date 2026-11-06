@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  NWP-20260823-05 (from the transition-screens inventory, boot edge): the gate's Android-12+ SPLASH SCREEN
+  used to be our spore icon centred on an AOSP-DERIVED LIGHT FIELD - the one frame of the boot sequence in
+  someone else's palette (Chester, 2026-08-23, screenshot: grey dots on light grey between FallbackHome and
+  the gate). The splash window is drawn by the SYSTEM from the activity THEME before any of our code runs,
+  so the fix lives here: pure black behind the icon, matching the boot animation, the FallbackHome brand
+  image and the gate background on either side of it - the whole boot reads as one dark sequence.
+  The icon disc keeps its own color (ic_launcher_bg #0B0F14) via windowSplashScreenIconBackgroundColor.
+-->
+<resources>
+    <style name="Theme.Nowhere" parent="@android:style/Theme.Material.NoActionBar">
+        <item name="android:windowSplashScreenBackground">#FF000000</item>
+        <!-- Belt (NWP-20260823-06 follow-up): the splash attr compiled in but the boot-time starting
+             window still drew LIGHT (Chester, 2026082113 boot): some launches draw an EMPTY starting
+             window from windowBackground rather than the icon-splash path. Black here covers that path;
+             every activity sets its own opaque content background, so nothing else changes. -->
+        <item name="android:windowBackground">@android:color/black</item>
+        <item name="android:windowSplashScreenIconBackgroundColor">#FF0B0F14</item>
+        <!-- NWP-20260823-17: the teal splash icon lives HERE, in the ACTIVITY theme, because that is the theme
+             the platform actually reads for the splash. NWP-20260823-16 put it in a separate theme pointed at
+             by android:splashScreenTheme, and the frame came back unchanged: ActivityRecord resolves the
+             splash theme from ActivityOptions or from a PM-PERSISTED per-package value, NOT from the manifest
+             attribute, so that theme was never consulted. The proof it is this theme was in front of me the
+             whole time: windowSplashScreenBackground here IS honoured, which is why the field went black. -->
+        <item name="android:windowSplashScreenAnimatedIcon">@drawable/splash_spore_fg</item>
+    </style>
+
+    <!-- NWP-20260823-16: a theme used ONLY for the boot splash, applied via android:splashScreenTheme on the
+         gate activity (API 31+; it is the FIRST branch of the platform's getSplashScreenTheme, ahead of the
+         activity theme). It exists because the splash needs two things the GATE must not have.
+
+         1. FULLSCREEN. Chester's boot video shows the status bar, its CLOCK and a heads-up notification card
+            drawn over the splash frame, between the boot animation and the gate. The gate itself wants its
+            status bar; the splash does not, and this is the only way to differ.
+         2. A TEAL icon. The splash is drawn from the launcher icon, and editions/endospore overrides that
+            with the grey GrapheneOS-theme variant, so the frame rendered grey dots with teal animation on
+            either side of it. windowSplashScreenAnimatedIcon takes a plain drawable and pins it to ours.
+
+         The background and icon-disc colours inherit from Theme.Nowhere, so the two stay in step. -->
+    <style name="Theme.Nowhere.Splash" parent="@style/Theme.Nowhere">
+        <item name="android:windowFullscreen">true</item>
+    </style>
+
+    <!-- NWP-20261117-35: the gate's dialogs in its light look (docs/product-decisions.md, 2026-10-26, "the gate gets a
+         light mode like the storefront's"). In light mode applyGateLook overlays GateLightDialogs on the gate's theme,
+         so every new AlertDialog.Builder(this) resolves GateDialogLight. The accent is GatePalette.LIGHT.accent,
+         pinned equal by test-gate-dialogs-java.sh. The dark look keeps the platform's dark dialog theme. -->
+    <style name="GateDialogLight" parent="@android:style/Theme.Material.Light.Dialog.Alert">
+        <item name="android:colorAccent">#FF087658</item>
+    </style>
+
+    <style name="GateLightDialogs">
+        <item name="android:alertDialogTheme">@style/GateDialogLight</item>
+    </style>
+</resources>

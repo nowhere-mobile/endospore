@@ -1,0 +1,8 @@
+    static String sessionId(Context ctx) {
+        try {
+            long s = ctx.getSystemService(android.os.UserManager.class).getSerialNumberForUser(android.os.Process.myUserHandle());
+            return s < 0 ? null : Long.toString(s);
+        } catch (Throwable t) {
+            return null;
+        }
+    }

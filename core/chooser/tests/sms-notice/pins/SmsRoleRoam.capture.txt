@@ -1,0 +1,35 @@
+    static void capture(Context ctx) {
+        synchronized (LOCK) {
+            final String self = ctx.getPackageName();
+            final String session = sessionId(ctx);
+            String[] m = parseMarker(read(ctx, MARKER), session);
+            if (m == null) return;
+            String holder = null;
+            try {
+                java.util.List<String> h = ctx.getSystemService(android.app.role.RoleManager.class)
+                        .getRoleHolders(android.app.role.RoleManager.ROLE_SMS);
+                holder = h == null || h.isEmpty() ? "" : h.get(0);
+            } catch (Throwable t) {
+                android.util.Log.w("NowhereChooser", "NWP-20261010-13 sms role read", t);
+            }
+            String record = parseSmsRecord(read(ctx, RECORD));
+            if (record != null && (MESSAGING.equals(holder) || "".equals(holder))) {
+                String st = standInState(record, holder, MESSAGING, self, presence(ctx, record));
+                if ("none".equals(st)) return; // PackageManager could not say: change nothing
+                if (st != null) {
+                    if (!st.equals(m[0]) || !record.equals(m[2])) {
+                        write(ctx, MARKER, markerText(session, st, MESSAGING, record));
+                        android.util.Log.i("NowhereChooser", "NWP-20261010-13 sms role: " + record + " is not installed -> "
+                                + st + ", the record kept, Messaging stands in");
+                    }
+                    return;
+                }
+            }
+            String v = smsCaptureValue(record, m[0], m[1], holder, MESSAGING, self);
+            if (v == null) return;
+            if (!write(ctx, RECORD, "app=" + v + "\n")) return;
+            write(ctx, MARKER, markerText(session, "applied", v, v));
+            android.util.Log.i("NowhereChooser", "NWP-20261010-13 sms role captured: " + v
+                    + " (was " + (record == null ? "none" : record) + ")");
+        }
+    }

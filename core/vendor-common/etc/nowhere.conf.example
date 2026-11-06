@@ -1,0 +1,143 @@
+# ⚠ HOW THIS FILE IS LOADED, since NWP-20260908-06: the BAKED ring conf at
+# /system/etc/nowhere/nowhere.conf is sourced FIRST, then this provisioned copy at
+# /data/nowhere/nowhere.conf ON TOP. It is a MERGE, per key -- the ring is the floor, the device
+# overrides it.
+#
+# It used to pick ONE file, and that silently discarded every ring setting the device conf did not
+# repeat. On a fielded handset the two shared ZERO keys, so the ring contributed nothing at all --
+# which is how a sequential-guard flag was shipped, measured for an evening, and found never to have
+# been applied (NWP-20260907-16 / -22).
+#
+# ⚠ CONSEQUENCE FOR AN OPERATOR: OMITTING A KEY NO LONGER TURNS IT OFF. The ring value stands. To
+# disable a ring setting on one device, set it explicitly (FLAG=0) rather than deleting the line.
+#
+# roamd logs what the merge did on every start -- `[roamd] conf merge: ring=[...] device=[...]
+# overridden=[...]` -- KEY NAMES ONLY, so a credential can never reach the log.
+# Nowhere device store config — TEMPLATE. Real values are provisioned out-of-band (NEVER committed).
+# Provision (with real values) to /data/nowhere/nowhere.conf on the device -- mutable, FBE-encrypted
+# at rest, and rotatable in place without a reflash. The scripts read it from there (with a legacy
+# /system/etc/nowhere/nowhere.conf fallback). It is NOT baked into the system image, so a clean
+# checkout builds an un-enrolled OS. The agent's S3 backend (store arg "s3") uses these; any S3 store
+# works: R2, B2, MinIO. The full discovery/bootstrap path is in docs/enrollment.md.
+#
+# The production store is Cloudflare R2 (nowhere-cloud `docs/filebase-decommission.md`, #132 — Filebase
+# is RETIRED; do not point a new device at it). R2's endpoint is account-specific, hence the placeholder.
+
+S3_ENDPOINT=https://__ACCOUNT_ID__.r2.cloudflarestorage.com
+S3_REGION=auto
+S3_BUCKET=nowhere
+S3_ACCESS_KEY=__PROVISION_ME__
+S3_SECRET_KEY=__PROVISION_ME__
+
+# Optional: seconds between the login daemon's continuous seal of the live roamed user. Default 120.
+#NOWHERE_SYNC_INTERVAL=120
+
+# NOWHERE_GATEWAY_DEFAULT -- which managed gateway the user’s "nowhere store" choice ENROLS against, as
+# distinct from GATEWAY_URL, which means "this device is ALREADY enrolled with that gateway".
+#
+# The difference decides whether first-run happens at all: GATEWAY_URL makes storeConfigured() true, so the
+# chooser SKIPS welcome entirely -- right for a turnkey dev handset, wrong for a device somebody unboxes,
+# because it silently answers the question the welcome exists to ask. NOWHERE_GATEWAY_DEFAULT does NOT mark
+# the device configured, so welcome -> Wi-Fi -> choose-storage -> owner-credential runs in full and the
+# managed-store choice then enrols against THIS gateway instead of falling through to production.
+#
+# Set by the beta-setup ring. Undocumented here until NWP-20260908-07, which is the gap that let the first
+# stallion release quietly enrol against prod.
+#NOWHERE_GATEWAY_DEFAULT=https://api-beta.nowhere.mobile
+
+# Optional app-store dynamic sources (no-OTA freshening). Both are plain HTTPS URLs to a SIGNED artifact;
+# the daemon fetches URL and URL + ".sig" and installs it to /data ONLY if the detached ed25519 signature
+# verifies against the key baked into the agent (a SEPARATE key per source). Unset => that refresh path is
+# simply off and the baked /system copy is served. A static, cacheable GET is all that's needed; no
+# credentials, since trust is the signature, not the host.
+#   INDEX_URL   = the trimmed full-catalog F-Droid SEARCH index (signed by the ONLINE index key). Now
+#                 GATEWAY-SERVED: prebuilts/publish-fdroid-index.sh (R2_DEST=r2:nowhere/fdroid) pushes it to
+#                 R2, each gateway pulls it and serves GET /fdroid/index.json(.sig) (nowhere-cloud
+#                 deploy/fdroid-index-deploy.md). Beta devices point at the api-beta host instead.
+#   CATALOG_URL = the curated storefront catalog (signed by the OFFLINE catalog key; see sign-catalog.sh), and the
+#                 ONLY source of its refresh: the phone does not derive one from GATEWAY_URL, and there is no
+#                 gateway route for it. Unset => the baked /system catalog is served, and it changes with each OTA.
+#                 If you set it, host the signed file statically wherever you serve signed files.
+#INDEX_URL=https://api.nowhere.mobile/fdroid/index.json
+#CATALOG_URL=https://static.nowhere.mobile/catalog.json
+#   STOREFRONT_URL = the storefront ORIGIN the chooser sends a buyer to (Profile > Storage > Plans).
+#                 NO PATH: the chooser appends /buy itself, so the two halves cannot drift. Unset means
+#                 the shipped default, https://nowhere.mobile -- which is why prod, which bakes no ring,
+#                 keeps working unchanged. Set by the beta ring so a beta handset buys against beta.
+#STOREFRONT_URL=https://beta.nowhere.mobile
+#   NOWHERE_OS_AGREEMENT = "draft" shows the first-run OS agreement screen with its DRAFT text
+#                 (NWP-20261114-13). The beta-setup ring sets it; prod bakes no ring, so unset means "off".
+#                 Any other value ("DRAFT", "on", "1") is also "off". This key is NOT the production switch:
+#                 that is the chooser's own gate.
+#NOWHERE_OS_AGREEMENT=draft
+
+
+# --- Multi-device (#91). Both default OFF and are enabled PER DEVICE, so a rollout is a conf edit rather
+# --- than a build. They are independent: #apps is account-shared whatever the first one says.
+#
+# NOWHERE_MULTIDEVICE=1 turns on the per-unit head model (slice 3): this device seals app data to its OWN
+# head instead of the single account head, so two phones signed into one profile stop overwriting each
+# other. The account head stays as the identity anchor and as the source a not-yet-sealed device adopts
+# from. Read by the login daemon, roamd and mediad, which MUST agree -- so set it here, not per-process.
+#NOWHERE_MULTIDEVICE=1
+#
+# NOWHERE_CARRY_ESSENTIAL -- ON BY DEFAULT since NWP-20261118-10 (DECIDED 2026-10-30, h48 #2: the #apps per-app
+# index comes from this flag); NOWHERE_CARRY_ESSENTIAL=0 switches it off. It turns on the #apps cross-lineage
+# carry (slice 5c): a per-file index of the sealed app-code region, per-file chunk alignment so those spans
+# exist, re-emitting BY HASH any package the stored head names that this handset never staged, and
+# account-level tombstones so a deliberate uninstall is not undone by a phone that was already signed in.
+# Without it a second handset silently seals away an app it never received, and store GC then reaps the bytes.
+# (superseded by NWP-20260906-15: the #apps presence guard refuses that seal, so the stored head keeps the app;
+# without the carry, that handset cannot save its #apps changes for the session)
+#
+# COST: the first seal after enabling re-chunks the #apps scope once, so that one save re-uploads the app-code
+# set. Turning it back off is safe: the next seal simply stops writing the index.
+#NOWHERE_CARRY_ESSENTIAL=0
+#
+# NOWHERE_CARRY_ESSENTIAL_MEDIA -- ON BY DEFAULT since NWP-20261023-09 (DECIDED 2026-09-12: two handsets MAY
+# be signed in at once, so the shared scopes must CONVERGE); NOWHERE_CARRY_ESSENTIAL_MEDIA=0 switches it off.
+# It is the same per-file index and hash carry for the shared #media head
+# (#91). #media is ACCOUNT-shared, so two signed-in handsets write one ref; without this a seal from the
+# handset that has not materialised the other’s photos publishes a head without them. With it, every
+# essential rel the stored head names that this handset never received is re-emitted BY HASH -- nothing
+# fetched, nothing re-uploaded.
+#
+# It does NOT make the two heads identical: they still churn, because directory entries ride an unindexed
+# grouped chunk and carried spans are appended rather than interleaved. It removes the data LOSS.
+#
+# COST: the first seal after enabling re-chunks the #media essential set once -- one region per file, so on
+# a real camera roll that is a large one-off upload. The deferred bulk is untouched.
+# ⚠ Both handsets must be on a build that carries the code BEFORE either gets the flag: a file-aligned head
+# against an old build’s grouped re-seal is a ~5x chunk collapse, which the shrink guard refuses -- and a
+# #media refusal fails the whole logoff.
+# (superseded by NWP-20260908-11: the shrink guard compares file counts when the stored head is file-aligned
+# and the seal is not, so a flagless handset's grouped re-seal is no longer refused -- see rings/beta.conf
+# "NOT A ROLLOUT CONSTRAINT")
+#NOWHERE_CARRY_ESSENTIAL_MEDIA=0
+
+# NOTE: there is intentionally no NOWHERE_PROFILE / NOWHERE_PASS here. Identity is the blind-login
+# chooser's job -- it hands the profile + passphrase to the daemon at login, and the sync is
+# session-driven (it reads the live identity from the tmpfs .session marker). Never put a passphrase
+# in this file: it would be a credential at rest on the device.
+
+# NOWHERE_SEQ_GUARD -- refuse a seal whose base is no longer current (NWP-20260907-13).
+#
+# The stale-publish guard samples the head at the START of a push and compares at the PUT, so it sees
+# only a head that moved DURING a seal: about one round trip. The common two-handset failure is
+# SEQUENTIAL -- the other handset restored an hour ago, this one has sealed since, and the other now
+# publishes content built on a base that is no longer current. Nothing moves during that push, so the
+# guard permits it and the newer work is replaced with no refusal anywhere.
+#
+# DETECTION IS ALWAYS ON AND ALWAYS LOGGED ("STALE BASE ... refusal=false"). This flag only decides
+# whether the seal is REFUSED.
+#
+# It is OFF by default because the resolution is a PRODUCT decision, not a technical one. When the
+# losing handset has genuinely diverged there is no correct automatic answer: it either loses its own
+# unsealed session, or it overwrites the other handset. Today it silently does the second -- two losses,
+# and the wrong copy survives. Refusing makes it one loss, borne by the handset that diverged, which is
+# almost certainly right; "almost certainly" is not a basis for changing when a customer loses a
+# session. See docs/product-decisions.md, where multi-device is recorded as an OPEN question.
+#
+# Turn it on to MEASURE on a real pair of handsets: watch for STALE BASE in roam.log and see how often
+# it fires in ordinary use before deciding.
+#NOWHERE_SEQ_GUARD=0

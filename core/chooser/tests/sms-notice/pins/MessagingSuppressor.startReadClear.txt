@@ -1,0 +1,17 @@
+    private synchronized void startReadClear() {
+        stopReadClear();
+        clearThread = new android.os.HandlerThread("nowhere-msg-readclear");
+        clearThread.start();
+        clearHandler = new android.os.Handler(clearThread.getLooper());
+        clearObserver = new android.database.ContentObserver(clearHandler) {
+            @Override public void onChange(boolean self) { scheduleEventSweep(); }
+        };
+        for (String uri : new String[]{"content://sms", "content://mms", "content://mms-sms"}) {
+            try {
+                getContentResolver().registerContentObserver(android.net.Uri.parse(uri), true, clearObserver);
+            } catch (Throwable t) {
+                android.util.Log.w("NowhereChooser", "NWP-20261010-13 observe " + uri, t);
+            }
+        }
+        scheduleEventSweep();
+    }

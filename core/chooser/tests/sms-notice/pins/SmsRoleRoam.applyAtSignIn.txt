@@ -1,0 +1,52 @@
+    static void applyAtSignIn(Context ctx) {
+        // The capture lives in MessagingSuppressor: grant the listener every session, not only one with texts staged
+        // (TelIngest.run grants it only when its mailbox has rows).
+        TelIngest.ensureNotificationListener(ctx);
+        boolean messaging;
+        synchronized (LOCK) {
+            final String self = ctx.getPackageName();
+            final android.os.UserHandle me = android.os.Process.myUserHandle();
+            final String session = sessionId(ctx);
+            // NWP-20261123-23: a record that exists but cannot be read is UNKNOWN, not "no record". Messaging stands in
+            // so texting works, and no marker is written, so nothing is captured this session and the record is kept.
+            final java.io.File rf = new java.io.File(ctx.getFilesDir(), RECORD);
+            final boolean isFile = rf.isFile();
+            final long length = rf.length();
+            final String content = read(ctx, RECORD);
+            if (recordUnknown(isFile, length, content)) {
+                ensureHolder(ctx, me, MESSAGING, true, self, ctx.getMainExecutor(), null);
+                messaging = true;
+                ChooserActivity.grantMessagingRestrictedRead(ctx); // #150: after the role settles
+                android.util.Log.i("NowhereChooser", "NWP-20261010-13 sms role at sign-in: record unreadable -> Messaging"
+                        + " stands in, no marker (NWP-20261123-23)");
+            } else {
+                final String record = parseSmsRecord(content);
+                final String presence = record == null ? "absent" : presence(ctx, record);
+                String[] plan = smsSignInPlan(record, presence, MESSAGING, self);
+                String want = plan[0], state = plan[1], target = plan[2];
+                String r = ensureHolder(ctx, me, want, true, self, ctx.getMainExecutor(), null);
+                if (!"held".equals(r) && !MESSAGING.equals(want)) {
+                    // The recorded app would not take the role (it no longer qualifies): Messaging, the record kept.
+                    state = "fallback"; want = MESSAGING;
+                    r = ensureHolder(ctx, me, want, true, self, ctx.getMainExecutor(), null);
+                }
+                messaging = MESSAGING.equals(want);
+                if (messaging) ChooserActivity.grantMessagingRestrictedRead(ctx); // #150: after the role settles
+                if (!"held".equals(r)) state = "fallback"; // nobody we meant holds it: the stand-in rule still keeps the record
+                android.util.Log.i("NowhereChooser", "NWP-20261010-13 sms role at sign-in: record=" + (record == null ? "none" : record)
+                        + " -> " + want + " (" + state + ", " + r + ")");
+                if (session != null) write(ctx, MARKER, markerText(session, state, want, target));
+            }
+        }
+        // #150: and again once the role machinery has settled -- a role-add can leave Messaging's restricted-read op at
+        // "ignore", and the role controller can revert a grant made right after it (the gate's repair re-grants only at
+        // +60 s, so without this an MMS can be unreadable in Messaging for a minute after sign-in).
+        if (messaging) {
+            try { Thread.sleep(4000); } catch (InterruptedException ie) { return; }
+            ChooserActivity.grantMessagingRestrictedRead(ctx);
+        }
+        // NWP-20261012-05: the role step has run. Re-apply the profile's recorded declines to the SMS and dialer role
+        // holders -- the role add above, or RoleService's own default-role grant if it landed first, can have granted
+        // over them. What can still land after this is in PermDeclines' class comment.
+        PermDeclines.reapplyRoleHolders(ctx, "sign-in role step");
+    }

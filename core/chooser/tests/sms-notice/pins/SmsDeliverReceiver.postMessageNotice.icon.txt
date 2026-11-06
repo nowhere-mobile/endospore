@@ -1,0 +1,1 @@
+                    .setSmallIcon(isCall ? R.drawable.ic_notif_call : R.drawable.ic_notif_message) // NWP-20261010-13: a white envelope, not the legacy glyph; NWP-20261123-24: a handset for a call

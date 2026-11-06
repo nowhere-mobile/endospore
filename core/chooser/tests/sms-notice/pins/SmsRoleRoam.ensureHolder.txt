@@ -1,0 +1,58 @@
+    static String ensureHolder(Context uc, android.os.UserHandle uh, String want, boolean signIn, String self,
+                               java.util.concurrent.Executor ex, String standIn) {
+        final int uid = uh.getIdentifier();
+        try {
+            android.app.role.RoleManager rm = uc.getSystemService(android.app.role.RoleManager.class);
+            if (rm == null || !rm.isRoleAvailable(android.app.role.RoleManager.ROLE_SMS)) {
+                android.util.Log.w("NowhereChooser", "#148 SMS role unavailable in " + uid + " (signIn=" + signIn + ")");
+                return "failed";
+            }
+            boolean confirmed = signIn;
+            // NWP-20261012-05: the SMS role overrides the user when granting -- an add grants every role permission
+            // `want` was not holding and CLEARS its USER_SET / USER_FIXED, undoing whatever the profile declined.
+            // Snapshot `want`'s live declines before the first add, and put them back once it holds the role -- all but
+            // the SMS permissions, which the SMS app keeps (NWP-20261012-08, PermDeclines.exceptSmsRole).
+            java.util.List<String[]> declines = null;
+            for (int attempt = 1; attempt <= 4; attempt++) {
+                java.util.List<String> holders = null;
+                try {
+                    holders = rm.getRoleHoldersAsUser(android.app.role.RoleManager.ROLE_SMS, uh);
+                } catch (Throwable ignore) { /* getRoleHoldersAsUser may be restricted -> smsRoleStep reads null */ }
+                String step = standIn != null ? takeoverStep(holders, self, want, standIn) : smsRoleStep(holders, signIn, self, want);
+                if ("held".equals(step)) {
+                    android.util.Log.i("NowhereChooser", "#148 " + want + " is default SMS in " + uid + " (verified, attempt " + attempt + ")");
+                    if (declines != null) PermDeclines.apply(uc, uh, want, declines, "sms role add"); // an earlier add landed late
+                    return "held";
+                }
+                if ("leave".equals(step)) {
+                    android.util.Log.i("NowhereChooser", "#148 SMS role in " + uid + " left to its holder ("
+                            + (holders == null ? "unreadable" : "another app") + ")");
+                    return "left";
+                }
+                if (!confirmed) { // a repair: look again before taking a role that may be changing hands
+                    confirmed = true;
+                    attempt--;
+                    try { Thread.sleep(2000); } catch (InterruptedException ie) { return "failed"; }
+                    continue;
+                }
+                if (declines == null) declines = self.equals(want) ? new java.util.ArrayList<>()
+                        : PermDeclines.exceptSmsRole(PermDeclines.snapshot(uc, uh, want));
+                final boolean[] ok = { false };
+                final java.util.concurrent.CountDownLatch done = new java.util.concurrent.CountDownLatch(1);
+                rm.addRoleHolderAsUser(android.app.role.RoleManager.ROLE_SMS, want,
+                        android.app.role.RoleManager.MANAGE_HOLDERS_FLAG_DONT_KILL_APP, uh,
+                        ex, r -> { ok[0] = r; done.countDown(); });
+                boolean returned = done.await(2, java.util.concurrent.TimeUnit.SECONDS);
+                android.util.Log.i("NowhereChooser", "#148 " + want + " default SMS in " + uid + " attempt " + attempt + ": ok=" + ok[0] + " returned=" + returned);
+                if (ok[0]) {
+                    PermDeclines.apply(uc, uh, want, declines, "sms role add");
+                    return "held";
+                }
+                try { Thread.sleep(300); } catch (InterruptedException ie) { return "failed"; } // let the role service settle
+            }
+            android.util.Log.w("NowhereChooser", "#148 " + want + " is NOT default SMS in " + uid + " after 4 attempts");
+        } catch (Throwable t) {
+            android.util.Log.w("NowhereChooser", "#148 ensureHolder", t);
+        }
+        return "failed";
+    }

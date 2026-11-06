@@ -1,0 +1,4 @@
+                // NWP-20261010-13: one more repair point for a cede that did not land (repairSmsRoleLater). Not because
+                // DISALLOW_SMS blocked it -- SmsRoleBehavior.isAvailableAsUser does not read that restriction -- but this
+                // is a moment the session is known live. A repair never replaces an app the user chose.
+                repairSmsRoleLater(uid, "lift");

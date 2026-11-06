@@ -1,0 +1,20 @@
+    private boolean ensureRoamedSmsRole(int uid) {
+        android.content.Context uc = null;
+        try {
+            final android.os.UserHandle uh = android.os.UserHandle.of(uid);
+            uc = createContextAsUser(uh, 0);
+            return "held".equals(SmsRoleRoam.ensureHolder(uc, uh, SmsRoleRoam.MESSAGING, false, getPackageName(),
+                    getMainExecutor(), null));
+        } catch (Throwable t) {
+            android.util.Log.w("NowhereChooser", "#148 ensureRoamedSmsRole", t);
+        } finally {
+            if (uc != null) {
+                final android.content.Context ruc = uc;
+                try { grantMessagingRestrictedRead(ruc); } catch (Throwable ignore) {} // #150: after the role settles
+                try { reassertGateWapPush(); } catch (Throwable ignore) {} // #150: the gate's own RECEIVE_WAP_PUSH grant
+                new android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(
+                        () -> grantMessagingRestrictedRead(ruc), 4000);
+            }
+        }
+        return false;
+    }

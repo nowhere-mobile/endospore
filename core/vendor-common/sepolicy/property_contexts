@@ -1,0 +1,20 @@
+# Control property for the Arc-2 data worker. The login daemon (u:r:nowhere:s0) starts the su:s0
+# worker via `setprop ctl.start nowhere_roamd`. Give THIS service's control property its own label
+# (more specific than the generic `ctl.start$` fallback) so the daemon can be granted `set` on just
+# this one service, not arbitrary `ctl.start`. See nowhere.te (ctl_nowhere_roamd_prop + set_prop).
+ctl.start$nowhere_roamd        u:object_r:ctl_nowhere_roamd_prop:s0
+# NWP-20261120-01: the login daemon stops an odrestore it gave up on (docs/product-decisions.md, 2026-11-01).
+# ctl.stop$ needs its own line (init looks up start and stop separately); the same label as the start line, so
+# the one set_prop grant in nowhere.te covers both. A PREFIX match like the start line (_ro and _cred too).
+ctl.stop$nowhere_roamd         u:object_r:ctl_nowhere_roamd_prop:s0
+# Control property for the on-demand OTA updater (DIA-20260618-03): the daemon ctl.starts it on a
+# user-confirmed install (see nowhere.te ctl_nowhere_otad_prop + set_prop).
+ctl.start$nowhere_otad         u:object_r:ctl_nowhere_otad_prop:s0
+# Control property for the on-demand media daemon (#84): the login daemon starts it after the essential
+# restore and stops it at logoff/cold-lock. ctl.stop$ needs its own line (init looks up start and stop
+# separately); both carry the same label so one set_prop grant covers the pair (nowhere.te).
+ctl.start$nowhere_mediad       u:object_r:ctl_nowhere_mediad_prop:s0
+ctl.stop$nowhere_mediad        u:object_r:ctl_nowhere_mediad_prop:s0
+# Per-edition brand (set in <edition>.mk): an app-readable type so the confined gate domain can read it
+# (default_prop is app-neverallow). See nowhere.te (nowhere_brand_prop + allow nowhere_chooser).
+ro.nowhere.brand               u:object_r:nowhere_brand_prop:s0

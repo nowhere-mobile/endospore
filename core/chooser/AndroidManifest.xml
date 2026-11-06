@@ -1,0 +1,680 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.nowhere.chooser"
+    android:versionCode="600"
+    android:versionName="8.35">
+  <uses-sdk android:minSdkVersion="24" android:targetSdkVersion="34"/>
+  <!-- #747 (DIA-20260818-08): the storefront UI now lives in its OWN package (nApps) so it appears in
+       Settings > Apps as its own app. It cannot talk to the login daemon: the daemon pins the first peer's
+       appId and rejects any other (audit #2, DIA-20260618-08), and that control stays exactly as it is. So
+       nApps binds StoreService here instead, and the chooser remains the only package on the socket.
+       SIGNATURE level: both APKs carry the platform cert, so nothing else on the device can bind it. -->
+  <permission android:name="com.nowhere.chooser.permission.STORE"
+              android:protectionLevel="signature"/>
+  <!-- No INTERNET / network permission: the app only talks to the root login daemon over the
+       /dev/socket/nowhere_login AF_UNIX socket; the daemon does the S3 network itself. -->
+  <!-- STATUS_BAR (signature, granted via the platform cert): kiosk-lock the gate (no notification
+       shade, recents, or nav escape) while it is showing; re-enabled on unlock. -->
+  <uses-permission android:name="android.permission.STATUS_BAR"/>
+  <!-- BootReceiver re-arms the gate after boot. -->
+  <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED"/>
+  <!-- #81 item 5: NfcAdapter reader mode + IsoDep, to run a FIDO2 CTAP2 assertion over an NFC security key
+       (the daemon frames CTAP2 and shuttles ISO-DEP APDUs to us; we transceive the tap). -->
+  <uses-permission android:name="android.permission.NFC"/>
+  <!-- #136 A3.b: read active SIMs (SubscriptionManager) in owner mode to bind them to profiles. READ_PHONE_STATE
+       is a DANGEROUS runtime perm (default-permissions/nowhere-chooser-telephony.xml pre-grants it);
+       READ_PRIVILEGED_PHONE_STATE (signature|privileged) is needed for the ICCID and comes via the platform signature:
+       the chooser is not a priv-app and no privapp-permissions file names it (NWP-20261010-13 corrected this line). -->
+  <uses-permission android:name="android.permission.READ_PHONE_STATE"/>
+  <uses-permission android:name="android.permission.READ_PRIVILEGED_PHONE_STATE"/>
+  <!-- #149: inbound stays with the gate (we intercept + inject; no SIM is associated with a roamed user).
+       #176 lockOwnerSimsToBound links a SIM the profile does not own to user 0, and reclaimSimsToGate clears a
+       stale association with a user that no longer exists; both need this. Plain signature perm (our platform sig). -->
+  <uses-permission android:name="android.permission.MANAGE_SUBSCRIPTION_USER_ASSOCIATION"/>
+  <!-- #150: setMobileDataPolicyEnabled(MMS_ALWAYS_ALLOWED) needs MODIFY_PHONE_STATE. The gate is Wi-Fi-only
+       (cellular data off), but an MMS body is on the carrier's MMSC, reachable only over the cellular MMS
+       PDN; this policy lets the framework bring up the mms APN on-demand for a download WITHOUT enabling
+       general cellular data. signature|privileged perm -> granted via our platform signature. -->
+  <uses-permission android:name="android.permission.MODIFY_PHONE_STATE"/>
+  <!-- NWP-20261012-05: capturePerms reads PackageManager.getPermissionFlags for each dangerous permission an app
+       has NOT been granted, so a permission the user declined (USER_SET / USER_FIXED) stays declined after a roam
+       instead of being asked again. getPermissionFlags enforces GRANT_, REVOKE_ or GET_RUNTIME_PERMISSIONS; this is
+       the read-only one. signature protection, granted via our platform signature. Without it every read throws
+       SecurityException, which capturePerms counts and logs as "permission-flag read(s) FAILED". -->
+  <uses-permission android:name="android.permission.GET_RUNTIME_PERMISSIONS"/>
+  <!-- NWP-20261012-05: a role add (the SMS role at sign-in) grants the role's permissions over the user and clears
+       USER_SET / USER_FIXED. PermDeclines puts the profile's declines back after it: updatePermissionFlags then
+       revokeRuntimePermission, both of which need this. signature|installer|verifier, granted via our platform
+       signature. Without it every write throws, and PermDeclines logs "flag write(s) FAILED". -->
+  <uses-permission android:name="android.permission.REVOKE_RUNTIME_PERMISSIONS"/>
+  <!-- NWP-20261112-10 (Q061): PermsLiveRecord, in the user-0 gate, hears a session's runtime-permission changes
+       through PackageManager.addOnPermissionsChangeListener, which enforces this, and relays them to the session's
+       capture after 2 s of quiet. signature|privileged, granted via our platform signature. Without it the listener
+       registration throws, PermsLiveRecord logs "perms relay listener register", and permissions are captured only
+       at sign-out. -->
+  <uses-permission android:name="android.permission.OBSERVE_GRANT_REVOKE_PERMISSIONS"/>
+  <!-- Launch the gate from the BootReceiver (background) — belt-and-suspenders next to the device-owner exemption. -->
+  <uses-permission android:name="android.permission.START_ACTIVITIES_FROM_BACKGROUND"/>
+  <!-- Arc 2: drive + switch the foreground user (ActivityManager.switchUser) for per-user roaming. -->
+  <uses-permission android:name="android.permission.INTERACT_ACROSS_USERS_FULL"/>
+  <uses-permission android:name="android.permission.MANAGE_USERS"/>
+  <!-- NWP-20260910-24: refuse to launch an app another handset holds, and say so in our own words.
+       SUSPEND_APPS is protectionLevel="signature|role|verifier", so the platform certificate alone grants
+       it: no privapp-permissions entry and no framework patch (proven by the NWP-20260910-21 spike).
+       It must be requested by the CHOOSER rather than reached through DevicePolicyManager, because DPM
+       suspends as the PLATFORM package, which sends ActivityStartInterceptor down
+       interceptSuspendedByAdminPackage() and shows a stock admin dialog carrying none of our text.
+       See AppClaim.java. -->
+  <uses-permission android:name="android.permission.SUSPEND_APPS"/>
+  <!-- #150: set app-op modes so the roamed Messaging can be granted OP_READ_RESTRICTED_MESSAGES (to play a
+       restricted MMS video part) and so ensureSmsWrite/ensureReadRestrictedMessages actually work. The code has
+       always ASSUMED we hold this ("platform-signed"), but it was never requested -> every AppOpsManager.setMode
+       threw SecurityException (verifyIncomingOp requires MANAGE_APP_OPS_MODES). Granted via the platform signature. -->
+  <uses-permission android:name="android.permission.MANAGE_APP_OPS_MODES"/>
+  <!-- DIA-20260814-01 "Leave Nowhere": flip Settings.Global.DEVELOPMENT_SETTINGS_ENABLED so the owner lands
+       directly on Developer options -> OEM unlocking, instead of the 7-tap Build-number ritual. signature
+       protection -> granted via our platform signature, same route as MANAGE_APP_OPS_MODES above. -->
+  <uses-permission android:name="android.permission.WRITE_SECURE_SETTINGS"/>
+  <!-- Logout reboots (the ephemeral roamed user auto-wipes on boot + the gate returns). -->
+  <uses-permission android:name="android.permission.REBOOT"/>
+  <!-- L4: briefly wake the screen on the logoff reap so the gate repaints after an idle / failed-attempt
+       auto-logoff that happened with the screen off (the switch to user 0 otherwise left a stale frame). -->
+  <uses-permission android:name="android.permission.WAKE_LOCK"/>
+  <!-- L4: the idle-logoff timeout MUST fire on time even in Doze. An inexact alarm gets deferred by
+       app-standby / Doze (the warm-CE exposure window would then extend indefinitely, defeating the
+       backstop), so setExactAndAllowWhileIdle needs this; without it the call falls back to inexact. -->
+  <uses-permission android:name="android.permission.USE_EXACT_ALARM"/>
+  <!-- #151: vibrate the full-screen gate alarm (a normal/install-time permission). -->
+  <uses-permission android:name="android.permission.VIBRATE"/>
+  <!-- Arc 2 clean landing: disable the setup wizard + force-stop the restore-window crashers for the roamed user. -->
+  <uses-permission android:name="android.permission.CHANGE_COMPONENT_ENABLED_STATE"/>
+  <uses-permission android:name="android.permission.FORCE_STOP_PACKAGES"/>
+  <!-- App provisioning: reinstall the roamed identity's apps (device-local install-existing). -->
+  <uses-permission android:name="android.permission.INSTALL_PACKAGES"/>
+  <!-- #206 on-demand idle-reclaim: PackageInstaller.requestArchive() requires DELETE_PACKAGES even for the
+       installer of record. Privileged; auto-granted to the platform-signed chooser like INSTALL_PACKAGES. -->
+  <uses-permission android:name="android.permission.DELETE_PACKAGES"/>
+  <!-- App provisioning, capture half: enumerate the roamed user's launchable apps to seal the list.
+       Under targetSdk 30+ package-visibility filtering, queryIntentActivities(MAIN+LAUNCHER) is otherwise
+       reduced to the forceQueryable system packages (Settings, DocumentsUI) and silently drops the rest,
+       which is exactly the capture bug. As the device owner the chooser legitimately enumerates every app
+       it roams/provisions, so grant it full package visibility (auto-granted to this system app). -->
+  <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES"/>
+  <!-- #206 on-demand idle-reclaim: read per-app last-use so ReArchiveReceiver re-archives an on-demand app the
+       user hasn't opened for a while. Appop-backed; the chooser self-grants GET_USAGE_STATS via MANAGE_APP_OPS_MODES. -->
+  <uses-permission android:name="android.permission.PACKAGE_USAGE_STATS"/>
+  <!-- NWP-20261128-17 (Q121): Profile > Report an issue reads this session's app crashes from DropBox (CrashRecords).
+       PEEK_DROPBOX_DATA is signature|privileged: the chooser is NOT a priv-app, so it holds it through the platform
+       certificate alone, and no privapp-permissions file applies. It covers DropBox only. READ_LOGS is deliberately
+       NOT requested: Q121 grants it only if this permission does not work, and every in-session report says which
+       (crash_access ok|denied|error). -->
+  <uses-permission android:name="android.permission.PEEK_DROPBOX_DATA"/>
+  <!-- Wi-Fi onboarding at the gate: as the DEVICE OWNER the chooser can add + enable a network so a fresh
+       device (whose saved wifi was wiped with /data) can get online to reach its store, without leaving the
+       kiosk for Settings. Normal/signature perms, auto-granted to this platform-signed app. -->
+  <uses-permission android:name="android.permission.ACCESS_WIFI_STATE"/>
+  <uses-permission android:name="android.permission.CHANGE_WIFI_STATE"/>
+  <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
+  <!-- #98: read saved Wi-Fi PSKs (getPrivilegedConfiguredNetworks) so a network joined INSIDE a roamed
+       session can be mirrored to the user-0 gate at logoff/cold-lock (Android saves networks per-user;
+       without this the switch back to the gate drops connectivity). Signature-granted (platform-signed). -->
+  <uses-permission android:name="android.permission.READ_WIFI_CREDENTIAL"/>
+  <!-- NWP-20261028-08: a signed-in profile's hotspot and USB/Bluetooth tethering, which Android keeps for the admin
+       user (the gate). TETHER_PRIVILEGED and NETWORK_SETTINGS are signature permissions granted by the platform
+       certificate (docs/product-decisions.md 2026-10-19, found on lynx 2026101801); HotspotService and HotspotReceiver
+       use them. Both are not exported: the session's own chooser binds the service across users (same app), roamd
+       reaches the receiver by explicit component as root, and the passphrase crosses only as a Binder parcel, never
+       argv. -->
+  <uses-permission android:name="android.permission.TETHER_PRIVILEGED"/>
+  <uses-permission android:name="android.permission.NETWORK_SETTINGS"/>
+  <!-- Scanned-network picker (DIA-45): NEARBY_WIFI_DEVICES lets getScanResults() return SSIDs without the
+       location toggle (neverForLocation = we don't derive location from it). Runtime perm, self-granted by
+       the device owner. Best-effort: without it the scan returns empty and the manual SSID field still works. -->
+  <uses-permission android:name="android.permission.NEARBY_WIFI_DEVICES"
+                   android:usesPermissionFlags="neverForLocation"/>
+  <!-- Fallback scan path: some builds only return getScanResults() to a caller holding ACCESS_FINE_LOCATION
+       (+ location enabled), even when NEARBY_WIFI_DEVICES is granted. Self-granted by the device owner. -->
+  <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"/>
+  <!-- Re-apply a roamed profile's LOCALE on login via the platform LocalePicker (updatePersistentConfiguration).
+       That call enforces BOTH CHANGE_CONFIGURATION and WRITE_SETTINGS (verified on FP3: without WRITE_SETTINGS it
+       throws "Permission Denial: updatePersistentConfiguration() requires android.permission.WRITE_SETTINGS").
+       Both are signature-level, granted by the platform cert. Timezone needs no extra perm (device-owner
+       setTimeZone). DIA-20260616-58. -->
+  <uses-permission android:name="android.permission.CHANGE_CONFIGURATION"/>
+  <uses-permission android:name="android.permission.WRITE_SETTINGS"/>
+  <!-- task_c272758a (force-ours): enable our MessagingSuppressor NotificationListenerService per roamed user at
+       login (TelIngest.ensureNotificationListener) so it cancels Bugle's duplicate live-SMS notice. The bind is
+       done via NotificationManager.setNotificationListenerAccessGranted (a plain Settings.Secure
+       enabled_notification_listeners write does NOT actually bind the listener); that call routes through
+       NotificationManagerService.setNotificationListenerAccessGrantedForUserInternal -> checkNotificationListenerAccess,
+       which enforces MANAGE_NOTIFICATION_LISTENERS (signature|installer) on the caller. Without it the grant threw
+       "Caller must hold android.permission.MANAGE_NOTIFICATION_LISTENERS" and Bugle's notice was never suppressed
+       (both notifications showed). Granted by our platform signature. WRITE_SECURE_SETTINGS is kept for the
+       belt-and-suspenders setting write but is not sufficient on its own. -->
+  <uses-permission android:name="android.permission.MANAGE_NOTIFICATION_LISTENERS"/>
+  <!-- NWP-20261010-13 (Chester, 2026-10-10): a message notice is named "Messages", not this app's label "Profile"
+       (Notification.EXTRA_SUBSTITUTE_APP_NAME, SmsDeliverReceiver.substituteAppName). NotificationManagerService
+       strips that extra, with only a log line, from a package that does not hold this permission.
+       protectionLevel signature|privileged: granted by the platform signature (certificate "platform" in
+       core/vendor-common/Android.bp), the same route as MODIFY_PHONE_STATE above. The chooser is NOT a priv-app
+       (no privileged: true), so no privapp-permissions allowlist applies to it and none is needed. -->
+  <uses-permission android:name="android.permission.SUBSTITUTE_NOTIFICATION_APP_NAME"/>
+  <!-- "Sign out of Google" (NWP-20261107-11, #743): lists the profile's com.google accounts. Removing another
+       authenticator's account is allowed to the user's profile owner (AccountManagerService.removeAccountAsUser), which
+       the chooser is for every user it creates with createAndManageUser; the device check proves both.
+       protectionLevel signature|privileged: granted by the platform signature, the same route as
+       SUBSTITUTE_NOTIFICATION_APP_NAME above. The chooser is NOT a priv-app, so no privapp-permissions allowlist
+       applies to it. -->
+  <uses-permission android:name="android.permission.GET_ACCOUNTS_PRIVILEGED"/>
+  <uses-permission android:name="android.permission.WRITE_SECURE_SETTINGS"/>
+  <!-- "Not backed up" status-bar notification (DIA-20260619-12): the user-0 device-owner process posts it
+       INTO the foreground roamed user (createContextAsUser) when the agent reports the periodic seal is
+       failing. POST_NOTIFICATIONS is a runtime perm (targetSdk 34) -> granted per-user via the
+       default-permissions exception (privapp-permissions doesn't cover runtime perms), so it holds in every
+       ephemeral roamed user too (same mechanism as the geotz location grant). -->
+  <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+  <!-- #204 on-demand apps: UnarchiveService fetches+installs a tapped on-demand app off the broadcast, as a
+       foreground service (a real download must not run inside the ACTION_UNARCHIVE_PACKAGE broadcast). Install-
+       time (normal) perms -> auto-granted to this system app in every user. -->
+  <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+  <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC"/>
+  <!-- "Your data -> Export a copy" (DIA-20260628-09 P2): read the roamed session's contacts + calendar to
+       write standard vCard/iCal files into Downloads. DANGEROUS runtime perms, declared here but NOT pre-granted
+       (no default-permissions entry): the export requests them on demand, so the kiosk never holds standing
+       access to your contacts; you grant it only when you choose to export. -->
+  <uses-permission android:name="android.permission.READ_CONTACTS"/>
+  <uses-permission android:name="android.permission.READ_CALENDAR"/>
+  <!-- Web-import ingestion (NWP-20260827-18): write the staged vcf/ics of a web-created profile into the
+       roamed user's OWN contacts/calendar providers (Ingest.java). DANGEROUS runtime perms, and like the
+       reads above deliberately NOT pre-granted: the chooser is the roamed user's PROFILE OWNER, so Ingest
+       self-grants them per-user via DevicePolicyManager.setPermissionGrantState (the ensureCallLogGrant
+       pattern); user 0's kiosk never holds standing access to anyone's contacts. -->
+  <uses-permission android:name="android.permission.WRITE_CONTACTS"/>
+  <uses-permission android:name="android.permission.WRITE_CALENDAR"/>
+  <!-- P4 (DIA-20260628-12): SMS + call log export, same on-demand-grant model as contacts/calendar above. -->
+  <uses-permission android:name="android.permission.READ_SMS"/>
+  <uses-permission android:name="android.permission.READ_CALL_LOG"/>
+  <!-- #135 B4.b: SCRUB user 0's call log. The Telecom framework auto-logs every inbound call to CallLog.Calls
+       for the default dialer (us), so we delete that row to keep the non-amnesiac user 0 free of a readable
+       call trace (the owner reads the record from the sealed inbox, not this row). WRITE_CALL_LOG is DANGEROUS
+       (runtime): pre-granted in default-permissions/nowhere-chooser-calls.xml because the scrub runs internally
+       with no user present to grant it. -->
+  <uses-permission android:name="android.permission.WRITE_CALL_LOG"/>
+  <!-- QR scan for Add-credits (DIA-20260630-16): scan a claim code / subscription key instead of typing it.
+       DANGEROUS runtime perm, requested on demand by QrScanActivity when the user taps Scan; never standing-held. -->
+  <uses-permission android:name="android.permission.CAMERA"/>
+  <!-- #135 B3: gate SMS. As the DEFAULT SMS app on user 0 we receive SMS_DELIVER (and own, then skip, the
+       inbox write, so no cleartext lands on the non-amnesiac user 0). RECEIVE_SMS is a DANGEROUS runtime
+       perm: the default-SMS-app role auto-grants it, and default-permissions/nowhere-chooser-sms.xml
+       pre-grants it belt-and-suspenders. MANAGE_ROLE_HOLDERS (signature, platform-signed) lets the device
+       owner set itself as the default SMS app with NO user prompt (RoleManager.addRoleHolderAsUser), as
+       required inside the kiosk. -->
+  <uses-permission android:name="android.permission.RECEIVE_SMS"/>
+  <!-- #150: RECEIVE_MMS is REQUIRED to receive WAP_PUSH_DELIVER. Unlike SMS_DELIVER (which imposes no
+       receiver perm, so RECEIVE_SMS is not strictly needed for delivery), com.android.phone sends the MMS
+       WAP_PUSH_DELIVER ordered broadcast with a required receiver permission of RECEIVE_MMS; without it the
+       broadcast is "skipped by policy at enqueue: Permission Denial ... requires RECEIVE_MMS" and our
+       WapPushDeliverReceiver never runs (every inbound MMS silently vanished). Same DANGEROUS SMS-group perm,
+       auto-granted to the default-SMS-app role + pre-granted in nowhere-chooser-sms.xml. -->
+  <uses-permission android:name="android.permission.RECEIVE_MMS"/>
+  <!-- #150 (2026-07-16): RECEIVE_WAP_PUSH is the ACTUAL blocker for inbound MMS (was misdiagnosed as the cede's
+       "exclusive uid-level op revoke"). OP_RECEIVE_WAP_PUSH is a PERMISSION-BACKED app-op
+       (AppOpInfo.setPermission(RECEIVE_WAP_PUSH)); the M-Notification.ind is delivered to the default SMS app
+       only when that op is ALLOW, and the op mode is DERIVED from this runtime permission. Without the app
+       DECLARING it, the SMS role cannot grant it, so the op is forced "ignore" and un-settable (setUidMode(allow)
+       is refused). PROVEN on-device: fresh boot, chooser is the SOLE SMS-role holder, no cede, op STILL ignore.
+       Same DANGEROUS SMS-group runtime perm as RECEIVE_SMS/MMS; auto-granted to the default-SMS-app role once
+       declared + pre-granted belt-and-suspenders in nowhere-chooser-sms.xml. -->
+  <uses-permission android:name="android.permission.RECEIVE_WAP_PUSH"/>
+  <uses-permission android:name="android.permission.MANAGE_ROLE_HOLDERS"/>
+  <!-- NWP-20261010-13 (Chester, 2026-10-11: the SMS app a user chooses roams with the profile): MessagingSuppressor
+       watches the SMS role in the roamed user and records each change (SmsRoleRoam.capture), through
+       RoleManager.addOnRoleHoldersChangedListenerAsUser. Signature-level, granted by the platform signature. -->
+  <uses-permission android:name="android.permission.OBSERVE_ROLE_HOLDERS"/>
+  <!-- #163 (DIA-20260714): lets Telecom bind our CONTROL InCallService for every inbound call (as the FOREGROUND
+       user, NWP-20260930-05), so a declined call's seal is handed to user 0. Signature perm, platform-signed. -->
+  <uses-permission android:name="android.permission.CONTROL_INCALL_EXPERIENCE"/>
+  <!-- #135 B4: gate incoming calls. As user-0's DEFAULT DIALER (ROLE_DIALER, set via the same MANAGE_ROLE_HOLDERS
+       path) the framework binds our InCallService for every inbound call, so we record + seal it and (B4.b) can
+       answer it. ANSWER_PHONE_CALLS is DANGEROUS (runtime), pre-granted via
+       default-permissions/nowhere-chooser-calls.xml (privapp covers only signature|privileged). USE_FULL_SCREEN_INTENT
+       keeps the incoming-call ring a full-screen wake surface (not demoted to a heads-up) on API 34; a calling app
+       (ROLE_DIALER holder) is granted it by default, declared here so the intent is honored. -->
+  <uses-permission android:name="android.permission.ANSWER_PHONE_CALLS"/>
+  <!-- 637: owner-mode transmit on the unbound SIM (the owner's outbound line). SEND_SMS + CALL_PHONE are DANGEROUS
+       runtime perms (privapp-permissions covers only signature|privileged, not DANGEROUS). The default-permissions
+       XMLs pre-grant them at FRESH user-0 creation only; on an existing user 0 (a flash or an OTA) neither that nor
+       the already-held SMS / dialer role grants them (seen on lynx 2026100101, 2026-10-01), so ensureTransmitPerms
+       self-grants them as device owner. Used only from owner mode (user 0, behind the owner passphrase), on a SIM
+       bound to no profile. -->
+  <uses-permission android:name="android.permission.SEND_SMS"/>
+  <uses-permission android:name="android.permission.CALL_PHONE"/>
+  <!-- NWP-20261001-05: DEVICE_POWER (signature|role; granted because the chooser is platform-signed) lets
+       ensurePushDozeExemption keep sandboxed Play services on the Doze allow-list by appId (PowerExemptionManager
+       getAllowListedAppIds, removeFromPermanentAllowList, addToPermanentAllowList), so FCM push - and a WhatsApp
+       call riding it - survives deep Doze. -->
+  <uses-permission android:name="android.permission.DEVICE_POWER"/>
+  <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT"/>
+  <!-- Belt-and-suspenders to QUERY_ALL_PACKAGES: also declare the LAUNCHER query the capture relies on,
+       plus the (legacy) HOME visibility for the now-unused launchLauncher() handoff helper. -->
+  <queries>
+    <intent>
+      <action android:name="android.intent.action.MAIN"/>
+      <category android:name="android.intent.category.LAUNCHER"/>
+    </intent>
+    <intent>
+      <action android:name="android.intent.action.MAIN"/>
+      <category android:name="android.intent.category.HOME"/>
+    </intent>
+  </queries>
+  <!-- persistent: keep the user-0 chooser process resident so its reap-watcher thread (startReapWatcher) is
+       never frozen by the cached-app freezer. While a roamed session is foreground, user 0 goes cached-empty;
+       the freezer then suspends the watcher's threads so the no-reboot-logoff SWITCH lagged ~1.5s (the gesture
+       escape window). A persistent (platform-signed system) process runs at PERSISTENT adj -> never cached ->
+       never frozen, so the watcher polls at its intended cadence and the gate reclaims the foreground in
+       ~250ms. (DIA-20260618-07; the poll itself backs off to an idle cadence when no session is active.) -->
+  <!-- The APPLICATION label is what Settings -> Apps (and permission/notification attribution) shows; the
+       launcher shows the ACTIVITY label instead. Those disagreed: the launcher icon read "Profile" while
+       Settings listed the same package as "nowhere", so the one app answered to two names and neither screen
+       agreed with the other. Users know it as Profile (that is the icon they tap), so the package takes that
+       name; the per-activity labels below ("Profile", "nApps") still override it where they are set.
+       DIA-20260816-20: nApps is still an ACTIVITY of this package, so Settings -> Apps continues to list ONE
+       entry, "Profile". Giving nApps its own Settings row means giving it its own PACKAGE; deferred. -->
+  <!-- NWP-20260823-10: the APPLICATION theme, not just each activity's. The boot SPLASH still drew a mid
+       grey (Chester, img3) even with Theme.Nowhere's black windowSplashScreenBackground compiled into the
+       flashed APK, because the system resolves the starting window from the APPLICATION element when it
+       builds one before the activity's own theme is in play — and with none declared that is the framework
+       default, whose colorBackground is #ff303030: exactly the grey observed. Declaring it here makes the
+       whole boot sequence one dark run. NOTE a splash window cannot render TEXT at all; the only additional
+       element it can carry is windowSplashScreenBrandingImage (a static image, pinned to the bottom). -->
+  <application android:theme="@style/Theme.Nowhere"
+               android:label="Profile" android:allowBackup="false" android:persistent="true"
+               android:name=".NowhereApp"
+               android:icon="@mipmap/ic_nowhere" android:roundIcon="@mipmap/ic_nowhere">
+    <!-- #46: the gate IS user 0's HOME (declares CATEGORY_HOME) so a task-death (crash / a11y NPE / foreground
+         race) RELAUNCHES THE GATE instead of dropping user 0 to launcher3 (which exposes the drawer + Settings,
+         un-authenticated). Per-user home is pinned explicitly (nowhere_provision sets user 0 -> this gate;
+         roamd's roam-in sets each roamed user -> launcher3) so the added HOME candidate never makes home
+         ambiguous. In a roamed session launcher3 is still that user's home, so its gestures/app-drawer/search
+         keep working. The gate stays a Lock-Task kiosk (onResume kiosk-locks); a correct unlock drops the lock
+         and finish()es, revealing that user's launcher3. Non-removable via DEVICE OWNER status.
+         configChanges=assetsPaths: removing a roamed user at the end of a no-reboot logoff flips
+         CONFIG_ASSETS_PATHS (0x80000000) on the gate's display, which otherwise RELAUNCHES this activity
+         right as "Signing out…" clears — the ~one-frame post-logoff flicker. The gate's views are all
+         programmatic (no per-user/overlay assets to reload), so it handles that config change itself instead
+         of recreating. locale|layoutDirection: applying a roamed profile's locale on login (LocalePicker)
+         fires a GLOBAL config change; the gate's text is hardcoded English, so it absorbs it rather than
+         recreating mid-login (DIA-20260616-58). A rotation, dark-theme switch, keyboard or SIM change would
+         also recreate a screen that a background thread is waiting on (the gate's recovery-code latch, a
+         PROMOTE2 reply on the Profile screen) and neither activity saves state, so both absorb these changes
+         (NWP-20261106-02). -->
+
+    <activity android:name=".ChooserActivity" android:exported="true"
+              android:theme="@style/Theme.Nowhere"
+              android:launchMode="singleTask"
+              android:excludeFromRecents="true"
+              android:stateNotNeeded="true"
+              android:configChanges="assetsPaths|locale|layoutDirection|orientation|screenSize|smallestScreenSize|screenLayout|uiMode|keyboard|keyboardHidden|navigation|mcc|mnc">
+      <intent-filter>
+        <action android:name="android.intent.action.MAIN"/>
+        <category android:name="android.intent.category.DEFAULT"/>
+      </intent-filter>
+      <!-- #46: HOME so the system can (and must, once set-home-activity pins it) treat the gate as user 0's
+           home and relaunch it on task-death. Kept as a SEPARATE filter (MAIN+HOME+DEFAULT) per the home
+           contract. It only becomes the *resolved* home once nowhere_provision `set-home-activity`s it for
+           user 0; roamed users are pinned to launcher3, so this candidate never wins there. -->
+      <intent-filter>
+        <action android:name="android.intent.action.MAIN"/>
+        <category android:name="android.intent.category.HOME"/>
+        <category android:name="android.intent.category.DEFAULT"/>
+      </intent-filter>
+    </activity>
+    <!-- "Profile" launcher-drawer entry: the signed-in profile's controls (log off, change passphrase, time
+         zone, delete). Renamed from "Log off" (DIA-20260617-07) now that it's more than just logging off. This
+         is the only LAUNCHER activity (the gate is not), so the drawer shows just this "Profile" entry. -->
+    <activity android:name=".ProfileActivity" android:exported="true"
+              android:label="Profile"
+              android:theme="@style/Theme.Nowhere"
+              android:excludeFromRecents="true"
+              android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|uiMode|keyboard|keyboardHidden|navigation|mcc|mnc">
+      <intent-filter>
+        <action android:name="android.intent.action.MAIN"/>
+        <category android:name="android.intent.category.LAUNCHER"/>
+      </intent-filter>
+    </activity>
+    <!-- NWP-20261106-03: the L4 backstop's only entry (five wrong unlocks -> AdminReceiver -> auto sign-out). It is
+         NOT exported, so no other app can start it; ProfileActivity stays exported for the launcher, and honours its
+         `auto` extra only when launched through this alias (AutoLogoffGate). -->
+    <activity-alias android:name=".AutoLogoff" android:targetActivity=".ProfileActivity"
+                    android:exported="false"/>
+    <!-- DIA-20260818-08 (#747): the AppStoreActivity trampoline is GONE. nApps is a real package now
+         (NowhereApps / com.nowhere.napps) with its own launcher entry AND its own Settings > Apps entry, so a
+         second door from here would be the "two doors into one room" this repo already removed once. -->
+    
+    <!-- QR scanner for Add-credits (DIA-20260630-16): Camera2 + ZXing, launched for-result by ProfileActivity
+         so a claim code / subscription key can be scanned. Not exported; portrait. -->
+    <activity android:name=".QrScanActivity" android:exported="false"
+              android:theme="@style/Theme.Nowhere"
+              android:screenOrientation="portrait"
+              android:excludeFromRecents="true"/>
+    <!-- #204 (DIA-20260726-08): "Getting <app> ready…" screen shown by UnarchiveService while an on-demand app
+         materialises on tap. Dialog theme so it floats over the launcher; no history / excluded from recents so it
+         never lingers once the real app has launched over it. -->
+    <activity android:name=".MaterializingActivity" android:exported="false"
+              android:theme="@android:style/Theme.Material.Dialog.NoActionBar"
+              android:excludeFromRecents="true"
+              android:noHistory="true"/>
+    <!-- NWP-20261124-04: the "Locking…" cover the gate starts inside the session's user when an unlock comes after
+         an idle cold lock committed (COLD-LOCK-ABORT answered COMMITTED). Full screen and opaque; it finishes when the
+         daemon's switch to the gate stops it; any other stop raises it again (ColdLockCoverRule). No noHistory: that
+         flag finishes it when Home covers it. Excluded from recents, and the cold lock's user stop removes it. -->
+    <activity android:name=".ColdLockCoverActivity" android:exported="false"
+              android:theme="@android:style/Theme.Material.NoActionBar.Fullscreen"
+              android:excludeFromRecents="true"
+              android:launchMode="singleTask"/>
+    <!-- NWP-20261122-15 (h50 #5): the one line a sign-in shows when its Auto sweep has apps to fetch, with OK.
+         Started by UnarchiveService.sweepAuto once per sign-in. Dismissible, not pinned: no noHistory, so it stays
+         until OK; excluded from recents. -->
+    <activity android:name=".LandingNoticeActivity" android:exported="false"
+              android:theme="@android:style/Theme.Material.Dialog.NoActionBar"
+              android:excludeFromRecents="true"/>
+    <!-- NWP-20261127-07 (h50 #4 A1): the blocked-encrypted-DNS dialog in a signed-in session, opened by the notification
+         PrivateDnsWatch posts there. Translucent: only the dialog shows. noHistory: leaving it without a choice
+         finishes it and sends nothing, so the notification asks again. Not exported: only the chooser's own immutable
+         PendingIntent starts it. -->
+    <activity android:name=".PrivateDnsPromptActivity" android:exported="false"
+              android:theme="@android:style/Theme.Translucent.NoTitleBar"
+              android:excludeFromRecents="true"
+              android:noHistory="true"
+              android:launchMode="singleTop"/>
+    <!-- dn-1023 #5 (NWP-20261114-14): the question a tap asks before it fetches the Play stack ("About 130 MB, 2–3
+         minutes. Download now?"). Shown and awaited by UnarchiveService.materializeLocked; same theme and flags as
+         the card above, so it floats over the launcher and never lingers in recents. -->
+    <activity android:name=".PlayFetchAskActivity" android:exported="false"
+              android:theme="@android:style/Theme.Material.Dialog.NoActionBar"
+              android:excludeFromRecents="true"
+              android:noHistory="true"/>
+    <!-- NWP-20261119-15 (h49 #1, Q055): the question a tap asks before it installs a Play client on an Endospore profile
+         with no Play Store ("<App> needs Play Store"). Shown and awaited by UnarchiveService.materializeLocked; same
+         theme and flags as the ask above. -->
+    <activity android:name=".PlayNeedAskActivity" android:exported="false"
+              android:theme="@android:style/Theme.Material.Dialog.NoActionBar"
+              android:excludeFromRecents="true"
+              android:noHistory="true"/>
+    <!-- Device-admin so the chooser can be the DEVICE OWNER and drive Lock Task (kiosk) silently. -->
+    <receiver android:name=".AdminReceiver"
+              android:permission="android.permission.BIND_DEVICE_ADMIN"
+              android:exported="true">
+      <meta-data android:name="android.app.device_admin" android:resource="@xml/device_admin"/>
+      <intent-filter>
+        <action android:name="android.app.action.DEVICE_ADMIN_ENABLED"/>
+      </intent-filter>
+    </receiver>
+    <!-- Re-arm the gate at every boot: launcher3 is the persistent home so the system launches IT; this
+         receiver then launches the chooser gate over it (device-owner BAL exemption) and it kiosk-locks. -->
+    <receiver android:name=".BootReceiver" android:exported="true">
+      <intent-filter>
+        <action android:name="android.intent.action.BOOT_COMPLETED"/>
+      </intent-filter>
+    </receiver>
+    <!-- L1: the user-0 gate startServiceAsUser()'s this INTO the roamed user, where (as that user's profile
+         owner) it sets the session keyguard credential; resetPasswordWithToken must run in the roamed
+         user's own process, not cross-user. Not exported; started only by the device-owner chooser. -->
+    <service android:name=".CredentialService" android:exported="false"/>
+    <!-- NWP-20261028-06: the gate's data-roaming write. setDataRoamingEnabled is the only write telephony honours (the
+         global settings key is inert: docs/product-decisions.md 2026-10-19, the hotspot entry's item 2), and only the
+         gate's chooser holds MODIFY_PHONE_STATE, so roamd asks here and reads the result line; roamd decides when.
+         It writes the device's data roaming for the session in front and reads back siminfo's value. Not exported, no
+         intent-filter: reached only by an explicit component from roamd (root), like CredentialService. -->
+    <receiver android:name=".DataRoamingReceiver" android:exported="false"/>
+    <!-- NWP-20261028-08: bound by the session's chooser across users; see the TETHER_PRIVILEGED comment above. -->
+    <service android:name=".HotspotService" android:exported="false"/>
+    <!-- #747: the storefront's data channel for the separate nApps app. Exported ONLY behind the
+         signature-level permission above; the install (FETCH-APP + package install) stays on this side of
+         the boundary because it needs the chooser's privileged authority, which a UI package must not hold. -->
+    <service android:name=".StoreService" android:exported="true"
+             android:permission="com.nowhere.chooser.permission.STORE"/>
+    <!-- #204 on-demand apps: foreground worker for materialise-on-tap. Started by UnarchiveReceiver (which gets
+         the framework's temporary FGS-start allowlist on the unarchive broadcast); runs in the roamed user,
+         fetches the app's deferred APK bytes + installs them. Not exported; started only by our own receiver. -->
+    <service android:name=".UnarchiveService" android:exported="false"
+             android:foregroundServiceType="dataSync"/>
+    <!-- NWP-20261126-02: the beta-only scheduled diagnostic report (docs/product-decisions.md, 2026-11-02). Runs in
+         the session's user, hourly; it sends only when the agent answers OFFERED 1 and DiagReports.due says SEND. -->
+    <service android:name=".DiagReportJob"
+             android:permission="android.permission.BIND_JOB_SERVICE"
+             android:exported="false"/>
+    <!-- task_c272758a (force-ours): a NotificationListenerService, enabled per roamed user at login, that cancels
+         Bugle's OWN conversation notification for a live-injected SMS (a duplicate of our nowhere notice; the SIM
+         never delivers natively in a roamed session). NWP-20261010-13: it also clears OUR message notice once its
+         message is read, for the whole session (TelIngest.clearReadNotices). BIND_NOTIFICATION_LISTENER_SERVICE is
+         system-held, so only the framework binds it. -->
+    <service android:name=".MessagingSuppressor"
+             android:label="Message notice"
+             android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE"
+             android:exported="true">
+      <intent-filter>
+        <action android:name="android.service.notification.NotificationListenerService"/>
+      </intent-filter>
+    </service>
+    <!-- L4 idle-timeout backstop: the gate's AlarmManager alarm (armed on screen-off, cancelled on unlock)
+         targets this; on fire it auto-logs-off the idle+locked session. Not exported; only our own alarm. -->
+    <receiver android:name=".IdleLogoffReceiver" android:exported="false"/>
+
+    <!-- NWP-20260824-03: the OTA wake-up. An idle phone on battery suspends, and the daemon's Go timer runs
+         on CLOCK_MONOTONIC, which does not advance across suspend — so the update check simply never ran
+         (device-proven: frankel offered nothing for 30+ minutes, then offered it seconds after being plugged
+         in). Only an ELAPSED_REALTIME_WAKEUP alarm can guarantee a check, so this receiver owns one and
+         re-arms itself. exported="false": nothing outside this app may trigger a wake-and-dial.
+         ACTION_POWER_CONNECTED is a second, free trigger — plugging in is the moment the user is most likely
+         to be about to install something, and it is exactly the signal that surfaced the bug. -->
+    <receiver android:name=".OtaWakeReceiver" android:exported="false">
+        <intent-filter>
+            <action android:name="android.intent.action.ACTION_POWER_CONNECTED"/>
+        </intent-filter>
+    </receiver>
+    <!-- NWP-20261108-08: the preferred-time install alarm (an RTC_WAKEUP alarm at the next chosen HH:MM, re-armed at
+         each fire). exported="false": only our own PendingIntent may reach it; no intent-filter. -->
+    <receiver android:name=".OtaTimeReceiver" android:exported="false"/>
+    <!-- #3 hard-wipe backstop: the gate's AlarmManager alarm (armed at cold-lock, cancelled on resume) targets
+         this; on fire it removes a cold-locked session left un-resumed past the hard bound (default 12 h), the
+         amnesiac escalation of an idle cold-lock. Not exported; only our own alarm. -->
+    <receiver android:name=".ColdWipeReceiver" android:exported="false"/>
+    <!-- #97: the reconnect notice's "Load my saved data" action fires this IN the roamed user; it asks the
+         daemon (RELOGIN) to discard the offline session and queue an auto online re-login at the gate. Not
+         exported; only our own notification PendingIntent. -->
+    <receiver android:name=".ReloginReceiver" android:exported="false"/>
+    <receiver android:name=".BackupNowReceiver" android:exported="false"/>
+    <!-- NWP-20260908-21: fired by nowhere_roamd.sh IN THE ROAMED USER after a #media push materialised
+         another handset new media, so MediaStore learns about files it did not mediate. Nothing else in
+         the OS triggers a media scan; a login only works because the volume mount at user start makes that
+         user MediaProvider attach and scan, and there is no mid-session equivalent. It lives here rather
+         than in the daemon because the scan must be issued AS THE ROAMED USER: this app already runs there,
+         where the call is same-user and rides the stock app_domain binder rules, while endospore_priv has
+         no rule towards MediaProvider at all. Not exported; only the daemon (root, cross-user) reaches it. -->
+    <receiver android:name=".MediaScanReceiver" android:exported="false"/>
+    <!-- NWP-20261002-03: the session half of the live Doze record. The user-0 gate (DozeAppsMirror.relayToLiveSession)
+         relays an explicit, extra-free broadcast here when the live session's own battery-Unrestricted set changes,
+         and this re-records it so the next periodic seal carries it. Not exported: a cross-user broadcast between
+         two instances of this same app passes the non-exported check. No intent-filter: it is reached only by name. -->
+    <receiver android:name=".DozeCaptureReceiver" android:exported="false"/>
+    <!-- NWP-20261112-07 (Q061): the session half of permissions captured on change. The user-0 gate relays an explicit,
+         extra-free broadcast here (NOWHERE-1073) and this re-runs capturePerms in the live session. Not exported; no
+         intent-filter: it is reached only by name. -->
+    <receiver android:name=".PermsCaptureReceiver" android:exported="false"/>
+    <!-- NWP-20261028-08: roamd releases a session's hotspot here by explicit component; no intent-filter. -->
+    <receiver android:name=".HotspotReceiver" android:exported="false"/>
+    <!-- #204 on-demand apps: the OS routes ACTION_UNARCHIVE_PACKAGE to the installer of record (us) IN THE
+         ROAMED user when the user taps an archived placeholder. This receiver materialises the app's deferred
+         APK bytes (MATERIALIZE-APP) then installs them, completing the unarchival. Exported because the system
+         (a different uid) delivers it; that also lets any app in the user target it explicitly with any action, so
+         UnarchiveGate is what refuses everything but the system's ACTION_UNARCHIVE_PACKAGE. -->
+    <receiver android:name=".UnarchiveReceiver" android:exported="true">
+      <intent-filter>
+        <action android:name="android.intent.action.UNARCHIVE_PACKAGE"/>
+      </intent-filter>
+    </receiver>
+    <!-- #206 on-demand apps: idle-reclaim. UnarchiveService arms an ~hourly AlarmManager sweep in the roamed user
+         after a materialise; on fire this re-archives on-demand apps unused past the idle threshold (freeing their
+         APK bytes; a later tap re-fetches). Not exported; only our own alarm PendingIntent targets it. -->
+    <receiver android:name=".ReArchiveReceiver" android:exported="false"/>
+    <!-- #135 B3: default-SMS-app components on user 0. Being the default SMS app means SMS_DELIVER comes to
+         us and WE own the inbox write, which we SKIP (no cleartext on the non-amnesiac user 0); the message
+         is sealed to its bound profile(s) via the daemon's SEAL-TEL verb and a CONTENT-FREE notice is shown
+         per the SIM's visibility dial. The WAP_PUSH / SENDTO / RESPOND_VIA_MESSAGE components are inert stubs
+         the default-SMS-app contract requires (the gate is not a messaging composer). Each receiver/service
+         requires the system-held BROADCAST_SMS / BROADCAST_WAP_PUSH / SEND_RESPOND_VIA_MESSAGE so only the
+         framework can invoke it. All four are DISABLED in every roamed user at login
+         (ChooserActivity.roamedSmsComponents, NWP-20261010-13): the profile's own SMS app holds the role there, and the
+         SENDTO stub would otherwise be offered as "Profile" in a "Send with" chooser. -->
+    <receiver android:name=".SmsDeliverReceiver"
+              android:permission="android.permission.BROADCAST_SMS"
+              android:exported="true">
+      <intent-filter>
+        <action android:name="android.provider.Telephony.SMS_DELIVER"/>
+      </intent-filter>
+    </receiver>
+    <receiver android:name=".WapPushDeliverReceiver"
+              android:permission="android.permission.BROADCAST_WAP_PUSH"
+              android:exported="true">
+      <intent-filter>
+        <action android:name="android.provider.Telephony.WAP_PUSH_DELIVER"/>
+        <data android:mimeType="application/vnd.wap.mms-message"/>
+      </intent-filter>
+    </receiver>
+    <!-- #150: download-complete callback for SmsManager.downloadMultimediaMessage. Not exported: it is only
+         ever invoked via our own explicit PendingIntent (which bypasses the export check for the owner). -->
+    <receiver android:name=".MmsDownloadedReceiver" android:exported="false"/>
+    <!-- NWP-20260930-05: seals, in user 0's persistent process, the record of a call NowhereCallControlService
+         declines in a stranger's session. Not exported: only the chooser sends it, from its own process in the
+         foreground user (the same app, so the export check passes). -->
+    <receiver android:name=".RejectedCallSealReceiver" android:exported="false"/>
+    <!-- NWP-20261119-21: applies, in user 0, a Security-screen idle or wipe change the running session saved. Not
+         exported: only the chooser sends it, from its own process in the foreground user. -->
+    <receiver android:name=".PrefsLiveReceiver" android:exported="false"/>
+    <!-- NWP-20261127-07: takes, in user 0, the choice made on the session's blocked-encrypted-DNS dialog to
+         PrivateDnsWatch's Gate. Not exported: only the chooser sends it, from its own process in the foreground user. -->
+    <receiver android:name=".PrivateDnsChoiceReceiver" android:exported="false"/>
+    <!-- NWP-20261122-13: holds, in the session, the SIM case the gate sends at sign-in and after each re-verdict, for
+         the foreign-SIM line on Preferences. Not exported: only the chooser sends it, from its own process in user 0. -->
+    <receiver android:name=".SimCaseReceiver" android:exported="false"/>
+    <!-- NWP-20261124-09: writes, in a just-created session, the Google Play answer of the create form (play.wanted=1),
+         sent once before the switch-in and only for on. Not exported: only the chooser sends it, from its own process
+         in user 0. -->
+    <receiver android:name=".PlayAtCreateReceiver" android:exported="false"/>
+    <!-- #150: the write target the MmsService (com.android.phone) downloads the M-Retrieve.conf into.
+         exported=false + grantUriPermissions so only the per-transaction Uri we explicitly grant is reachable;
+         the body is an app-private staging file, unlinked as soon as it is parsed. -->
+    <provider android:name=".MmsFileProvider"
+              android:authorities="com.nowhere.chooser.mms"
+              android:exported="false"
+              android:grantUriPermissions="true"/>
+    <activity android:name=".ComposeSmsActivity" android:exported="true"
+              android:theme="@style/Theme.Nowhere"
+              android:excludeFromRecents="true">
+      <intent-filter>
+        <action android:name="android.intent.action.SENDTO"/>
+        <category android:name="android.intent.category.DEFAULT"/>
+        <data android:scheme="sms"/>
+        <data android:scheme="smsto"/>
+        <data android:scheme="mms"/>
+        <data android:scheme="mmsto"/>
+      </intent-filter>
+    </activity>
+    <service android:name=".HeadlessSmsSendService"
+             android:permission="android.permission.SEND_RESPOND_VIA_MESSAGE"
+             android:exported="true">
+      <intent-filter>
+        <action android:name="android.intent.action.RESPOND_VIA_MESSAGE"/>
+        <category android:name="android.intent.category.DEFAULT"/>
+        <data android:scheme="sms"/>
+        <data android:scheme="smsto"/>
+        <data android:scheme="mms"/>
+        <data android:scheme="mmsto"/>
+      </intent-filter>
+    </service>
+    <!-- #135 B4: default-dialer components on user 0. As the default dialer the framework binds our
+         InCallService for every inbound call (user 0 owns the radio), so we record + seal it per the SIM's
+         visibility dial and (B4.b) can answer an open line. IN_CALL_SERVICE_UI marks us as the primary call
+         UI; BIND_INCALL_SERVICE is the system-held permission the OS presents when binding. DialProxyActivity
+         is the inert tel: DIAL stub the ROLE_DIALER contract requires (the gate is not a dialer). The AOSP
+         Dialer is deliberately kept OUT of the LockTask allowlist (its keypad/contacts are a kiosk escape). -->
+    <service android:name=".NowhereInCallService"
+             android:permission="android.permission.BIND_INCALL_SERVICE"
+             android:exported="true">
+      <meta-data android:name="android.telecom.IN_CALL_SERVICE_UI" android:value="true"/>
+      <meta-data android:name="android.telecom.INCLUDE_EXTERNAL_CALLS" android:value="false"/>
+      <intent-filter>
+        <action android:name="android.telecom.InCallService"/>
+      </intent-filter>
+    </service>
+    <!-- #163 (DIA-20260714): CONTROL InCallService (NO IN_CALL_SERVICE_UI meta -> control-type, bound for every
+         inbound call, unlike the UI service above). NWP-20260930-05: Telecom binds it as the FOREGROUND user (a SIM
+         account is MULTI_USER), so it rejects a non-owner session's call and hands the seal to user 0. -->
+    <service android:name=".NowhereCallControlService"
+             android:permission="android.permission.BIND_INCALL_SERVICE"
+             android:exported="true">
+      <intent-filter>
+        <action android:name="android.telecom.InCallService"/>
+      </intent-filter>
+    </service>
+    <!-- NWP-20261012-07: as user 0's default dialer, take Telecom's missed-call notification so it never posts its
+         own. Telecom posts one in user 0, with the caller's number in the clear, whenever user 0's dialer has NO
+         receiver for this action (MissedCallNotifierImpl.shouldManageNotificationThroughDefaultDialer): for a live miss
+         at the gate, and at every switch back to user 0, when it re-reads user 0's call log, where every SIM call is
+         also written. This receiver posts nothing; it scrubs user 0's call log (MissedCallReceiver). The action is a
+         protected broadcast, so only the system can send it; Telecom requires the receiver to hold
+         READ_PHONE_STATE, which the dialer role grants. Exported with no permission, as the AOSP Dialer declares it.
+         Removing it brings the leak back with no build break and no log line. -->
+    <receiver android:name=".MissedCallReceiver" android:exported="true">
+      <intent-filter>
+        <action android:name="android.telecom.action.SHOW_MISSED_CALLS_NOTIFICATION"/>
+      </intent-filter>
+    </receiver>
+    <activity android:name=".DialProxyActivity" android:exported="true"
+              android:theme="@style/Theme.Nowhere"
+              android:excludeFromRecents="true">
+      <intent-filter>
+        <action android:name="android.intent.action.DIAL"/>
+        <category android:name="android.intent.category.DEFAULT"/>
+      </intent-filter>
+      <intent-filter>
+        <action android:name="android.intent.action.DIAL"/>
+        <category android:name="android.intent.category.DEFAULT"/>
+        <data android:scheme="tel"/>
+      </intent-filter>
+    </activity>
+    <!-- #135 B4.b: the full-screen answer surface. Started ONLY by NowhereInCallService (exported=false).
+         No taskAffinity -> it inherits the chooser package affinity == the gate's task, so it stacks INSIDE
+         the one LockTask (kiosk) task and never trips the two-task lock shuffle; singleTop collapses the
+         direct-start + retry onto one instance. showWhenLocked + turnScreenOn wake the panel and draw over
+         the insecure user-0 keyguard on a cold-lock ring WITHOUT unlocking (the amnesiac invariant; it never
+         calls requestDismissKeyguard). Portrait; absorbs rotation/config flips so the live call is not lost. -->
+    <activity android:name=".IncomingCallActivity" android:exported="false"
+              android:theme="@style/Theme.Nowhere"
+              android:launchMode="singleTop"
+              android:excludeFromRecents="true"
+              android:showWhenLocked="true"
+              android:turnScreenOn="true"
+              android:screenOrientation="portrait"
+              android:configChanges="orientation|screenSize|keyboardHidden|assetsPaths"/>
+
+    <!-- #151 (a phone that can't wake you): the full-screen gate ALARM ring. Same over-keyguard / same-task
+         attributes as IncomingCallActivity so it draws over the insecure user-0 keyguard and stays in the one
+         LockTask task. Fired by GateAlarmReceiver from a user-0 AlarmManager alarm scheduled from a logged-off
+         session's relayed next-alarm time. -->
+    <activity android:name=".GateAlarmActivity" android:exported="false"
+              android:theme="@style/Theme.Nowhere"
+              android:launchMode="singleTop"
+              android:excludeFromRecents="true"
+              android:showWhenLocked="true"
+              android:turnScreenOn="true"
+              android:screenOrientation="portrait"
+              android:configChanges="orientation|screenSize|keyboardHidden|assetsPaths"/>
+    <receiver android:name=".GateAlarmReceiver" android:exported="false"/>
+      <!-- NWP-20260825-19: AppInstallReceiver is deliberately NOT declared here. A manifest receiver does
+         not get implicit broadcasts on Android 8+ unless the action is on the platform exemption list, and
+         ACTION_PACKAGE_ADDED is not on it, so declared here it never fired once. NowhereApp registers it
+         at runtime instead, which is exempt from that ban. -->
+</application>
+</manifest>

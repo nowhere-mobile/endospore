@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- NowherePush (#157): a UnifiedPush distributor. Apps that speak UnifiedPush (Fediverse/Matrix/etc.)
+     REGISTER with us; we mint an endpoint at our gateway (POST /push/register), hand it back, and hold a
+     long-lived SSE stream (POST /push/stream; GET only as the fallback for an older gateway) so a push POSTed to that endpoint is delivered to the app as a
+     MESSAGE broadcast. The gateway (and this app) only ever see RFC 8291 webpush ciphertext (the app
+     holds the decryption key). Amnesiac: this runs in the roamed session; on logoff it dies and the gateway
+     queues (store-and-forward), draining on the next login when the app re-registers. See
+     docs/157-apps-push.md. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.nowhere.push"
+    android:versionCode="2"
+    android:versionName="1.1">
+  <uses-sdk android:minSdkVersion="24" android:targetSdkVersion="34"/>
+
+  <!-- Reach the gateway (register/unregister + the SSE stream). Only HTTPS to the managed gateway. -->
+  <uses-permission android:name="android.permission.INTERNET"/>
+  <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
+  <!-- Hold the push connection alive as a foreground service. specialUse = a persistent push socket
+       (the same type ntfy/other distributors use on Android 14+). -->
+  <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+  <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE"/>
+  <!-- The FGS status notification (mandatory for a foreground service). -->
+  <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+
+  <application
+      android:label="Push"
+      android:allowBackup="false"
+      android:icon="@android:drawable/stat_notify_sync">
+
+    <!-- The distributor front door: apps send REGISTER/UNREGISTER here. Exported (apps target it by our
+         package). Discovery: an app enumerates distributors by querying receivers for
+         org.unifiedpush.android.distributor.REGISTER. -->
+    <receiver
+        android:name=".DistributorReceiver"
+        android:exported="true">
+      <intent-filter>
+        <action android:name="org.unifiedpush.android.distributor.REGISTER"/>
+        <action android:name="org.unifiedpush.android.distributor.UNREGISTER"/>
+        <action android:name="org.unifiedpush.android.distributor.MESSAGE_ACK"/>
+      </intent-filter>
+    </receiver>
+
+    <!-- The persistent connection holder. Not exported (only our own receiver starts it). -->
+    <service
+        android:name=".PushService"
+        android:exported="false"
+        android:foregroundServiceType="specialUse">
+      <property
+          android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+          android:value="unifiedpush_distributor"/>
+    </service>
+  </application>
+</manifest>

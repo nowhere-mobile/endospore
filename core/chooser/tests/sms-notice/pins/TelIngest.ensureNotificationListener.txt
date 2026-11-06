@@ -1,0 +1,12 @@
+    static void ensureNotificationListener(Context ctx) {
+        try {
+            android.content.ComponentName comp = new android.content.ComponentName(ctx, MessagingSuppressor.class);
+            android.app.NotificationManager nm = ctx.getSystemService(android.app.NotificationManager.class);
+            if (nm != null && !nm.isNotificationListenerAccessGranted(comp)) {
+                nm.setNotificationListenerAccessGranted(comp, true);
+                android.util.Log.i("NowhereChooser", "task_c272758a granted MessagingSuppressor listener in " + android.os.Process.myUserHandle());
+            }
+        } catch (Throwable t) {
+            android.util.Log.w("NowhereChooser", "grant notif listener", t);
+        }
+    }

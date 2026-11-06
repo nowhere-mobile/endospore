@@ -1,0 +1,687 @@
+# Endospore sepolicy delta (E.2c) -- GrapheneOS-specific additions on top of core nowhere.te. Two
+# concerns: (1) a real privileged worker domain to replace the userdebug-only su:s0 on a USER build
+# (GrapheneOS neuters su -- every su.te rule is userdebug_or_eng-gated), and (2) the small nowhere_chooser
+# denial tail GrapheneOS framework triggers that LineageOS did not.
+# NOTE: SELinux .te comments use hash, NOT C-style double-slash; and avoid backtick + apostrophe chars in
+# comments here -- the build runs .te through m4 (those two are m4 quote delimiters), then checkpolicy.
+
+# ---- (1) endospore_priv: privileged init worker domain (provision/roamd/otad/gate) ----
+# On userdebug those four run as su:s0 (permissive root); on a USER build su is inert, so they need a real
+# domain. The endospore rc retargets their seclabel su:s0 -> endospore_priv:s0 (stage-vendor sed). Brought
+# up PERMISSIVE to collect the on-HW denial set (the capability + app-data relabel set that roamd needs is
+# installd-shaped -- chown/fowner/dac + app_data_file_type relabelto -- added at the ENFORCING pass once the
+# audit log confirms the exact subset, so a stray neverallow does not block the first build).
+type endospore_priv, domain, coredomain;
+# Dedicated exec type for the four worker scripts. Entering the domain via this specific type (NOT the broad
+# system_file) keeps endospore_priv a clean core-only domain -- granting entrypoint on system_file made the
+# Treble/coredomain sepolicy_test flag it as "system and vendor" (stray entrypoints like /adb_keys).
+type endospore_priv_exec, exec_type, file_type, system_file_type;
+# DIA-20260806-07: PERMISSIVE IS OFF, DELIBERATELY.
+#
+# It used to be enabled on userdebug/eng to "collect the exact denial set on hardware". It did the opposite:
+# permissive silently waives MLS/MCS category constraints and some binder callbacks WITHOUT LOGGING ANYTHING,
+# so a harvest taken under it looks complete and is not. This file records that trap twice already --
+# mlstrustedsubject (~line 145) and the cmd ResultReceiver callback (~line 165), each found only after an
+# enforcing device failed. frankel, the first `user` build we ever shipped, then kept NOTHING across a roam:
+# a 2-chunk (empty) vault push and every app's restore refused with "mkdir parent: permission denied".
+#
+# With this off, a userdebug device roams under exactly the rules a user build does, so the next gap surfaces
+# on a dev phone with adb attached instead of on a customer's. That is worth more than quiet dev roams.
+#
+# Re-enable ONLY for a deliberate first-light bring-up on brand-new hardware, and never leave it on. The
+# m4 form below is correct (balanced backtick/apostrophe); the earlier build failure was UNBALANCED quotes.
+#
+#   userdebug_or_eng(`
+#     permissive endospore_priv;
+#   ')
+
+# init enters the domain on the endospore_priv_exec-labeled worker scripts (file_contexts appended by
+# stage-vendor). init_daemon_domain wires the init->endospore_priv transition + entrypoint on that exec type
+# (the rc seclabel u:r:endospore_priv:s0 reinforces it). The workers also exec the agent + toolbox applets
+# (cmd/pm/am/dpm/settings/locksettings/device_config/chown/restorecon/sqlite3/stat) + sh in-domain.
+init_daemon_domain(endospore_priv)
+allow endospore_priv system_file:file { rx_file_perms execute_no_trans };
+allow endospore_priv { toolbox_exec shell_exec }:file { rx_file_perms execute_no_trans };
+allow endospore_priv nowhere_exec:file { rx_file_perms execute_no_trans };
+allow endospore_priv self:process { fork sigchld signal };
+
+# Roaming state + store conf + logs under /data/nowhere.
+allow endospore_priv nowhere_data_file:dir create_dir_perms;
+allow endospore_priv nowhere_data_file:file create_file_perms;
+
+# Network: the agent does S3 over TLS (TCP) + DNS (UDP) for restore/seal.
+net_domain(endospore_priv)
+# The resolver's DNS discovery reads net.dns* (net_dns_prop) as its first source before falling to `dumpsys
+# connectivity`. Empty on modern Android, but read it cleanly rather than eat an enforced denial on a user build.
+get_prop(endospore_priv, net_dns_prop)
+
+# Reboot (roamd logout / provision) + the two worker control props (typed in core nowhere.te).
+set_prop(endospore_priv, powerctl_prop)
+set_prop(endospore_priv, ctl_nowhere_roamd_prop)
+set_prop(endospore_priv, ctl_nowhere_otad_prop)
+
+# ---- harvested allow set (from the userdebug permissive bring-up; see worklog DIA-20260619-21) ----
+# cmd-delegation: the workers exec cmd/pm/am/dpm/settings/locksettings/device_config, which run in-domain
+# and binder to servicemanager (lookup) + the framework services (system_server) to do their work.
+binder_use(endospore_priv)
+allow endospore_priv system_server:binder call;
+allow endospore_priv {
+    activity_service
+    package_service
+    device_policy_service
+    lock_settings_service
+    device_config_service
+    alarm_service
+    power_service
+    connectivity_service
+    user_service
+}:service_manager find;
+# user_service (#137): roamd's relabel_launcher runs `dumpsys user` to read THIS ephemeral user's serialNo
+# (the /data/system/users XML is binary ABX, not greppable) so it can rewrite the restored launcher.db's
+# favorites.profileId to match -- else Launcher3 drops every home/dock item and the home layout never roams.
+# `dumpsys user` first checkService("user")s the UserManager, so it needs user_service:find. This was MISSED
+# in the original harvest because endospore_priv is PERMISSIVE on userdebug (the find is silently waived, so
+# relabel appears to work on the dev device); on a USER build (enforcing) the lookup denies -> `dumpsys user`
+# returns empty -> relabel no-ops -> broken home-layout roam. The fifo_file write below is necessary but NOT
+# sufficient: system_server can write the dump into the pipe only once endospore_priv is allowed to find +
+# call the service. (seed_home avoids dumpsys by reading the serial from the launcher.db dock rows, but
+# relabel_launcher runs on a fully-stale db BEFORE the launcher re-imports, so it has no correct row to read.)
+# The DIA-56 cmd fd-passing trick: the workers send cmd stdio to /dev/null; cmd hands that fd to
+# system_server over binder, so system_server must be allowed to use an endospore_priv fd. This was the one
+# enforcing (permissive=0) denial in the harvest -- without it the cmd transaction fails (Failed transaction).
+allow system_server endospore_priv:fd use;
+# ...but when the worker wants a cmd/dumpsys's OUTPUT (not /dev/null) it passes a real stdout PIPE, and
+# system_server (the dumped service) writes the dump INTO that pipe -- an endospore_priv-owned fifo_file. `fd
+# use` above only lets system_server HOLD the fd; writing needs fifo_file write too. Missing it, every
+# `dumpsys X` the agent runs returns EMPTY: the DNS resolver's `dumpsys connectivity` discovery yields nothing
+# (falls back to a public resolver -> intermittent false-offline on the roam/switch window), and roamd's
+# relabel_launcher `dumpsys` silently no-ops (#137 home-layout roam). Enforced (permissive=0) on user builds.
+allow system_server endospore_priv:fifo_file write;
+
+# owner_ok / provision read device-policy + user state under /data/system (device_owner_*.xml etc).
+allow endospore_priv system_data_file:dir r_dir_perms;
+allow endospore_priv system_data_file:file r_file_perms;
+
+# Capabilities: provision needs dac_read_search (read root-owned state); roamd needs the installd-shaped set
+# to chown + relabel restored app data across per-user uids. net_raw: the agent SO_BINDTODEVICE's its store/DNS
+# sockets to the validated default network's interface -- on a multi-network device (two SIMs + Wi-Fi) an unbound
+# cgo-less socket gets ambiguous fwmark routing and its connections stall; SO_BINDTODEVICE needs CAP_NET_RAW.
+allow endospore_priv self:capability { chown dac_override dac_read_search fowner fsetid setgid setuid kill net_raw };
+
+# roamd app-data restore (CONFIRMED on a real on-device roam, DIA-20260620-02: a 6 MB multi-package profile
+# restored into a fresh ephemeral user under endospore_priv permissive; the harvest below is the complete
+# avc set the agent untar + remap_per_pkg chown + restorecon walk hits). app_data_file_type covers app_data_file
+# + privapp_data_file (chown + relabel into /data/user/N CE and /data/user_de/N DE); media_rw_data_file is the
+# shared media tree /data/media/N.
+allow endospore_priv app_data_file_type:dir { create_dir_perms relabelfrom relabelto };
+allow endospore_priv app_data_file_type:file { create_file_perms relabelfrom relabelto };
+# NWP-20260821-06 (NW-b8b659735124, root-caused on lynx as scontext=endospore_priv): lnk_file READ.
+# The seal walk lstat's every entry; AliExpress's v8_cache symlinks else denied { getattr }
+# tclass=lnk_file -> BLIND -> every logoff REFUSED. getattr+read only (r_file_perms): the seal SKIPS
+# links and the restore REJECTS them, so endospore_priv never creates a link -> no create grant, and
+# no new relabelto surface for restorecon (the restored tree contains no lnk_file nodes we made).
+allow endospore_priv app_data_file_type:lnk_file r_file_perms;
+allow endospore_priv media_rw_data_file:dir { create_dir_perms relabelfrom relabelto };
+allow endospore_priv media_rw_data_file:lnk_file r_file_perms; # NWP-20260821-06: same lnk_file blind-seal guard on /data/media/N
+allow endospore_priv media_rw_data_file:file { create_file_perms relabelfrom relabelto };
+# ---- #media seal reads the #84 on-demand media served by nowhere_mediad (DIA-20260730) ----
+# The seal walks the nowhere_mediad FUSE overlay (mounted context=nowhere_media_file) to capture the deferred
+# media into the #media scope. endospore_priv had NO rule for that type -> the walk denied getattr/open and
+# #media sealed a SHORT manifest (SEAL REFUSED 4<<268 shrink-guard), so a fresh restore came up short of app-
+# essential chunks (Toon Blast files/il2cpp/Metadata/global-metadata.dat missing -> "not enough storage").
+# Read-only, mirroring appdomain's nowhere_media_file r_*_perms (nowhere.te); endospore_priv is already
+# mlstrustedsubject (below) so the s0<->s0:cN MLS bridge holds.
+#   avc:  denied  { getattr open } ... tcontext=u:object_r:nowhere_media_file:s0 tclass=dir
+#   avc:  denied  { getattr }      ... tcontext=u:object_r:nowhere_media_file:s0 tclass=file
+allow endospore_priv nowhere_media_file:dir r_dir_perms;
+allow endospore_priv nowhere_media_file:file r_file_perms;
+# NWP-20260901-03: THE SAME PAIR ON THE fuse TYPE. NWP-20260901-01 moved the overlay mount off
+# context=nowhere_media_file to plain fuse (so apps could CREATE -- the MLS create constraint has no
+# mlstrustedobject clause), which silently invalidated the grant directly above: the walk still lstats and
+# opens the overlay MOUNTPOINT itself, that object is now labelled fuse, and this domain had no rule for it.
+# The result was exactly the failure the comment above describes, re-created verbatim one build later:
+#   push: [walk] unreadable "/data/media/10/Download" ctx=u:object_r:fuse:s0 err=open ...: permission denied
+#   push: profile odtest35 SEAL REFUSED -- the walk could not read 3 path(s) under /data/user/10
+# Chester saw it as "The session isnt being saved". The blind-walk guard did its job -- it refused rather than
+# publishing a short manifest, so the stored copy stayed intact and nothing was lost.
+#
+# ⚠ THE PATTERN, THIRD OCCURRENCE IN ONE DAY: -01 moved the label, and access had to be carried across for
+# EVERY domain that touches these paths, one at a time as each broke -- mediad (-02, mounting), then this
+# (sealing). The mount map (media-unders) was present and correct throughout; it redirects where CONTENT is
+# read from, it does not stop the walk stat-ing the mountpoint. When a mount label changes, enumerate the
+# grants on the OLD type and mirror the whole set, rather than waiting for each domain to fail.
+allow endospore_priv fuse:dir r_dir_perms;
+allow endospore_priv fuse:file r_file_perms;
+# The pieces the installd model missed (harvested DIA-20260620-02, would-deny on enforcing -> restorecon
+# silently fails -> restored app data keeps the root/endospore_priv label -> apps crash-loop on a real roam):
+#  - restorecon reads the SELinux file_contexts under /system/etc/selinux to compute the target labels.
+allow endospore_priv file_contexts_file:file r_file_perms;
+#  - read-only traversal of system-app data dirs + the per-user media userdir parent during the restore walk.
+allow endospore_priv system_app_data_file:dir r_dir_perms;
+# DIA-20260804-10: read /data/app so the storage breakdown can price an app's CODE, not just its data. The
+# walk measured data dirs only, so on odtest4 Ring showed "5 MB" while its ~145 MB APK sat unread in
+# /data/app -- and switching Ring off cut the BILLED figure by 150 MB against a 5 MB local drop, because the
+# #apps scope carries exactly these bytes. Without this rule the walk reads nothing there and (before the
+# paired agent fix) reported a confident total with every APK missing. Read-only: the breakdown only stats.
+allow endospore_priv apk_data_file:dir r_dir_perms;
+allow endospore_priv apk_data_file:file r_file_perms;
+allow endospore_priv media_userdir_file:dir r_dir_perms;
+#  - restorecon "touches" the already-correct system_data_file top dir (/data/user/N itself); that relabel is
+#    a no-op (the dir is already system_data_file) and is neverallow-guarded on this sensitive type, so just
+#    suppress the audit noise -- the children still relabel via the r_dir_perms traversal granted at line 69.
+# NARROWED to relabelto (DIA-20260806-10). relabelFROM is now GRANTED above -- restorecon needs it to move a
+# freshly created package dir from system_data_file to app_data_file, so suppressing it would have hidden the
+# next stage of the very failure we are fixing.
+#
+# relabelTO stays denied, and that denial is LOAD-BEARING. A dry run shows what restorecon actually wants to
+# do to the userdir root: "Relabeling /data/user/11 from system_data_file:s0:c523,c768 to system_data_file:s0"
+# -- it would STRIP the per-user MCS categories, because file_contexts says s0 while the dir really carries
+# c523,c768. A relabel needs both perms, so denying relabelto keeps the root untouched while children (whose
+# target type is app_data_file_type, relabelto granted at line 116) relabel normally. Suppressed rather than
+# granted, and suppressed rather than merely left noisy, because the denial is the mechanism.
+dontaudit endospore_priv system_data_file:dir relabelto;
+
+# ---- enforcing-roam completion (PROVEN end-to-end on a relock-equivalent build, DIA-20260620-03) ----
+# The above was harvested under endospore_priv PERMISSIVE, which silently waives MLS/MCS constraints -- so the
+# real enforcing roam still BLANKed. On an instrumented userdebug-ENFORCING build the actual blocker showed:
+# per-user app data is labelled with MCS categories (e.g. system_data_file:s0:c522,c768); the worker runs at
+# s0 and was denied by the *category* constraint, NOT a type rule. installd crosses per-user categories via
+# mlstrustedsubject; endospore_priv -- the same cross-user data manager -- needs it too. THIS was the BLANK.
+typeattribute endospore_priv mlstrustedsubject;
+# provision's dpm/settings device-owner path + roamd's relabel_launcher dumpsys go cmd->system_server and pass
+# fds over binder -> need binder transfer (binder_call), not just call; and the settings applet looks up the
+# settings service. (Both confirmed by the on-device enforcing repro; provisioning device-owner needs them.)
+binder_call(endospore_priv, system_server)
+allow endospore_priv settings_service:service_manager find;
+# NWP-20260914-04: `cmd overlay enable-exclusive` from roamd (nav-mode roam). OverlayActorEnforcer already
+# admits ROOT before any package/permission check; THIS is the separate SELinux gate, and without it the
+# call no-ops silently on an enforcing user build while working on permissive lynx -- the `dumpsys user`
+# shape. overlay_service is system_api_service (system/sepolicy/public/service.te), the same class as the
+# settings_service find above.
+allow endospore_priv overlay_service:service_manager find;
+# NWP-20261010-15: roamd runs two app_process helpers (editions/endospore/vendor/helpers): np.VpnAlwaysOn for the
+# always-on VPN (#159) and its carried lockdown choice, np.SyncRoam for the account sync switches (both roam with
+# the profile, docs/product-decisions.md 2026-10-10). On an enforcing build neither could run:
+#  - app_process64 is labelled zygote_exec, not system_file, so the system_file grant at the top of this section never
+#    covered it and the exec itself was denied. The helper runs IN this domain (rx_file_perms carries
+#    execute_no_trans), the way the platform own in-domain app_process users do -- never a transition into zygote.
+#  - each helper looks its service up through servicemanager. vpn_management_service (VpnManagerService) was in no .te
+#    in this tree, so np.VpnAlwaysOn got a null binder on every enforcing user build; #159 was proven on lynx userdebug
+#    while this domain was still permissive. content_service is ContentService, which holds the sync switches.
+#    account_service (the account list) is already granted further down, with appops_service.
+# The rest MIRRORS what the platform grants its own in-domain app_process users, line for line: incidentd
+# (system/sepolicy private/incidentd.te, the block after its zygote_exec grant) and tradeinmode (private/tradeinmode.te):
+# the ART runtime reads apex-info-list.xml, the runtime feature-flag and odsign properties, and locks profile files on
+# system_file; and it probes dalvik-cache, the ART apexdata and the module apexdata dirs and tries a JIT mapping, all
+# of which it survives without, so those are dontaudit exactly as incidentd has them.
+# np.SyncRoam drops from root to the system uid before it relaunches (SyncRoam.java says why): that is the setuid and
+# setgid capabilities this domain already holds for the chown work, so nothing is added for it.
+# The binder calls need nothing more: binder_call(endospore_priv, system_server) above covers them, and none of them
+# passes an fd or takes a callback.
+allow endospore_priv zygote_exec:file rx_file_perms;
+allow endospore_priv { vpn_management_service content_service }:service_manager find;
+allow endospore_priv apex_info_file:file r_file_perms;
+get_prop(endospore_priv, device_config_runtime_native_prop)
+get_prop(endospore_priv, device_config_runtime_native_boot_prop)
+get_prop(endospore_priv, odsign_prop)
+allow endospore_priv system_file:file lock;
+dontaudit endospore_priv dalvikcache_data_file:dir r_dir_perms;
+dontaudit endospore_priv apex_module_data_file:dir r_dir_perms;
+dontaudit endospore_priv apex_art_data_file:dir r_dir_perms;
+dontaudit endospore_priv tmpfs:file rwx_file_perms;
+dontaudit endospore_priv domain:memfd_file rwx_file_perms;
+# restorecon's setxattr on the shared media tree wants CAP_SYS_ADMIN, but the labels are already correct via
+# inheritance (media_rw_data_file) so the relabel is a no-op -- suppress rather than grant SYS_ADMIN to a worker.
+# RESTORED (DIA-20260806-09) after the harvest, which showed 285 of these in a single roam -- all from
+# restorecon, all on a tree whose labels are already correct by inheritance. Suppressed, not granted: a
+# roam worker has no business holding CAP_SYS_ADMIN, and nothing in the roam failed for want of it.
+dontaudit endospore_priv self:capability sys_admin;
+# DIA-20260806-07: REMOVED. This used to read "creating a new package dir under /data/user/N is installd's
+# job, not ours -- suppress the worker's harmless mkdir attempts on absent apps."
+#
+# They were not harmless. On frankel (enforcing) the restore refused EVERY app with "mkdir parent: mkdir
+# /data/user/N/<pkg>: permission denied" -- Thunderbird, Vanadium, cellbroadcast, all of them -- and this
+# dontaudit meant the device could not even report why. The issue report carried the consequences in detail
+# and not one denial, because the denial for the thing that was actually failing was suppressed here by name.
+#
+# A dontaudit is a claim that a denial is expected AND harmless. That claim was true on a permissive dev
+# device, where the mkdir succeeded anyway, and false everywhere else. Suppressing a log line to keep a dev
+# device quiet cost a release image that keeps nothing and a day of diagnosis that could not see the cause.
+#
+#   dontaudit endospore_priv system_data_file:dir { create add_name };
+
+# ---- THE ENFORCING HARVEST (DIA-20260806-09) -- the rules a `user` build actually needs ----
+# Collected on lynx 2026-08-06 with permissive OFF and every dontaudit removed (DIA-20260806-07), across one
+# real login -> set up Thunderbird -> logoff -> login roam. 13 unique tuples, every one at permissive=0.
+# This is the set that stayed invisible for as long as endospore_priv ran permissive, and the first rule
+# below is why frankel -- the first `user` build we ever shipped -- came back from a roam with nothing.
+#
+# NOTE ON READING A HARVEST: the kernel reports only the FIRST permission denied on a path. `mkdir` fails in
+# inode_permission() on the parent's `write` long before security_inode_mkdir() would ever ask about
+# `add_name`/`create`. So the pair that was dontaudit'd by name was not even the visible symptom -- which is
+# exactly how a suppression can hide a total failure while looking like it is hiding noise.
+
+# THE data-loss rule (1958 denials in ONE roam; name="10"/"11" -- the roamed user ids). Creating
+# /data/user/N/<pkg> needs write+add_name on the PARENT, which is system_data_file, and we granted only
+# r_dir_perms there. Every app's restore died on "mkdir parent: permission denied".
+allow endospore_priv system_data_file:dir { write add_name remove_name };
+# ROUND 2 (DIA-20260806-10), from the roam that followed the round-1 fix. The kernel reports only the FIRST
+# denied permission, so granting `write` simply moved the wall: inode_permission() now passes and
+# security_inode_mkdir() denies `create` instead -- 153 unique records, one per package.
+#   create      -- the new dir inherits the PARENT's type, so it is checked against system_data_file
+#   setattr     -- remap_per_pkg chowns the dir, and that runs BEFORE the restorecon
+#   relabelfrom -- how restorecon then moves it to app_data_file (relabelto on app_data_file_type: line 116)
+allow endospore_priv system_data_file:dir { create setattr relabelfrom };
+# ROUND 3 (DIA-20260807-17), from the DIA-20260807-16 reap on lynx. `remove_name` above lets the worker unlink
+# FILES inside a system_data_file dir, but removing the DIRECTORY itself is a separate permission, and without
+# it `rm -rf` deletes every file and then fails on the empty shell:
+#   avc: denied { rmdir } for comm="rm" name="inputmethod" tcontext=u:object_r:system_data_file:s0 tclass=dir
+#   avc: denied { rmdir } for comm="rm" name="22"          tcontext=u:object_r:system_data_file:s0 tclass=dir
+# Device-observed: /data/system/users/22 lost all five XML files (app_idle_stats, ssaid, settings_secure/system,
+# appwidgets) -- so the RESIDUE was gone -- while the directory and its inputmethod/ subdir stayed, and the op
+# reported failure. This is the smaller half of the pair: `write`+`remove_name` (the ability to empty a system
+# directory) is already granted above; rmdir only removes what is by then an empty shell.
+allow endospore_priv system_data_file:dir rmdir;
+# ROUND 4 (DIA-20260808-03) -- #204 on-demand app hold. hold_ondemand (roamd) `mv`s a restored per-app data dir
+# out of /data/user/N/<pkg> into the chooser's .nowhere-odhold stash, BEFORE the placeholder install, so
+# installd's fresh install lands on a clean dir instead of finding a root-owned one and WIPING it. Under
+# enforcing the mv was denied and the hold parked nothing:
+#   avc: denied { rename } for comm="mv" name="com.android.vending" tcontext=u:object_r:system_data_file:s0 tclass=dir
+#   (same for com.atomczak.notepat, com.ringapp -- one per on-demand/kept package, every login)
+# THE LABEL IS THE WHOLE POINT: `rename` is checked on the SOURCE INODE, and at hold time that dir was created
+# by OUR restore before the app existed, so it inherited system_data_file from /data/user/N and no restorecon
+# had reached it. Sampling the same path later shows app_data_file -- but that is the label installd applied
+# AFTER the hold had already failed, and app_data_file:dir rename is allowed anyway (create_dir_perms, line 116).
+# Reading the label off the live path would have written the wrong rule; the denial's own tcontext is the
+# authority. Symptom was silent: .nowhere-odhold stayed empty, the canonical dir stayed put, and the placeholder
+# install then wiped the data the roam had just restored.
+allow endospore_priv system_data_file:dir rename;
+# ROUND 5 (DIA-20260808-05) -- and rename ALONE WAS NOT ENOUGH, proven on lynx with a planted probe package.
+# With rename granted the mv STILL failed, and the audit log simply moved on to the next link:
+#   avc: denied { reparent } for comm="mv" name="com.nowhere.odholdprobe"
+#        tcontext=u:object_r:system_data_file:s0 tclass=dir
+# rename covers renaming a directory WITHIN its parent. Moving it to a DIFFERENT parent is a separate
+# permission, reparent, checked on the directory being moved -- and hold_ondemand moves /data/user/N/<pkg>
+# into /data/user/N/com.nowhere.chooser/.nowhere-odhold/<pkg>, which is a different parent.
+# app_data_file:dir has reparent via create_dir_perms (line 116); the hand-written system_data_file subset
+# did not. Enumerating the WHOLE dir class for both types through the selinuxfs access node -- instead of
+# fixing one denial and rebuilding to find the next -- showed reparent is the ONLY remaining gap: relabelto
+# is the sole other difference and it is withheld deliberately (the dontaudit at line 158).
+#
+# THIS IS THE PLAY-SIGN-IN REGRESSION. hold_ondemand parks BOTH ondemand and installed keep-set rows, which
+# is the path com.google.android.gms takes. Until 2026-08-06 endospore_priv ran PERMISSIVE on userdebug, so
+# both denials were silently waived and the hold worked; d771673 turned permissive off and the mv began
+# failing, leaving the restored gms data in the canonical dir where the placeholder install then WIPED it.
+# Sandboxed Play stopped roaming that day, and the cause was never a Play change.
+allow endospore_priv system_data_file:dir reparent;
+# ...and the same for the restored FILES: without relabelfrom they keep the wrong label even once the dirs
+# relabel correctly. create_file_perms (line 204) does not include it.
+allow endospore_priv system_data_file:file relabelfrom;
+# restorecon derives the per-app label AND its MCS categories from seapp_contexts, not file_contexts. Same
+# grant installd/zygote/artd/vold_prepare_subdirs already hold.
+allow endospore_priv seapp_contexts_file:file r_file_perms;
+
+# ---- DIA-20260808-06 (#47): let the reap's rm BACKSTOP actually reap ----
+# cleanstorage rm -rf's /data/<tree>/<uid> for nine trees as the net under a removeUser that did not finish
+# (the 22-minute watchdog reboot mid-logoff is the case it exists for). Under enforcing it could not finish
+# EITHER, and said nothing about it. Measured on lynx 2026-08-08 by enumerating the whole dir class through
+# the selinuxfs access node rather than chasing one denial per build:
+#   - it CAN empty the six system trees and /data/media (those per-user dirs are system_data_file /
+#     media_rw_data_file, both fully granted above)
+#   - it CANNOT unlink the <uid> dir itself: that needs write+remove_name on the PARENT, and none of the
+#     three parent types granted either -- so an empty husk was left in every tree, one per departed user
+#   - it CANNOT touch /data/vendor_{ce,de}/<uid> at all: read/write/remove_name/rmdir all denied
+# Nothing was leaking when this was written (a full sweep found zero orphans, so removeUser is reaching
+# everything), but the whole point of a backstop is the day removeUser does not.
+allow endospore_priv { system_userdir_file media_userdir_file vendor_userdir_file }:dir { write remove_name };
+# The vendor per-user tree is SIX types, not one -- measured, because granting only vendor_data_file would
+# have stopped the walk at the first subdirectory and looked like a fix. facedata/fpdata are where the
+# biometric HAL keeps per-user templates, and /data/vendor_de is DEVICE-encrypted, so unlike the CE trees its
+# residue is not rendered inert by destroying the user key.
+# The list is written out twice rather than hidden behind an m4 define(): this file runs through m4 before
+# checkpolicy, its header warns about exactly that, and a repeated five-line set is cheaper to read than a
+# macro is to debug.
+allow endospore_priv {
+    vendor_data_file
+    face_vendor_data_file
+    fingerprint_vendor_data_file
+    wifi_vendor_user_data_file
+    wpa_user_data_file
+}:dir { getattr search open read write remove_name rmdir };
+# DELETE-ONLY, DELIBERATELY: getattr + unlink, and NO file read anywhere in this block. The reap must be able
+# to remove a departed profile's biometric template; it has no business being able to read one.
+allow endospore_priv {
+    vendor_data_file
+    face_vendor_data_file
+    fingerprint_vendor_data_file
+    wifi_vendor_user_data_file
+    wpa_user_data_file
+}:{ file lnk_file sock_file fifo_file } { getattr unlink };
+
+# /data/anr (NWP-20261015-21). ANR traces open with `Cmd line: <package>`, so they name the apps departed sessions
+# ran; roamd's bootsweep `anr` category empties the directory at boot. The type is anr_data_file, not
+# system_data_file, and this file held no rule for it: the sweep alone would have been AVC-denied and, on an
+# enforcing build, silently inert. The grant is the slice; the sweep line is the easy part.
+# DELETE-ONLY, DELIBERATELY: getattr + unlink on the traces, and NO file read -- the sweep counts entries and
+# never opens a trace. The dir set is the fingerprint block's (list, remove, and rmdir for a subdirectory, which
+# the sweep removes recursively). The public GrapheneOS system/sepolicy branches 16 and 17 name anr_data_file in
+# neverallows only for untrusted apps and isolated_app_all; the policy compile on the build host stays the gate.
+allow endospore_priv anr_data_file:dir { getattr search open read write remove_name rmdir };
+allow endospore_priv anr_data_file:{ file lnk_file } { getattr unlink };
+
+# ROUND 2 (still DIA-20260808-06). The first pass fixed the parents, /data/media and both vendor trees, and
+# the new REAP-INCOMPLETE line then named exactly what was still standing:
+#   REAP-INCOMPLETE user 10 survives: /data/system_ce/10 /data/system_de/10 /data/misc_ce/10
+#                                     /data/misc_de/10 /data/user/10
+# Those five hold a further TWELVE types, enumerated on-device rather than discovered one build at a time --
+# 85 apexdata subdirectories alone. Without them the trees cannot be emptied, so the <uid> dir cannot be
+# rmdir-ed, so the warning would fire on EVERY logoff. A warning that always fires is worse than none: it is
+# the dontaudit lesson (line 186) running in reverse, and it would train the next reader to ignore the one
+# line that is supposed to mean something.
+#
+# SEVERITY, stated precisely, because it decides how much surface this is worth: none of this residue is
+# readable. /data/misc_de/<uid> comes back with ENCRYPTED FILENAMES exactly like the CE trees, so the per-user
+# DE key is destroyed at removeUser too, and a read of any survivor fails with the key gone. Boot reconcile
+# then clears the husks. So this round buys a MEANINGFUL signal and tidy disk, not a plugged leak -- and it
+# stays delete-only for the same reason as the vendor block above.
+allow endospore_priv {
+    apex_module_data_file
+    apex_system_server_data_file
+    apex_wifi_data_file
+    apex_rollback_data_file
+    appsearch_data_file
+    backup_data_file
+    checkin_data_file
+    ringtone_file
+    rollback_data_file
+    sdk_sandbox_system_data_file
+    storaged_data_file
+    vold_data_file
+}:dir { getattr search open read write remove_name rmdir };
+allow endospore_priv {
+    apex_module_data_file
+    apex_system_server_data_file
+    apex_wifi_data_file
+    apex_rollback_data_file
+    appsearch_data_file
+    backup_data_file
+    checkin_data_file
+    ringtone_file
+    rollback_data_file
+    sdk_sandbox_system_data_file
+    storaged_data_file
+    vold_data_file
+}:{ file lnk_file sock_file fifo_file } { getattr unlink };
+# ROUND 3 (DIA-20260806-11): 467 denials of selinuxfs:file { read write } in one roam -- and they only
+# appeared BECAUSE the restorecon -D fix made the walk descend, so each of the ~470 files it now reaches asks
+# the kernel to validate a context string by writing it to /sys/fs/selinux/context. The labels came out
+# correct anyway (restorecon falls back), but a security-relevant validation step should not be running on a
+# fallback path, ~470 times per login. This is the exact macro installd and vold_prepare_subdirs use for the
+# same job: r_dir_file(selinuxfs) + selinuxfs:file w_file_perms + kernel:security check_context.
+selinux_check_context(endospore_priv)
+# Cold-lock cache flush: roamd writes /proc/sys/vm/drop_caches so a powered-on, cold-locked device does not
+# keep the stopped user's plaintext inodes in the page cache. Denied, and INVISIBLY: the shell redirection
+# `echo 3 > /proc/sys/vm/drop_caches 2>>"$LOG"` fails on the `>` before `2>>` can apply, so nothing reached
+# the log while roamd logged "[roamd] drop_caches" regardless. A security control with no evidence of failure.
+allow endospore_priv proc_drop_caches:file write;
+
+# roamd swaps the per-user account databases (/data/system_ce/N/accounts_ce.db + -journal/-shm/-wal, and
+# the _de pair) while AMS has them detached. The harvest showed setattr + write; the swap also creates,
+# renames and unlinks, so grant the whole create set rather than re-harvest the same operation three times.
+allow endospore_priv system_data_file:file create_file_perms;
+
+# the agent sizes its seal pipes from /proc/sys/fs/pipe-max-size.
+allow endospore_priv proc_pipe_conf:file r_file_perms;
+# roamd maps package -> uid from /data/system/packages.list for the per-package chown.
+allow endospore_priv packages_list_file:file r_file_perms;
+# a roamd sweep stats from / -- harmless, and cheaper to allow than to restructure the walk.
+allow endospore_priv rootfs:dir r_dir_perms;
+
+# The keystore roam (DIA-20260730, #210 p2): the per-user keystore db under /data/misc/keystore is captured
+# and re-imported so a signed-in app survives the wipe. Only { search } surfaced here -- the walk stops at
+# its first denial -- but the operation is a read-and-replace, so grant what it actually performs.
+allow endospore_priv keystore_data_file:dir { r_dir_perms w_dir_perms };
+allow endospore_priv keystore_data_file:file create_file_perms;
+
+# appops: roamd resets per-package app-op state for the roamed user. account: the #sys account reload.
+allow endospore_priv { appops_service account_service }:service_manager find;
+
+# roamd starts/stops the on-demand media daemon (`setprop ctl.start|ctl.stop nowhere_mediad`).
+allow endospore_priv ctl_nowhere_mediad_prop:property_service set;
+
+# The harvest also showed `system_file:file { entrypoint }` on /system/bin/nowhere_mediad.sh, 23 times.
+# That one is NOT granted here, deliberately. It is a packaging bug, not a policy gap: nowhere.rc gives FIVE
+# services the endospore_priv seclabel but stage-vendor.sh labelled only FOUR scripts endospore_priv_exec,
+# so init could not enter the domain through mediad's entrypoint at all -- meaning on-demand media was dead
+# on every enforcing build. Granting entrypoint on the broad system_file type is exactly what the comment at
+# the top of this file warns against (it makes the Treble/coredomain sepolicy_test flag this domain as
+# "system and vendor"). Fixed where it belongs, in stage-vendor.sh, by deriving the label list from
+# nowhere.rc instead of hardcoding it.
+
+# ---- device-owner auto-provisioning: the cmd ResultReceiver CALLBACK direction (DIA-20260621-01) ----
+# THE blocker that made the relocked gate fail EVERY roam ("Couldn't sign in"): provision never set the device
+# owner on a fresh /data. binder_call(endospore_priv, system_server) above grants endospore_priv->system_server
+# {call transfer} + the reverse *transfer*/*fd* -- but on this tree the macro does NOT grant the reverse *call*.
+# Every `cmd` (pm/am/dpm/settings) hands system_server a ShellCallback + ResultReceiver binder HOSTED IN THIS
+# worker process; system_server CALLS BACK on that object to stream output / deliver the shell result. Without
+# this rule that callback is denied (permissive=0), so the cmd blocks FOREVER on the reply (futex_wait_queue):
+# provision's first `pm path`/`am start`/`set-device-owner` never returns -> device owner is never set on a
+# fresh /data -> createAndManageUser throws "admin not owned by uid" -> the gate cannot roam. Hidden through the
+# entire harvest because PERMISSIVE silently waives the callback -- the exact same trap as mlstrustedsubject.
+# Reproduced cold on a pristine `fastboot -w` ENFORCING boot (two cmds wedged on this denial, owner unset);
+# flipping the device permissive let provision claim ownership on attempt 0. (system_server already callbacks
+# into every app it manages, so allowing it into this confined worker is in-pattern, not a privilege widening.)
+allow system_server endospore_priv:binder call;
+
+# ---- otad: on-device OTA updater under endospore_priv (E.4 — MODELED, confirm by on-device harvest) ----
+# nowhere_otad (shared core OTA worker) runs as endospore_priv on Endospore. On the FP3 it was su:s0
+# (LineageOS root) so needed NO explicit policy; the thin endospore_priv does. It ota-checks + restores the
+# A/B payload over the network (net_domain already granted), stages it under /data/ota_package, restorecons
+# it, then drives update_engine to apply + reboots (powerctl_prop already granted). High-confidence set:
+# (1) stage the restored payload under /data/ota_package (ota_package_file) + relabel it (restorecon -R).
+# The agent STATs the existing dir (getattr -- MkdirAll's existence check) + writes the payload files;
+# restorecon getattrs + relabels. (Harvested DIA-20260621-03: the first pass denied getattr -> the resilient
+# untar skipped the payload -> ERR-PAYLOAD; r_dir_perms covers the getattr/read/open the modeled set missed.)
+allow endospore_priv ota_package_file:dir { r_dir_perms w_dir_perms relabelto };
+allow endospore_priv ota_package_file:file { create_file_perms relabelto };
+# (2) drive update_engine via update_engine_client --update --follow: find its service + binder both ways.
+# --follow subscribes to progress, so the daemon CALLS BACK into the worker -> the reverse binder *call*
+# (binder_call grants only the reverse transfer; same callback direction proven for system_server, -01).
+allow endospore_priv update_engine_service:service_manager find;
+binder_call(endospore_priv, update_engine)
+allow update_engine endospore_priv:binder call;
+
+# ---- #135 B5 telephony janitor: per-boot secure-erase of user 0's SMS/MMS DBs (endospore_priv) ----
+# nowhere_gate.sh (endospore_priv on Endospore; su:s0 on the FP3, no policy needed there) sqlite3-scrubs +
+# VACUUMs user 0's message/call databases and rm's the MMS attachment store, so no readable telephony trace
+# survives on the non-amnesiac user 0. The CallLog DB (com.android.providers.contacts) is app_data_file --
+# already covered by the app_data_file_type rw + mlstrustedsubject granted above for the roam restore. The
+# SMS/MMS provider DBs (com.android.providers.telephony -> mmssms.db + the app_parts/PART_* attachment files)
+# are radio_data_file (radio uid), a distinct type the worker cannot yet touch: it needs traversal + rw +
+# unlink + create (sqlite writes a VACUUM temp + a -journal/-wal beside the db; the rm unlinks app_parts
+# files). MODELED from the on-device label survey (both DBs live at /data/user{,_de}/0, owner radio); the
+# residual runtime set is confirmed/extended on the userdebug-ENFORCING harvest (endospore_priv is permissive
+# there, so it runs + logs the exact avc set -- the same bring-up model as the roam-restore harvest above).
+allow endospore_priv radio_data_file:dir create_dir_perms;
+allow endospore_priv radio_data_file:file create_file_perms;
+
+# ---- (2) nowhere_chooser GrapheneOS tail (observed enforcing denials on the E.2b build; non-blocking) ----
+# Framework services the chooser Activity probes on GrapheneOS that the FP3 (LineageOS) did not surface.
+allow nowhere_chooser {
+    thermal_service
+    hint_service
+    uimode_service
+}:service_manager find;
+# protolog config find + a handful of read-only system-property reads the app framework attempts at
+# startup; apps tolerate the failures, so suppress the noise rather than grant them.
+dontaudit nowhere_chooser protolog_configuration_service:service_manager find;
+# #135 B6 harvest (2026-07-11): the app framework probes app_function_service (AppFunctions) at startup; the
+# gate does not use it, so suppress the noise rather than grant it.
+# NWP-20260909-04: trust_service WAS in this list on the same reasoning ("the gate uses neither"). That was
+# true when it was written and became FALSE on 2026-09-02, when the cold-lock abort started calling
+# KeyguardManager -- whose constructor needs TRUST_SERVICE, and returns NULL without it. The suppression then
+# guaranteed nobody could see why: 161 of 161 aborts silently read `secure=0` for a week. It is GRANTED in
+# core/vendor-common/sepolicy/nowhere.te now, and deliberately not re-listed here, so a future regression on
+# this service is audible again.
+dontaudit nowhere_chooser app_function_service:service_manager find;
+dontaudit nowhere_chooser {
+    build_attestation_prop
+    zygote_config_prop
+    graphics_config_writable_prop
+    qemu_sf_lcd_density_prop
+    hdmi_config_prop
+}:file { read open getattr map };
+
+# ---- #181/#182: login-daemon DNS discovery (slow multi-network login) ----
+# The resolver's DNS discovery runs IN the login daemon, which stays u:r:nowhere:s0 -- only the four WORKER
+# scripts were retargeted su:s0 -> endospore_priv above, so the endospore_priv DNS grants do NOT cover the
+# daemon. Under enforcing, the daemon's "dumpsys connectivity" + net.dns* reads DENY -> the resolver falls
+# back to a PUBLIC resolver on an UNBOUND socket (iface="") -> with Wi-Fi + SIM data both up the login stalls
+# on network-unreachable / TLS-handshake / awaiting-headers timeouts (OTA-check + fetch retries). Mirror the
+# same proven discovery grants onto the nowhere domain (Endospore-only; the FP3/LineageOS daemon is untouched).
+get_prop(nowhere, net_dns_prop)
+allow nowhere system_file:file execute_no_trans;
+binder_use(nowhere)
+allow nowhere system_server:binder call;
+allow nowhere connectivity_service:service_manager find;
+# Wi-Fi mirror capture (#98): the login daemon reads the saved-network store under the wifi APEX's data dir
+# to carry ssid/psk/mac across a roam. Denied on an enforcing build, and wifi_store.go swallows the error
+# with a bare return -- so on a Wi-Fi-only phone the gate silently cannot rejoin the network after a roam,
+# which means no network and no way back in. (DIA-20260806-10)
+allow nowhere apex_module_data_file:dir search;
+allow system_server nowhere:fd use;
+allow system_server nowhere:fifo_file write;
+
+# DIA-20260720-05: the resolver's network-change watcher (core/agent resolver.go watchNetChanges) opens a
+# NETLINK_ROUTE socket and re-discovers the egress iface + DNS the instant the kernel reports a link/route/
+# addr change -- so the daemon hops to the new validated default (e.g. Wi-Fi) at once, instead of waiting for
+# the next lookup's dnsTTL to lazily re-bind. Best-effort in code (a denied socket just returns), so this
+# grant is what actually enables the proactive path on Endospore.
+allow nowhere self:netlink_route_socket { create bind read nlmsg_read };
+
+# ---- DIA-20260807-01: Bluetooth bond amnesia (#154) ----
+# roamd's Bluetooth control (bt_reset in nowhere_roamd.sh) clears the device's Bluetooth state at both ends of a
+# session and lays the roamed profile's own state back down. It shipped with NO sepolicy at all: #154 was
+# developed and proven on a userdebug lynx where the workers still ran su:s0 PERMISSIVE, and the enforcing
+# endospore_priv migration went out without the grants that file's own comment asks for by name. On every build
+# since, roamd could not so much as stat /data/misc/bluedroid -- its work probe found nothing to do, took the
+# do-nothing branch, and the caller logged "bt bonds wiped at logoff". A security control that cannot see the
+# thing it guards, reporting that it guarded it. Both directions were dead: bonds neither roamed with a profile
+# nor cleared between sessions, so a fresh login and the gate inherited the previous user's paired devices, and
+# /data/misc survives reboot (see the KS_IMPORT note above) -- meaning the residue accumulated indefinitely.
+#
+# ONE type covers all three stores (checked on lynx 2026-08-07, all u:object_r:bluetooth_data_file:s0):
+# /data/misc/bluedroid, and the Bluetooth app's own /data/user/0/com.android.bluetooth and
+# /data/user_de/0/com.android.bluetooth -- it is singleUser + directBootAware, so its per-remote-device metadata
+# and its OPP transfer history are device-global residue exactly like the bond files.
+#
+# NOT a neverallow violation: AOSP's rule (system/sepolicy/private/app.te) is scoped to
+# `neverallow { appdomain -bluetooth } bluetooth_data_file:...`, and endospore_priv is domain+coredomain, never
+# appdomain. Checked before writing this rather than discovered at checkpolicy.
+allow endospore_priv bluetooth_data_file:dir create_dir_perms;
+allow endospore_priv bluetooth_data_file:file { create_file_perms relabelfrom relabelto };
+# `cmd bluetooth_manager disable/enable` and `dumpsys bluetooth_manager`. BluetoothManagerService is hosted by
+# system_server, so binder_call(endospore_priv, system_server) above already covers the call itself -- the piece
+# that was missing is the servicemanager lookup. Without it dumpsys returns nothing, which the old bt_state read
+# as "the adapter is not OFF", so it edited the config under a stack it had never asked to stop.
+allow endospore_priv bluetooth_manager_service:service_manager find;
+
+# DIA-20260807-08: `dumpsys bluetooth_manager` from endospore_priv is forwarded by system_server to the
+# Bluetooth APP (domain `bluetooth`), which then cannot write to the pipe roamd handed it:
+#   avc: denied { use } for comm="BluetoothSystem" path="pipe:[131159]"
+#        scontext=u:r:bluetooth:s0 tcontext=u:r:endospore_priv:s0 tclass=fd
+# So the app's half of the dump is DROPPED, silently. bt_state survives that because the `State:` line comes
+# from BluetoothManagerService in system_server -- but `Bonded devices:` comes from the app half, so anything
+# that later reads it from this domain would quietly get nothing. That is the same silent-truncation shape
+# that cost three build/flash rounds on 2026-08-07 (DIA-20260807-06/-07), and it is one rule to close.
+# Observed on lynx 2026-08-07 during the #154 end-to-end test: 4 denials per roam.
+allow bluetooth endospore_priv:fd use;
+# DIA-20260807-10: and the other half of the pair. Granting `fd use` alone moved the denial rather than
+# removing it -- device-proven on lynx after flashing -08:
+#   avc: denied { write } for comm="BluetoothSystem" path="pipe:[46029]"
+#        scontext=u:r:bluetooth:s0 tcontext=u:r:endospore_priv:s0 tclass=fifo_file
+# Handing a pipe across binder needs BOTH: `fd use` to accept the descriptor, `fifo_file write` to write
+# through it. This file already carries that exact pair for the nowhere domain (`allow system_server
+# nowhere:fd use` + `allow system_server nowhere:fifo_file write`); -08 copied one line of a two-line idiom.
+allow bluetooth endospore_priv:fifo_file write;
+
+# ---- USB-C FIDO2 key (#142 on Endospore, NWP-20260823-06) --------------------------------------------
+# Device-proven missing on lynx 2026-08-23 (Chester, enrolling a YubiKey over USB-C): the kernel enumerated
+# the key fine (hidraw0, port0 [host]) but roamd's usb_host helper was AVC-denied { search } on
+# u:object_r:sysfs_typec:s0, so its `[ -e /sys/class/typec/port0/data_role ]` probe read as ABSENT ("no
+# ssusb/typec role-switch found") and the agent's hidraw scan never saw the key -- "couldn't enroll", no
+# blink. The #142 work gave the FP3 kernel CONFIG_HIDRAW, but Diaspore's roamd runs as su:s0; Endospore
+# retargeted it into THIS strict domain and the USB path was never exercised (NFC was). The agent runs from
+# roamd via execute_no_trans (see nowhere_exec above), so ALL of the USB enroll/assert I/O -- the typec role
+# probe+switch AND the hidraw open -- happens in endospore_priv, and these are the only two surfaces it needs:
+# typec to force/verify host mode, hidraw to talk CTAP to the key. Both types are GrapheneOS-labeled
+# (device-read: /sys/class/typec = sysfs_typec, /dev/hidraw0 = hidraw_device); nothing new is declared, so
+# the frozen-API mirroring the nowhere_media_file saga needed does not apply.
+allow endospore_priv sysfs_typec:dir r_dir_perms;
+allow endospore_priv sysfs_typec:file { open read write getattr };
+allow endospore_priv hidraw_device:chr_file { open read write ioctl getattr };
+
+# Round 2, device-derived (the latent-denial onion, walked WITHOUT permissive: each target label read off the
+# live device with the key enumerated). The first three allows unblocked the typec DIR -- and the failure
+# moved one hop down each path:
+#   * /sys/class/typec/port0 is a SYMLINK into /sys/devices/platform/10d60000.hsi2c/i2c-13/13-0025/typec/,
+#     and Pixel labels that whole PMIC/i2c subtree sysfs_batteryinfo -- so the probe's [ -e ] dies on the
+#     traversal (avc: denied { search } name="10d60000.hsi2c" tcontext=sysfs_batteryinfo). Search only: no
+#     read of battery internals is granted.
+#   * the agent's findFidoHidraw Globs /dev/hidraw* -- denied { read } on device:dir killed the listing
+#     before any hidraw open could happen.
+#   * it then reads /sys/class/hidraw/<n>/device/report_descriptor to match the FIDO usage page; the entire
+#     resolved chain (xhci -> usb1 -> 1-1 -> 0003:1050:0402.* -> hidraw) is GENERIC u:object_r:sysfs:s0 on
+#     lynx, and plain-sysfs FILE read is not in the coredomain defaults (dir search is). r_file_perms on
+#     generic sysfs is broad, accepted knowingly: this domain is the su-replacement root worker and already
+#     execs toolbox; a narrower genfscon label would be per-device-path fragile.
+allow endospore_priv sysfs_batteryinfo:dir search;
+allow endospore_priv device:dir r_dir_perms;
+allow endospore_priv sysfs:file r_file_perms;
+
+# NWP-20260905-03: THE OTA WAKELOCK, WHICH SHIPPED AND HAS NEVER ONCE HELD.
+#
+# NWP-20260903-02 added a kernel wakelock across the OTA apply because nothing held one and the SoC
+# suspended mid-apply the moment the screen went off. It was the headline item of 2026090320. It has been
+# INERT on every Endospore device since, and it said so itself, in ota.log, on every run:
+#
+#     [otad] WARNING: /sys/power/wake_lock refused -- apply can stall while the screen is off
+#
+# Found because Chester ran validation 7.1 on frankel and reported "Ota installation stuck with screen off"
+# (NW-3f3b0ca711bf, 2026-09-05). The device reproduced the exact bug on a build containing its fix.
+#
+# ⚠ WHY IT WAS MISSED, AND IT IS NOT THE user-vs-userdebug TRAP. The slice recorded "device-probed on lynx in
+# the real su:s0 domain ... so no sepolicy change" (the NWP-20260903-02 worklog row, nowhere_otad.sh:71). But the SERVICE does
+# not run in su:s0 on Endospore: stage-vendor.sh rewrites every seclabel to u:r:endospore_priv:s0 and fails
+# the build if one survives. Read off a live lynx, /system/etc/init/nowhere.rc has
+# `seclabel u:r:endospore_priv:s0` for nowhere_otad. So the probe measured a DIFFERENT domain -- one that is
+# permissive on userdebug -- while the service runs in this one, which is enforcing on BOTH build types by
+# deliberate choice (see the permissive note at the top of this file). That is why lynx would not have caught
+# it either: the fix is dead on userdebug too. A "device-probed" claim must name the domain the SERVICE runs
+# in, not the domain the prober happened to be standing in.
+#
+# VERIFIED IN THE BUILT ARTIFACT, both editions of the trap ruled out: system_ext_sepolicy.cil for frankel
+# (user) AND lynx (userdebug) each carry ZERO rules matching endospore_priv+wake_lock and ZERO matching
+# endospore_priv+suspend, while the same grep finds init's two in plat_sepolicy.cil -- so the grep and the
+# type name are right and the absence is real. The generic `sysfs:file r_file_perms` above does NOT reach
+# these: /power/wake_lock is its own type (sysfs_wake_lock, genfs_contexts:181), and that grant is read-only
+# regardless.
+#
+# ⚠ THE CAPABILITY IS NOT OPTIONAL, AND A FILE-ONLY RULE WOULD LOOK CORRECT WHILE CHANGING NOTHING. The
+# platform's own wakelock_use macro pairs them and says why: "Accessing these files requires
+# CAP_BLOCK_SUSPEND" (public/te_macros). endospore_priv holds no capability2 grant at all today. Shipping
+# only the file rule reproduces this bug exactly -- refused write, same WARNING, a diff that reads as a fix.
+#
+# We take the two rules the raw /sys write needs and NOT the wakelock_use macro: the rest of it is the
+# system_suspend HAL client path (binder_call, hwservice find, AIDL service find) which this script does not
+# use and which would widen the domain for nothing.
+allow endospore_priv sysfs_wake_lock:file rw_file_perms;
+allow endospore_priv self:global_capability2_class_set block_suspend;
+
+# And the counter that PROVES it held. otad logs "suspends during apply: <n>" from
+# /sys/power/suspend_stats/success (susp(), nowhere_otad.sh:74); a non-zero delta means the device suspended
+# during the apply, i.e. this grant is absent or refused. Without read access that line reads "unknown" and
+# the fix becomes unfalsifiable from the field -- which is the property that let it hide for two days. The
+# node is its own type (sysfs_suspend_stats, genfs_contexts:178), a directory, so it needs the search too.
+allow endospore_priv sysfs_suspend_stats:dir search;
+allow endospore_priv sysfs_suspend_stats:file r_file_perms;

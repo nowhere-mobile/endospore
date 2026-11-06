@@ -1,0 +1,8 @@
+version 0.5.47
+previous 0.5.46
+- Signing in to a large profile no longer fails partway through with "Couldn't load your data".
+- A permission you declined for an app stays declined when you sign in again; the app you use for texts keeps its SMS permissions.
+- In Your apps you can drag apps into the order they install, and choose which apps are woken for notifications.
+- An app you installed from the App store is no longer reinstalled at sign-in; only its data is restored.
+- A missed call from a session no longer leaves its own notice on the gate after you sign out.
+- The App store marks apps that will not run on this phone and says when its list was last updated.

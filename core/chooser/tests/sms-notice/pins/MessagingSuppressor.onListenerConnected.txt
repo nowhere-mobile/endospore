@@ -1,0 +1,10 @@
+    @Override public void onListenerConnected() {
+        // We may enable the listener just AFTER the first live row inserted (Bugle already posted) -- clear any
+        // Bugle message notice already showing when we bind.
+        try {
+            StatusBarNotification[] active = getActiveNotifications();
+            if (active != null) for (StatusBarNotification sbn : active) cancelIfBugleMessage(sbn);
+        } catch (Throwable ignore) {}
+        startReadClear();
+        startRoleCapture();
+    }

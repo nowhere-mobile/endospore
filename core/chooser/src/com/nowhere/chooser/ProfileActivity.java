@@ -1,0 +1,14984 @@
+package com.nowhere.chooser;
+
+import android.Manifest;
+import android.app.Activity;
+import android.content.Intent;
+import android.content.pm.PackageManager;
+import android.database.Cursor;
+import android.graphics.drawable.GradientDrawable;
+import android.net.LocalSocket;
+import android.net.LocalSocketAddress;
+import android.net.Uri;
+import android.os.Bundle;
+import android.os.UserManager;
+import android.provider.CalendarContract;
+import android.provider.ContactsContract;
+import android.util.Log;
+import android.util.TypedValue;
+import android.view.Gravity;
+import android.view.View;
+import android.widget.Button;
+import android.widget.EditText;
+import android.widget.LinearLayout;
+import android.widget.TextView;
+import java.io.BufferedReader;
+import java.io.ByteArrayOutputStream;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.io.OutputStream;
+
+/**
+ * The post-login Profile app (the dock icon "Profile"; was LogoffActivity until the regroup). It NAMES the
+ * signed-in profile -- from the daemon's owner-scoped GET-SESSION-NAME, because the Android user is
+ * deliberately NOT named after the profile (NWP-20260922-05; see profileName() below, which carries the
+ * reasoning) -- and hosts the session's actions + settings: Storage, Lock / Log off, security/auto-lock,
+ * preferences, delete.
+ *
+ * The name is therefore ADVISORY here: it can be absent, and the screen must stay whole without it. Only the
+ * two actions that put the name ON THE WIRE (Change passphrase -> ROTATE, Delete -> DELETE) are gated on
+ * having one; everything else -- Lock, Log off, Storage, Your data, Preferences, Report an issue -- is gated
+ * on the SESSION TYPE, because those frames are nameless and the daemon resolves them from its own marker.
+ *
+ * "Log off" is one of those actions: it tells the root login daemon (LOGOUT) to seal the live session to the
+ * store, then reap this profile IN PLACE -- switch back to the gate on user 0 and stop+wipe this ephemeral
+ * user (its /data is deleted and the FBE key destroyed) -- all WITHOUT a reboot, so logout takes seconds. If
+ * the daemon is unreachable it falls back to a reboot (which also wipes the ephemeral user). The seal can
+ * touch the network, so it runs off the UI thread. Cancel just returns to the home.
+ */
+public class ProfileActivity extends Activity {
+    private static final String SOCKET = "nowhere_login";
+
+    // Set once logoff begins: the "Logging off…" screen is then UNESCAPABLE until the reap switches to the
+    // gate -- you must not be able to Home/Back your way back into a session you've already logged off.
+    private boolean loggingOff = false;
+
+    private static final int MATCH = LinearLayout.LayoutParams.MATCH_PARENT;
+    private static final int WRAP  = LinearLayout.LayoutParams.WRAP_CONTENT;
+
+    // NWP-20261117-21: the device's look, from GatePalette. Not final: applyProfileLook() sets them in onCreate,
+    // before the first view.
+    private static int BG        = GatePalette.DARK.bg;
+    private static int INK       = GatePalette.DARK.ink;
+    private static int MUTED     = GatePalette.DARK.muted;
+    private static int ACCENT    = GatePalette.DARK.accent;
+    private static int ON_ACCENT = GatePalette.DARK.onAccent;
+    private static int FIELD_BG  = GatePalette.DARK.fieldBg;
+    private static int FIELD_LN  = GatePalette.DARK.fieldLn;
+    private static int HINT      = GatePalette.DARK.hint;
+    private static int FIELD_TX  = GatePalette.DARK.fieldTx;
+    private static int DANGER    = GatePalette.DARK.danger;
+    private static int ERROR_TX  = GatePalette.DARK.error;
+    private static int PANEL     = GatePalette.DARK.panel;
+    private static int PANEL_LN  = GatePalette.DARK.panelLn;
+    private static int WARN      = GatePalette.DARK.warn;
+    private static int OUTLINE   = GatePalette.DARK.outline;
+
+    // #4 (DIA-20260626-04): "LOCAL" = a throwaway (logged in with a name that has no stored account) -> offer
+    // "Save to your store"; "STORED" = a real roaming profile; "" = unknown until GET-SESSION-TYPE returns.
+    private volatile String sessionType = "";
+    /** NWP-20261028-04: the Storage screen's last GET-USAGE total (every scope together), or -1 when not measured. */
+    volatile long occupiedBytes = -1;
+    // #49/#97: an OFFLINE session reports LOCAL too, but it is NOT a throwaway -- it's (probably) an existing
+    // stored profile signed into while the store was unreachable. It must NOT offer "Save to your store"
+    // (promoting would try to create a new profile over the real one -- the daemon refuses, ERR-OFFLINE);
+    // the right offer is the reconnect prompt's "Load my saved data".
+    private volatile boolean offlineSession = false;
+
+    // DIA-20260628-09 P2 (export): the Your-data status line (shared by Back up now + Export a copy) and the
+    // runtime-permission request code for the contacts/calendar read the export needs.
+    private static final int REQ_EXPORT = 0x5870;
+    // Export reads these on demand -- whatever is granted gets exported. Declared in the manifest, NOT
+    // pre-granted (the kiosk never holds standing access). P2 = contacts/calendar; P4 = SMS + call log.
+    private static final String[] EXPORT_PERMS = {
+            Manifest.permission.READ_CONTACTS, Manifest.permission.READ_CALENDAR,
+            Manifest.permission.READ_SMS, Manifest.permission.READ_CALL_LOG,
+    };
+    private TextView dataStatusTv;
+    private android.widget.ProgressBar dataBar; // #88: shared Back up / Export progress bar (determinate for backup, indeterminate for export)
+
+
+    /** #81: never leave a revealed credential on screen when this screen loses the foreground (screen off, task
+     *  switch, user switch). Same rule the gate has always followed for its passphrase; now it covers the change
+     *  passphrase, session PIN and ceremony fields too. Masking from the decor view catches whichever screen is
+     *  currently mounted, since this activity swaps its content view per screen. */
+    @Override
+    protected void onPause() {
+        super.onPause();
+        paused = true; // NWP-20261121-04: holds the Your data repaint until onResume
+        if (getWindow() != null) PassReveal.maskAll(getWindow().getDecorView());
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        paused = false; // NWP-20261121-04: the Your data poll repaints only while this screen is in front
+    }
+
+    // NWP-20261113-06: the view this activity last set, and the one showConfirm() last built. Both UI-thread only. The
+    // probe's answer redraws the menu only while it is still on screen (shownView == confirmView), so an answer that
+    // lands after the user opened a sub-screen does not pull them back; the next showConfirm() reads the fields.
+    private android.view.View shownView;
+    private android.view.View confirmView;
+
+    @Override
+    public void setContentView(android.view.View view) {
+        if (getWindow() != null) PassReveal.maskAll(getWindow().getDecorView());
+        shownView = view;
+        super.setContentView(view);
+    }
+    @Override
+    protected void onCreate(Bundle b) {
+        // NWP-20261117-21: the gate's one device-wide look (docs/product-decisions.md, 2026-10-29). This user cannot
+        // read the gate's prefs; ChooserActivity.mirrorGateLook() copies the look to a Global setting. The light
+        // framework theme goes in before super.onCreate, so dialogs, switches and fields follow it.
+        GatePalette look = GatePalette.DARK;
+        try {
+            look = GatePalette.forLook(android.provider.Settings.Global.getString(getContentResolver(), GatePalette.GLOBAL_KEY));
+        } catch (Throwable t) {
+            android.util.Log.w("NowhereChooser", "profile look not read, dark: " + t);
+        }
+        if (look == GatePalette.LIGHT) setTheme(android.R.style.Theme_Material_Light_NoActionBar);
+        super.onCreate(b);
+        applyProfileLook(look);
+        // L4: the failed-unlock auto-logoff backstop (AdminReceiver) launches this with auto=true -> skip the
+        // confirmation and seal+reap immediately. (The idle timeout does not come here: it COLD-LOCKS, and the
+        // daemon withdraws any "Sign out & install" request when that lock is taken.) Otherwise this is the
+        // user-driven Profile screen. doLogoff() withdraws a pending install request like every sign-out that is
+        // not the install button's own (NWP-20261017-17).
+        // NWP-20261106-03: this activity is exported, so `auto` is honoured only for a launch through the
+        // non-exported .AutoLogoff alias. getIntent().getComponent() is the component the caller named, and Android
+        // refuses that alias to any other app before onCreate runs, so only this app or the system can name it.
+        if (getIntent() != null && AutoLogoffGate.honoured(getIntent().getComponent() == null ? null : getIntent().getComponent().getClassName(), getIntent().getBooleanExtra("auto", false))) {
+            doLogoff();
+            return;
+        }
+        // #4: learn whether this session is a throwaway, so the menu shows the right warning + the "Save to your
+        // store" button. NWP-20261113-06: the menu is drawn FIRST ("Checking whether this session is saved…"), then
+        // redrawn with the answer; a wedged daemon used to keep this screen black for minutes.
+        // DIA-20260818-08 (#747): the "openAppStore" trampoline is gone. nApps is its own package now
+        // (com.nowhere.napps), which is what gives it a Settings > Apps entry; it gets its data by binding
+        // StoreService rather than by launching a screen in here.
+        probeSession();
+    }
+
+    /** NWP-20261117-21: draws this process in the look p: StatusLine through use(), every colour field, and the system
+     *  bars (a no-op for DARK). Once, in onCreate, before the first view. */
+    private void applyProfileLook(GatePalette p) {
+        GatePalette.use(p);
+        BG        = p.bg;
+        INK       = p.ink;
+        MUTED     = p.muted;
+        ACCENT    = p.accent;
+        ON_ACCENT = p.onAccent;
+        FIELD_BG  = p.fieldBg;
+        FIELD_LN  = p.fieldLn;
+        HINT      = p.hint;
+        FIELD_TX  = p.fieldTx;
+        DANGER    = p.danger;
+        ERROR_TX  = p.error;
+        PANEL     = p.panel;
+        PANEL_LN  = p.panelLn;
+        WARN      = p.warn;
+        OUTLINE   = p.outline;
+        ChooserActivity.applyGateBars(getWindow(), p);
+    }
+
+    // NWP-20261113-02: the L4 backstop must also be honoured when this screen is already on top. Device run, lynx
+    // 2026102201, 2026-10-22: with the Profile screen the session's top activity, five wrong bouncer passwords logged
+    // `START u10 ... cmp=com.nowhere.chooser/.AutoLogoff ... result code=3` (START_DELIVERED_TO_TOP). The alias's intent
+    // reached the existing instance here, not onCreate, nothing read `auto`, and the session stayed signed in. The
+    // check below is onCreate's alias gate on the delivered intent (its component is the one the caller named), so an
+    // explicit .ProfileActivity start with the extra still changes nothing on screen, as any other new intent.
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        // AdminReceiver restarts the alias on EVERY wrong unlock from the fifth on, so a sixth typed while "Logging
+        // off..." is shown is delivered here again. A second sign-out would start a second capture thread and a LOGOUT
+        // that fails after the reap, then paint the failed-logoff UI over a session being removed. loggingOff is
+        // written only on the UI thread, where this runs, so it needs no lock. NWP-20261113-02.
+        if (loggingOff) return;
+        if (AutoLogoffGate.honoured(intent.getComponent() == null ? null : intent.getComponent().getClassName(), intent.getBooleanExtra("auto", false))) {
+            doLogoff();
+            return;
+        }
+        openYourAppsIfAsked();
+    }
+
+    /** NWP-20261126-05: the landing card's "+<n> more" row starts this screen with EXTRA_OPEN = OPEN_YOUR_APPS, and it
+     *  opens Your apps. Once: the extra is removed when honoured. Only after a screen is drawn (shownView), so an intent
+     *  that arrives before the first menu waits for the probe's drawChecking. */
+    private void openYourAppsIfAsked() {
+        Intent in = getIntent();
+        if (in == null || shownView == null
+                || !LandingLine.OPEN_YOUR_APPS.equals(in.getStringExtra(LandingLine.EXTRA_OPEN))) return;
+        in.removeExtra(LandingLine.EXTRA_OPEN);
+        showYourApps();
+    }
+
+    /** The session probe: throwaway or stored, offline, the profile's name and the OS update offer. Re-run from the
+     *  status line when the first try got no answer. NWP-20261113-06: ProfileProbe draws the menu before the first
+     *  read, each read waits 5 s at most, and the probe stops at the first request with no answer. */
+    private void probeSession() {
+        new Thread(() -> ProfileProbe.run(
+                msg -> "OTA-STATUS\n".equals(msg)
+                        ? String.join("\n", DaemonSocket.roundTripLines("OTA-STATUS\n", 5000))
+                        : DaemonSocket.roundTrip(msg, 5000),
+                new ProfileProbe.Ui() {
+                    @Override
+                    public void drawChecking() {
+                        runOnUiThread(() -> {
+                            sessionType = "CHECKING";
+                            showConfirm();
+                            openYourAppsIfAsked();
+                        });
+                    }
+
+                    @Override
+                    public void apply(ProfileProbe.Result r) {
+                        runOnUiThread(() -> {
+                            sessionType = r.sessionType;
+                            offlineSession = r.offline;
+                            if (r.name != null) sessionName = r.name;
+                            updateStatus = OtaUpdate.parse(r.otaLines);
+                            sweepGoogleMarks();
+                            if (shownView == confirmView) showConfirm();
+                        });
+                    }
+                }), "nowhere-profile-probe").start();
+    }
+
+    /** The live session's profile name, or null -> the caller uses generic copy.
+     *
+     *  ⚠⚠ NWP-20260922-05: THIS NO LONGER READS UserManager.getUserName(), AND MUST NOT GO BACK TO IT.
+     *  The roamed Android user used to be created with the bare profile name, which put it in
+     *  /data/system/users/&lt;id&gt;.xml and in every user-switcher surface -- a profile list, against "the
+     *  absence of a profile list is the security property". The user is now named after the device brand,
+     *  so getUserName() would return "nowhere"/the brand for every profile: not merely useless here, but
+     *  actively wrong, because it would render the BRAND wherever a profile name belongs.
+     *
+     *  ⚠ CACHED, AND THAT IS NOT AN OPTIMISATION. Three of the four callers (showConfirm, showSecurity,
+     *  doLogoff) run on the UI thread, and the source is now a LocalSocket round trip -- exactly the ANR
+     *  shape #151 already produced in this app. The value is fetched on the probe thread onCreate starts
+     *  (ProfileProbe, beside GET-SESSION-TYPE; the menu is drawn first and redrawn with it), and read from the
+     *  field here.
+     *
+     *  ⚠ NULL IS A REAL ANSWER, NOT A FAILURE. The auto-logoff backstop (auto=true) returns from onCreate
+     *  before the probe thread is ever started, so doLogoff() on that path sees no cached name and renders
+     *  generic copy. That is deliberate and it is the right direction: #110 made exactly these covers
+     *  nameless on purpose, so a nameless auto-logoff is consistent rather than degraded. A dropped socket
+     *  read and a marker the daemon reads as DAMAGED land in the same place.
+     *
+     *  ⚠⚠ SO NULL MUST NEVER HIDE A CONTROL, WITH EXACTLY TWO EXCEPTIONS. Gate on the SESSION TYPE, never on
+     *  the name: `local`/sessionType is what actually distinguishes a throwaway from a stored profile, and
+     *  every other daemon frame this screen sends is nameless. The exceptions are "Change passphrase"
+     *  (ROTATE) and "Delete this profile" (DELETE), which put the name on the wire and genuinely cannot run
+     *  without it. This rule is written down because the opposite was briefly true and was invisible: while
+     *  the name came from getUserName() it was never absent, so `name != null` had been used as a synonym
+     *  for "signed in" -- and moving the source turned that into a Profile screen that silently collapsed to
+     *  a bare "Log off", losing Lock, Delete and "Report an issue", the only diagnostic channel a locked
+     *  user build has, in precisely the states where something had already gone wrong. */
+    private volatile String sessionName;
+
+    // NWP-20261011-05: the OTA-STATUS the session probe read -- drives the Update row (NONE until it answers).
+    private volatile OtaUpdate.Status updateStatus = OtaUpdate.NONE;
+    // NWP-20261011-05: this Profile instance's nonce for "Sign out & install": the request it makes carries it (with this
+    // user's id, so only the reap of THIS session takes it), and a refused sign-out withdraws only that request.
+    private final String otaReqNonce = java.util.UUID.randomUUID().toString();
+
+    private String profileName() {
+        String n = sessionName;
+        return (n != null && !n.trim().isEmpty()) ? n.trim() : null;
+    }
+
+    private void showConfirm() {
+        final String name = profileName();
+        final boolean local = "LOCAL".equals(sessionType); // #4: a throwaway -> not saved anywhere yet
+
+        LinearLayout ll = new LinearLayout(this);
+        ll.setOrientation(LinearLayout.VERTICAL);
+        ll.setBackgroundColor(BG);
+        ll.setPadding(dp(22), dp(44), dp(22), dp(30));
+
+        // --- identity header (centered): name + a one-line status ---
+        TextView nameTv = new TextView(this);
+        nameTv.setText(name == null ? "Signed in" : name);
+        nameTv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 30);
+        nameTv.setTextColor(INK);
+        nameTv.setGravity(Gravity.CENTER);
+        nameTv.setLetterSpacing(0.02f);
+        ll.addView(nameTv, new LinearLayout.LayoutParams(MATCH, WRAP));
+
+        // NWP-20261125-04 (h55 #2): past the date GrapheneOS full support for this phone ended, say so under the
+        // header, naming the build and the date. The baked file is read once, here; missing or unreadable = no line.
+        String supportEndText = null;
+        try {
+            supportEndText = new String(java.nio.file.Files.readAllBytes(java.nio.file.Paths.get(
+                    "/system/etc/nowhere/support-end")), java.nio.charset.StandardCharsets.UTF_8);
+        } catch (Throwable ignore) { }
+        String supportEndLine = SupportEnd.line(supportEndText,
+                java.time.LocalDate.now(java.time.ZoneOffset.UTC).toString(), android.os.Build.VERSION.INCREMENTAL);
+        if (supportEndLine != null) {
+            TextView supportEndTv = new TextView(this);
+            supportEndTv.setText(supportEndLine);
+            supportEndTv.setTextColor(MUTED);
+            supportEndTv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+            supportEndTv.setGravity(Gravity.CENTER);
+            LinearLayout.LayoutParams supportEndLp = new LinearLayout.LayoutParams(MATCH, WRAP);
+            supportEndLp.topMargin = dp(6);
+            ll.addView(supportEndTv, supportEndLp);
+        }
+
+        final boolean offline = offlineSession; // #49: offline-started session -- not a throwaway, no Save offer
+        TextView status = new TextView(this);
+        // NWP-20261113-06: CHECKING = the probe has not answered yet. It draws the UNKNOWN layout (Lock, Log off,
+        // Report an issue), with no tap action, no Save offer and no SEAL-DELTA read.
+        final boolean checking = "CHECKING".equals(sessionType);
+        final boolean unknown = checking || "UNKNOWN".equals(sessionType); // NWP-20261006-23: the probe got no answer
+        status.setText(checking ? "Checking whether this session is saved…"
+                : offline ? "Signed in offline — your saved data isn't loaded"
+                : local ? "Throwaway — lives only on this phone"
+                : unknown ? "Couldn't check whether this session is saved. Tap to check again."
+                : "Signed in · roams to your store");
+        if (unknown && !checking && !offline) status.setOnClickListener(v -> probeSession());
+        // NWP-20260901-28 (#145 S4): the stored branch's line was an unevidenced promise -- upgrade it to the
+        // live headline off-thread (SEAL-DELTA's RAM half is instant) and make it the door to the screen that
+        // explains it. The offline/local branches keep their words: both are already true statements.
+        if (!offline && !local && !unknown) {
+            final TextView stv = status;
+            stv.setOnClickListener(v -> showYourData());
+            new Thread(() -> {
+                try {
+                    String[] lr = daemonLenReply("SEAL-DELTA\n", 8000);
+                    if (lr == null || lr[1] == null || lr[1].isEmpty()) return;
+                    org.json.JSONObject o = new org.json.JSONObject(lr[1]);
+                    if (!"stored".equals(o.optString("session"))) return;
+                    final long lastOK = o.optLong("lastOK", 0);
+                    final String run = o.optString("run", "");
+                    // NWP-20261104-09 (Q058): the last attempt's verdict is part of the line, and a failed save is soft red.
+                    final String verdict = o.optString("verdict", "");
+                    final String line = SaveStatusLine.text(run, lastOK > 0 ? fmtAgo(lastOK) : null, verdict);
+                    final boolean err = run.isEmpty() && SaveStatusLine.isError(verdict);
+                    runOnUiThread(() -> { if (err) StatusLine.error(stv, line); else stv.setText(line); });
+                } catch (Throwable ignore) { /* the generic line stands */ }
+            }).start();
+        }
+        status.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        status.setTextColor(MUTED);
+        status.setGravity(Gravity.CENTER);
+        LinearLayout.LayoutParams stlp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        stlp.topMargin = dp(5);
+        stlp.bottomMargin = dp(26);
+        ll.addView(status, stlp);
+
+        // --- offline session (#49): explain the state instead of offering Save (this is an existing stored
+        // profile the store couldn't be reached for -- promoting it would collide with the real one) ---
+        if (offline) {
+            TextView note = new TextView(this);
+            note.setText("You signed in without a connection, so this is a temporary session — nothing here is "
+                    + "saved to your store. When you're back online, use the \"Load my saved data\" notification "
+                    + "(or log off and sign in again) to load your saved profile. Anything you do in this "
+                    + "session is discarded.");
+            note.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+            note.setTextColor(MUTED);
+            note.setGravity(Gravity.CENTER);
+            note.setLineSpacing(dp(3), 1f);
+            LinearLayout.LayoutParams nlp = new LinearLayout.LayoutParams(MATCH, WRAP);
+            nlp.topMargin = dp(2);
+            nlp.bottomMargin = dp(12);
+            ll.addView(note, nlp);
+        }
+
+        // --- throwaway: the prominent Save path + a short note ---
+        if (local && !offline) {
+            ll.addView(accentButton("Save to your store", () -> doPromote()), btnLp(0));
+            TextView note = new TextView(this);
+            note.setText("Saving keeps this profile and lets it roam to other devices. Otherwise it's erased "
+                    + "on log off or power off.");
+            note.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+            note.setTextColor(MUTED);
+            note.setGravity(Gravity.CENTER);
+            note.setLineSpacing(dp(3), 1f);
+            LinearLayout.LayoutParams nlp = new LinearLayout.LayoutParams(MATCH, WRAP);
+            nlp.topMargin = dp(10);
+            ll.addView(note, nlp);
+        }
+
+        // --- session actions: Lock (stored, the everyday "stepping away") then Log off ---
+        // NWP-20260922-05: gated on `local`, NOT on `name`. COLD-LOCK and LOGOUT are NAMELESS frames -- the
+        // daemon resolves the session from its own marker -- so a name that did not arrive must not cost the
+        // user the Lock button. It used to, silently: while the name came from getUserName() it was never
+        // absent in a live session, so `name != null` read as a free synonym for "signed in" and was used as
+        // one in three places. It is not one any more.
+        final String logoffLabel = name == null ? "Log off" : "Log off " + name;
+        if (!local) {
+            ll.addView(accentButton("Lock — keep on this device", () -> doColdLock()), btnLp(0));
+            ll.addView(secondaryButton(logoffLabel, () -> doLogoff()), btnLp(dp(10)));
+        } else {
+            ll.addView(secondaryButton(logoffLabel, () -> doLogoff()), btnLp(dp(16)));
+        }
+
+        // NWP-20261011-05: the Update row -- present for as long as an update is offered, not a notice that goes
+        // away. The OS installs only from the gate (it ends in a restart), so its one action is "Sign out & install":
+        // the normal sign-out, after which the gate starts the install. Nothing installs without this tap.
+        final OtaUpdate.Status us = updateStatus;
+        if (us.avail) addUpdateCard(ll, us, local);
+
+        // NWP-20261126-09: the Privacy level card (docs/product-decisions.md 2026-11-03), after the Update card and
+        // before the menu. A throwaway is LOCAL and not offline, and shows none (A7); an offline stored session shows it.
+        if (PresetPicker.cardShown(local, offline)) addPrivacyLevelCard(ll);
+
+        // --- the menu: one row per area, each opening its OWN screen (DIA-20260628-08). The hub used to inline
+        // every setting as grouped cards -- too crowded; now it's just a table of contents that points onward. ---
+        // NWP-20260922-05: gated on `local` only. Every row here opens a screen whose daemon calls are
+        // nameless, and "Report an issue" is the ONLY diagnostic channel a locked user build has -- it has to
+        // be reachable in exactly the states where something has gone wrong, which is precisely when the name
+        // probe is the thing that failed. Under the old `name != null` gate this whole card disappeared and
+        // the screen collapsed to a bare "Log off".
+        if (!local) {
+            sectionCard(ll, null,
+                    new String[]{"Storage", "Security", "Preferences", "Your data", "Report an issue", "Help"},
+                    new Runnable[]{() -> showStorage(), () -> showSecurity(), () -> showPreferences(),
+                            () -> showYourData(), () -> showReportIssue(), () -> showHelp()}, false);
+        } else { // a throwaway: device-local Security (idle/wipe) + Preferences; no store/delete
+            sectionCard(ll, null,
+                    new String[]{"Security", "Preferences", "Help"},
+                    new Runnable[]{() -> showSecurity(), () -> showPreferences(), () -> showHelp()}, false);
+        }
+
+        // Delete: a deliberate, separate destructive action (stored profiles only) -- a quiet centered link, NOT a
+        // menu row, so it doesn't read as "just another setting". Sits above Done, off the easiest-to-tap spot.
+        //
+        // ⚠ NWP-20260922-05: this is one of the TWO gates that legitimately keep `name != null`, and it is not
+        // an oversight that it differs from the two above. DELETE carries the profile name ON THE WIRE
+        // (showDeleteConfirm sends a DELETE frame whose first argument is the name), so without one the
+        // action cannot be performed at all -- offering it would send the literal string "null", and
+        // answer a correct passphrase with "that doesn't match". Hiding it is the honest failure. The
+        // other is "Change passphrase" (-> ROTATE) in showSecurity. Do NOT "consistency-fix" these two
+        // to match the session-type gates around them.
+        if (name != null && !local) {
+            TextView del = new TextView(this);
+            del.setText("Delete this profile");
+            del.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+            del.setTextColor(DANGER);
+            del.setGravity(Gravity.CENTER);
+            del.setPadding(dp(8), dp(30), dp(8), dp(8));
+            ll.addView(del, new LinearLayout.LayoutParams(MATCH, WRAP));
+            del.setOnClickListener(v -> showDeleteConfirm(name));
+        }
+
+        // Done: leave the Profile app, back to the home screen. (Was "Cancel" -- on a menu there's nothing to
+        // cancel; the sub-screens use "Back" to return HERE, the menu uses "Done" to return home.)
+        TextView done = new TextView(this);
+        done.setText("Done");
+        done.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        done.setTextColor(MUTED);
+        done.setGravity(Gravity.CENTER);
+        done.setPadding(dp(8), dp(18), dp(8), dp(8));
+        ll.addView(done, new LinearLayout.LayoutParams(MATCH, WRAP));
+        done.setOnClickListener(v -> finish());
+
+        android.widget.ScrollView sc = new android.widget.ScrollView(this);
+        sc.setBackgroundColor(BG);
+        sc.addView(ll);
+        confirmView = sc;
+        setContentView(sc);
+    }
+
+    /** Full-width primary (accent) button with its click. */
+    private Button accentButton(String text, final Runnable onClick) {
+        Button b = accentBtn(text); // reuse the accent-styled builder
+        b.setOnClickListener(v -> onClick.run());
+        return b;
+    }
+
+    /** Full-width secondary (outlined) button -- for "Log off" when Lock is the primary action. */
+    private Button secondaryButton(String text, final Runnable onClick) {
+        Button b = new Button(this);
+        b.setText(text);
+        b.setAllCaps(false);
+        b.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
+        b.setTextColor(ACCENT);
+        GradientDrawable bg = new GradientDrawable();
+        bg.setColor(BG);
+        bg.setCornerRadius(dp(13));
+        bg.setStroke(dp(1), FIELD_LN);
+        b.setBackground(bg);
+        b.setStateListAnimator(null);
+        b.setSoundEffectsEnabled(false);
+        b.setPadding(0, dp(13), 0, dp(13));
+        b.setOnClickListener(v -> onClick.run());
+        return b;
+    }
+
+    private LinearLayout.LayoutParams btnLp(int topMargin) {
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        lp.topMargin = topMargin;
+        return lp;
+    }
+
+    /** NWP-20261011-05: Profile's Update card -- what is offered and, for a mandatory update, by when and the SIGNED
+     *  reason and consequence (OtaUpdate.profileRowDetail; the phone composes none of that text), with its one action.
+     *  A mandatory update gets the accent outline so it reads as more than a setting. NWP-20261124-14: it also shows
+     *  "What's in this update", the offered versions' notes as the gate's "what's new" gives them (OtaNotes.cardNotes). */
+    private void addUpdateCard(LinearLayout parent, final OtaUpdate.Status us, final boolean local) {
+        LinearLayout card = new LinearLayout(this);
+        card.setOrientation(LinearLayout.VERTICAL);
+        card.setPadding(dp(16), dp(14), dp(16), dp(14));
+        GradientDrawable cbg = new GradientDrawable();
+        cbg.setColor(FIELD_BG);
+        cbg.setCornerRadius(dp(14));
+        cbg.setStroke(dp(1), us.mandatory() ? ACCENT : FIELD_LN);
+        card.setBackground(cbg);
+        LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        clp.topMargin = dp(20);
+        parent.addView(card, clp);
+
+        TextView title = new TextView(this);
+        title.setText(OtaUpdate.profileRowTitle(us));
+        title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16);
+        title.setTextColor(INK);
+        card.addView(title, new LinearLayout.LayoutParams(MATCH, WRAP));
+
+        TextView detail = new TextView(this);
+        detail.setText(OtaUpdate.profileRowDetail(us, java.util.TimeZone.getDefault(), java.util.Locale.getDefault()));
+        detail.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        detail.setTextColor(us.mandatory() ? INK : MUTED);
+        detail.setLineSpacing(dp(2), 1f);
+        LinearLayout.LayoutParams dlp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        dlp.topMargin = dp(4);
+        card.addView(detail, dlp);
+
+        // NWP-20261124-14: "What's in this update" -- the offered versions' notes, the same body the gate's Software
+        // update shows under "what's new" (OtaNotes.cardNotes). Hidden until the daemon answers OTA-NOTES (from memory,
+        // lock-free, not gate-only); a reply that did not end draws nothing, and the card stays as it was. Asked off
+        // the UI thread (#151's ANR), and dropped if a later redraw replaced this card. Text only: the published
+        // points as published. The one action below does not change.
+        final TextView notesHdr = new TextView(this);
+        notesHdr.setText(OtaNotes.CARD_HEADING);
+        notesHdr.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        notesHdr.setTextColor(INK);
+        notesHdr.setVisibility(android.view.View.GONE);
+        LinearLayout.LayoutParams nhlp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        nhlp.topMargin = dp(12);
+        card.addView(notesHdr, nhlp);
+        final TextView notes = new TextView(this);
+        notes.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        notes.setTextColor(MUTED);
+        notes.setLineSpacing(dp(2), 1f);
+        notes.setVisibility(android.view.View.GONE);
+        LinearLayout.LayoutParams nlp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        nlp.topMargin = dp(4);
+        card.addView(notes, nlp);
+        new Thread(() -> {
+            final String body = OtaNotes.cardNotes(DaemonSocket.roundTripLines("OTA-NOTES\n", 5000));
+            if (body == null) return;
+            runOnUiThread(() -> {
+                if (isFinishing() || isDestroyed() || !card.isAttachedToWindow()) return; // a redraw replaced this card
+                notes.setText(body);
+                notesHdr.setVisibility(android.view.View.VISIBLE);
+                notes.setVisibility(android.view.View.VISIBLE);
+            });
+        }, "nowhere-update-card-notes").start();
+
+        card.addView(accentButton("Sign out & install", () -> confirmSignOutAndInstall(local)), btnLp(dp(12)));
+    }
+
+    /** NWP-20261011-05: "Sign out &amp; install" -- confirm, record the request with the daemon, then the ordinary
+     *  sign-out. The gate starts the install once the sign-out has saved and removed this session
+     *  (ChooserActivity.maybeInstallAfterLogoff), and a refused sign-out withdraws the request (doLogoffImpl). It is the ONLY caller of
+     *  doLogoffForInstall: every other sign-out goes through doLogoff(), which withdraws the request first. */
+    private void confirmSignOutAndInstall(final boolean local) {
+        new android.app.AlertDialog.Builder(this)
+                .setTitle("Sign out and install?")
+                .setMessage(OtaUpdate.installConfirm(local))
+                .setNegativeButton("Not now", null)
+                .setPositiveButton("Sign out & install", (d, w) -> new Thread(() -> {
+                    // Off the UI thread (sendDaemon blocks). If the daemon does not take the request, do NOT sign out:
+                    // the user asked for an install, and a bare sign-out would silently be something else.
+                    final boolean ok = sendDaemon("OTA-AFTER-LOGOFF\n1 " + android.os.UserHandle.myUserId() + " "
+                            + otaReqNonce + "\n").trim().startsWith("OK");
+                    runOnUiThread(() -> {
+                        if (ok) {
+                            doLogoffForInstall();
+                        } else {
+                            android.widget.Toast.makeText(this, "Couldn't start the update. Nothing changed — try again.",
+                                    android.widget.Toast.LENGTH_LONG).show();
+                        }
+                    });
+                }, "nowhere-signout-install").start())
+                .show();
+    }
+
+    /** A titled card of tappable rows (label left, chevron right) with hairline dividers. danger -> red, no chevron. */
+    private void sectionCard(LinearLayout parent, String header, String[] labels, Runnable[] actions, boolean danger) {
+        if (header != null) {
+            TextView h = new TextView(this);
+            h.setText(header.toUpperCase(java.util.Locale.US));
+            h.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
+            h.setTextColor(MUTED);
+            h.setLetterSpacing(0.08f);
+            h.setPadding(dp(8), dp(26), dp(8), dp(8));
+            parent.addView(h, new LinearLayout.LayoutParams(MATCH, WRAP));
+        } else {
+            android.view.View sp = new android.view.View(this);
+            parent.addView(sp, new LinearLayout.LayoutParams(MATCH, dp(20)));
+        }
+        LinearLayout card = new LinearLayout(this);
+        card.setOrientation(LinearLayout.VERTICAL);
+        GradientDrawable cbg = new GradientDrawable();
+        cbg.setColor(FIELD_BG);
+        cbg.setCornerRadius(dp(14));
+        cbg.setStroke(dp(1), FIELD_LN);
+        card.setBackground(cbg);
+        parent.addView(card, new LinearLayout.LayoutParams(MATCH, WRAP));
+        for (int i = 0; i < labels.length; i++) {
+            if (i > 0) {
+                android.view.View div = new android.view.View(this);
+                div.setBackgroundColor(FIELD_LN);
+                LinearLayout.LayoutParams dlp = new LinearLayout.LayoutParams(MATCH, Math.max(1, dp(0.5f)));
+                dlp.leftMargin = dp(16);
+                card.addView(div, dlp);
+            }
+            card.addView(cardRow(labels[i], actions[i], danger));
+        }
+    }
+
+    private LinearLayout cardRow(String label, final Runnable onClick, boolean danger) {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(dp(16), dp(15), dp(16), dp(15));
+        TextView l = new TextView(this);
+        l.setText(label);
+        l.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
+        l.setTextColor(danger ? DANGER : INK);
+        row.addView(l, new LinearLayout.LayoutParams(0, WRAP, 1f));
+        if (!danger) {
+            TextView chev = new TextView(this);
+            chev.setText("›"); // a right chevron
+            chev.setTextSize(TypedValue.COMPLEX_UNIT_SP, 18);
+            chev.setTextColor(MUTED);
+            row.addView(chev, new LinearLayout.LayoutParams(WRAP, WRAP));
+        }
+        row.setOnClickListener(v -> onClick.run());
+        return row;
+    }
+
+    /** A titled sub-screen header (title + one muted line) on the standard menu background; callers add the card(s)
+     *  then a Back link. Factors the boilerplate shared by the menu's child screens (DIA-20260628-08). */
+    private LinearLayout menuScreen(String title, String subtitle) {
+        LinearLayout ll = new LinearLayout(this);
+        ll.setOrientation(LinearLayout.VERTICAL);
+        ll.setBackgroundColor(BG);
+        ll.setPadding(dp(22), dp(44), dp(22), dp(30));
+
+        TextView t = new TextView(this);
+        t.setText(title);
+        t.setTextColor(INK);
+        t.setTextSize(TypedValue.COMPLEX_UNIT_SP, 24);
+        t.setGravity(Gravity.CENTER);
+        ll.addView(t, new LinearLayout.LayoutParams(MATCH, WRAP));
+
+        TextView sub = new TextView(this);
+        sub.setText(subtitle);
+        sub.setTextColor(MUTED);
+        sub.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        sub.setGravity(Gravity.CENTER);
+        LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        slp.topMargin = dp(5);
+        slp.bottomMargin = dp(2);
+        ll.addView(sub, slp);
+        return ll;
+    }
+
+    /** Add a centered "Back" link (returns to the Profile menu) and present the screen in a ScrollView. */
+    /** Append the "Back" link and present the screen. onBack is the screen's REAL parent.
+     *
+     *  #74a / NWP-20260821-14: this used to hardcode showConfirm(), so EVERY sub-screen exited to the Profile
+     *  root no matter where it was opened from -- the user lost their place. Chester hit it twice: "Your apps"
+     *  (entered from Preferences) and "Start or extend a plan" (entered from Storage). Tracing all six callers
+     *  showed only those two are wrong; the other four ARE entered from the Profile hub, so the default
+     *  overload above keeps them exactly as they were rather than churning them. */
+    private void finishMenuScreen(LinearLayout ll, Runnable onBack) {
+        finishMenuScreen(ll, onBack, null);
+    }
+
+    /** NWP-20261016-48: finishMenuScreen with a `head` pinned above the scrolling screen -- Your apps' title and search,
+     *  so the search is always on top however far down the list you are. null = no head, as every other screen. */
+    private void finishMenuScreen(LinearLayout ll, Runnable onBack, LinearLayout head) {
+        TextView back = new TextView(this);
+        back.setText("Back");
+        back.setTextColor(ACCENT);
+        back.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        back.setGravity(Gravity.CENTER);
+        back.setPadding(dp(8), dp(22), dp(8), dp(8));
+        ll.addView(back, new LinearLayout.LayoutParams(MATCH, WRAP));
+        back.setOnClickListener(v -> onBack.run());
+        if (head == null) presentMenuScreen(ll);
+        else presentMenuScreen(head, ll);
+    }
+
+    /** finishMenuScreen with the DEFAULT destination: the Profile hub. Correct for every screen entered from
+     *  showConfirm (Security, Report an issue, Preferences, Your data) -- verified by tracing each caller's
+     *  entry point, not assumed. Screens entered from somewhere ELSE must pass their real parent. */
+    private void finishMenuScreen(LinearLayout ll) {
+        finishMenuScreen(ll, this::showConfirm);
+    }
+
+    /** Present a menu screen with NO "Back" link of its own. Every live screen reaches this through
+     *  finishMenuScreen, which adds the Back link first. The only caller that skipped it was the old in-chooser
+     *  nApps, entered from the launcher with no back stack behind it (#74c, Chester 2026-08-18: "doesnt make
+     *  sense a back in that"); DIA-20260818-08 (#747) moved nApps to com.nowhere.napps and NWP-20261013-38
+     *  deleted that screen. */
+    private void presentMenuScreen(LinearLayout ll) {
+        android.widget.ScrollView sc = new android.widget.ScrollView(this);
+        sc.setBackgroundColor(BG);
+        sc.addView(ll);
+        setContentView(sc);
+    }
+
+    /** NWP-20261016-48: presentMenuScreen with `head` outside the ScrollView, above it, so it never scrolls away. The
+     *  ScrollView takes the height the head leaves and is still ll's parent: keepOrderDrag's edge scroll finds it. */
+    private void presentMenuScreen(LinearLayout head, LinearLayout ll) {
+        LinearLayout root = new LinearLayout(this);
+        root.setOrientation(LinearLayout.VERTICAL);
+        root.setBackgroundColor(BG);
+        root.addView(head, new LinearLayout.LayoutParams(MATCH, WRAP));
+        android.widget.ScrollView sc = new android.widget.ScrollView(this);
+        sc.setBackgroundColor(BG);
+        sc.addView(ll);
+        root.addView(sc, new LinearLayout.LayoutParams(MATCH, 0, 1f));
+        setContentView(root);
+    }
+
+    /** Security menu (DIA-20260628-08): the passphrase + the two auto-lock backstops, each its own screen/dialog.
+     *  Change passphrase is store-only -- a throwaway has no stored passphrase to change, so it's hidden there.
+     *  NWP-20261112-22: a throwaway hides the standby and wipe pickers too and says it runs on the standard times. */
+    private void showSecurity() {
+        final String name = profileName();
+        final boolean local = "LOCAL".equals(sessionType);
+        // NWP-20261112-22: an OFFLINE sign-in reports LOCAL too but is a stored profile (the Profile menu's rule).
+        // The gate reads idle/wipe only at sign-in (ChooserActivity.applyRoamedPrefs) and a throwaway is never
+        // signed into again, so its pickers would save a choice nothing reads.
+        final boolean throwaway = local && !offlineSession;
+        LinearLayout ll = menuScreen("Security", "how this profile locks and unlocks");
+
+        java.util.ArrayList<String> labels = new java.util.ArrayList<>();
+        final java.util.ArrayList<Runnable> actions = new java.util.ArrayList<>();
+        // NWP-20260922-05: `name != null` as well as !local -- ROTATE carries the name on the wire (see the
+        // Delete gate in showConfirm). Every other row here is a nameless frame or pure device-local state.
+        if (!local && name != null) { labels.add("Change passphrase"); actions.add(() -> showChangePass(name)); }
+        if (!local) { labels.add("Use a security key"); actions.add(() -> showAddSecurityKey()); } // #81: FIDO2 2FA
+        if (!local) { labels.add("Session PIN"); actions.add(() -> showSessionPin()); } // #81 item 3: remembered PIN
+        if (!local) { labels.add("Tie to this phone"); actions.add(() -> showPhoneTie()); } // NWP-20261006-09: opt-in, undoable
+        if (!throwaway) { labels.add("Auto standby when idle"); actions.add(() -> showIdlePicker()); } // #51 (Chester wording): idle = resumable cold standby, not a sign-out
+        if (!throwaway) { labels.add("Auto-wipe when left locked"); actions.add(() -> showWipePicker()); }
+        labels.add("Always-on VPN");                actions.add(() -> showVpnPicker());       // #159: kill-switch VPN that survives roam
+        sectionCard(ll, null, labels.toArray(new String[0]), actions.toArray(new Runnable[0]), false);
+        if (throwaway) {
+            TextView note = new TextView(this);
+            note.setText("This session isn't saved, so it uses the standard standby and wipe times.");
+            note.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+            note.setTextColor(MUTED);
+            note.setLineSpacing(dp(3), 1f);
+            LinearLayout.LayoutParams nlp = new LinearLayout.LayoutParams(MATCH, WRAP);
+            nlp.topMargin = dp(12);
+            ll.addView(note, nlp);
+        }
+
+        finishMenuScreen(ll);
+    }
+
+    /** "Report an issue" (task ii): let the user file a diagnostic report with support. The daemon does the SCRUB
+     *  (creds/PII/store-refs stripped, the live profile name redacted) and the POST; we gather Android-side device
+     *  status the confined daemon can't, offer a real preview of the scrubbed bytes, and require explicit consent
+     *  before anything leaves the phone. Anonymous end to end -- there is no account, only a quotable ticket. */
+    private void showReportIssue() {
+        LinearLayout ll = menuScreen("Report an issue", "send a diagnostic report to support");
+
+        TextView explain = new TextView(this);
+        explain.setText(ReportIntroCopy.PROFILE);
+        explain.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        explain.setTextColor(MUTED);
+        explain.setLineSpacing(dp(3), 1f);
+        LinearLayout.LayoutParams elp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        elp.topMargin = dp(18); elp.bottomMargin = dp(16);
+        ll.addView(explain, elp);
+
+        // NWP-20261126-02: the beta-only "Send diagnostic reports" switch, above the note. The agent decides beta
+        // (DIAG-SUMMARY status answers OFFERED 1); on any other reply nothing is drawn. The choice is OPT_FILE in the
+        // profile's files, so it roams; DiagReportJob sends the reports. Nothing here logs the tag.
+        final LinearLayout diagBox = new LinearLayout(this);
+        diagBox.setOrientation(LinearLayout.VERTICAL);
+        ll.addView(diagBox, new LinearLayout.LayoutParams(MATCH, WRAP));
+        new Thread(() -> {
+            final String diagSt = sendDaemon("DIAG-SUMMARY\nstatus\n");
+            final boolean diagOn = DiagReports.optedIn(DiagReportJob.readFile(this, DiagReports.OPT_FILE));
+            runOnUiThread(() -> {
+                if (DiagReports.offered(diagSt)) {
+                    LinearLayout row = new LinearLayout(this);
+                    row.setOrientation(LinearLayout.HORIZONTAL);
+                    row.setGravity(Gravity.CENTER_VERTICAL);
+                    row.setPadding(dp(4), dp(4), dp(4), dp(2));
+                    LinearLayout col = new LinearLayout(this);
+                    col.setOrientation(LinearLayout.VERTICAL);
+                    TextView lab = new TextView(this);
+                    lab.setText(DiagReports.TITLE);
+                    lab.setTextColor(INK);
+                    lab.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
+                    col.addView(lab);
+                    TextView sub = new TextView(this);
+                    sub.setText(DiagReports.SUBLINE);
+                    sub.setTextColor(MUTED);
+                    sub.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+                    col.addView(sub);
+                    LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(0, WRAP, 1f);
+                    clp.rightMargin = dp(10);
+                    row.addView(col, clp);
+                    final android.widget.Switch sw = GateSwitch.style(new android.widget.Switch(this), GatePalette.active());
+                    sw.setChecked(diagOn);
+                    row.addView(sw, new LinearLayout.LayoutParams(WRAP, WRAP));
+                    diagBox.addView(row, new LinearLayout.LayoutParams(MATCH, WRAP));
+
+                    final TextView diagLine = new TextView(this);
+                    diagLine.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+                    diagLine.setTextColor(MUTED);
+                    TextView reset = new TextView(this);
+                    reset.setText(DiagReports.RESET);
+                    reset.setTextColor(ACCENT);
+                    reset.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+                    reset.setPadding(dp(4), dp(8), dp(4), dp(8));
+                    reset.setOnClickListener(v -> DiagReports.SWITCH.execute(() -> {
+                        final boolean wrote = DiagReportJob.writeFile(this, DiagReports.TAG_FILE,
+                                DiagReports.newTag(new java.security.SecureRandom()) + "\n");
+                        runOnUiThread(() -> {
+                            if (wrote) { diagLine.setTextColor(MUTED); diagLine.setText(DiagReports.RESET_DONE); }
+                            else StatusLine.error(diagLine, DiagReports.RESET_FAILED);
+                        });
+                    }));
+                    diagBox.addView(reset, new LinearLayout.LayoutParams(WRAP, WRAP));
+                    LinearLayout.LayoutParams dlp = new LinearLayout.LayoutParams(MATCH, WRAP);
+                    dlp.bottomMargin = dp(12);
+                    diagBox.addView(diagLine, dlp);
+
+                    // Both transitions run on DiagReports.SWITCH, one at a time in tap order, under the consent
+                    // lock: an Off tapped before an On always lands first, and no scheduled send starts after an Off.
+                    final DiagReports.Port port = new DiagReportJob.AndroidPort(getApplicationContext());
+                    final boolean[] quiet = {false}; // set back off by code: not a user tap
+                    sw.setOnCheckedChangeListener((b, on) -> {
+                        if (quiet[0]) return;
+                        diagLine.setText("");
+                        if (on) {
+                            sw.setEnabled(false); // until the agent answers
+                            DiagReports.SWITCH.execute(() -> {
+                                final boolean ok = DiagReports.switchOn(port);
+                                runOnUiThread(() -> {
+                                    sw.setEnabled(true);
+                                    if (ok) return;
+                                    quiet[0] = true;
+                                    sw.setChecked(false);
+                                    quiet[0] = false;
+                                    StatusLine.error(diagLine, DiagReports.ON_FAILED);
+                                });
+                            });
+                        } else {
+                            DiagReports.SWITCH.execute(() -> DiagReports.switchOff(port));
+                        }
+                    });
+                }
+            });
+        }).start();
+
+        // NWP-20261114-21 (Q041): paste only while ClipboardManager is reachable; the clipboard_service grant is the follow-up.
+        final EditText note = SafeEdit.withPaste(this);
+        note.setHint("What went wrong? (optional)");
+        note.setInputType(android.text.InputType.TYPE_CLASS_TEXT
+                | android.text.InputType.TYPE_TEXT_FLAG_MULTI_LINE | android.text.InputType.TYPE_TEXT_FLAG_CAP_SENTENCES);
+        note.setMinLines(3);
+        note.setGravity(Gravity.TOP | Gravity.START);
+        note.setTextColor(INK);
+        note.setHintTextColor(MUTED);
+        note.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
+        note.setBackgroundColor(PANEL);
+        note.setPadding(dp(12), dp(10), dp(12), dp(10));
+        LinearLayout.LayoutParams nlp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        nlp.bottomMargin = dp(6);
+        ll.addView(note, nlp);
+
+        final TextView statusTv = new TextView(this);
+        statusTv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        statusTv.setTextColor(MUTED);
+        statusTv.setGravity(Gravity.CENTER);
+        LinearLayout.LayoutParams sglp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        sglp.topMargin = dp(12);
+
+        ll.addView(secondaryButton("View what's sent", () -> {
+            statusTv.setTextColor(MUTED);
+            StatusLine.busy(statusTv, "Preparing preview…");
+            final String previewNote = note.getText().toString(); // read the EditText on the main thread (matches the Send path)
+            new Thread(() -> {
+                final String out = sendDaemonMulti("REPORT-ISSUE\n" + reportRequestJson(previewNote, true) + "\n");
+                runOnUiThread(() -> {
+                    statusTv.setText("");
+                    if (out == null || out.trim().isEmpty() || out.trim().startsWith("ERR")) {
+                        StatusLine.error(statusTv, "Couldn't build the preview.");
+                        return;
+                    }
+                    showReportPreview(out);
+                });
+            }).start();
+        }), btnLp(dp(6)));
+
+        ll.addView(accentButton("Send report", () -> new android.app.AlertDialog.Builder(this)
+                .setTitle("Send report?")
+                .setMessage("Your device info and scrubbed diagnostics will be sent to support. This can't be traced "
+                        + "back to you. Continue?")
+                .setNegativeButton("Cancel", (d, w) -> {})
+                .setPositiveButton("Send", (d, w) -> {
+                    statusTv.setTextColor(MUTED);
+                    StatusLine.busy(statusTv, "Sending…");
+                    final String noteText = note.getText().toString();
+                    new Thread(() -> {
+                        final String reply = sendDaemon("REPORT-ISSUE\n" + reportRequestJson(noteText, false) + "\n").trim();
+                        runOnUiThread(() -> renderReportResult(reply, statusTv, noteText));
+                    }).start();
+                }).show()), btnLp(dp(10)));
+
+        ll.addView(statusTv, sglp);
+        ticketTable(ll); // past reports (persisted locally, rides the profile seal)
+        finishMenuScreen(ll);
+    }
+
+    /** NWP-20261119-16: Profile › Help, the session's pages from HelpPages (decision 2026-10-31, Part B, B1). The list
+     *  is HelpPages.TITLES itself. NWP-20261126-08 (decision 2026-11-03, docs/product-decisions.md, "... Profile Help's
+     *  cards show where to tap", NWP-20261103-24): each topic row is its icon and title, and a tap opens the topic IN
+     *  PLACE, under its row, closing any other open topic; a second tap closes it. Entered from the Profile hub. */
+    private void showHelp() {
+        LinearLayout ll = menuScreen(HelpPages.indexTitle(), "how to use each part of this phone");
+        LinearLayout card = new LinearLayout(this);
+        card.setOrientation(LinearLayout.VERTICAL);
+        GradientDrawable cbg = new GradientDrawable();
+        cbg.setColor(FIELD_BG);
+        cbg.setCornerRadius(dp(14));
+        cbg.setStroke(dp(1), FIELD_LN);
+        card.setBackground(cbg);
+        LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        clp.topMargin = dp(20);
+        ll.addView(card, clp);
+        final Runnable[] close = new Runnable[HelpPages.TITLES.length];
+        final int[] open = {-1};
+        for (int i = 0; i < HelpPages.TITLES.length; i++) {
+            final int k = i;
+            if (i > 0) {
+                View div = new View(this);
+                div.setBackgroundColor(FIELD_LN);
+                LinearLayout.LayoutParams dlp = new LinearLayout.LayoutParams(MATCH, Math.max(1, dp(0.5f)));
+                dlp.leftMargin = dp(16);
+                card.addView(div, dlp);
+            }
+            LinearLayout row = new LinearLayout(this);
+            row.setOrientation(LinearLayout.HORIZONTAL);
+            row.setGravity(Gravity.CENTER_VERTICAL);
+            row.setPadding(dp(16), dp(12), dp(16), dp(12));
+            helpTopicIcon(row, i, 32);
+            TextView t = new TextView(this);
+            t.setText(HelpPages.TITLES[i]);
+            t.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
+            t.setTextColor(INK);
+            LinearLayout.LayoutParams tlp = new LinearLayout.LayoutParams(0, WRAP, 1f);
+            tlp.leftMargin = dp(14);
+            row.addView(t, tlp);
+            card.addView(row, new LinearLayout.LayoutParams(MATCH, WRAP));
+            final LinearLayout body = new LinearLayout(this);
+            body.setOrientation(LinearLayout.VERTICAL);
+            body.setPadding(dp(16), 0, dp(16), dp(14));
+            body.setVisibility(View.GONE);
+            card.addView(body, new LinearLayout.LayoutParams(MATCH, WRAP));
+            // Closing a topic removes its views: the picture detaches, so its listener stops and drops it.
+            close[i] = () -> {
+                body.removeAllViews();
+                body.setVisibility(View.GONE);
+                if (open[0] == k) open[0] = -1;
+            };
+            row.setOnClickListener(v -> {
+                boolean was = open[0] == k;
+                if (open[0] >= 0) close[open[0]].run();
+                if (was) return;
+                body.setVisibility(View.VISIBLE);
+                showHelpPage(body, k, close[k]);
+                open[0] = k;
+                body.post(() -> body.requestRectangleOnScreen(
+                        new android.graphics.Rect(0, 0, body.getWidth(), body.getHeight()), false));
+            });
+        }
+        finishMenuScreen(ll);
+    }
+
+    /** NWP-20261122-08, NWP-20261126-08: one Help topic as step cards, built into ll, the topic's body under its row in
+     *  showHelp (decisions 2026-11-02 and 2026-11-03, docs/product-decisions.md). Each card is its path as chips
+     *  (HelpCards.path), a drawn panel of the menu with the row to tap highlighted (HelpCards.panel; the topic's icon
+     *  when the step has no path or the menu is not known), HelpCards.text and the card's second line, then the
+     *  position and one dot a card. The picture slot HelpCards.slotName(page, card) stays GONE until its WebP lands;
+     *  then the picture shows in place of the panel. Back / Next and a horizontal fling move between cards, and the
+     *  support-pages line shows under the last card. Back on the first card runs close: the topic closes, the list
+     *  stays. */
+    private void showHelpPage(LinearLayout ll, int page, Runnable close) {
+        final String[][] cards = HelpCards.cards(HelpPages.steps(page));
+        final int[] at = {0};
+        final java.util.Set<String> failed = new java.util.HashSet<>();
+
+        LinearLayout area = new LinearLayout(this);
+        area.setOrientation(LinearLayout.VERTICAL);
+        final LinearLayout chips = new LinearLayout(this);
+        chips.setOrientation(LinearLayout.HORIZONTAL);
+        chips.setGravity(Gravity.CENTER_VERTICAL);
+        area.addView(chips, new LinearLayout.LayoutParams(MATCH, WRAP));
+        final android.widget.ImageView pic = new android.widget.ImageView(this);
+        pic.setAdjustViewBounds(true);
+        pic.setScaleType(android.widget.ImageView.ScaleType.FIT_CENTER);
+        pic.setMaxHeight(getResources().getDisplayMetrics().heightPixels / 2);
+        pic.setVisibility(View.GONE);
+        // The topic closes or the screen leaves (another screen replaces it): stop and drop the shown picture.
+        pic.addOnAttachStateChangeListener(new View.OnAttachStateChangeListener() {
+            @Override public void onViewAttachedToWindow(View v) {}
+            @Override public void onViewDetachedFromWindow(View v) { helpCardDrop(pic); }
+        });
+        LinearLayout.LayoutParams pclp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        pclp.topMargin = dp(12);
+        area.addView(pic, pclp);
+        final LinearLayout fig = new LinearLayout(this);
+        fig.setOrientation(LinearLayout.VERTICAL);
+        fig.setGravity(Gravity.CENTER_HORIZONTAL);
+        LinearLayout.LayoutParams flp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        flp.topMargin = dp(12);
+        area.addView(fig, flp);
+        final TextView text = new TextView(this);
+        text.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
+        text.setTextColor(INK);
+        text.setLineSpacing(dp(3), 1f);
+        LinearLayout.LayoutParams tlp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        tlp.topMargin = dp(14);
+        area.addView(text, tlp);
+        LinearLayout.LayoutParams alp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        alp.topMargin = dp(10);
+        ll.addView(area, alp);
+
+        final TextView pos = new TextView(this);
+        pos.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        pos.setTextColor(MUTED);
+        pos.setGravity(Gravity.CENTER);
+        LinearLayout.LayoutParams plp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        plp.topMargin = dp(16);
+        ll.addView(pos, plp);
+
+        final TextView dots = new TextView(this);
+        dots.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10);
+        dots.setTextColor(MUTED);
+        dots.setGravity(Gravity.CENTER);
+        dots.setLetterSpacing(0.1f);
+        LinearLayout.LayoutParams dlp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        dlp.topMargin = dp(4);
+        ll.addView(dots, dlp);
+
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        final TextView back = new TextView(this);
+        back.setText(HelpCards.BACK);
+        final TextView next = new TextView(this);
+        next.setText(HelpCards.NEXT);
+        for (TextView b : new TextView[] {back, next}) {
+            b.setTextColor(ACCENT);
+            b.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+            b.setPadding(dp(8), dp(12), dp(8), dp(12));
+        }
+        row.addView(back, new LinearLayout.LayoutParams(WRAP, WRAP));
+        row.addView(new View(this), new LinearLayout.LayoutParams(0, WRAP, 1f));
+        row.addView(next, new LinearLayout.LayoutParams(WRAP, WRAP));
+        LinearLayout.LayoutParams rlp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        rlp.topMargin = dp(6);
+        ll.addView(row, rlp);
+
+        final TextView more = new TextView(this);
+        more.setText(HelpPages.moreLine());
+        more.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        more.setTextColor(MUTED);
+        more.setLineSpacing(dp(3), 1f);
+        more.setVisibility(View.GONE);
+        LinearLayout.LayoutParams mlp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        mlp.topMargin = dp(16);
+        ll.addView(more, mlp);
+
+        // go moves dir cards (1, -1, or 0 for the first draw) and redraws the card: only that card's picture decodes.
+        final java.util.function.IntConsumer go = dir -> {
+            if (cards.length == 0) { more.setVisibility(View.VISIBLE); return; }
+            at[0] = HelpCards.next(at[0], cards.length, dir);
+            boolean last = at[0] == cards.length - 1;
+            String[] path = HelpCards.path(cards[at[0]][0]);
+            helpCardChips(chips, path);
+            helpCardPicture(pic, page, at[0], failed);
+            fig.removeAllViews();
+            if (pic.getVisibility() == View.VISIBLE) {
+                fig.setVisibility(View.GONE);
+            } else {
+                fig.setVisibility(View.VISIBLE);
+                HelpCards.Panel panel = HelpCards.panel(path);
+                if (panel != null) helpCardPanel(fig, panel);
+                else helpTopicIcon(fig, page, 64);
+            }
+            String[] lines = cards[at[0]].clone();
+            lines[0] = HelpCards.text(lines[0]);
+            text.setText(String.join("\n", lines));
+            pos.setText(HelpCards.position(at[0], cards.length));
+            dots.setText(HelpCards.dots(at[0], cards.length));
+            next.setVisibility(last ? View.INVISIBLE : View.VISIBLE);
+            more.setVisibility(last ? View.VISIBLE : View.GONE);
+        };
+        // Back on the first card closes the topic, and the list stays; a fling does what Back / Next do.
+        final java.util.function.IntConsumer swipe = dir -> {
+            if (dir < 0 && at[0] == 0) close.run();
+            else go.accept(dir);
+        };
+        back.setOnClickListener(v -> swipe.accept(-1));
+        next.setOnClickListener(v -> swipe.accept(1));
+        helpCardFling(area, swipe);
+        go.accept(0);
+    }
+
+    /** NWP-20261122-08: show a card's picture, or collapse its slot. Only this card's image is decoded, on the UI
+     *  thread, after the previous one is stopped and dropped. No drawable named HelpCards.slotName(page, card) (its
+     *  WebP has not landed) makes the slot GONE. A decode error collapses the slot and logs one line, the slot and the
+     *  error class only; `failed` keeps that slot from being decoded, and logged, again on this screen. An animated
+     *  WebP loops; it has no sound track. */
+    private void helpCardPicture(android.widget.ImageView pic, int page, int card, java.util.Set<String> failed) {
+        helpCardDrop(pic);
+        int id = getResources().getIdentifier(HelpCards.slotName(page, card), "drawable", getPackageName());
+        if (id == 0) { pic.setVisibility(View.GONE); return; }
+        if (failed.contains(HelpCards.slotName(page, card))) { pic.setVisibility(View.GONE); return; }
+        final int maxW = getResources().getDisplayMetrics().widthPixels;
+        try {
+            android.graphics.drawable.Drawable d = android.graphics.ImageDecoder.decodeDrawable(
+                    android.graphics.ImageDecoder.createSource(getResources(), id), (dec, info, src) -> {
+                        int s = 1;
+                        while (info.getSize().getWidth() / (s * 2) >= maxW) s *= 2;
+                        dec.setTargetSampleSize(s);
+                    });
+            if (d instanceof android.graphics.drawable.AnimatedImageDrawable) {
+                android.graphics.drawable.AnimatedImageDrawable anim =
+                        (android.graphics.drawable.AnimatedImageDrawable) d;
+                anim.setRepeatCount(android.graphics.drawable.AnimatedImageDrawable.REPEAT_INFINITE);
+                anim.start();
+            }
+            pic.setImageDrawable(d);
+            pic.setVisibility(View.VISIBLE);
+        } catch (java.io.IOException | RuntimeException e) {
+            failed.add(HelpCards.slotName(page, card));
+            pic.setVisibility(View.GONE);
+            Log.w("NowhereChooser", String.join(" ", "help card picture not decoded, slot collapsed:",
+                    HelpCards.slotName(page, card), e.getClass().getSimpleName()));
+        }
+    }
+
+    /** NWP-20261122-08: stop the shown card's animation, if it has one, and drop its picture. */
+    private void helpCardDrop(android.widget.ImageView pic) {
+        android.graphics.drawable.Drawable old = pic.getDrawable();
+        if (old instanceof android.graphics.drawable.AnimatedImageDrawable) {
+            ((android.graphics.drawable.AnimatedImageDrawable) old).stop();
+        }
+        pic.setImageDrawable(null);
+    }
+
+    /** NWP-20261122-08: a horizontal fling on the card does what Back / Next do (to the left = Next, to the right =
+     *  Back). A mostly vertical drag is left to the ScrollView. */
+    private void helpCardFling(View area, java.util.function.IntConsumer swipe) {
+        final int min = dp(48);
+        final android.view.GestureDetector g = new android.view.GestureDetector(this,
+                new android.view.GestureDetector.SimpleOnGestureListener() {
+                    @Override public boolean onDown(android.view.MotionEvent e) { return true; }
+                    @Override public boolean onFling(android.view.MotionEvent e1, android.view.MotionEvent e2,
+                                                     float vx, float vy) {
+                        if (e1 == null) return false;
+                        float dx = e2.getX() - e1.getX();
+                        float dy = e2.getY() - e1.getY();
+                        if (Math.abs(dx) < min || Math.abs(dx) <= Math.abs(dy)) return false;
+                        swipe.accept(dx < 0 ? 1 : -1);
+                        return true;
+                    }
+                });
+        area.setOnTouchListener((v, e) -> g.onTouchEvent(e));
+    }
+
+    /** NWP-20261126-08: a topic's icon, HelpCards.icon(page), in a circle sizeDp across: left of the title in the Help
+     *  list, centered on a card whose step has no panel. */
+    private void helpTopicIcon(LinearLayout into, int page, int sizeDp) {
+        TextView t = new TextView(this);
+        t.setText(HelpCards.icon(page));
+        t.setGravity(Gravity.CENTER);
+        t.setTextColor(ACCENT);
+        t.setTextSize(TypedValue.COMPLEX_UNIT_SP, sizeDp / 2f);
+        t.setIncludeFontPadding(false);
+        GradientDrawable bg = new GradientDrawable();
+        bg.setShape(GradientDrawable.OVAL);
+        bg.setColor(BG);
+        bg.setStroke(dp(1), FIELD_LN);
+        t.setBackground(bg);
+        into.addView(t, new LinearLayout.LayoutParams(dp(sizeDp), dp(sizeDp)));
+    }
+
+    /** NWP-20261126-08: a card's path as chips, one small rounded label a path element, HelpCards.chipSep() between
+     *  two. No path makes the row GONE. A later chip gets only the width that is left, so it ellipsizes on a narrow
+     *  screen; there is no HorizontalScrollView, which would take the card's horizontal fling. */
+    private void helpCardChips(LinearLayout into, String[] path) {
+        into.removeAllViews();
+        into.setVisibility(path.length == 0 ? View.GONE : View.VISIBLE);
+        for (int k = 0; k < path.length; k++) {
+            if (k > 0) {
+                TextView s = new TextView(this);
+                s.setText(HelpCards.chipSep());
+                s.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+                s.setTextColor(MUTED);
+                into.addView(s, new LinearLayout.LayoutParams(WRAP, WRAP));
+            }
+            TextView c = new TextView(this);
+            c.setText(path[k]);
+            c.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+            c.setTextColor(INK);
+            c.setSingleLine(true);
+            c.setEllipsize(android.text.TextUtils.TruncateAt.END);
+            c.setPadding(dp(8), dp(3), dp(8), dp(3));
+            GradientDrawable bg = new GradientDrawable();
+            bg.setColor(BG);
+            bg.setStroke(dp(1), FIELD_LN);
+            bg.setCornerRadius(dp(10));
+            c.setBackground(bg);
+            into.addView(c, new LinearLayout.LayoutParams(WRAP, WRAP));
+        }
+    }
+
+    /** NWP-20261126-08: a drawn menu panel, no screenshot: a bordered box headed with the menu's name, then its rows
+     *  (at most HelpCards.PANEL_ROWS), the row to tap in ACCENT on a filled background. */
+    private void helpCardPanel(LinearLayout into, HelpCards.Panel p) {
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setPadding(dp(10), dp(10), dp(10), dp(10));
+        GradientDrawable bg = new GradientDrawable();
+        bg.setColor(BG);
+        bg.setStroke(dp(1), FIELD_LN);
+        bg.setCornerRadius(dp(12));
+        box.setBackground(bg);
+        TextView h = new TextView(this);
+        h.setText(p.title);
+        h.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
+        h.setTextColor(MUTED);
+        h.setPadding(dp(10), 0, dp(10), dp(6));
+        box.addView(h, new LinearLayout.LayoutParams(MATCH, WRAP));
+        for (int r = 0; r < p.rows.length; r++) {
+            TextView t = new TextView(this);
+            t.setText(p.rows[r]);
+            t.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+            t.setSingleLine(true);
+            t.setEllipsize(android.text.TextUtils.TruncateAt.END);
+            t.setPadding(dp(10), dp(8), dp(10), dp(8));
+            if (r == p.hi) {
+                t.setTextColor(ACCENT);
+                GradientDrawable hb = new GradientDrawable();
+                hb.setColor(GatePalette.withAlpha(ACCENT, 0x26));
+                hb.setStroke(dp(1), ACCENT);
+                hb.setCornerRadius(dp(8));
+                t.setBackground(hb);
+            } else {
+                t.setTextColor(INK);
+            }
+            box.addView(t, new LinearLayout.LayoutParams(MATCH, WRAP));
+        }
+        LinearLayout.LayoutParams blp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        blp.leftMargin = dp(24);
+        blp.rightMargin = dp(24);
+        into.addView(box, blp);
+    }
+
+    /** The device status keys of a session's report (NWP-20261126-02: shared with DiagReportJob's scheduled report). */
+    static org.json.JSONObject reportStatus(android.content.Context ctx) throws org.json.JSONException {
+        org.json.JSONObject st = new org.json.JSONObject();
+        st.put("device", android.os.Build.MODEL);
+        st.put("os_build", android.os.Build.FINGERPRINT);
+        st.put("android_sdk", String.valueOf(android.os.Build.VERSION.SDK_INT)); // NWP-20260819-01 review: same wire bug as the gate reporter -- Status is map[string]string daemon-side
+        try {
+            st.put("chooser_version", ctx.getPackageManager().getPackageInfo(ctx.getPackageName(), 0).versionName);
+        } catch (Exception ignore) {}
+        return st;
+    }
+
+    /** Build the one-line JSON the daemon reads: note + device status (+ preview flag). org.json escapes newlines
+     *  so a multi-line note stays a single wire line. The daemon re-scrubs everything; this is only what WE can
+     *  gather (the confined daemon lacks the Android build/version/package APIs). */
+    private String reportRequestJson(String note, boolean preview) {
+        try {
+            org.json.JSONObject o = new org.json.JSONObject();
+            o.put("note", note == null ? "" : note);
+            o.put("preview", preview);
+            org.json.JSONObject st = reportStatus(this);
+            // NWP-20261126-02: with "Send diagnostic reports" on, a by-hand report carries the same tag as the
+            // scheduled ones; with it off, neither key.
+            String tag = DiagReportJob.readFile(this, DiagReports.TAG_FILE).trim();
+            if (DiagReports.optedIn(DiagReportJob.readFile(this, DiagReports.OPT_FILE)) && DiagReports.tagOk(tag)) {
+                for (java.util.Map.Entry<String, String> e : DiagReports.status(tag, false).entrySet()) st.put(e.getKey(), e.getValue());
+            }
+            o.put("status", st);
+            // NWP-20261128-17 (Q121): this session's app crashes from DropBox, start-time and user filtered, and the
+            // read's outcome in every in-session report: crash_access is the decision's PEEK_DROPBOX_DATA check. Both
+            // callers run on the report's worker thread. The agent drops both keys at the gate and scrubs the stacks.
+            CrashRecords.Result cr = CrashRecords.read(this);
+            o.put("crash_access", cr.access);
+            if ("ok".equals(cr.access) && !cr.crashes.isEmpty()) o.put("crashes", new org.json.JSONArray(cr.crashes));
+            return o.toString();
+        } catch (Exception e) {
+            return "{\"preview\":" + preview + "}";
+        }
+    }
+
+    /** Show the exact scrubbed report bytes (from the daemon's preview) on a full screen of their own, over the
+     *  Report an issue screen so the note typed there stays as it is (NWP-20261113-39): a search (n of m, previous /
+     *  next, every match highlighted) and a Section and a Tag filter. ReportPreviewFilter only drops lines, so what is
+     *  shown is still the preview's own bytes; nothing new is read, and neither the preview nor the query is logged. */
+    private void showReportPreview(String text) {
+        final android.app.Dialog dlg = new android.app.Dialog(this,
+                android.R.style.Theme_DeviceDefault_NoActionBar_Fullscreen);
+        LinearLayout root = new LinearLayout(this);
+        root.setOrientation(LinearLayout.VERTICAL);
+        root.setBackgroundColor(BG);
+        root.setPadding(dp(16), dp(16), dp(16), dp(12));
+
+        TextView title = new TextView(this);
+        title.setText("What's sent");
+        title.setTextColor(INK);
+        title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 18);
+        root.addView(title, new LinearLayout.LayoutParams(MATCH, WRAP));
+
+        // Search row: the field (a SafeEdit, as the note box: a long-press on a bare EditText crashes this app),
+        // the "n of m" count, Prev and Next.
+        LinearLayout srow = new LinearLayout(this);
+        srow.setOrientation(LinearLayout.HORIZONTAL);
+        srow.setGravity(Gravity.CENTER_VERTICAL);
+        final EditText search = new SafeEdit(this);
+        search.setHint("Search");
+        search.setSingleLine(true);
+        search.setTextColor(FIELD_TX);
+        search.setHintTextColor(HINT);
+        search.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        search.setBackgroundColor(FIELD_BG);
+        search.setPadding(dp(10), dp(8), dp(10), dp(8));
+        srow.addView(search, new LinearLayout.LayoutParams(0, WRAP, 1f));
+        final TextView count = new TextView(this);
+        count.setTextColor(MUTED);
+        count.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        count.setPadding(dp(8), 0, dp(4), 0);
+        srow.addView(count, new LinearLayout.LayoutParams(WRAP, WRAP));
+        Button prev = new Button(this);
+        prev.setText("Prev");
+        Button next = new Button(this);
+        next.setText("Next");
+        for (Button b : new Button[] {prev, next}) {
+            b.setAllCaps(false);
+            b.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+            b.setTextColor(ACCENT);
+            b.setBackgroundColor(BG);
+            b.setMinWidth(0);
+            b.setMinimumWidth(0);
+            b.setPadding(dp(10), dp(6), dp(10), dp(6));
+            srow.addView(b, new LinearLayout.LayoutParams(WRAP, WRAP));
+        }
+        LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        slp.topMargin = dp(12);
+        root.addView(srow, slp);
+
+        // Filter row: Section (All + "status" + each log) and Tag (All + each leading [tag]). Position 0 is All.
+        final java.util.List<String> secs = new java.util.ArrayList<>();
+        secs.add("All");
+        secs.addAll(ReportPreviewFilter.sections(text));
+        final java.util.List<String> tags = new java.util.ArrayList<>();
+        tags.add("All");
+        tags.addAll(ReportPreviewFilter.tags(text));
+        LinearLayout frow = new LinearLayout(this);
+        frow.setOrientation(LinearLayout.HORIZONTAL);
+        frow.setGravity(Gravity.CENTER_VERTICAL);
+        final android.widget.Spinner secSp = new android.widget.Spinner(this);
+        final android.widget.Spinner tagSp = new android.widget.Spinner(this);
+        String[] labels = {"Section", "Tag"};
+        android.widget.Spinner[] sps = {secSp, tagSp};
+        java.util.List<java.util.List<String>> items = java.util.Arrays.asList(secs, tags);
+        for (int i = 0; i < 2; i++) {
+            TextView lab = new TextView(this);
+            lab.setText(labels[i]);
+            lab.setTextColor(MUTED);
+            lab.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+            lab.setPadding(i == 0 ? 0 : dp(8), 0, dp(4), 0);
+            frow.addView(lab, new LinearLayout.LayoutParams(WRAP, WRAP));
+            // Item colours set here, not left to the theme, so the text reads on BG whatever the dialog theme is.
+            android.widget.ArrayAdapter<String> ad = new android.widget.ArrayAdapter<String>(this,
+                    android.R.layout.simple_spinner_item, items.get(i)) {
+                @Override public View getView(int pos, View cv, android.view.ViewGroup parent) {
+                    return paint(super.getView(pos, cv, parent));
+                }
+                @Override public View getDropDownView(int pos, View cv, android.view.ViewGroup parent) {
+                    return paint(super.getDropDownView(pos, cv, parent));
+                }
+                private View paint(View v) {
+                    if (v instanceof TextView) {
+                        ((TextView) v).setTextColor(INK);
+                        ((TextView) v).setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+                        ((TextView) v).setSingleLine(true);
+                        ((TextView) v).setEllipsize(android.text.TextUtils.TruncateAt.END);
+                    }
+                    v.setBackgroundColor(FIELD_BG);
+                    v.setPadding(dp(10), dp(8), dp(10), dp(8));
+                    return v;
+                }
+            };
+            ad.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+            sps[i].setAdapter(ad);
+            sps[i].setPopupBackgroundDrawable(new android.graphics.drawable.ColorDrawable(FIELD_BG));
+            frow.addView(sps[i], new LinearLayout.LayoutParams(0, WRAP, 1f));
+        }
+        LinearLayout.LayoutParams flp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        flp.topMargin = dp(8);
+        root.addView(frow, flp);
+
+        // The text: the same monospace, selectable view as before, now over the filtered preview.
+        final TextView tv = new TextView(this);
+        tv.setTextColor(INK);
+        tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
+        tv.setTypeface(android.graphics.Typeface.MONOSPACE);
+        tv.setPadding(dp(4), dp(12), dp(4), dp(12));
+        tv.setTextIsSelectable(true);
+        final android.widget.ScrollView scroll = new android.widget.ScrollView(this);
+        scroll.addView(tv);
+        LinearLayout.LayoutParams tlp = new LinearLayout.LayoutParams(MATCH, 0, 1f);
+        tlp.topMargin = dp(8);
+        root.addView(scroll, tlp);
+
+        root.addView(secondaryButton("Close", dlg::dismiss), btnLp(dp(8)));
+
+        // State: the filtered text, the query's match offsets in it, and the current match.
+        final String[] shown = {text};
+        final int[][] hits = {new int[0]};
+        final int[] cur = {0};
+        final Runnable render = () -> {
+            final String q = search.getText().toString();
+            final int[] h = hits[0];
+            android.text.SpannableString ss = new android.text.SpannableString(shown[0]);
+            // Every match is marked (up to 2000, so a one-letter query does not stall the UI); the current one stands out.
+            for (int i = 0; i < h.length && i < 2000; i++) {
+                if (i == cur[0]) continue;
+                ss.setSpan(new android.text.style.BackgroundColorSpan(FIELD_LN), h[i], h[i] + q.length(),
+                        android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+            }
+            if (h.length > 0) {
+                ss.setSpan(new android.text.style.BackgroundColorSpan(ACCENT), h[cur[0]], h[cur[0]] + q.length(),
+                        android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+                ss.setSpan(new android.text.style.ForegroundColorSpan(ON_ACCENT), h[cur[0]], h[cur[0]] + q.length(),
+                        android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+            }
+            tv.setText(ss, TextView.BufferType.SPANNABLE);
+            count.setText(q.isEmpty() ? "" : h.length == 0 ? "0 of 0" : (cur[0] + 1) + " of " + h.length);
+            if (h.length > 0) {
+                final int at = h[cur[0]];
+                tv.post(() -> {
+                    android.text.Layout lay = tv.getLayout(); // null before the first layout pass
+                    if (lay != null) scroll.smoothScrollTo(0, lay.getLineTop(lay.getLineForOffset(at)) + tv.getPaddingTop());
+                });
+            }
+        };
+        // A new query or filter: re-filter, search the filtered text, start at its first match.
+        final Runnable refresh = () -> {
+            int s = secSp.getSelectedItemPosition(), t = tagSp.getSelectedItemPosition();
+            shown[0] = ReportPreviewFilter.filter(text, s > 0 ? secs.get(s) : null, t > 0 ? tags.get(t) : null);
+            hits[0] = ReportPreviewFilter.matches(shown[0], search.getText().toString());
+            cur[0] = 0;
+            render.run();
+        };
+        search.addTextChangedListener(new android.text.TextWatcher() {
+            @Override public void afterTextChanged(android.text.Editable s) { refresh.run(); }
+            @Override public void beforeTextChanged(CharSequence s, int a, int b, int c) {}
+            @Override public void onTextChanged(CharSequence s, int a, int b, int c) {}
+        });
+        android.widget.AdapterView.OnItemSelectedListener onPick = new android.widget.AdapterView.OnItemSelectedListener() {
+            @Override public void onItemSelected(android.widget.AdapterView<?> p, View v, int pos, long id) { refresh.run(); }
+            @Override public void onNothingSelected(android.widget.AdapterView<?> p) {}
+        };
+        secSp.setOnItemSelectedListener(onPick);
+        tagSp.setOnItemSelectedListener(onPick);
+        prev.setOnClickListener(v -> {
+            int n = hits[0].length;
+            if (n == 0) return;
+            cur[0] = (cur[0] - 1 + n) % n;
+            render.run();
+        });
+        next.setOnClickListener(v -> {
+            int n = hits[0].length;
+            if (n == 0) return;
+            cur[0] = (cur[0] + 1) % n;
+            render.run();
+        });
+        refresh.run();
+
+        dlg.setContentView(root);
+        dlg.setCancelable(true); // Back closes it, as Close does
+        dlg.show();
+    }
+
+    /** Map the daemon's REPORT-ISSUE reply to a user-facing status (and a ticket dialog on success). */
+    private void renderReportResult(String reply, TextView statusTv, String noteText) {
+        if (reply != null && reply.startsWith("OK ")) {
+            final String ticket = reply.substring(3).trim();
+            appendTicket(ticket, noteText); // persist so the user can track it later
+            statusTv.setTextColor(ACCENT);
+            statusTv.setText("Sent · " + ticket);
+            new android.app.AlertDialog.Builder(this)
+                    .setTitle("Report sent")
+                    .setMessage("Thanks. Your reference is:\n\n" + ticket + "\n\nQuote it if you follow up with support. "
+                            + "The report is anonymous.")
+                    .setPositiveButton("Done", (d, w) -> showReportIssue()) // re-render so the new row shows in the table
+                    .show();
+            return;
+        }
+        String msg;
+        if ("ERR-NOGW".equals(reply))          msg = "Support reporting isn't available on this device.";
+        else if ("ERR-DISABLED".equals(reply)) msg = "Support isn't accepting reports right now. Try again later.";
+        else if ("ERR-TOOBIG".equals(reply))   msg = "The report was too large to send.";
+        else if ("ERR-NET".equals(reply) || reply == null || reply.isEmpty())
+                                               msg = "Couldn't reach support. Check your connection and try again.";
+        else                                   msg = "Couldn't send the report (" + reply + ").";
+        StatusLine.error(statusTv, msg);
+    }
+
+    // Past "Report an issue" tickets persist in getFilesDir()/nowhere-tickets.json -- it rides the profile seal
+    // (the roam seal walks the whole roamed-user dir), like nowhere-pins, so a user's tickets follow them across
+    // devices. status is a local "Submitted": the gateway files reports with no status API yet (tracked as the
+    // admin issue-tracking backlog). Capped so the sealed file stays small.
+    private static final int MAX_TICKETS = 50;
+
+    /** The ledger's text: "" when the file is absent, null when it exists but cannot be read (NWP-20261111-24).
+     *  appendTicket acts on the difference: a read failure must never read as "no past reports", or the next
+     *  append rewrites up to MAX_TICKETS references as one. */
+    private String readTicketsText() {
+        java.io.File f = new java.io.File(getFilesDir(), "nowhere-tickets.json");
+        if (!f.exists()) return "";
+        try { return KeepOrder.readText(f); } catch (Throwable t) { return null; }
+    }
+
+    private org.json.JSONArray readTickets() {
+        String text = readTicketsText();
+        if (text == null || text.isEmpty()) return new org.json.JSONArray();
+        try { return new org.json.JSONArray(text); } catch (Throwable t) { return new org.json.JSONArray(); }
+    }
+
+    private void appendTicket(String ticket, String note) {
+        try {
+            // An unreadable ledger is left as it is (the dialog still shows the reference); one that reads but does
+            // not parse (cut by an interrupted write) already shows no rows, so it is replaced (NWP-20261111-24).
+            String text = readTicketsText();
+            if (text == null) { Log.w("NowhereChooser", "nowhere-tickets.json unreadable -- reference not recorded (NWP-20261111-24)"); return; }
+            org.json.JSONArray prev;
+            try { prev = text.isEmpty() ? new org.json.JSONArray() : new org.json.JSONArray(text); }
+            catch (Throwable t) { Log.w("NowhereChooser", "nowhere-tickets.json unparsable -- replaced (NWP-20261111-24)"); prev = new org.json.JSONArray(); }
+            org.json.JSONObject o = new org.json.JSONObject();
+            o.put("ticket", ticket);
+            o.put("raised", System.currentTimeMillis() / 1000L);
+            o.put("status", "Submitted");
+            o.put("note", note == null ? "" : note);
+            org.json.JSONArray out = new org.json.JSONArray();
+            out.put(o); // newest first
+            for (int i = 0; i < prev.length() && out.length() < MAX_TICKETS; i++) out.put(prev.get(i));
+            StoreInstaller.writeAtomic(new java.io.File(getFilesDir(), "nowhere-tickets.json"), out.toString());
+        } catch (Throwable t) { Log.w("NowhereChooser", "appendTicket", t); }
+    }
+
+    /** Render past report tickets as a table (ticket · raised · status, note below) at the bottom of the
+     *  Report-an-issue screen. No-op when there are none. Reuses the sectionCard chrome. */
+    private void ticketTable(LinearLayout parent) {
+        org.json.JSONArray a = readTickets();
+        if (a.length() == 0) return;
+
+        TextView header = new TextView(this);
+        header.setText("PAST REPORTS");
+        header.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
+        header.setTextColor(MUTED);
+        header.setLetterSpacing(0.08f);
+        header.setPadding(dp(8), dp(26), dp(8), dp(8));
+        parent.addView(header, new LinearLayout.LayoutParams(MATCH, WRAP));
+
+        LinearLayout card = new LinearLayout(this);
+        card.setOrientation(LinearLayout.VERTICAL);
+        GradientDrawable cbg = new GradientDrawable();
+        cbg.setColor(FIELD_BG);
+        cbg.setCornerRadius(dp(14));
+        cbg.setStroke(dp(1), FIELD_LN);
+        card.setBackground(cbg);
+        card.setPadding(dp(16), dp(12), dp(16), dp(12));
+
+        for (int i = 0; i < a.length(); i++) {
+            org.json.JSONObject o = a.optJSONObject(i);
+            if (o == null) continue;
+            if (i > 0) {
+                android.view.View div = new android.view.View(this);
+                div.setBackgroundColor(FIELD_LN);
+                LinearLayout.LayoutParams dlp = new LinearLayout.LayoutParams(MATCH, Math.max(1, dp(0.5f)));
+                dlp.topMargin = dp(10); dlp.bottomMargin = dp(10);
+                card.addView(div, dlp);
+            }
+            LinearLayout row = new LinearLayout(this);
+            row.setOrientation(LinearLayout.HORIZONTAL);
+            TextView tkt = new TextView(this);
+            tkt.setText(o.optString("ticket", "—"));
+            tkt.setTextColor(INK);
+            tkt.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+            tkt.setTypeface(android.graphics.Typeface.MONOSPACE);
+            row.addView(tkt, new LinearLayout.LayoutParams(0, WRAP, 2f));
+            TextView when = new TextView(this);
+            when.setText(snapDate(o.optLong("raised", 0)));
+            when.setTextColor(MUTED);
+            when.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+            row.addView(when, new LinearLayout.LayoutParams(0, WRAP, 2f));
+            TextView st = new TextView(this);
+            st.setText(o.optString("status", "Submitted"));
+            st.setTextColor(ACCENT);
+            st.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+            st.setGravity(Gravity.END);
+            row.addView(st, new LinearLayout.LayoutParams(0, WRAP, 1f));
+            card.addView(row, new LinearLayout.LayoutParams(MATCH, WRAP));
+
+            String note = o.optString("note", "");
+            if (!note.isEmpty()) {
+                TextView nt = new TextView(this);
+                nt.setText(note);
+                nt.setTextColor(MUTED);
+                nt.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+                nt.setMaxLines(2);
+                nt.setEllipsize(android.text.TextUtils.TruncateAt.END);
+                LinearLayout.LayoutParams ntlp = new LinearLayout.LayoutParams(MATCH, WRAP);
+                ntlp.topMargin = dp(3);
+                card.addView(nt, ntlp);
+            }
+        }
+        parent.addView(card, new LinearLayout.LayoutParams(MATCH, WRAP));
+    }
+
+    /** #81: enroll a FIDO2 security key as a SECOND FACTOR. After this, signing in needs the passphrase AND a
+     *  touch of this key (the recovery code is the lose-the-key backstop). The FP3 has one USB-C port, so the
+     *  charger must come out while the key is in; the daemon forces USB host mode for the enrollment. */
+    private void showAddSecurityKey() { showAddSecurityKey(null); }
+
+    /** #81: the "Use a security key" screen -- enroll a key (USB or NFC), and list already-enrolled keys with a
+     *  per-key Remove. @param flash, when non-null, is a success banner shown at the top (right after an enroll)
+     *  so the newly added key is immediately visible+removable in the list below -- the confirmation Chester
+     *  asked for ("if it's enrolled, it should let me remove it"). Re-rendering the whole screen also reloads
+     *  loadEnrolledKeys, so the list reflects the new key without a manual back-and-forth. */
+    private void showAddSecurityKey(final String flash) {
+        LinearLayout ll = menuScreen("Use a security key",
+                "add a hardware key as a second factor — sign-in then needs your passphrase AND a tap of the key");
+
+        if (flash != null) {
+            TextView ok = new TextView(this);
+            ok.setText(flash);
+            ok.setTextColor(ACCENT);
+            ok.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
+            ok.setLineSpacing(dp(5), 1f);
+            LinearLayout.LayoutParams flp = new LinearLayout.LayoutParams(MATCH, WRAP);
+            flp.topMargin = dp(18);
+            ll.addView(ok, flp);
+        }
+
+        TextView steps = new TextView(this);
+        steps.setText("USB-C key: 1. Unplug the charger.  2. Plug the key into the USB-C port.  "
+                + "3. Tap Enroll, then touch the key when it blinks (twice).\n\n"
+                + "NFC key: tap “Tap an NFC key”, then hold the key flat to the back of the phone until "
+                + "both steps finish.\n\n"
+                + "Keep your recovery words safe — they're the only way in if you lose the key.");
+        steps.setTextColor(FIELD_TX);
+        steps.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
+        steps.setLineSpacing(dp(5), 1f);
+        LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        slp.topMargin = dp(24);
+        ll.addView(steps, slp);
+
+        final TextView msg = new TextView(this);
+        msg.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        msg.setTextColor(MUTED);
+        msg.setVisibility(android.view.View.GONE);
+        LinearLayout.LayoutParams mlp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        mlp.topMargin = dp(16);
+        ll.addView(msg, mlp);
+
+        final Button enroll = accentBtn("Enroll the key");
+        LinearLayout.LayoutParams elp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        elp.topMargin = dp(22);
+        ll.addView(enroll, elp);
+        enroll.setOnClickListener(v -> {
+            enroll.setEnabled(false);
+            enroll.setText("Touch the key when it blinks…");
+            msg.setVisibility(android.view.View.GONE);
+            new Thread(() -> {
+                // The ENROLL-FIDO2 arm's deadline is 120 s from reading the request; read past it, as ADOPT-FIDO2 does.
+                final String r = DaemonSocket.roundTrip("ENROLL-FIDO2\n", 130000);
+                runOnUiThread(() -> {
+                    final String t = Fido2KeyList.enrollText(r);
+                    if (t == null) {
+                        showAddSecurityKey("Key enrolled ✓\n\nSigning in now needs your passphrase AND this key. "
+                                + "It's listed below — you can remove it any time. Keep your 12-word recovery code "
+                                + "safe; it's the only way in if you lose the key.");
+                    } else if (t.equals(Fido2KeyList.ENROLL_MAY_HAVE_ADDED)) {
+                        showAddSecurityKey(t); // NWP-20261119-11: it may have committed; the re-render reloads the list
+                    } else {
+                        enroll.setEnabled(true);
+                        enroll.setText("Enroll the key");
+                        msg.setTextColor(MUTED);
+                        msg.setText(t);
+                        msg.setVisibility(android.view.View.VISIBLE);
+                    }
+                });
+            }, "nowhere-fido2-enroll").start();
+        });
+
+        // #81 item 5: NFC enroll -- tap the key to the back of the phone instead of the single USB-C port (no
+        // charger to unplug). #143: shown whenever the device HAS NFC hardware (even if the radio is off -- then
+        // the tap opens the NFC toggle), not only when it's already on, so it's never silently hidden. TWO taps
+        // once armed: an NFC key grants ONE user presence per tap
+        // and the ceremony needs two presence-gated ops (makeCredential, then the hmac-secret assertion) -- the
+        // NFC twin of the USB flow's "touch the key twice". The daemon drives CTAP2 in-process and shuttles
+        // APDUs to NfcFido2 (reader mode + IsoDep); BEGIN parks the credId, FINISH writes the same 2FA slot as
+        // the USB path.
+        if (NfcFido2.hasHardware(this)) { // #143: OFFER the NFC path whenever the device HAS NFC, even if it's off
+            final Button nfcBtn = accentBtn("Tap an NFC key");
+            LinearLayout.LayoutParams nlp = new LinearLayout.LayoutParams(MATCH, WRAP);
+            nlp.topMargin = dp(12);
+            ll.addView(nfcBtn, nlp);
+            final Runnable nfcFail = () -> { // shared reset for either tap failing
+                enroll.setEnabled(true);
+                nfcBtn.setEnabled(true);
+                nfcBtn.setText("Tap an NFC key");
+            };
+            nfcBtn.setOnClickListener(v -> {
+                if (!NfcFido2.available(this)) { // #143: NFC hardware present but the radio is OFF -> guide to enable
+                    msg.setTextColor(MUTED);
+                    msg.setText("NFC is off. Turn it on, then tap “Tap an NFC key” again.");
+                    msg.setVisibility(android.view.View.VISIBLE);
+                    // The app can't toggle the radio itself (no WRITE_SECURE_SETTINGS); open the inline NFC toggle
+                    // panel. A re-tap once it's on arms reader mode (this handler re-checks available() on entry).
+                    try {
+                        startActivity(new android.content.Intent(android.provider.Settings.Panel.ACTION_NFC));
+                    } catch (Throwable t) {
+                        try { startActivity(new android.content.Intent(android.provider.Settings.ACTION_NFC_SETTINGS)); }
+                        catch (Throwable t2) { msg.setText("Turn on NFC in Settings, then tap “Tap an NFC key” again."); }
+                    }
+                    return;
+                }
+                enroll.setEnabled(false);
+                nfcBtn.setEnabled(false);
+                nfcBtn.setText("Tap 1 of 2 — hold your key to the phone…");
+                msg.setVisibility(android.view.View.GONE);
+                NfcFido2.run(this, "FIDO2-NFC-ENROLL-BEGIN\n", (ok1, detail1) -> runOnUiThread(() -> {
+                    if (!ok1) {
+                        nfcFail.run();
+                        msg.setTextColor(MUTED);
+                        msg.setText("no-nfc".equals(detail1)
+                                ? "Turn on NFC in Settings, then try again."
+                                : "Couldn't read the key — hold it flat to the back of the phone and try again.");
+                        msg.setVisibility(android.view.View.VISIBLE);
+                        return;
+                    }
+                    // Tap 1 done (credential created). The FINISH re-arms reader mode, which power-cycles the RF
+                    // field -- a still-held key RE-ACTIVATES, and that fresh activation IS the fresh user presence
+                    // the assertion needs (proven on the Yubico C NFC). So the user just keeps holding; lifting and
+                    // re-tapping also works (it's the same fresh-activation path).
+                    nfcBtn.setText("Step 2 of 2 — keep holding the key…");
+                    msg.setTextColor(MUTED);
+                    msg.setText("Almost there — keep the key on the phone (or tap it again) to finish.");
+                    msg.setVisibility(android.view.View.VISIBLE);
+                    NfcFido2.run(this, "FIDO2-NFC-ENROLL-FINISH\n", (ok2, detail2) -> runOnUiThread(() -> {
+                        if (ok2) {
+                            showAddSecurityKey("Key enrolled ✓\n\nSigning in now needs your passphrase AND this key. "
+                                + "It's listed below — you can remove it any time. Keep your 12-word recovery code "
+                                + "safe; it's the only way in if you lose the key.");
+                        } else {
+                            final String t = Fido2KeyList.nfcFinishText(detail2);
+                            if (t.equals(Fido2KeyList.ENROLL_MAY_HAVE_ADDED)) {
+                                showAddSecurityKey(t); // NWP-20261119-11: the write may have committed; reload the list
+                            } else {
+                                nfcFail.run();
+                                msg.setTextColor(MUTED);
+                                msg.setText(t);
+                                msg.setVisibility(android.view.View.VISIBLE);
+                            }
+                        }
+                    }));
+                }));
+            });
+        }
+
+        // #81 multi-key (DIA-20260704-35): a profile that ALREADY has key(s) can add ANOTHER (enroll works the
+        // same) or remove keys one at a time. A container we fill async from LIST-FIDO2 with one row per key,
+        // each with its own "Remove" -- so losing one key revokes JUST it, keeping the others (all-or-nothing
+        // was wrong once multi-key exists, Chester). (Off-thread: sendDaemon is a socket round-trip.)
+        final LinearLayout keyList = new LinearLayout(this);
+        keyList.setOrientation(LinearLayout.VERTICAL);
+        LinearLayout.LayoutParams klp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        klp.topMargin = dp(14);
+        ll.addView(keyList, klp);
+        loadEnrolledKeys(keyList, enroll);
+
+        TextView back = new TextView(this); // Back -> Security (NOT the profile menu); wrap manually so
+        back.setText("Back");               // finishMenuScreen doesn't ALSO add its showConfirm() Back (double-Back bug)
+        back.setTextColor(ACCENT);
+        back.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        back.setGravity(Gravity.CENTER);
+        back.setPadding(dp(8), dp(20), dp(8), dp(8));
+        ll.addView(back, new LinearLayout.LayoutParams(MATCH, WRAP));
+        back.setOnClickListener(v -> { NfcFido2.stop(this); showSecurity(); }); // cancel any pending NFC read
+
+        android.widget.ScrollView sc = new android.widget.ScrollView(this);
+        sc.setBackgroundColor(BG);
+        sc.addView(ll);
+        setContentView(sc);
+    }
+
+    /** #81 multi-key (DIA-20260704-35): fill `keyList` with one row per enrolled key (LIST-FIDO2), each with
+     *  its own "Remove", and set the enroll button's label. Off the main thread (socket round-trip). Called on
+     *  entry and after each removal to refresh. When zero keys, the list is empty and the button says "Enroll
+     *  the key"; with one+, it says "Add another key". */
+    private void loadEnrolledKeys(final LinearLayout keyList, final Button enroll) {
+        // Spinner while LIST-FIDO2 runs off-thread (a socket round-trip). Without it the list just sits empty
+        // and the enrolled keys pop in silently "after a while" with no feedback -- mirror the offline-media
+        // loader so entering the screen (and refreshing after a removal) visibly reads as "working". The
+        // worker's keyList.removeAllViews() below clears this loader when the real rows land.
+        keyList.removeAllViews();
+        final LinearLayout loading = new LinearLayout(this);
+        loading.setOrientation(LinearLayout.HORIZONTAL);
+        loading.setGravity(Gravity.CENTER);
+        loading.setPadding(0, dp(16), 0, dp(4));
+        TextView lt = new TextView(this);
+        StatusLine.busy(lt, "Loading your security keys…"); // NWP-20261007-13: the spinner rides the line
+        lt.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        loading.addView(lt, new LinearLayout.LayoutParams(WRAP, WRAP));
+        keyList.addView(loading, new LinearLayout.LayoutParams(MATCH, WRAP));
+
+        new Thread(() -> {
+            // sendDaemonMulti, NOT sendDaemon: LIST-FIDO2 streams "OK <n>" + one line per key, and sendDaemon
+            // reads only the FIRST line -- which made this list render empty forever (found via the NFC enroll:
+            // the store head PROVABLY had two slots while the UI showed none).
+            final String reply = sendDaemonMulti("LIST-FIDO2\n");
+            // NWP-20261114-29: only the FIRST line is the header -- a credID is standard base64 and can begin "OK",
+            // so a loop that skipped every "OK..." line hid that key. NWP-20261006-23: null (ERR, "" = no reply) is
+            // not an answer; it used to render as an empty list under "Enroll the key".
+            final java.util.List<String[]> keys = Fido2KeyList.parse(reply); // {credID, added, transport, label}
+            final boolean answered = keys != null;
+            runOnUiThread(() -> {
+                keyList.removeAllViews();
+                if (!answered) {
+                    TextView e = new TextView(this);
+                    e.setText("Couldn't read your security keys just now. Go back and open this screen again in a moment.");
+                    e.setTextColor(MUTED);
+                    e.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+                    keyList.addView(e, new LinearLayout.LayoutParams(MATCH, WRAP));
+                    return;
+                }
+                enroll.setText(keys.isEmpty() ? "Enroll the key" : "Add another key");
+                int n = 0;
+                for (String[] k : keys) {
+                    n++;
+                    final String credID = k[0];
+                    long added = 0;
+                    try { added = Long.parseLong(k[1]); } catch (Exception ignore) {}
+                    String transport = k[2];
+                    // Name a key by its transport ("USB-C key" / "NFC key") so two keys aren't both "Security key";
+                    // a user nickname (k[3]) wins when set, and a legacy slot with no recorded transport ("-"/"")
+                    // falls back to the generic "Security key N".
+                    String kind = "nfc".equals(transport) ? "NFC key"
+                            : "usb".equals(transport) ? "USB-C key"
+                            : "Security key";
+                    String label = !k[3].isEmpty() ? k[3] : kind + " " + n;
+                    String when = added > 0
+                            ? "added " + android.text.format.DateFormat.getDateFormat(this).format(new java.util.Date(added * 1000L))
+                            : "";
+                    LinearLayout row = new LinearLayout(this);
+                    row.setOrientation(LinearLayout.HORIZONTAL);
+                    row.setPadding(dp(4), dp(10), dp(4), dp(10));
+                    TextView name = new TextView(this);
+                    name.setText(when.isEmpty() ? label : label + "  ·  " + when);
+                    name.setTextColor(FIELD_TX);
+                    name.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
+                    LinearLayout.LayoutParams nlp = new LinearLayout.LayoutParams(0, WRAP, 1f);
+                    nlp.gravity = Gravity.CENTER_VERTICAL;
+                    row.addView(name, nlp);
+                    TextView rm = new TextView(this);
+                    rm.setText("Remove");
+                    rm.setTextColor(ERROR_TX);
+                    rm.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+                    rm.setPadding(dp(12), dp(4), dp(4), dp(4));
+                    final boolean last = keys.size() == 1;
+                    rm.setOnClickListener(v -> confirmRemoveKey(credID, label, last, keyList, enroll));
+                    row.addView(rm, new LinearLayout.LayoutParams(WRAP, WRAP));
+                    keyList.addView(row);
+                }
+            });
+        }, "nowhere-fido2-list").start();
+    }
+
+    /** Confirm + remove ONE key. Removing the LAST one is a downgrade to passphrase-only, so its dialog says
+     *  so; removing one of several just revokes that key. The recovery code is unaffected either way.
+     *  NWP-20261127-02 (h53 #3): the removal then needs a FRESH tap -- of one of the other keys, or of this key when
+     *  it is the last one; the key answer cached at sign-in does not count. USB-C only: a key that answers only by
+     *  NFC cannot confirm a removal yet, and the daemon's ERR-NOKEY reads "Plug in one of your keys to remove a key." */
+    private void confirmRemoveKey(final String credID, String label, boolean last,
+                                  final LinearLayout keyList, final Button enroll) {
+        String msg = last
+                ? "This is your only security key. Removing it means signing in needs just your passphrase "
+                  + "again — no key. You can add one back any time. Your recovery code is unchanged."
+                : "Sign-in will still need one of your other keys. Your recovery code is unchanged.";
+        final String tapMsg = last
+                ? "Touch this key to confirm."
+                : "Touch one of your other keys to confirm. The key you're removing doesn't count.";
+        new android.app.AlertDialog.Builder(this)
+                .setTitle("Remove " + label + "?")
+                .setNegativeButton("Keep it", (d, w) -> {})
+                .setPositiveButton("Remove", (d, w) -> new android.app.AlertDialog.Builder(this)
+                        .setTitle("Confirm with a key")
+                        .setMessage(tapMsg)
+                        .setNegativeButton("Cancel", (d2, w2) -> {})
+                        .setPositiveButton("USB-C key", (d2, w2) -> {
+                            final android.app.AlertDialog working =
+                                    showWorking("Plug in your security key and touch it when it blinks.");
+                            // The daemon's REMOVE-FIDO2-KEY deadline is 220 s from when it has READ the request (the
+                            // tap, then the paid vault write): read past it, as ADOPT-FIDO2's caller does.
+                            new Thread(() -> {
+                                final String r = DaemonSocket.roundTrip("REMOVE-FIDO2-KEY\n" + credID + "\n", 230000);
+                                runOnUiThread(() -> {
+                                    // NWP-20261116-29: the text for every reply comes from Fido2KeyList.removeText, and
+                                    // the list is reloaded on EVERY reply. A lost reply ("") can follow a vault write
+                                    // that committed, so the screen shows the daemon's list, never the old one on a guess.
+                                    working.dismiss();
+                                    android.widget.Toast.makeText(this, Fido2KeyList.removeText(r),
+                                            android.widget.Toast.LENGTH_LONG).show();
+                                    loadEnrolledKeys(keyList, enroll);
+                                });
+                            }, "nowhere-fido2-remove").start();
+                        })
+                        .show())
+                .setMessage(msg)
+                .show();
+    }
+
+    /** #81 item 3 (DIA-20260704-40): the remembered session PIN. A 4-16 digit LOCAL convenience credential --
+     *  it roams SEALED under the profile's data key (readable only after a passphrase[+key] login), and later
+     *  slices arm it as the warm keyguard + mix it into the cold-resume credential. This screen sets, changes
+     *  or removes it; the sign-in passphrase is unchanged. */
+    /** NWP-20261006-09 (Chester, 2026-10-06): tying a profile to this phone's security chip is OPT-IN, and undoable. "The
+     *  only way to tie is for user to pick that option knowing what they are doing with a way to revert back when they
+     *  prefer." So this screen says what each direction costs before it acts, and asks for the passphrase to confirm.
+     *  The daemon does the work from the session it already holds (SE-STATUS / SE-TIE / SE-UNTIE, se_tie.go): the chip
+     *  secret was computed by the gate at sign-in, because the chip key lives in user 0, which this session cannot reach. */
+    private void showPhoneTie() {
+        final LinearLayout ll = menuScreen("Tie to this phone", "whether this phone's security chip is needed to open your profile");
+        final TextView body = new TextView(this);
+        StatusLine.busy(body, "Checking…");
+        body.setTextColor(FIELD_TX);
+        body.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
+        body.setLineSpacing(dp(5), 1f);
+        LinearLayout.LayoutParams blp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        blp.topMargin = dp(20);
+        ll.addView(body, blp);
+        final EditText pass = passField("your passphrase");
+        final TextView msg = new TextView(this);
+        msg.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        msg.setTextColor(MUTED);
+        msg.setGravity(Gravity.CENTER);
+        final Button act = accentBtn("");
+        // NWP-20261112-02 (2026-10-22 decision): before it ties, the screen asks for the 12 words to be written down.
+        // New and unticked each time the screen opens, and given no view id, so a recreate never restores it ticked.
+        final android.widget.CheckBox confirm = new android.widget.CheckBox(this);
+        confirm.setText(TieCopy.CONFIRM);
+        confirm.setTextColor(FIELD_TX);
+        confirm.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        // The confirm controls arrive with the status, after the screen is up; they go in this slot, ABOVE the Back
+        // link finishMenuScreen appends. Back returns to Security, where this screen is opened from.
+        // NWP-20261008-04: the photos, files and installed apps, protected in the background after a tie.
+        final LinearLayout prog = new LinearLayout(this);
+        prog.setOrientation(LinearLayout.VERTICAL);
+        ll.addView(prog, new LinearLayout.LayoutParams(MATCH, WRAP));
+        final LinearLayout slot = new LinearLayout(this);
+        slot.setOrientation(LinearLayout.VERTICAL);
+        ll.addView(slot, new LinearLayout.LayoutParams(MATCH, WRAP));
+        finishMenuScreen(ll, this::showSecurity);
+        new Thread(() -> {
+            final String st = sendDaemon("SE-STATUS\n");
+            runOnUiThread(() -> {
+                final String verb;
+                String alt = null; // NWP-20261007-12: a second action, offered only on a partly tied profile
+                // NWP-20261007-12: a tie re-keys the apps' data, settings and the keys that keep apps signed in at once;
+                // NWP-20261008-03/-04: photos and files and installed apps follow in the background, and the screen
+                // shows how far that has got (showTieProgress) -- until each is done, the passphrase still opens it.
+                if ("OK UNTIED".equals(st)) {
+                    body.setText("Right now your name and passphrase open this profile on any Nowhere phone.\n\n"
+                            + "Tied, this phone's security chip is needed as well to sign in and to open your apps' data, "
+                            + "your settings and the keys that keep apps signed in, so a copy of them can't be opened by "
+                            + "guessing your passphrase. Your photos and files and your installed apps follow in the "
+                            + "background, over Wi-Fi (or mobile data if you allow downloads over it) while the battery "
+                            + "is above 20% or charging. Until each is done, your passphrase alone still opens it.\n\n"
+                            + "What it costs:\n"
+                            + "• Tying saves your data again under the chip, once: app data and settings straight away, "
+                            + "photos, files and apps in the background. That uses some of your storage plan and data, "
+                            + "and can take a while.\n"
+                            + "• Every other phone you use this profile on will need your 12-word recovery code once "
+                            + "(“Add this phone”).\n"
+                            + "• A Fairphone can't open a tied profile at all.\n"
+                            + TieCopy.COST_RESET + "\n\n"
+                            + "You can untie it again here.");
+                    act.setText("Tie this profile to this phone");
+                    verb = "SE-TIE";
+                    act.setEnabled(false); // NWP-20261112-02: not until the box is ticked; unticking disables it again
+                    confirm.setOnCheckedChangeListener((b, on) -> act.setEnabled(on));
+                } else if ("OK TIED".equals(st)) {
+                    body.setText("This profile is tied to this phone: its security chip is needed, with your passphrase, "
+                            + "to sign in and to open your apps' data, your settings and the keys that keep apps signed "
+                            + "in.\n\n"
+                            + "Untied, your name and passphrase alone open it on any Nowhere phone again, with no recovery "
+                            + "code. A copy of your stored data could then be opened by guessing your passphrase, so it "
+                            + "should be a strong one.");
+                    act.setText("Untie it from this phone");
+                    verb = "SE-UNTIE";
+                    showTieProgress(prog);
+                } else if ("OK TIED PARTIAL".equals(st)) {
+                    body.setText("This profile is tied to this phone, but some of its data isn't protected by the chip "
+                            + "yet: your apps' data, your settings or the keys that keep apps signed in can still be "
+                            + "opened with your passphrase alone. Finishing saves that data again under the chip, which "
+                            + "uses some of your storage plan and can take a few minutes.");
+                    act.setText("Finish tying it to this phone");
+                    verb = "SE-TIE";
+                    alt = "SE-UNTIE";
+                    showTieProgress(prog);
+                } else if ("OK NOCHIP".equals(st)) {
+                    body.setText("This phone has no security chip, so a profile can't be tied to it. Your name and "
+                            + "passphrase open it on any Nowhere phone.");
+                    return;
+                } else if ("OK OTHER".equals(st)) {
+                    body.setText("This profile uses a security key, which already has to be present to open it. Tying it "
+                            + "to this phone isn't available for it.");
+                    return;
+                } else if (st.startsWith("ERR-NOTSTORED")) {
+                    body.setText("Save this profile to your store first.");
+                    return;
+                } else {
+                    StatusLine.error(body, "Couldn't check this right now. Go back and try again.");
+                    return;
+                }
+                if ("OK UNTIED".equals(st)) { // NWP-20261112-02: the confirmation, above the passphrase
+                    LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(MATCH, WRAP);
+                    clp.topMargin = dp(22);
+                    slot.addView(confirm, clp);
+                }
+                LinearLayout.LayoutParams plp = fieldLp(dp(14));
+                plp.topMargin = "OK UNTIED".equals(st) ? dp(12) : dp(22);
+                slot.addView(PassReveal.wrap(pass, MUTED, new Object()), plp);
+                LinearLayout.LayoutParams mlp = new LinearLayout.LayoutParams(MATCH, WRAP);
+                mlp.topMargin = dp(10);
+                slot.addView(msg, mlp);
+                LinearLayout.LayoutParams alp = new LinearLayout.LayoutParams(MATCH, WRAP);
+                alp.topMargin = dp(16);
+                slot.addView(act, alp);
+                if (alt == null) {
+                    // NWP-20261112-02: the click re-reads the box -- runTieVerb re-enables its buttons on every
+                    // reply, so the enabled state alone is no guard. The box rides as a button too, so it is locked
+                    // while a tie runs. On the untie screen it is never shown and maySend does not ask.
+                    act.setOnClickListener(v -> {
+                        if (TieCopy.maySend(verb, confirm.isChecked())) runTieVerb(verb, pass, msg, act, confirm);
+                        else StatusLine.error(msg, "tick the box above to confirm you have your recovery code");
+                    });
+                } else {
+                    final String altVerb = alt;
+                    final Button[] both = new Button[2];
+                    both[0] = act;
+                    both[1] = secondaryButton("Untie it instead", () -> runTieVerb(altVerb, pass, msg, both));
+                    act.setOnClickListener(v -> runTieVerb(verb, pass, msg, both));
+                    slot.addView(both[1], btnLp(dp(8)));
+                }
+            });
+        }, "nowhere-phone-tie-status").start();
+    }
+
+    /** NWP-20261008-04: the background re-key of the photos, files and installed apps, under the Tie screen's text. Polls
+     *  SE-PROGRESS every 5 s while the screen is up and says, per scope, how far it has got or why it is waiting; a
+     *  scope that is done drops out, and once both are done one line says so. Stops when the screen goes away. */
+    private void showTieProgress(final LinearLayout prog) {
+        final java.util.concurrent.atomic.AtomicBoolean up = new java.util.concurrent.atomic.AtomicBoolean(true);
+        prog.addOnAttachStateChangeListener(new android.view.View.OnAttachStateChangeListener() {
+            @Override public void onViewAttachedToWindow(android.view.View v) {}
+            @Override public void onViewDetachedFromWindow(android.view.View v) { up.set(false); }
+        });
+        new Thread(() -> {
+            while (up.get()) {
+                final String r = sendDaemonMulti("SE-PROGRESS\n");
+                runOnUiThread(() -> { if (up.get()) renderTieProgress(prog, r); });
+                try { Thread.sleep(5000); } catch (InterruptedException e) { return; }
+            }
+        }, "nowhere-tie-progress").start();
+    }
+
+    /** NWP-20261008-04: one SE-PROGRESS reply ("OK" + "<MEDIA|APPS> <state> <done> <total>" lines, or "OK NONE")
+     *  into the progress block. An unreadable reply leaves the block as it was. */
+    private void renderTieProgress(LinearLayout prog, String r) {
+        if (r == null || !r.startsWith("OK")) return;
+        prog.removeAllViews();
+        if (r.startsWith("OK NONE")) return;
+        java.util.List<String[]> open = new java.util.ArrayList<>();
+        int rows = 0;
+        for (String l : r.split("\n")) {
+            String[] f = l.trim().split(" ");
+            if (f.length != 4 || !("MEDIA".equals(f[0]) || "APPS".equals(f[0]))) continue;
+            rows++;
+            if (!"done".equals(f[1])) open.add(f);
+        }
+        if (rows == 0) return;
+        TextView head = new TextView(this);
+        head.setTextColor(FIELD_TX);
+        head.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
+        head.setLineSpacing(dp(5), 1f);
+        head.setText(open.isEmpty()
+                ? "Your photos and files and your installed apps are protected by the chip too."
+                : "Your photos and files and your installed apps move under the chip in the background. Until each "
+                  + "is done, your passphrase alone still opens it:");
+        LinearLayout.LayoutParams hlp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        hlp.topMargin = dp(14);
+        prog.addView(head, hlp);
+        for (String[] f : open) {
+            String what = "MEDIA".equals(f[0]) ? "Photos and files" : "Installed apps";
+            long done = 0, total = 0;
+            try { done = Long.parseLong(f[2]); total = Long.parseLong(f[3]); } catch (NumberFormatException ignore) { }
+            TextView line = new TextView(this);
+            line.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+            line.setTextColor(MUTED);
+            switch (f[1]) {
+                case "running":
+                    StatusLine.busy(line, total > 0
+                            ? what + ": protecting… " + (done * 100 / total) + "% (" + humanBytes(done) + " of "
+                              + humanBytes(total) + ")"
+                            : what + ": protecting…");
+                    break;
+                case "credit":
+                    StatusLine.error(line, what + ": your storage plan is full — add storage to finish");
+                    break;
+                case "wifi":
+                    line.setText(what + ": waiting for Wi-Fi");
+                    break;
+                case "net":
+                    line.setText(what + ": waiting for a connection");
+                    break;
+                case "battery":
+                    line.setText(what + ": waiting until the battery is above 20% or charging");
+                    break;
+                default:
+                    line.setText(what + ": waiting to start");
+            }
+            LinearLayout.LayoutParams llp = new LinearLayout.LayoutParams(MATCH, WRAP);
+            llp.topMargin = dp(6);
+            prog.addView(line, llp);
+        }
+    }
+
+    /** NWP-20261007-12: one tie or untie, from the Tie screen. A tie re-saves data under the chip, so it reads for
+     *  TieCopy.READ_MS, which outlasts the daemon's own deadline (seTieSlotWait + 10 min in se_tie.go handleSETie), so
+     *  a late tie is not cut off. It says so while it works, and TieCopy.failText words every reply that is not OK
+     *  (NWP-20261119-23). Every button on the screen stays disabled while one runs. */
+    private void runTieVerb(final String verb, final EditText pass, final TextView msg, final Button... buttons) {
+        final String p = pass.getText().toString();
+        if (p.isEmpty()) { StatusLine.error(msg, "enter your passphrase to confirm"); return; }
+        for (Button b : buttons) b.setEnabled(false); // one verb at a time
+        StatusLine.busy(msg, "SE-TIE".equals(verb)
+                ? "protecting your data — this can take a few minutes, keep this screen open"
+                : "working…");
+        new Thread(() -> {
+            final String r = DaemonSocket.roundTrip(verb + "\n" + p + "\n", TieCopy.READ_MS).trim();
+            runOnUiThread(() -> {
+                for (Button b : buttons) b.setEnabled(true);
+                if (r.startsWith("OK")) {
+                    android.widget.Toast.makeText(this, "SE-TIE".equals(verb)
+                            ? "Tied to this phone" : "Untied — your passphrase opens it on any phone",
+                            android.widget.Toast.LENGTH_LONG).show();
+                    showPhoneTie();
+                } else if ("ERR-PASS".equals(r) || "ERR-WORKER-BUSY".equals(r) || "ERR-NOCREDIT".equals(r)
+                        || "BUSY".equals(r)) {
+                    StatusLine.error(msg, TieCopy.failText(r)); // nothing changed: say why where the user typed
+                } else {
+                    // No reply (the read ran out, so the tie may still finish), a store refusal, or the state changed
+                    // under us: show what is true now.
+                    android.widget.Toast.makeText(this, TieCopy.failText(r),
+                            android.widget.Toast.LENGTH_LONG).show();
+                    showPhoneTie();
+                }
+            });
+        }, "nowhere-phone-tie").start();
+    }
+
+    private void showSessionPin() {
+        LinearLayout ll = menuScreen("Session PIN",
+                "a short PIN for unlocking this phone — your passphrase still signs you in");
+
+        TextView steps = new TextView(this);
+        steps.setText("4–16 digits. It's remembered with your profile (encrypted), so you set it once. "
+                + "Wrong-guess attempts are limited by the phone's hardware. "
+                + "A new or changed PIN takes effect the next time you sign in.");
+        steps.setTextColor(FIELD_TX);
+        steps.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
+        steps.setLineSpacing(dp(5), 1f);
+        LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        slp.topMargin = dp(20);
+        ll.addView(steps, slp);
+
+        final EditText pin = passField("new PIN");
+        pin.setInputType(android.text.InputType.TYPE_CLASS_NUMBER | android.text.InputType.TYPE_NUMBER_VARIATION_PASSWORD);
+        final Object pinRevGrp = new Object(); // #96: PIN + confirm reveal together
+        // DIA-20260818-12 (#129 follow-up): the breathing room has to go ABOVE this field. fieldLp() sets
+        // bottomMargin ONLY, so #129's dp(18)->dp(30) widened the gap BETWEEN the two PIN boxes and left the
+        // explainer sitting flush on top of the first one -- the exact thing it was filed to fix. Chester,
+        // 2026-08-18, looking at it: "there is no space at all". Set the top margin explicitly.
+        LinearLayout.LayoutParams pinLp = fieldLp(dp(30));
+        pinLp.topMargin = dp(22);
+        ll.addView(PassReveal.wrap(pin, MUTED, pinRevGrp), pinLp);                  // #81 session PIN
+        final EditText confirm = passField("confirm PIN");
+        confirm.setInputType(android.text.InputType.TYPE_CLASS_NUMBER | android.text.InputType.TYPE_NUMBER_VARIATION_PASSWORD);
+        ll.addView(PassReveal.wrap(confirm, MUTED, pinRevGrp), fieldLp(dp(11)));   // #81 confirm PIN
+
+        final TextView msg = new TextView(this);
+        msg.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        msg.setTextColor(MUTED);
+        msg.setGravity(Gravity.CENTER);
+        LinearLayout.LayoutParams mlp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        mlp.topMargin = dp(14);
+        ll.addView(msg, mlp);
+
+        final Button set = accentBtn("Set PIN");
+        LinearLayout.LayoutParams blp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        blp.topMargin = dp(16);
+        ll.addView(set, blp);
+        set.setOnClickListener(v -> {
+            final String p = pin.getText().toString();
+            if (p.isEmpty()) { StatusLine.error(msg, "enter a PIN"); return; }
+            if (!p.equals(confirm.getText().toString())) { StatusLine.error(msg, "PINs don't match"); return; }
+            set.setEnabled(false);
+            StatusLine.busy(msg, "saving…");
+            new Thread(() -> {
+                final String r = sendDaemon("SET-PIN\n" + p + "\n").trim();
+                runOnUiThread(() -> {
+                    set.setEnabled(true);
+                    final String err = PinCopy.setText(r); // NWP-20261124-10: the whole reply, BUSY and no answer included
+                    if (err == null) {
+                        android.widget.Toast.makeText(this, "PIN saved — active after your next sign-in", android.widget.Toast.LENGTH_LONG).show();
+                        showSecurity();
+                    } else {
+                        StatusLine.error(msg, err);
+                    }
+                });
+            }, "nowhere-set-pin").start();
+        });
+
+        // "Remove PIN" appears only when one is set (PIN-STATUS, async).
+        final TextView remove = new TextView(this);
+        remove.setText("Remove PIN");
+        remove.setTextColor(ERROR_TX);
+        remove.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        remove.setGravity(Gravity.CENTER);
+        remove.setPadding(dp(8), dp(18), dp(8), dp(4));
+        remove.setVisibility(android.view.View.GONE);
+        ll.addView(remove, new LinearLayout.LayoutParams(MATCH, WRAP));
+        // NWP-20260909-01: CONFIRM, AND SAY WHAT IT COSTS. Removing the PIN leaves the roamed session with no
+        // device credential, and that silently switches off the cold-lock abort as well: NWP-20260902-04 gates
+        // the revoke on an AUTHENTICATED unlock, and on a non-secure keyguard ACTION_USER_PRESENT is a swipe,
+        // which a bystander could use to defer the at-rest backstop for ever. So the gate is right to refuse --
+        // but until now nothing told the user that clearing the PIN is what disarmed it. Measured cost, from
+        // frankel: a PIN cleared on 2026-09-07 for one test left every abort attempt for three days logging
+        // "abort skip secure=0", and two cold locks landed in the user’s hand while it did.
+        remove.setOnClickListener(v -> new android.app.AlertDialog.Builder(this)
+                .setTitle("Remove PIN?")
+                .setMessage("Sign-in will have no device credential. That also switches off the safeguard "
+                        + "that cancels a pending cold lock when you pick the phone up — with no credential, "
+                        + "unlocking is only a swipe, so it cannot count as proof it’s you. Expect the phone "
+                        + "to cold-lock in your hand sometimes. You can set a PIN again any time.")
+                .setNegativeButton("Keep it", (d, w) -> {})
+                .setPositiveButton("Remove", (d, w) -> new Thread(() -> {
+            final String r = sendDaemon("SET-PIN\n\n").trim(); // empty PIN = clear
+            runOnUiThread(() -> {
+                final String err = PinCopy.clearText(r); // NWP-20261124-10: the whole reply, BUSY and no answer included
+                if (err == null) {
+                    android.widget.Toast.makeText(this, "PIN removed — active after your next sign-in", android.widget.Toast.LENGTH_LONG).show();
+                    showSecurity();
+                } else {
+                    StatusLine.error(msg, err);
+                }
+            });
+        }, "nowhere-clear-pin").start())
+                .show());
+        new Thread(() -> {
+            final String ps = sendDaemon("PIN-STATUS\n").trim();
+            final boolean has = "SET".equals(ps);
+            runOnUiThread(() -> {
+                // NWP-20261006-23: SET and NONE are the answers. No reply used to read as NONE: "Set PIN" with no
+                // Remove, telling a profile that has a PIN it has none.
+                if (!has && !"NONE".equals(ps) && msg.getText().length() == 0) {
+                    StatusLine.error(msg, "Couldn't check whether a PIN is set. Go back and open this screen again in a moment.");
+                }
+                // NWP-20261014-36: the screen answers "is a PIN set". Never over a saving or error status.
+                if ((has || "NONE".equals(ps)) && msg.getText().length() == 0) {
+                    msg.setText(has ? "A PIN is set for this profile." : "No PIN is set.");
+                    msg.setTextColor(MUTED);
+                }
+                if (has) {
+                    set.setText("Change PIN");
+                    remove.setVisibility(android.view.View.VISIBLE);
+                }
+            });
+        }, "nowhere-pin-status").start();
+
+        TextView back = new TextView(this); // Back -> Security; wrap manually (no finishMenuScreen double-Back)
+        back.setText("Back");
+        back.setTextColor(ACCENT);
+        back.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        back.setGravity(Gravity.CENTER);
+        back.setPadding(dp(8), dp(20), dp(8), dp(8));
+        ll.addView(back, new LinearLayout.LayoutParams(MATCH, WRAP));
+        back.setOnClickListener(v -> showSecurity());
+
+        android.widget.ScrollView sc = new android.widget.ScrollView(this);
+        sc.setBackgroundColor(BG);
+        sc.addView(ll);
+        setContentView(sc);
+    }
+
+    /** Preferences menu (DIA-20260628-08): how the profile behaves. Its rows depend on the session: a stored
+     *  profile gets all five, an offline sign-in the three that work without the store, a throwaway only Time
+     *  zone (NWP-20260924-02). A stored profile also gets Mobile data (NWP-20261026-07, MobileData.offered) and,
+     *  on an image that has GrapheneOS's location provider, Location services (NWP-20261016-45, locOffered). */
+    private void showPreferences() {
+        sweepGoogleMarks();
+        LinearLayout ll = menuScreen("Preferences", "how this profile behaves");
+        // NWP-20260924-02 (Chester: "other than timezone, nothing is applicable"): a THROWAWAY shows Time zone
+        // only. Every other row configures what the store keeps or serves -- Your apps (the roamed keep-set),
+        // Apps this device is holding, Offline media, and Configuration (the defaults for new apps and media) --
+        // and a throwaway is never sealed, so each was a control that did nothing. The test is LOCAL without
+        // offlineSession: an OFFLINE sign-in reports LOCAL too, but it is a real stored profile and keeps its rows
+        // below. Saving the throwaway flips sessionType to STORED, and the full list comes back.
+        if ("LOCAL".equals(sessionType) && !offlineSession) {
+            sectionCard(ll, null, new String[]{"Time zone"}, new Runnable[]{() -> showTimezonePicker()}, false);
+            finishMenuScreen(ll);
+            return;
+        }
+        // #offline (DIA-20260713): hide "Offline media" in an OFFLINE session. #49 offline sign-in means the
+        // store isn't reachable and the saved data wasn't loaded, so managing store-backed media (pin /
+        // prefetch / budget all round-trip the store via mediad) does nothing and only confuses. Time zone is
+        // local and always relevant. offlineSession is set by onCreate's GET-OFFLINE probe; a fast-navigation
+        // race defaults it false (shows the row -- the safe online default).
+        // #201 "Your apps": the app-persistence opt-in (which installed apps to keep on the account). Local --
+        // it writes a roamed keep-set file, no store round-trip -- so it's shown even in an OFFLINE session,
+        // unlike "Offline media" (which manages store-backed media via mediad).
+        // DIA-20260816-20: "Get apps" is GONE from here. It is now nApps, reached from the launcher (drawer +
+        // home page 2) like any other app, so a Preferences row pointing at the same screen is a second door
+        // into one room. DIA-20260818-08 (#747) removed the AppStoreActivity trampoline and its openAppStore
+        // extra (see onCreate); nApps is com.nowhere.napps, and NWP-20261013-38 deleted the in-chooser copy.
+        if (offlineSession) {
+            // "Apps this device is holding" is HIDDEN offline for the same reason "Offline media" is, and
+            // the rule is stated in the comment above: an offline session never reached the store, so every
+            // sentence on that screen about what the other device is told would be false here.
+            sectionCard(ll, null, new String[]{"Your apps", "Configuration", "Time zone"},
+                    new Runnable[]{() -> showYourApps(), () -> showConfiguration(), () -> showTimezonePicker()}, false);
+        } else {
+            // NWP-20261026-07: Mobile data and Location services are each offered on their own condition, so the rows
+            // are built as lists; the order is fixed (Time zone, Mobile data, Hotspot & tethering, Location services).
+            java.util.ArrayList<String> rows = new java.util.ArrayList<>(java.util.Arrays.asList("Your apps",
+                    "Apps this device is holding", "Offline media", "Configuration", "Time zone"));
+            java.util.ArrayList<Runnable> acts = new java.util.ArrayList<>(java.util.Arrays.<Runnable>asList(
+                    () -> showYourApps(), () -> showHeldApps(), () -> showOfflineMedia(),
+                    () -> showConfiguration(), () -> showTimezonePicker()));
+            if (MobileData.offered(sessionType, offlineSession)) {
+                rows.add("Mobile data");
+                acts.add(() -> showMobileData());
+            }
+            // NWP-20261028-11: Hotspot & tethering, after Mobile data and before Location services. Following the
+            // 2026-10-19 decision, not offered to throwaway or offline sessions, as for location (Hotspot.offered).
+            if (Hotspot.offered(sessionType, offlineSession)) {
+                rows.add("Hotspot & tethering");
+                acts.add(() -> showHotspot());
+            }
+            if (locOffered(sessionType, offlineSession, locServicesAvailable())) {
+                rows.add("Location services");
+                acts.add(() -> showLocationServices());
+            }
+            sectionCard(ll, null, rows.toArray(new String[0]), acts.toArray(new Runnable[0]), false);
+        }
+        // NWP-20261122-13 (h52 #3, docs/product-decisions.md 2026-11-01): while the phone has an active SIM this
+        // profile does not own, one muted line directly under the card that holds Mobile data, in stored and offline
+        // sessions alike (an offline session has no Mobile data row, so it sits under its one card). The case is the
+        // one the gate last sent (SimCaseReceiver); it is redrawn on the next showPreferences.
+        String simLine = ForeignSimLine.line(SimCaseReceiver.stored());
+        if (simLine != null) {
+            TextView note = new TextView(this);
+            note.setText(simLine);
+            note.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+            note.setTextColor(MUTED);
+            note.setLineSpacing(dp(3), 1f);
+            LinearLayout.LayoutParams nlp = new LinearLayout.LayoutParams(MATCH, WRAP);
+            nlp.topMargin = dp(12);
+            ll.addView(note, nlp);
+        }
+        addGoogleSignOutCard(ll);
+        finishMenuScreen(ll);
+    }
+
+    // ---- NWP-20261122-02: the preset picker (docs/profile-presets.md sections (b), (d) and Custom). Since
+    // NWP-20261126-09 the Privacy level card on Profile home opens it (docs/product-decisions.md 2026-11-03): a pick
+    // says how many settings change, then previews every change and the preset's two consent links, and Apply writes
+    // through the screens' own writers. What to write and what a hand change does to the saved Custom are
+    // PresetPicker's, which runs under javac (core/vendor-common/bin/test-preset-picker-java.sh); only the file I/O and
+    // the dialogs are here. A preset never writes a tie, netloc= or geocoder=: its links only open those screens.
+
+    /** The table's current map from this profile's prefs, config and reclaim files. */
+    private java.util.Map<String, String> presetCurrent() {
+        java.io.File dir = getFilesDir();
+        return PresetPicker.current(readPrefsText(), SettingsText.read(new java.io.File(dir, PresetPicker.CONFIG_FILE)),
+                SettingsText.read(new java.io.File(dir, PresetPicker.RECLAIM_FILE)));
+    }
+
+    /** The saved Custom, or null when none is saved or the file does not parse whole. */
+    private java.util.Map<String, String> presetSavedCustom() {
+        return ProfilePresets.parseCustom(SettingsText.read(new java.io.File(getFilesDir(), PresetPicker.CUSTOM_FILE)));
+    }
+
+    /** The name the picker last applied, or "". */
+    private String presetLast() {
+        String t = SettingsText.read(new java.io.File(getFilesDir(), PresetPicker.LAST_FILE));
+        return t == null ? "" : t;
+    }
+
+    /** What the Privacy level card shows. */
+    private String presetShown() {
+        return PresetPicker.shown(presetCurrent(), presetLast());
+    }
+
+    /** NWP-20261126-09: the Privacy level card on Profile home. The five-step scale fills the shown preset's step (none
+     *  for Custom), the name sits under it, and the row below shows the shown dropdown row and opens the dropdown
+     *  (showPresetPicker). File reads only. */
+    private void addPrivacyLevelCard(LinearLayout parent) {
+        final String shown = presetShown();
+        LinearLayout card = new LinearLayout(this);
+        card.setOrientation(LinearLayout.VERTICAL);
+        card.setPadding(dp(16), dp(14), dp(16), dp(14));
+        GradientDrawable cbg = new GradientDrawable();
+        cbg.setColor(FIELD_BG);
+        cbg.setCornerRadius(dp(14));
+        cbg.setStroke(dp(1), FIELD_LN);
+        card.setBackground(cbg);
+        LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        clp.topMargin = dp(20);
+        parent.addView(card, clp);
+
+        TextView title = new TextView(this);
+        title.setText(PresetPicker.CARD_TITLE);
+        title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16);
+        title.setTextColor(INK);
+        card.addView(title, new LinearLayout.LayoutParams(MATCH, WRAP));
+
+        LinearLayout scale = new LinearLayout(this);
+        scale.setOrientation(LinearLayout.HORIZONTAL);
+        int pos = PresetPicker.scalePos(shown);
+        for (int i = 0; i < PresetPicker.SCALE.size(); i++) {
+            android.view.View seg = new android.view.View(this);
+            GradientDrawable sbg = new GradientDrawable();
+            sbg.setColor(i == pos ? ACCENT : FIELD_LN);
+            sbg.setCornerRadius(dp(3));
+            seg.setBackground(sbg);
+            LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(0, dp(6), 1f);
+            if (i > 0) slp.leftMargin = dp(4);
+            scale.addView(seg, slp);
+        }
+        LinearLayout.LayoutParams sclp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        sclp.topMargin = dp(12);
+        card.addView(scale, sclp);
+
+        TextView level = new TextView(this);
+        level.setText(shown);
+        level.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        level.setTextColor(MUTED);
+        LinearLayout.LayoutParams llp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        llp.topMargin = dp(6);
+        card.addView(level, llp);
+
+        TextView pick = new TextView(this);
+        pick.setText(PresetPicker.rowOf(shown) + "  ▾");
+        pick.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
+        pick.setTextColor(INK);
+        pick.setPadding(0, dp(10), 0, dp(4));
+        pick.setOnClickListener(v -> showPresetPicker());
+        card.addView(pick, new LinearLayout.LayoutParams(MATCH, WRAP));
+    }
+
+    /** Keep m as the saved Custom; a null or incomplete m removes the file. True when the file holds m (or is gone). */
+    private boolean presetSaveCustom(java.util.Map<String, String> m) {
+        java.io.File f = new java.io.File(getFilesDir(), PresetPicker.CUSTOM_FILE);
+        String text = ProfilePresets.formatCustom(m);
+        if (text == null) return !f.exists() || f.delete();
+        if (text.equals(SettingsText.read(f))) return true;
+        try {
+            StoreInstaller.writeAtomic(f, text);
+            return true;
+        } catch (Exception e) {
+            android.util.Log.w("NowhereChooser", "presetSaveCustom", e);
+            return false;
+        }
+    }
+
+    /** The card's dropdown, a single-choice list: the five presets with their lines, then Custom when one is saved, the
+     *  shown one checked. A tap goes to pickPreset. */
+    private void showPresetPicker() {
+        boolean saved = presetSavedCustom() != null;
+        final java.util.List<String> names = PresetPicker.dropdownNames(saved);
+        java.util.List<String> rows = PresetPicker.dropdownRows(saved);
+        new android.app.AlertDialog.Builder(this)
+                .setTitle(PresetPicker.CARD_TITLE)
+                .setSingleChoiceItems(rows.toArray(new String[0]), names.indexOf(presetShown()), (d, which) -> {
+                    d.dismiss();
+                    pickPreset(names.get(which));
+                })
+                .setNegativeButton("Cancel", null)
+                .show();
+    }
+
+    /** Custom with none saved says so and writes nothing; anything else says how many settings will change, and
+     *  Continue opens the preview. */
+    private void pickPreset(final String picked) {
+        final java.util.Map<String, String> cur = presetCurrent();
+        final ProfilePresets.Choice c = ProfilePresets.choose(PresetPicker.shown(cur, presetLast()), picked, cur,
+                presetSavedCustom());
+        if (c.valuesToApply == null) {
+            android.widget.Toast.makeText(this, PresetPicker.NO_CUSTOM, android.widget.Toast.LENGTH_LONG).show();
+            return;
+        }
+        new android.app.AlertDialog.Builder(this)
+                .setTitle(picked)
+                .setMessage(PresetPicker.countLine(PresetPicker.changeCount(cur, c.valuesToApply)))
+                .setPositiveButton(PresetPicker.CONTINUE, (d, w) -> showPresetPreview(picked, cur, c))
+                .setNegativeButton(PresetPicker.CANCEL, null)
+                .show();
+    }
+
+    /** The preview: one line per change (or "Nothing changes."), then the preset's two consent links. A link is
+     *  tappable only where its screen is offered -- the tie where showSecurity offers it (!local), Location services
+     *  where Preferences does (locOffered) -- and a tap only opens that screen. Apply / Cancel. */
+    private void showPresetPreview(final String picked, final java.util.Map<String, String> cur,
+            final ProfilePresets.Choice c) {
+        LinearLayout body = new LinearLayout(this);
+        body.setOrientation(LinearLayout.VERTICAL);
+        body.setPadding(dp(20), dp(8), dp(20), dp(4));
+        java.util.List<String> lines = ProfilePresets.previewLines(cur, c.valuesToApply);
+        if (lines.isEmpty()) lines = java.util.Collections.singletonList(PresetPicker.NOTHING_CHANGES);
+        for (String l : lines) body.addView(presetLine(l, INK));
+        final android.app.AlertDialog[] dlg = new android.app.AlertDialog[1];
+        java.util.List<String> links = PresetPicker.links(picked);
+        for (int i = 0; i < links.size(); i++) {
+            final boolean tie = i == 0;
+            boolean offered = tie ? !"LOCAL".equals(sessionType)
+                    : locOffered(sessionType, offlineSession, locServicesAvailable());
+            TextView t = presetLine(links.get(i), offered ? ACCENT : MUTED);
+            if (offered) {
+                t.setPaintFlags(t.getPaintFlags() | android.graphics.Paint.UNDERLINE_TEXT_FLAG);
+                t.setOnClickListener(v -> {
+                    if (dlg[0] != null) dlg[0].dismiss();
+                    if (tie) showPhoneTie();
+                    else showLocationServices();
+                });
+            }
+            body.addView(t);
+        }
+        android.widget.ScrollView sc = new android.widget.ScrollView(this);
+        sc.addView(body);
+        dlg[0] = new android.app.AlertDialog.Builder(this)
+                .setTitle(picked)
+                .setView(sc)
+                .setPositiveButton("Apply", (d, w) -> applyPreset(picked, cur, c))
+                .setNegativeButton("Cancel", null)
+                .show();
+    }
+
+    private TextView presetLine(String text, int color) {
+        TextView t = new TextView(this);
+        t.setText(text);
+        t.setTextColor(color);
+        t.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        t.setPadding(0, dp(6), 0, dp(6));
+        return t;
+    }
+
+    /** Apply a pick: the saved Custom first (a failed save writes no value, so leaving Custom never loses it), then
+     *  each planned write through its screen's writer, then LAST_FILE. The result is read back: a row that did not
+     *  land says APPLY_FAILED and the rows written stay. A prefs write is sent to the gate, as the Security pickers do. */
+    private void applyPreset(String picked, java.util.Map<String, String> cur, ProfilePresets.Choice c) {
+        if (!presetSaveCustom(c.savedCustomAfter)) {
+            android.widget.Toast.makeText(this, PresetPicker.APPLY_FAILED, android.widget.Toast.LENGTH_LONG).show();
+            showConfirm();
+            return;
+        }
+        boolean prefs = false;
+        for (PresetPicker.Write w : PresetPicker.plan(cur, c.valuesToApply)) {
+            try {
+                if (PresetPicker.PREFS_FILE.equals(w.file)) {
+                    prefs = true;
+                    if ("wipe".equals(w.key)) writeWipePref(Integer.parseInt(w.value));
+                    else setPref(w.key, w.value);
+                } else if (PresetPicker.CONFIG_FILE.equals(w.file)) {
+                    cfgPut(w.key, w.value);
+                } else {
+                    setReclaimIdleMs(Long.parseLong(w.value));
+                }
+            } catch (RuntimeException e) {
+                android.util.Log.w("NowhereChooser", "applyPreset " + w.key, e);
+            }
+        }
+        boolean ok;
+        try {
+            StoreInstaller.writeAtomic(new java.io.File(getFilesDir(), PresetPicker.LAST_FILE), picked + "\n");
+            ok = true;
+        } catch (Exception e) {
+            android.util.Log.w("NowhereChooser", "applyPreset last", e);
+            ok = false;
+        }
+        if (!PresetPicker.unapplied(c.valuesToApply, presetCurrent()).isEmpty()) ok = false;
+        if (prefs) sendLivePrefs();
+        if (!ok) android.widget.Toast.makeText(this, PresetPicker.APPLY_FAILED, android.widget.Toast.LENGTH_LONG).show();
+        showConfirm();
+    }
+
+    /** The hand-change guard, called by each Security and Configuration write path before it writes, with the values it
+     *  is about to write. PresetPicker.guardAction decides; this only runs it: write, write and save the Custom, or ask
+     *  REPLACE_ASK first (Cancel, or Back, writes nothing and runs onCancel). NWP-20261125-22: the Custom is saved only
+     *  when the files, read back after the write, hold the change; a write that did not land saves or replaces none. */
+    private void presetGuard(java.util.Map<String, String> change, final Runnable write, final Runnable onCancel) {
+        java.util.Map<String, String> cur = presetCurrent();
+        final PresetPicker.Guard g = PresetPicker.guardAction(PresetPicker.shown(cur, presetLast()), cur, change,
+                presetSavedCustom());
+        switch (g.action) {
+            case WRITE_ONLY:
+                write.run();
+                break;
+            case WRITE_AND_SAVE:
+                write.run();
+                if (SettingLanded.landed(change, presetCurrent())) presetSaveCustom(g.save);
+                break;
+            case ASK:
+                new android.app.AlertDialog.Builder(this)
+                        .setMessage(PresetPicker.replaceMessage())
+                        .setPositiveButton(PresetPicker.REPLACE, (d, w) -> {
+                            write.run();
+                            if (SettingLanded.landed(change, presetCurrent())) presetSaveCustom(g.save);
+                        })
+                        .setNegativeButton(PresetPicker.CANCEL, (d, w) -> {
+                            if (onCancel != null) onCancel.run();
+                        })
+                        .setOnCancelListener(d -> {
+                            if (onCancel != null) onCancel.run();
+                        })
+                        .show();
+                break;
+        }
+    }
+
+    // NWP-20261107-11 (#743, dn-1025 #2 / dn-1106 #2): "Sign out of Google", one row per Google account. The account
+    // guard in roamd's acct_seal refuses a drop it cannot tell from a destruction (#732) unless the account carries a
+    // mark, so the sign-out writes the account's mark FIRST and removes the account only once the mark is on disk. A
+    // removal that does not happen takes the mark back out: a mark beside an account still on the phone would let a
+    // later destruction of that account seal in this session, the very drop the every-account rule refuses. The
+    // account name is never logged. The file and the hash are roamd's contract (GoogleSignOut, acct_mark_file).
+    // NWP-20261113-31 (Chester 2026-10-22: "i've 4 google accounts on this phone and it looks way too long on
+    // preference"): Preferences holds ONE "Google accounts" row with the count; the per-account rows are on
+    // showGoogleAccounts.
+    private void addGoogleSignOutCard(LinearLayout ll) {
+        if (!GoogleSignOut.offered(sessionType, offlineSession)) return;
+        android.accounts.Account[] accts;
+        try {
+            accts = android.accounts.AccountManager.get(this).getAccountsByType(GoogleSignOut.ACCOUNT_TYPE);
+        } catch (Throwable t) {
+            return;
+        }
+        if (accts == null || accts.length == 0) return;
+        googleCard(ll).addView(googleCardRow(GoogleSignOut.GROUP_LABEL, GoogleSignOut.groupSubtitle(accts.length), () -> showGoogleAccounts()));
+    }
+
+    /** NWP-20261113-31: one "Sign out of Google" row per Google account, each opening confirmGoogleSignOut; Back
+     *  returns to Preferences. With no account left (or not offered) it draws Preferences instead, so the redraw after
+     *  a sign-out lands on Preferences once the last account is gone. It sweeps as showPreferences does: every redraw
+     *  after a sign-out used to be showPreferences, and its sweep withdraws a mark a failed rollback left behind. */
+    private void showGoogleAccounts() {
+        if (!GoogleSignOut.offered(sessionType, offlineSession)) {
+            showPreferences();
+            return;
+        }
+        android.accounts.Account[] accts;
+        try {
+            accts = android.accounts.AccountManager.get(this).getAccountsByType(GoogleSignOut.ACCOUNT_TYPE);
+        } catch (Throwable t) {
+            accts = null;
+        }
+        if (accts == null || accts.length == 0) {
+            showPreferences();
+            return;
+        }
+        sweepGoogleMarks();
+        LinearLayout ll = menuScreen(GoogleSignOut.GROUP_LABEL, GoogleSignOut.groupSubtitle(accts.length));
+        LinearLayout card = googleCard(ll);
+        for (int i = 0; i < accts.length; i++) {
+            final android.accounts.Account acct = accts[i];
+            if (i > 0) {
+                android.view.View div = new android.view.View(this);
+                div.setBackgroundColor(FIELD_LN);
+                LinearLayout.LayoutParams dlp = new LinearLayout.LayoutParams(MATCH, Math.max(1, dp(0.5f)));
+                dlp.leftMargin = dp(16);
+                card.addView(div, dlp);
+            }
+            card.addView(googleCardRow(GoogleSignOut.ROW_LABEL, acct.name, () -> confirmGoogleSignOut(acct)));
+        }
+        finishMenuScreen(ll, () -> showPreferences());
+    }
+
+    /** The Google card: a 20dp spacer, then the card itself, both added to ll; the card is returned for its rows. */
+    private LinearLayout googleCard(LinearLayout ll) {
+        android.view.View sp = new android.view.View(this);
+        ll.addView(sp, new LinearLayout.LayoutParams(MATCH, dp(20)));
+        LinearLayout card = new LinearLayout(this);
+        card.setOrientation(LinearLayout.VERTICAL);
+        GradientDrawable cbg = new GradientDrawable();
+        cbg.setColor(FIELD_BG);
+        cbg.setCornerRadius(dp(14));
+        cbg.setStroke(dp(1), FIELD_LN);
+        card.setBackground(cbg);
+        ll.addView(card, new LinearLayout.LayoutParams(MATCH, WRAP));
+        return card;
+    }
+
+    /** One row of the Google card: title over a muted second line, onClick on tap. */
+    private LinearLayout googleCardRow(String title, String sub, final Runnable onClick) {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.VERTICAL);
+        row.setPadding(dp(16), dp(15), dp(16), dp(15));
+        TextView t = new TextView(this);
+        t.setText(title);
+        t.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
+        t.setTextColor(INK);
+        row.addView(t, new LinearLayout.LayoutParams(MATCH, WRAP));
+        TextView st = new TextView(this);
+        st.setText(sub);
+        st.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        st.setTextColor(MUTED);
+        row.addView(st, new LinearLayout.LayoutParams(MATCH, WRAP));
+        row.setOnClickListener(v -> onClick.run());
+        return row;
+    }
+
+    /** A mark beside a Google account still on the phone is taken out (GoogleSignOut.sweep). A failed removal whose
+     *  rollback could not land is caught here, on the next Profile screen or Preferences draw, even after the chooser
+     *  process died. Off the UI thread; STORED sessions only, the only ones that are offered the row. */
+    private void sweepGoogleMarks() {
+        if (!GoogleSignOut.offered(sessionType, offlineSession)) return;
+        new Thread(() -> GoogleSignOut.sweep(acctMarksStore(GoogleSignOut.MARK_FILE), acctMarksStore(GoogleSignOut.JOURNAL_FILE), () -> {
+            java.util.Set<String> here = new java.util.HashSet<>();
+            for (android.accounts.Account a : android.accounts.AccountManager.get(this).getAccountsByType(GoogleSignOut.ACCOUNT_TYPE)) {
+                here.add(GoogleSignOut.markHash(a.name));
+            }
+            return here;
+        }), "nowhere-google-signout-sweep").start();
+    }
+
+    private void confirmGoogleSignOut(final android.accounts.Account acct) {
+        new android.app.AlertDialog.Builder(this)
+                .setTitle(GoogleSignOut.ROW_LABEL)
+                .setMessage(GoogleSignOut.CONFIRM)
+                .setNegativeButton("Cancel", null)
+                .setPositiveButton("Sign out", (d, w) -> {
+                    final String hash = GoogleSignOut.markHash(acct.name);
+                    // one sign-out per account at a time, through its removal callback
+                    if (GoogleSignOut.claim(hash)) {
+                        new Thread(() -> signOutGoogle(acct, hash), "nowhere-google-signout").start();
+                    }
+                })
+                .show();
+    }
+
+    /** Off the UI thread. Mark first; remove the account only if the mark was written. The claim on hash ends in
+     *  every path below: when the removal's outcome is settled. */
+    private void signOutGoogle(final android.accounts.Account acct, final String hash) {
+        boolean recorded = GoogleSignOut.mark(acctMarksStore(GoogleSignOut.MARK_FILE), acctMarksStore(GoogleSignOut.JOURNAL_FILE), hash);
+        if (!recorded) {
+            GoogleSignOut.release(hash);
+            googleSignOutFailed("not recorded");
+            return;
+        }
+        try {
+            android.accounts.AccountManager.get(this).removeAccount(acct, this, fut -> new Thread(() -> {
+                boolean removed = false;
+                try {
+                    removed = fut.getResult().getBoolean(android.accounts.AccountManager.KEY_BOOLEAN_RESULT, false);
+                } catch (Throwable t) {
+                    removed = false;
+                }
+                if (removed) {
+                    // the journal entry ends with the removal; one that cannot be cleared makes the sweep withdraw the mark
+                    for (int i = 0; i < 3 && !GoogleSignOut.settle(acctMarksStore(GoogleSignOut.JOURNAL_FILE), hash); i++) {
+                        try { Thread.sleep(500); } catch (InterruptedException ie) { break; }
+                    }
+                    GoogleSignOut.release(hash);
+                    runOnUiThread(() -> showGoogleAccounts());
+                } else {
+                    unmarkAndReport(hash);
+                }
+            }, "nowhere-google-signout-done").start(), null);
+        } catch (Throwable t) {
+            unmarkAndReport(hash);
+        }
+    }
+
+    /** A removal that did not happen takes its mark back out (GoogleSignOut.unmark falls back to deleting the whole
+     *  file when the precise rewrite cannot land), then says so. */
+    private void unmarkAndReport(String hash) {
+        // a mark that cannot come out is caught by the sweep (the account is still on the phone): a few tries here
+        for (int i = 0; i < 10 && !GoogleSignOut.unmark(acctMarksStore(GoogleSignOut.MARK_FILE), acctMarksStore(GoogleSignOut.JOURNAL_FILE), hash); i++) {
+            try { Thread.sleep(1000); } catch (InterruptedException ie) { break; }
+        }
+        GoogleSignOut.release(hash);
+        googleSignOutFailed("not removed");
+    }
+
+    private void googleSignOutFailed(final String why) {
+        runOnUiThread(() -> {
+            android.widget.Toast.makeText(this, GoogleSignOut.failLine(why), android.widget.Toast.LENGTH_LONG).show();
+            showGoogleAccounts();
+        });
+    }
+
+    private GoogleSignOut.Store acctMarksStore(final String fileName) {
+        final java.io.File dir = getFilesDir();
+        final java.io.File dst = new java.io.File(dir, fileName);
+        return new GoogleSignOut.Store() {
+            @Override public String read() throws java.io.IOException {
+                if (!dst.exists()) return "";
+                return new String(java.nio.file.Files.readAllBytes(dst.toPath()), java.nio.charset.StandardCharsets.UTF_8);
+            }
+
+            /** Replace the marks file through a temp in the same directory and a rename. */
+            @Override public void write(String content) throws java.io.IOException {
+                java.io.File tmp = java.io.File.createTempFile(fileName, ".tmp", dir);
+                try (java.io.FileOutputStream o = new java.io.FileOutputStream(tmp)) {
+                    o.write(content.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                    o.getFD().sync();
+                } catch (java.io.IOException e) {
+                    tmp.delete();
+                    throw e;
+                }
+                if (!tmp.renameTo(dst)) {
+                    tmp.delete();
+                    throw new java.io.IOException("rename");
+                }
+            }
+
+            @Override public void delete() throws java.io.IOException {
+                if (!dst.exists() || dst.delete()) return;
+                // a file that cannot be unlinked is emptied in place: roamd reads an empty marks file as no mark
+                try (java.io.FileOutputStream o = new java.io.FileOutputStream(dst)) {
+                    o.getFD().sync();
+                }
+            }
+        };
+    }
+
+    /** #108 Offline media: pin an app so its bulk media (maps, downloads) is kept LOCAL -- restored at sign-in so
+     *  it opens instantly and works offline -- instead of streamed on demand. Lists the apps that HAVE deferred
+     *  media (LIST-MEDIA-APPS) with a size + a per-app toggle. The pin set is a small file in THIS (roamed) user's
+     *  chooser dir (getFilesDir/nowhere-pins) -- it roams with the profile and the seal reads the same file. Turning
+     *  a pin ON signals mediad (PIN-MATERIALIZE) to fetch that app's media to local; progress shows via the
+     *  usual "Loading your media" notification. NWP-20260829-27: the signal is ADVISORY -- init ignores
+     *  ctl.start for an already-running daemon, so what actually picks the change up is mediad's own 20s
+     *  poll of this file. Expect up to ~20s before the fetch starts, not "now". */
+    private void showOfflineMedia() {
+        final LinearLayout ll = menuScreen("Offline media", "keep an app's maps & files on this device");
+        TextView note = new TextView(this);
+        note.setText("Choose how each app keeps its maps & files. Essential downloads at sign-in so it's ready "
+                + "instantly. Auto fills in the background. On-demand streams as you use it to save space.");
+        note.setTextColor(MUTED);
+        note.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        LinearLayout.LayoutParams nlp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        nlp.topMargin = dp(10);
+        nlp.bottomMargin = dp(6);
+        ll.addView(note, nlp);
+
+        // #108 P3: a user-set offline budget (GB). A pinned app's media is kept local only up to this many
+        // bytes; the excess falls back to on-demand streaming. Blank/0 = no limit. The summary tracks total
+        // pinned size against the budget. Stored in getFilesDir/nowhere-media-budget (the seal reads the same).
+        final java.util.Map<String, Long> sizes = new java.util.HashMap<>();
+        final long[] budget = { readBudgetBytes() };
+        final TextView usage = new TextView(this);
+        usage.setTextColor(MUTED);
+        usage.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        final Runnable updateUsage = () -> {
+            java.util.Set<String> ps = readPins();
+            long used = 0;
+            for (java.util.Map.Entry<String, Long> e : sizes.entrySet()) if (ps.contains(e.getKey())) used += e.getValue();
+            String u = android.text.format.Formatter.formatShortFileSize(this, used);
+            if (budget[0] <= 0) { usage.setText("Keeping " + u + " offline · no limit set"); return; }
+            String cap = android.text.format.Formatter.formatShortFileSize(this, budget[0]);
+            usage.setText(used > budget[0]
+                    ? "Keeping " + u + " of " + cap + " — over budget; the rest streams on demand"
+                    : "Keeping " + u + " of " + cap + " offline");
+        };
+        LinearLayout brow = new LinearLayout(this);
+        brow.setOrientation(LinearLayout.HORIZONTAL);
+        brow.setGravity(Gravity.CENTER_VERTICAL);
+        brow.setPadding(dp(4), dp(10), dp(4), dp(2));
+        TextView blab = new TextView(this);
+        blab.setText("Keep offline up to");
+        blab.setTextColor(INK);
+        blab.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
+        brow.addView(blab, new LinearLayout.LayoutParams(0, WRAP, 1f));
+        // NWP-20261019-13: SafeEdit, not a bare EditText -- a long-press reaches canPaste() and kills the process.
+        final android.widget.EditText gb = new SafeEdit(this);
+        gb.setInputType(android.text.InputType.TYPE_CLASS_NUMBER);
+        gb.setTextColor(INK);
+        gb.setGravity(Gravity.END);
+        gb.setHint("∞"); // ∞ = no limit
+        if (budget[0] > 0) gb.setText(String.valueOf((budget[0] + (1L << 30) - 1) >> 30)); // bytes -> GiB, round up
+        brow.addView(gb, new LinearLayout.LayoutParams(dp(64), WRAP));
+        TextView gunit = new TextView(this);
+        gunit.setText(" GB");
+        gunit.setTextColor(MUTED);
+        gunit.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
+        brow.addView(gunit, new LinearLayout.LayoutParams(WRAP, WRAP));
+        ll.addView(brow, new LinearLayout.LayoutParams(MATCH, WRAP));
+        ll.addView(usage, new LinearLayout.LayoutParams(MATCH, WRAP));
+        gb.setOnFocusChangeListener((v, has) -> {
+            if (has) return; // apply when the field loses focus
+            long b = 0;
+            try { String s = gb.getText().toString().trim(); if (!s.isEmpty()) b = Long.parseLong(s) << 30; } catch (Throwable ignore) {}
+            if (b < 0) b = 0;
+            // NWP-20261124-23: a failed save says so, tells mediad nothing and redraws from the file. Posted: a
+            // focus loss can come from leaving this screen, and the redraw must not pull the user back into it.
+            if (!writeBudgetBytes(b)) {
+                android.widget.Toast.makeText(this, SettingsSaveCopy.NOT_SAVED, android.widget.Toast.LENGTH_LONG).show();
+                ll.post(() -> { if (ll.isAttachedToWindow()) showOfflineMedia(); });
+                return;
+            }
+            budget[0] = b;
+            updateUsage.run();
+            new Thread(() -> sendDaemon("PIN-MATERIALIZE\n")).start(); // re-apply the budget in mediad
+        });
+
+        // #129 metered opt-in: Auto prefetch is Wi-Fi-only by default; this lets it also use mobile data.
+        LinearLayout mrow = new LinearLayout(this);
+        mrow.setOrientation(LinearLayout.HORIZONTAL);
+        mrow.setGravity(Gravity.CENTER_VERTICAL);
+        mrow.setPadding(dp(4), dp(14), dp(4), dp(2));
+        LinearLayout mcol = new LinearLayout(this);
+        mcol.setOrientation(LinearLayout.VERTICAL);
+        TextView mlab = new TextView(this);
+        mlab.setText("Download over mobile data");
+        mlab.setTextColor(INK);
+        mlab.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
+        mcol.addView(mlab);
+        TextView msub = new TextView(this);
+        msub.setText("Auto downloads stay on Wi-Fi unless this is on");
+        msub.setTextColor(MUTED);
+        msub.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        mcol.addView(msub);
+        mrow.addView(mcol, new LinearLayout.LayoutParams(0, WRAP, 1f));
+        android.widget.Switch msw = GateSwitch.style(new android.widget.Switch(this), GatePalette.active());
+        msw.setChecked(readPrefetchMetered());
+        msw.setOnCheckedChangeListener((b, on) -> {
+            // NWP-20261124-23: a failed save says so, tells the daemon nothing and redraws from the file (the switch
+            // is rebuilt with setChecked before its listener is set, so the redraw does not fire this again).
+            if (!writePrefetchMetered(on)) {
+                android.widget.Toast.makeText(this, SettingsSaveCopy.NOT_SAVED, android.widget.Toast.LENGTH_LONG).show();
+                showOfflineMedia();
+                return;
+            }
+            // NWP-20261005-08: the gate's 30s prefetch tick picks this up from the daemon. Off-thread: a socket round-trip.
+            final String v = on ? "1" : "0";
+            // NWP-20261007-08: the choice is saved above (it roams and roamd reads it at the next sign-in); the
+            // daemon call only makes it apply now. If it does not land, say when it will, instead of showing a
+            // switch whose effect this session will not have.
+            new Thread(() -> {
+                boolean ok = false;
+                for (int i = 0; i < 2 && !ok; i++) {
+                    try { ok = sendDaemon("SET-PREFETCH-METERED\n" + v + "\n").startsWith("OK"); } catch (Throwable ignore) {}
+                }
+                if (!ok) runOnUiThread(() -> android.widget.Toast.makeText(this,
+                        "Saved. It takes effect from your next sign-in.", android.widget.Toast.LENGTH_LONG).show());
+            }).start();
+        });
+        mrow.addView(msw, new LinearLayout.LayoutParams(WRAP, WRAP));
+        ll.addView(mrow, new LinearLayout.LayoutParams(MATCH, WRAP));
+
+        // #172 (2026-07-16): a real spinner (not just faint "Loading…" text) so the tap gives obvious feedback
+        // while LIST-MEDIA-APPS runs off-thread -- it now fetches BOTH the CE and #media heads, so the wait is a
+        // touch longer and needs to visibly read as "working", not "frozen".
+        final LinearLayout loading = new LinearLayout(this);
+        loading.setOrientation(LinearLayout.HORIZONTAL);
+        loading.setGravity(Gravity.CENTER);
+        loading.setPadding(0, dp(20), 0, dp(4));
+        TextView lt = new TextView(this);
+        StatusLine.busy(lt, "Loading your offline media…"); // NWP-20261007-13: the spinner rides the line
+        lt.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        loading.addView(lt, new LinearLayout.LayoutParams(WRAP, WRAP));
+        ll.addView(loading, new LinearLayout.LayoutParams(MATCH, WRAP));
+
+        // #74b / NWP-20260821-14: Back BEFORE the load, not after it. The screen is presented immediately
+        // with the spinner, but Back used to be appended only by finishOfflineMedia() inside the runOnUiThread
+        // that fires when LIST-MEDIA-APPS returns -- so for the whole scan there was NO WAY OUT of this screen.
+        // Chester, twice: it should be visible as soon as the screen opens. Added here so the escape exists
+        // from the first frame; finishOfflineMedia() removes this one before appending the final Back, so the
+        // finished screen still ends with exactly one Back link below the content.
+        offlineMediaBack = offlineMediaBackLink();
+        ll.addView(offlineMediaBack, new LinearLayout.LayoutParams(MATCH, WRAP));
+
+        // Present the screen NOW so the tap lands instantly and the "Loading…" line is visible while
+        // LIST-MEDIA-APPS runs off-thread -- else the screen only appears after the daemon round-trip and the
+        // tap feels frozen. finishOfflineMedia() appends Back to this same (already-shown) ll, no re-wrap.
+        android.widget.ScrollView loadingSc = new android.widget.ScrollView(this);
+        loadingSc.setBackgroundColor(BG);
+        loadingSc.addView(ll);
+        setContentView(loadingSc);
+
+        new Thread(() -> {
+            final String reply = sendDaemonMulti("LIST-MEDIA-APPS\n");
+            final java.util.Set<String> pins = readPins();
+            final java.util.Map<String,String> overrides = readTiers();
+            runOnUiThread(() -> {
+                ll.removeView(loading);
+                String[] lines = reply.split("\n");
+                String head = lines.length == 0 ? "" : lines[0].trim();
+                if (!head.equals("OK")) {
+                    // NWP-20260916-01: only LOCAL is a real "nothing here". ERR, an empty reply (the daemon did
+                    // not answer) and NONE are failures to READ, and calling them emptiness is what hid a
+                    // tied profile's photos for two months: the screen said there was nothing to manage.
+                    TextView e = new TextView(this);
+                    e.setText(head.equals("LOCAL")
+                            ? "This session is local, so nothing is stored online and there is no on-demand media."
+                            : "Couldn't read your offline media just now. Go back and open this screen again in a moment.");
+                    e.setTextColor(MUTED);
+                    e.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+                    e.setPadding(0, dp(16), 0, 0);
+                    ll.addView(e, new LinearLayout.LayoutParams(MATCH, WRAP));
+                    finishOfflineMedia(ll);
+                    return;
+                }
+                int rows = 0;
+                for (int i = 1; i < lines.length; i++) {
+                    String[] parts = lines[i].trim().split(" ");
+                    if (parts.length < 2) continue; // "<app.segment> <bytes> [<tier>]" -- segments never contain spaces
+                    String app = parts[0];
+                    long bytes = 0;
+                    try { bytes = Long.parseLong(parts[1]); } catch (Throwable ignore) {}
+                    int daemonTier = 0;
+                    if (parts.length >= 3) try { daemonTier = Integer.parseInt(parts[2]); } catch (Throwable ignore) {}
+                    sizes.put(app, bytes);
+                    ll.addView(mediaAppRow(app, bytes, tierIndexFor(app, daemonTier, pins, overrides), updateUsage));
+                    rows++;
+                }
+                if (rows == 0) {
+                    TextView none = new TextView(this);
+                    none.setText("Nothing to manage here. Smaller files are always kept on the phone and arrive when you sign in; only large photos, videos and downloads can be left in your store until you open them.");
+                    none.setTextColor(MUTED);
+                    none.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+                    none.setPadding(0, dp(16), 0, 0);
+                    ll.addView(none, new LinearLayout.LayoutParams(MATCH, WRAP));
+                }
+                updateUsage.run();
+                finishOfflineMedia(ll);
+            });
+        }).start();
+    }
+
+    /** #74b: the Back link, built once so the pre-load one and the final one cannot drift apart. */
+    private TextView offlineMediaBackLink() {
+        TextView back = new TextView(this);
+        back.setText("Back");
+        back.setTextColor(ACCENT);
+        back.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        back.setGravity(Gravity.CENTER);
+        back.setPadding(dp(8), dp(22), dp(8), dp(8));
+        back.setOnClickListener(v -> showPreferences());
+        return back;
+    }
+
+    /** The Back link shown while the listing loads (#74b), so it can be removed before the final one is
+     *  appended below the content. Null once consumed. */
+    private TextView offlineMediaBack;
+
+    private void finishOfflineMedia(LinearLayout ll) {
+        if (offlineMediaBack != null) { // #74b: drop the pre-load Back so it does not end up ABOVE the rows
+            ll.removeView(offlineMediaBack);
+            offlineMediaBack = null;
+        }
+        TextView back = offlineMediaBackLink();
+        ll.addView(back, new LinearLayout.LayoutParams(MATCH, WRAP));
+        // ll is already attached to the ScrollView presented in showOfflineMedia (screen shown before the
+        // load), so just append Back to the live layout -- re-wrapping in a new ScrollView would throw
+        // "already has a parent".
+    }
+
+    /** NWP-20261014-32: a top-level shared dir (Download, DCIM) groups under its own name like an app, but
+     *  package names always contain '.', so a dot-less segment is never a package: label it a folder.
+     *  A dotted segment (a loose file, a user dir with a dot) keeps the app label; tiers/pins stay keyed
+     *  by the same segment. */
+    static String mediaFolderLabel(String seg) {
+        return seg != null && !seg.isEmpty() && seg.indexOf('.') < 0 ? "Files \u00b7 " + seg : null;
+    }
+
+    /** #129 One app row: name + size on top, a "Maps & files" caption, then a 3-way tier segmented control below.
+     *  tierIdx: 0=Essential, 1=Auto, 2=On-demand. Changing it writes the pin/tier files + re-kicks mediad. */
+    private View mediaAppRow(final String app, final long bytes, int tierIdx, final Runnable onToggle) {
+        LinearLayout col = new LinearLayout(this);
+        col.setOrientation(LinearLayout.VERTICAL);
+        col.setPadding(dp(4), dp(12), dp(4), dp(12));
+
+        LinearLayout top = new LinearLayout(this);
+        top.setOrientation(LinearLayout.HORIZONTAL);
+        top.setGravity(Gravity.CENTER_VERTICAL);
+        TextView nm = new TextView(this);
+        String folder = mediaFolderLabel(app);
+        nm.setText(folder != null ? folder : appLabel(app));
+        nm.setTextColor(INK);
+        nm.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16);
+        top.addView(nm, new LinearLayout.LayoutParams(0, WRAP, 1f));
+        TextView sz = new TextView(this);
+        sz.setText(android.text.format.Formatter.formatShortFileSize(this, bytes));
+        sz.setTextColor(MUTED);
+        sz.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        top.addView(sz, new LinearLayout.LayoutParams(WRAP, WRAP));
+        col.addView(top, new LinearLayout.LayoutParams(MATCH, WRAP));
+
+        // Q074: the control below sets the app's maps & files, not the app's own keep mode (the Apps screens' chip).
+        TextView cap = new TextView(this);
+        cap.setText(MediaTierCopy.CAPTION);
+        cap.setTextColor(MUTED);
+        cap.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        clp.topMargin = dp(6);
+        col.addView(cap, clp);
+
+        View seg = segmentedTier(tierIdx, idx -> {
+            // NWP-20261124-23: a failed save says so, tells mediad nothing and redraws: the segment is rebuilt from
+            // nowhere-pins and nowhere-media-tiers, which is what the seal reads.
+            if (!applyTier(app, idx)) {
+                android.widget.Toast.makeText(this, SettingsSaveCopy.NOT_SAVED, android.widget.Toast.LENGTH_LONG).show();
+                showOfflineMedia();
+                return;
+            }
+            boolean essential = idx == 0;
+            String msg = essential ? "Keeping " + appLabel(app) + " on this phone — downloading now…"
+                    : idx == 1 ? appLabel(app) + " will auto-download in the background"
+                    : appLabel(app) + " will stream on demand";
+            android.widget.Toast.makeText(this, msg, android.widget.Toast.LENGTH_SHORT).show();
+            new Thread(() -> sendDaemon("PIN-MATERIALIZE\n")).start(); // re-read pins/tiers + (de)materialize in mediad
+            if (onToggle != null) onToggle.run(); // refresh the "X of Y GB" budget summary
+        });
+        seg.setContentDescription(MediaTierCopy.CAPTION);
+        LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        slp.topMargin = dp(8);
+        col.addView(seg, slp);
+        return col;
+    }
+
+    /** #129 A 3-segment tier picker (Essential | Auto | On-demand). The selected segment is filled with
+     *  ACCENT; onSelect(idx) fires on a change. Built from plain views so it matches the app's dark palette. */
+    // ---- NWP-20260825-15: Configuration -- the per-profile DEFAULTS for new things ----------------
+    //
+    // Chester: "a centralized place for modes". Before this, the default a NEW app or a NEW app's media got
+    // was buried in code -- curatedTier() for media, MODE_INSTALLED for apps -- with no way for a profile to
+    // say "apps I install from Play should not roam". The per-app screens stay exactly as they were; this
+    // only decides what an app gets the FIRST time it is seen.
+    //
+    // ⚠ NEW THINGS ONLY, never retroactive. Changing a default must not reach back and alter apps already on
+    // the profile: "Play Store -> Off" retroactively would silently stop existing Play apps roaming and drop
+    // their data at the next logoff. Chester chose this explicitly. Everything already decided keeps its
+    // decision, whether the user set it or a previous default did.
+    //
+    // Lives in the chooser's files dir, so it SEALS AND ROAMS with the profile like nowhere-appkeep and
+    // nowhere-media-tiers -- a device you sign into next should behave the way you configured it, not the way
+    // that handset happens to be set up.
+    static final String CFG_FILE          = "nowhere-config";
+    static final String CFG_MEDIA_DEFAULT = "media.default";   // essential|prefetch|ondemand
+    static final String CFG_APPS_NAPPS    = "apps.default.napps";
+    static final String CFG_APPS_PLAY     = "apps.default.play";
+    static final String CFG_APPS_AURORA   = "apps.default.aurora";
+    // NWP-20260827-08: the GrapheneOS App Store (Endospore's own store, and the documented way to install
+    // sandboxed Play). Before this it had no bucket at all, so every app from it fell into CFG_APPS_OTHER --
+    // whose default is OFF -- and was silently not kept. Device-proven on lynx 2026-08-27: Chester installed
+    // Play Store from it on a fresh profile and neither com.android.vending nor com.google.android.gms
+    // reached the keep-set, so both would have vanished at logoff.
+    //
+    // ⚠ ITS OWN ROW RATHER THAN FOLDING INTO nApps, and the default stays OFF. Folding it in (the way F-Droid
+    // is folded in, "nApps is mainly just a curated version of f-droid") would be defensible on trust, but
+    // this store is ALSO how Play arrives -- so it would quietly flip Play Store from its deliberate Off
+    // default to Auto. A separate row changes no behaviour and makes the behaviour visible instead.
+    static final String CFG_APPS_GOS      = "apps.default.gos";
+    static final String GOS_STORE_PKG     = "app.grapheneos.apps";
+    // ⚠ NWP-20260825-18: the catch-all -- a sideload, or a store we do not recognise. It is a REAL bucket, not
+    // a leftover: those installs genuinely carry no usable attribution, and before this they had no default at
+    // all (the classifier returned null and the receiver did nothing).
+    static final String CFG_APPS_OTHER    = "apps.default.other";
+
+    /** The app-default vocabulary. "off" is the switched-off state (recordTurnedOff) -- the app is not kept at
+     *  all, which is what Chester means by "No"; it is NOT a mode, which is why it is not in MODE_*. */
+    static final String APPDEF_OFF = "off";
+
+    private java.util.Map<String,String> readConfig() {
+        String text = SettingsText.read(new java.io.File(getFilesDir(), CFG_FILE));
+        return SettingsText.parseConfig(text == null ? "" : text);
+    }
+
+    /** Read one setting, falling back to the shipped default. The fallbacks ARE the documented product
+     *  defaults (media on-demand; nApps auto; Play and Aurora off), so a profile with no config file behaves
+     *  exactly as the screen says it does. */
+    /** Context-only form, for StoreInstaller and AppInstallReceiver, which have no Activity. Same fallbacks,
+     *  because a profile with no config file must behave exactly as the Configuration screen says it does. */
+    static String cfgStatic(android.content.Context ctx, String key) {
+        String v = null;
+        try (java.io.BufferedReader br = new java.io.BufferedReader(
+                new java.io.FileReader(new java.io.File(ctx.getFilesDir(), CFG_FILE)))) {
+            String ln;
+            while ((ln = br.readLine()) != null) {
+                ln = ln.trim();
+                int eq = ln.indexOf('=');
+                if (eq <= 0 || ln.startsWith("#")) continue;
+                if (ln.substring(0, eq).trim().equals(key)) v = ln.substring(eq + 1).trim();
+            }
+        } catch (Throwable ignore) {
+        }
+        if (v != null && !v.isEmpty()) return v;
+        if (CFG_MEDIA_DEFAULT.equals(key)) return "ondemand";
+        if (CFG_APPS_NAPPS.equals(key))    return MODE_AUTO;
+        return APPDEF_OFF; // Play, Aurora, the GrapheneOS App Store, and everything else
+    }
+
+    /** Which default applies to an app installed by this installer. Never null -- an installer we do not
+     *  recognise (including a null one, i.e. a sideload) falls to CFG_APPS_OTHER.
+     *
+     *  ⚠ NWP-20260825-18 RETRACTS THE MEASUREMENT THAT NWP-20260825-17 COLLAPSED THIS ON. -17 replaced the
+     *  per-store keys with a single "everything else" because a survey of 248 packages showed 244 with
+     *  installerPackageName=null, read as "Android does not record where an app came from". That survey was
+     *  measuring THE BUNDLED IMAGE. Re-run on lynx 2026-08-25 after the flash, split by package type:
+     *
+     *      242  packages on user 0
+     *      242  system (bundled -- they ship in the image and by definition have NO installer)
+     *        0  third-party
+     *
+     *  Every null was a preinstalled app. The -17 survey's own output contained the disproof -- it listed
+     *  `1 com.aurora.store` as an installer, i.e. an Aurora install with Aurora correctly recorded -- and it
+     *  was read past. Attribution works for real store installs, so per-store defaults are implementable and
+     *  the four rows Chester originally asked for are back.
+     *
+     *  ⚠ AURORA HAS TWO INSTALLER IDENTITIES. Aurora Store can delegate the actual install to Aurora Services
+     *  (com.aurora.services, a privileged installer bundled on this image), in which case IT is what lands in
+     *  installerPackageName. The pre--17 three-bucket code matched only com.aurora.store, so an Aurora install
+     *  through Services would have silently missed the Aurora default -- the same silent-miss shape all over
+     *  again. Both are matched here.
+     *
+     *  nApps needs none of this: StoreInstaller writes the keep line on the install path itself. */
+    static String appDefaultForInstaller(android.content.Context ctx, String installer) {
+        return cfgStatic(ctx, cfgKeyForInstaller(installer));
+    }
+
+    static String cfgKeyForInstaller(String installer) {
+        if (installer == null) return CFG_APPS_OTHER;  // a sideload records no installer
+        switch (installer) {
+            // Chester: "nApps is mainly just a curated version of f-droid" -- so an F-Droid install is filed
+            // under the nApps default rather than counting as a sideload. Note a nApps install carries the
+            // CHOOSER as its installer (the chooser completes the unarchive), not com.nowhere.napps.
+            case "com.nowhere.chooser": case "com.nowhere.napps": case "org.fdroid.fdroid":
+                return CFG_APPS_NAPPS;
+            case "com.android.vending":
+                return CFG_APPS_PLAY;
+            case "com.aurora.store": case "com.aurora.services":
+                return CFG_APPS_AURORA;
+            case GOS_STORE_PKG:
+                return CFG_APPS_GOS;
+        }
+        return CFG_APPS_OTHER;
+    }
+
+    String cfg(String key) {
+        String v = readConfig().get(key);
+        if (v != null && !v.isEmpty()) return v;
+        if (CFG_MEDIA_DEFAULT.equals(key)) return "ondemand";
+        if (CFG_APPS_NAPPS.equals(key))    return MODE_AUTO;
+        return APPDEF_OFF; // Play, Aurora, the GrapheneOS App Store, and everything else
+    }
+
+    private void cfgPut(String key, String val) {
+        cfgPutStatic(this, key, val);
+    }
+
+    /** NWP-20261124-09: cfgPut's read-merge-write, for a caller without an Activity (PlayAtCreateReceiver). The same
+     *  rules: an unreadable file is left alone (NWP-20261111-17), and temp + rename publishes the file. */
+    static void cfgPutStatic(android.content.Context ctx, String key, String val) {
+        // NWP-20261111-17: a file that exists and cannot be read is left alone -- rewriting it from an empty read
+        // would reset every other default in it
+        String text = SettingsText.read(new java.io.File(ctx.getFilesDir(), CFG_FILE));
+        if (text == null) {
+            android.util.Log.w("NowhereChooser", "nowhere-config unreadable -- nothing written (NWP-20261111-17)");
+            return;
+        }
+        java.util.Map<String,String> m = SettingsText.parseConfig(text);
+        m.put(key, val);
+        StringBuilder sb = new StringBuilder();
+        for (java.util.Map.Entry<String,String> e : m.entrySet()) {
+            sb.append(e.getKey()).append('=').append(e.getValue()).append('\n');
+        }
+        // temp + rename: a failed write keeps the old file whole, where a FileWriter truncated it at open
+        try {
+            StoreInstaller.writeAtomic(new java.io.File(ctx.getFilesDir(), CFG_FILE), sb.toString());
+        } catch (Throwable t) {
+            android.util.Log.w("NowhereChooser", "cfgPut " + key, t);
+        }
+    }
+
+    /** NWP-20260825-15: Configuration -- one place for the defaults that decide what a NEW app, or a new
+     *  app's media, starts out as. The per-app screens (Your apps / Offline media) are unchanged and still
+     *  win: this only supplies the starting point when a profile has never expressed an opinion about an app.
+     *
+     *  ⚠ Changing anything here is NOT retroactive -- see the note on CFG_FILE. The screen says so, because a
+     *  settings page that silently restates the past is how you lose someone's data. */
+    private void showConfiguration() {
+        LinearLayout ll = menuScreen("Configuration", "defaults for new apps and media");
+
+        TextView m = new TextView(this);
+        m.setText("Offline media");
+        m.setTextColor(INK);
+        m.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
+        m.setPadding(dp(4), dp(14), dp(4), dp(2));
+        ll.addView(m);
+        TextView ms = new TextView(this);
+        ms.setText("What a new app's media starts as. On-demand streams it when you open it.");
+        ms.setTextColor(MUTED);
+        ms.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        ms.setPadding(dp(4), 0, dp(4), dp(8));
+        ll.addView(ms);
+        String mv = cfg(CFG_MEDIA_DEFAULT);
+        int mi = "essential".equals(mv) ? 0 : "prefetch".equals(mv) ? 1 : 2;
+        // NWP-20261122-02: through the preset guard; its Cancel redraws the screen, putting the segment back.
+        // NWP-20261125-22: cfgPut is void, so read the file back; a write that did not land says so and redraws.
+        ll.addView(segmented(new String[]{"Essential", "Auto", "On-demand"}, mi,
+                idx -> presetGuard(PresetPicker.change(CFG_MEDIA_DEFAULT, PresetPicker.MEDIA_SCREEN_VALUES.get(idx)),
+                        () -> {
+                            cfgPut(CFG_MEDIA_DEFAULT, idx == 0 ? "essential" : idx == 1 ? "prefetch" : "ondemand");
+                            if (!SettingLanded.landed(PresetPicker.change(CFG_MEDIA_DEFAULT,
+                                    PresetPicker.MEDIA_SCREEN_VALUES.get(idx)), presetCurrent())) {
+                                android.widget.Toast.makeText(this, SettingLanded.NOT_SAVED,
+                                        android.widget.Toast.LENGTH_LONG).show();
+                                showConfiguration();
+                            }
+                        },
+                        () -> showConfiguration())));
+
+        TextView a = new TextView(this);
+        a.setText("Your apps");
+        a.setTextColor(INK);
+        a.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
+        a.setPadding(dp(4), dp(22), dp(4), dp(2));
+        ll.addView(a);
+        TextView as = new TextView(this);
+        as.setText("What a newly installed app starts as, by where it came from. Off means it is "
+                + "not kept — it will not come back after you sign out.\n\n"
+                + "“Everything else” is an app you sideload, or one from a store we do not "
+                + "recognise.\n\n"
+                + "Apps that came with the phone are not listed in Your apps at all: they are part "
+                + "of the image, so they are always there and there is nothing to keep.");
+        as.setTextColor(MUTED);
+        as.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        as.setPadding(dp(4), 0, dp(4), dp(8));
+        ll.addView(as);
+        appDefaultRow(ll, "nApps", CFG_APPS_NAPPS);
+        appDefaultRow(ll, "Play Store", CFG_APPS_PLAY);
+        appDefaultRow(ll, "Aurora Store", CFG_APPS_AURORA);
+        // ⚠ ONLY WHERE THAT STORE EXISTS. The chooser lives in core/ and is shared by both editions, but
+        // app.grapheneos.apps ships on ENDOSPORE only -- on Diaspore this row would be a control for a store
+        // the user cannot have, which is the same class of lie as the Play Store chip that did nothing.
+        // Gating on the package rather than on the edition keeps core/ edition-agnostic, per AGENTS.md.
+        if (isInstalledPkg(GOS_STORE_PKG)) appDefaultRow(ll, "GrapheneOS App Store", CFG_APPS_GOS);
+        appDefaultRow(ll, "Everything else", CFG_APPS_OTHER);
+
+        TextView note = new TextView(this);
+        note.setText("Changing these affects apps you install from now on. Apps already on this profile keep "
+                + "what they have — nothing here removes anything.");
+        note.setTextColor(MUTED);
+        note.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        note.setPadding(dp(4), dp(22), dp(4), dp(8));
+        ll.addView(note);
+        // ⚠ NWP-20260825-16: menuScreen() only BUILDS the column -- finishMenuScreen is what adds the Back
+        // control and presents it. Omitting it made the Configuration row a dead tap: the screen was
+        // constructed correctly and then never shown, with no exception to find in logcat. Every one of the
+        // nine sibling screens calls this; mine did not, and I claimed the screen was "straightforward to
+        // eyeball" without eyeballing it.
+        //
+        // Back goes to PREFERENCES, not the profile root: that is where this screen is entered from, and it is
+        // the same "the REAL parent, per entry point" rule as NWP-20260821-14. The 1-arg overload would have
+        // dropped the user two levels up.
+        finishMenuScreen(ll, this::showPreferences);
+    }
+
+    /** One store's app default. Order runs least-kept to most-kept so the row reads as a dial. */
+    private void appDefaultRow(LinearLayout parent, String label, final String key) {
+        TextView t = new TextView(this);
+        t.setText(label);
+        t.setTextColor(MUTED);
+        t.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        t.setPadding(dp(4), dp(10), dp(4), dp(4));
+        parent.addView(t);
+        String v = cfg(key);
+        int idx = APPDEF_OFF.equals(v) ? 0 : MODE_ONDEMAND.equals(v) ? 1 : MODE_AUTO.equals(v) ? 2 : 3;
+        // NWP-20261122-02: through the preset guard; its Cancel redraws the screen, putting the segment back.
+        // NWP-20261125-22: cfgPut is void, so read the file back; a write that did not land says so and redraws.
+        parent.addView(segmented(new String[]{"Off", "On-demand", "Auto", "Installed"}, idx,
+                i -> presetGuard(PresetPicker.change(key, PresetPicker.APPDEF_SCREEN_VALUES.get(i)),
+                        () -> {
+                            cfgPut(key, i == 0 ? APPDEF_OFF : i == 1 ? MODE_ONDEMAND : i == 2 ? MODE_AUTO : MODE_INSTALLED);
+                            if (!SettingLanded.landed(PresetPicker.change(key,
+                                    PresetPicker.APPDEF_SCREEN_VALUES.get(i)), presetCurrent())) {
+                                android.widget.Toast.makeText(this, SettingLanded.NOT_SAVED,
+                                        android.widget.Toast.LENGTH_LONG).show();
+                                showConfiguration();
+                            }
+                        },
+                        () -> showConfiguration())));
+    }
+
+    private View segmentedTier(int selected, final java.util.function.IntConsumer onSelect) {
+        return segmented(MediaTierCopy.labels(), selected, onSelect);
+    }
+
+    /** NWP-20260825-15: the same control, any number of segments. Extracted from segmentedTier so the
+     *  Configuration screen can offer a 4-way app default (Off / On-demand / Auto / Installed) without a
+     *  second copy of the painting logic drifting out of step with this one. */
+    private View segmented(final String[] labels, int selected, final java.util.function.IntConsumer onSelect) {
+        final int n = labels.length;
+        final LinearLayout group = new LinearLayout(this);
+        group.setOrientation(LinearLayout.HORIZONTAL);
+        GradientDrawable track = new GradientDrawable();
+        track.setColor(PANEL);
+        track.setStroke(dp(1), PANEL_LN);
+        track.setCornerRadius(dp(10));
+        group.setBackground(track);
+        group.setPadding(dp(3), dp(3), dp(3), dp(3));
+        final TextView[] segs = new TextView[n];
+        final int[] sel = { selected };
+        final Runnable paint = () -> {
+            for (int i = 0; i < n; i++) {
+                boolean on = i == sel[0];
+                GradientDrawable sb = new GradientDrawable();
+                sb.setColor(on ? ACCENT : android.graphics.Color.TRANSPARENT);
+                sb.setCornerRadius(dp(8));
+                segs[i].setBackground(sb);
+                segs[i].setTextColor(on ? BG : MUTED);
+                segs[i].setTypeface(null, on ? android.graphics.Typeface.BOLD : android.graphics.Typeface.NORMAL);
+            }
+        };
+        for (int i = 0; i < n; i++) {
+            final int idx = i;
+            TextView t = new TextView(this);
+            t.setText(labels[i]);
+            t.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+            t.setGravity(Gravity.CENTER);
+            t.setPadding(dp(2), dp(9), dp(2), dp(9));
+            group.addView(t, new LinearLayout.LayoutParams(0, WRAP, 1f));
+            segs[i] = t;
+            t.setOnClickListener(v -> {
+                if (sel[0] == idx) return;
+                sel[0] = idx;
+                paint.run();
+                onSelect.accept(idx);
+            });
+        }
+        paint.run();
+        return group;
+    }
+
+    /** #129 Apply a 3-way tier choice: 0=Essential(pin), 1=Auto(prefetch), 2=On-demand. Essential is the
+     *  #108 forcing pin; Auto/On-demand are explicit entries in nowhere-media-tiers (and clear the pin). The seal
+     *  re-stamps deferredFile.Tier. True only when both files now hold the choice (NWP-20261124-23); on true the
+     *  caller re-kicks mediad so it re-reads the files and starts materializing/de-materializing. */
+    private boolean applyTier(String app, int idx) {
+        boolean essential = idx == 0;
+        boolean pinOk = setPinned(app, essential);                 // Essential == the #108 forcing pin
+        boolean tierOk = setTierOverride(app, essential ? null : (idx == 1 ? "prefetch" : "ondemand"));
+        return SettingsSaveCopy.tierSaved(pinOk, tierOk);
+    }
+
+    /** #129 UI segment for an app: an explicit nowhere-media-tiers entry wins, else a pin = Essential, else the
+     *  daemon-reported (curated/sealed) tier. 0=Essential, 1=Auto(prefetch), 2=On-demand. */
+    private int tierIndexFor(String app, int daemonTier, java.util.Set<String> pins, java.util.Map<String,String> overrides) {
+        String o = overrides.get(app);
+        if (o != null) {
+            if (o.equals("essential")) return 0;
+            if (o.equals("prefetch")) return 1;
+            if (o.equals("ondemand")) return 2;
+        }
+        if (pins.contains(app)) return 0;
+        return daemonTier == 2 ? 1 : 2;
+    }
+
+    /** #129 per-app tier overrides: getFilesDir/nowhere-media-tiers, one "app.segment tier" per line
+     *  (tier = essential|prefetch|ondemand). The seal's loadTiers reads the same file. */
+    private java.util.Map<String,String> readTiers() {
+        String text = SettingsText.read(new java.io.File(getFilesDir(), "nowhere-media-tiers"));
+        return SettingsText.parseTiers(text == null ? "" : text);
+    }
+
+    private boolean setTierOverride(String app, String tier) {
+        java.io.File f = new java.io.File(getFilesDir(), "nowhere-media-tiers");
+        // NWP-20261111-17: an unreadable file is neither rewritten nor deleted -- an empty read plus one removal
+        // would delete every other app's choice
+        String text = SettingsText.read(f);
+        if (text == null) {
+            Log.w("NowhereChooser", "nowhere-media-tiers unreadable -- nothing written (NWP-20261111-17)");
+            return false;
+        }
+        java.util.Map<String,String> m = SettingsText.parseTiers(text);
+        if (tier == null) m.remove(app); else m.put(app, tier);
+        if (m.isEmpty()) { f.delete(); return !f.exists(); }
+        StringBuilder sb = new StringBuilder();
+        for (java.util.Map.Entry<String,String> e : m.entrySet()) sb.append(e.getKey()).append(' ').append(e.getValue()).append('\n');
+        try { StoreInstaller.writeAtomic(f, sb.toString()); }
+        catch (Throwable t) { Log.w("NowhereChooser", "setTierOverride", t); return false; }
+        return true;
+    }
+
+    /** #129 Tier-2 metered opt-in: getFilesDir/nowhere-prefetch-metered ("1" = allow prefetch on mobile data).
+     *  Absent/anything-else = Wi-Fi only (default). This file is the copy that ROAMS. The user-0 gate asks the
+     *  daemon (GET-PREFETCH-METERED), which cannot read it here (MLS, NWP-20261005-08): the worker surfaces it at
+     *  sign-in, and the Offline media switch tells the daemon directly for a change made mid-session. */
+    private boolean readPrefetchMetered() {
+        try (java.io.BufferedReader r = new java.io.BufferedReader(new java.io.FileReader(new java.io.File(getFilesDir(), "nowhere-prefetch-metered")))) {
+            String ln = r.readLine();
+            return ln != null && ln.trim().equals("1");
+        } catch (Throwable ignore) {}
+        return false;
+    }
+
+    /** True only when the file now holds the choice (NWP-20261124-23). The Offline media switch tells the daemon. */
+    private boolean writePrefetchMetered(boolean on) {
+        java.io.File f = new java.io.File(getFilesDir(), "nowhere-prefetch-metered");
+        if (!on) { f.delete(); return !f.exists(); } // absent = Wi-Fi only (default)
+        try { StoreInstaller.writeAtomic(f, "1"); }
+        catch (Throwable t) { Log.w("NowhereChooser", "writePrefetchMetered", t); return false; }
+        return true;
+    }
+
+    /** This profile's pin set: one app segment per line in getFilesDir/nowhere-pins (we run as the roamed user,
+     *  so this is /data/user/N/com.nowhere.chooser/files/nowhere-pins -- the seal's loadPins reads the same). */
+    private java.util.Set<String> readPins() {
+        String text = SettingsText.read(new java.io.File(getFilesDir(), "nowhere-pins"));
+        return SettingsText.parsePins(text == null ? "" : text);
+    }
+
+    private boolean setPinned(String app, boolean on) {
+        // NWP-20261111-17: an unreadable pin file is left alone -- rewriting it from an empty read unpins the rest
+        String text = SettingsText.read(new java.io.File(getFilesDir(), "nowhere-pins"));
+        if (text == null) {
+            Log.w("NowhereChooser", "nowhere-pins unreadable -- nothing written (NWP-20261111-17)");
+            return false;
+        }
+        java.util.Set<String> s = SettingsText.parsePins(text);
+        if (on) s.add(app); else s.remove(app);
+        StringBuilder sb = new StringBuilder();
+        for (String a : s) sb.append(a).append('\n');
+        try { StoreInstaller.writeAtomic(new java.io.File(getFilesDir(), "nowhere-pins"), sb.toString()); }
+        catch (Throwable t) { Log.w("NowhereChooser", "setPinned", t); return false; }
+        return true;
+    }
+
+    /** #108 P3: the offline-media budget in BYTES (getFilesDir/nowhere-media-budget; the seal reads the same file
+     *  via loadBudget). 0 / absent = no limit. */
+    private long readBudgetBytes() {
+        try (java.io.BufferedReader r = new java.io.BufferedReader(new java.io.FileReader(new java.io.File(getFilesDir(), "nowhere-media-budget")))) {
+            String ln = r.readLine();
+            if (ln != null) { ln = ln.trim(); if (!ln.isEmpty()) { long v = Long.parseLong(ln); return v > 0 ? v : 0; } }
+        } catch (Throwable ignore) {}
+        return 0;
+    }
+
+    /** True only when the file now holds the budget (NWP-20261124-23). */
+    private boolean writeBudgetBytes(long bytes) {
+        java.io.File f = new java.io.File(getFilesDir(), "nowhere-media-budget");
+        if (bytes <= 0) { f.delete(); return !f.exists(); } // no limit -> remove the file (absent = unlimited to loadBudget)
+        try { StoreInstaller.writeAtomic(f, String.valueOf(bytes)); }
+        catch (Throwable t) { Log.w("NowhereChooser", "writeBudgetBytes", t); return false; }
+        return true;
+    }
+
+    /** Friendly label for an app segment: the app's real name, else the raw segment (e.g. a media folder).
+     *
+     *  NWP-20260822-01 — delegates to keptLabel, which is the SAME question already answered correctly one
+     *  screen over. This used to be a bare `getApplicationInfo(app, 0)` with a catch that returned the raw
+     *  string, and flags=0 is exactly wrong here: an ARCHIVED on-demand placeholder has no on-device APK, so
+     *  PM throws and the screen printed the PACKAGE NAME. "Offline media" lists precisely the apps whose media
+     *  is deferred -- i.e. on-demand apps -- so the fallback was not an edge case, it was the common case, and
+     *  the same profile rendered "Toon Blast" under Your apps and "net.peakgames.toonblast" here.
+     *
+     *  ⚠ THIS IS THE THIRD SITE OF ONE DEFECT, and it was already fixed at the other two: #204 wrote keptLabel
+     *  for Your apps ("an ARCHIVED on-demand app ... falls back to the bare package name"), and DIA-20260804-09
+     *  added the gms/vending/gsf names because "What's using space" led with a raw `com.google.android.gms`.
+     *  Delegating rather than re-implementing is the point -- a fourth copy would drift the same way.
+     *
+     *  Non-package segments (a media folder like Download, when a deferred rel is not under an app dir) still
+     *  render as themselves: keptLabel's last resort returns its argument unchanged, which is what this method
+     *  already did for them. */
+    private String appLabel(String app) {
+        return keptLabel(app).toString();
+    }
+
+    /** Your data (DIA-20260628-09): it's yours -- back it up, and take a portable copy elsewhere.
+     *  - Back up now (P1): forces an immediate seal of the live session to the store via the daemon (BACKUP),
+     *    reusing the logoff seal-progress channel for a "Backing up… N%" line. The data already roams (~every
+     *    minute); this just captures the latest changes on demand.
+     *  - Export a copy (P2, tier-1): writes your contacts (vCard) + calendar (iCal) as standard files into your
+     *    Downloads folder, so you can take them to any phone. Reads via the providers under a runtime permission
+     *    you grant on demand (a privacy OS shouldn't standing-grant the kiosk your contacts). Media + a portable
+     *    archive are the next increments; see docs/data-export.md. */
+    private void showYourData() {
+        // NWP-20260901-28 (#145 S4): the DELTA leads and the button follows -- a "Back up now" under an
+        // unevidenced promise was the placement bug the #145 row named ("a Back up now button means little
+        // without the delta; the delta is what makes it actionable"). The screen presents IMMEDIATELY (Back
+        // exists from the first frame -- the #74b lesson, "for the whole scan there was NO WAY OUT... Chester,
+        // twice") and the delta paints when SEAL-DELTA lands, cheap RAM half first.
+        LinearLayout ll = menuScreen("Your data", "what's saved — and what isn't yet");
+
+        savedHeadTv = new TextView(this);
+        StatusLine.busy(savedHeadTv, "Checking what's saved…");
+        savedHeadTv.setTextColor(INK);
+        savedHeadTv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16);
+        savedHeadTv.setGravity(Gravity.CENTER);
+        LinearLayout.LayoutParams shlp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        shlp.topMargin = dp(22);
+        ll.addView(savedHeadTv, shlp);
+
+        savedSubTv = new TextView(this);
+        savedSubTv.setTextColor(MUTED);
+        savedSubTv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        savedSubTv.setGravity(Gravity.CENTER);
+        savedSubTv.setLineSpacing(dp(3), 1f);
+        savedSubTv.setVisibility(View.GONE);
+        LinearLayout.LayoutParams sslp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        sslp.topMargin = dp(6);
+        ll.addView(savedSubTv, sslp);
+
+        unsavedAppsTv = new TextView(this);
+        unsavedAppsTv.setTextColor(MUTED);
+        unsavedAppsTv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        unsavedAppsTv.setGravity(Gravity.CENTER);
+        unsavedAppsTv.setLineSpacing(dp(3), 1f);
+        unsavedAppsTv.setVisibility(View.GONE);
+        LinearLayout.LayoutParams ualp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        ualp.topMargin = dp(6);
+        ualp.bottomMargin = dp(4);
+        ll.addView(unsavedAppsTv, ualp);
+
+        changedTv = new TextView(this);
+        changedTv.setTextColor(MUTED);
+        changedTv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        changedTv.setGravity(Gravity.CENTER);
+        changedTv.setLineSpacing(dp(3), 1f);
+        changedTv.setVisibility(View.GONE);
+        LinearLayout.LayoutParams chlp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        chlp.topMargin = dp(6);
+        ll.addView(changedTv, chlp);
+
+        TextView note = new TextView(this);
+        // NWP-20260901-28: "about once a minute" was a hardcoded claim about a daemon setting this app does
+        // not control. The generic sentence ships; the real cadence is patched in from GET-SYNC-INTERVAL when
+        // it answers (loadSealDelta), so the copy can never drift from the daemon again.
+        note.setText("Saved to your store automatically. Back up to capture your latest "
+                + "changes now, or export a portable copy to take elsewhere.");
+        note.setTextColor(MUTED);
+        note.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        note.setGravity(Gravity.CENTER);
+        note.setLineSpacing(dp(4), 1f);
+        LinearLayout.LayoutParams nlp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        nlp.topMargin = dp(16);
+        nlp.bottomMargin = dp(18);
+        ll.addView(note, nlp);
+        syncNoteTv = note;
+
+        ll.addView(accentButton("Back up now", () -> doBackup()), btnLp(0));
+        ll.addView(secondaryButton("Export a copy", () -> startExport()), btnLp(dp(10)));
+        TextView exportNote = new TextView(this); // NWP-20261101-02: what a copy leaves out (ExportCopy)
+        exportNote.setText(ExportCopy.UNDER_BUTTON);
+        exportNote.setTextColor(MUTED);
+        exportNote.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        exportNote.setGravity(Gravity.CENTER);
+        exportNote.setLineSpacing(dp(4), 1f);
+        LinearLayout.LayoutParams exlp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        exlp.topMargin = dp(6);
+        ll.addView(exportNote, exlp);
+        ll.addView(secondaryButton("Restore a snapshot", () -> showSnapshots()), btnLp(dp(10))); // #58
+
+        dataStatusTv = new TextView(this); // shared status line for both actions
+        dataStatusTv.setTextColor(MUTED);
+        dataStatusTv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        dataStatusTv.setGravity(Gravity.CENTER);
+        dataStatusTv.setLineSpacing(dp(4), 1f);
+        LinearLayout.LayoutParams dlp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        dlp.topMargin = dp(20);
+        ll.addView(dataStatusTv, dlp);
+
+        // #88: a visual progress bar under the status line -- determinate %-driven for "Back up now" (from
+        // SEAL-STATUS), indeterminate for "Export a copy" (a single-blob upload with no % yet). Hidden when idle.
+        dataBar = new android.widget.ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
+        dataBar.setMax(100);
+        dataBar.setVisibility(View.GONE);
+        dataBar.setProgressTintList(android.content.res.ColorStateList.valueOf(ACCENT));
+        dataBar.setIndeterminateTintList(android.content.res.ColorStateList.valueOf(ACCENT));
+        LinearLayout.LayoutParams barLp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        barLp.topMargin = dp(14);
+        ll.addView(dataBar, barLp);
+
+        finishMenuScreen(ll);
+        loadSealDelta(); // NWP-20260901-28: off-thread; the screen above is already presented and escapable
+        startSaveLinesPoll(savedHeadTv); // NWP-20261121-04: repaint when a save lands while this screen is open
+    }
+
+    // NWP-20260901-28 (#145 S4): the delta screen's views. They stay set after the screen is left (nothing clears
+    // them), so a late painter writes to a detached view, harmlessly. NWP-20261121-04: the save-lines poll therefore
+    // stops on attachment and identity (savedHeadTv == its own view), never on null.
+    private TextView savedHeadTv, savedSubTv, unsavedAppsTv, syncNoteTv, changedTv;
+    // NWP-20261121-04: the stamp the save lines were painted for, whether loadSealDelta is running, and whether this
+    // activity is paused. The poll repaints only when a newer stamp arrives and neither holds it.
+    private final SaveLinesRefresh saveLines = new SaveLinesRefresh();
+    private final java.util.concurrent.atomic.AtomicBoolean deltaLoading =
+            new java.util.concurrent.atomic.AtomicBoolean();
+    private volatile boolean paused;
+
+    /** Relative time for the headline: seconds granularity is noise, days are despair. */
+    private static String fmtAgo(long unixSec) {
+        long d = System.currentTimeMillis() / 1000 - unixSec;
+        if (d < 0) d = 0;
+        if (d < 90) return "just now";
+        if (d < 90 * 60) return (d / 60) + " min ago";
+        if (d < 36 * 3600) return (d / 3600) + (d / 3600 == 1 ? " hour ago" : " hours ago");
+        return (d / 86400) + " days ago";
+    }
+
+    /** The keep-set the Signal-2 diff runs against: files/nowhere-appkeep, minus bundled-system entries
+     *  (they ship in the image and are never sealed, so "not in the store" is their correct, safe state).
+     *  Returns null when the keep-set could not be read -- never an empty set, which would read as "keeps no apps"
+     *  (NWP-20261026-18). An absent file, or one listing only bundled-system, blank or comment lines, is empty. */
+    private java.util.Set<String> keptSetForDelta() {
+        java.util.Set<String> out = new java.util.HashSet<>();
+        try {
+            java.io.File f = new java.io.File(getFilesDir(), "nowhere-appkeep");
+            if (!f.exists()) return out;
+            android.content.pm.PackageManager pm = getPackageManager();
+            for (String l : new String(java.nio.file.Files.readAllBytes(f.toPath()), "UTF-8").split("\n")) {
+                l = l.trim();
+                if (l.isEmpty() || l.startsWith("#")) continue;
+                // NWP-20260903-01: a line is `pkg<TAB>mode[<TAB>group:<name>]` -- readAppModes says exactly that in its
+                // own comment and splits on it. This read the WHOLE LINE as a package, and every consumer then missed,
+                // silently:
+                //
+                //   * isBundledSystem(pm, "pkg<TAB>ondemand") throws -> false, so bundled-system entries were NEVER
+                //     filtered -- which is why Google Play services and Play Store appeared at all, against this very
+                //     method doc comment saying they are excluded;
+                //   * the storedApps removal at the call site keys off the REAL package, so it never matched and
+                //     NOTHING was ever removed. Apps already safely in the store were listed as "Not in your store yet
+                //     ... back up before powering off". Chester, on lynx: "all those are in store (i havent downloaded
+                //     those - just logged into to the profile)" -- a false alarm in the DANGEROUS direction, on a phone
+                //     whose whole promise is knowing when it is safe to power off;
+                //   * keptLabel("pkg<TAB>ondemand") misses every rung INCLUDING the fixed Play names and returns its
+                //     argument, so the row rendered as a raw package with the mode appended.
+                //
+                // One parse, three symptoms. The mode is dropped deliberately: this set answers "which apps do I keep",
+                // and every caller compares it against package keys.
+                int t = l.indexOf((char) 9);
+                String pkg = (t < 0 ? l : l.substring(0, t)).trim();
+                if (pkg.isEmpty() || isBundledSystem(pm, pkg)) continue;
+                out.add(pkg);
+            }
+        } catch (Throwable t) {
+            Log.w("NowhereChooser", "keptSetForDelta", t);
+            return null;
+        }
+        return out;
+    }
+
+    /** Fetch SEAL-DELTA off-thread and paint Signals 1 + 2. Failure directions per the S3 contract: an
+     *  unreadable reply paints "can't check" (never "all saved"), and storedMeasured=false paints "unknown"
+     *  (never "none") unless the keep-set itself is empty -- an over-claiming delta tells someone it is safe to power off when it is not. */
+    private void loadSealDelta() {
+        new Thread(() -> {
+            deltaLoading.set(true);
+            try {
+                // NWP-20261121-04: the stamp this paint is for, read BEFORE SEAL-DELTA, so a save that lands during
+                // the load moves GET-SEAL-LANDED past it and the poll paints again.
+                saveLines.painted(SaveLinesRefresh.parseLanded(sendDaemon("GET-SEAL-LANDED\n")));
+                String[] lr = daemonLenReply("SEAL-DELTA\n", 15000);
+                final TextView head = savedHeadTv, sub = savedSubTv, apps = unsavedAppsTv;
+                if (head == null) return; // screen already left
+                // NWP-20260903-05: hoisted up from the cadence sentence below, because the staleness
+                // threshold for the deferral notice has to be expressed in CYCLES rather than minutes --
+                // the cadence is user-settable (GET/SET-SYNC-INTERVAL), so any hardcoded "10 minutes"
+                // would be wrong for whoever changed it. Same thread and the same round trip that was
+                // already being made a few lines down; nothing extra is spent.
+                int syncSec = 120;
+                try { syncSec = Integer.parseInt(sendDaemon("GET-SYNC-INTERVAL\n").trim()); }
+                catch (Throwable ignore) { /* default cadence stands */ }
+                if (syncSec <= 0) syncSec = 120;
+                if (lr == null || lr[1] == null || lr[1].isEmpty()) {
+                    runOnUiThread(() -> { if (savedHeadTv != null) StatusLine.error(savedHeadTv,
+                            "Can't check what's saved right now."); });
+                    return;
+                }
+                try {
+                    org.json.JSONObject o = new org.json.JSONObject(lr[1]);
+                    final String run = o.optString("run", "");
+                    final String verdict = o.optString("verdict", "");
+                    // NWP-20260904-09: the gateway's own refusal text behind a "nocredit" verdict. Server text the
+                    // daemon has already bounded (200 printable ASCII bytes, single line); rendered as plain text
+                    // into the same StringBuilder, never interpreted.
+                    final String reason = o.optString("reason", "");
+                    final long lastOK = o.optLong("lastOK", 0), lastStart = o.optLong("lastStart", 0);
+                    final long deferrals = o.optLong("deferrals", 0);
+                    final boolean measured = o.optBoolean("storedMeasured", false);
+                    org.json.JSONObject sa = o.optJSONObject("storedApps");
+                    org.json.JSONArray blind = o.optJSONArray("blind");
+
+                    String h;
+                    if ("local".equals(o.optString("session"))) {
+                        h = "Throwaway — lives only on this phone, never saved.";
+                    } else if (!run.isEmpty()) {
+                        h = "manual".equals(run) ? "Saving now…" : "Saving automatically now…";
+                    } else if (lastOK > 0) {
+                        h = "Last saved " + fmtAgo(lastOK) + ".";
+                    } else if (lastStart > 0) {
+                        h = "A save ran — it hasn't finished cleanly yet.";
+                    } else {
+                        // NWP-20260903-01: this is the NO-PRIOR-SAVE fallback (lastOK == 0), which is also what a freshly
+                        // restarted daemon reports -- so it fires right after a reboot on a profile whose data IS in the
+                        // store. "Not saved yet this session" then reads as "nothing of yours is saved", which is false and
+                        // alarming on the one screen whose job is telling you whether it is safe to power off. Say only what
+                        // is actually known: no save has completed SINCE SIGNING IN. What is already stored is the delta
+                        // line's business, directly below.
+                        h = "No save since you signed in.";
+                    }
+                    StringBuilder d = new StringBuilder();
+                    // #145 S6 (NWP-20260901-30): what the last manual save actually stored. "captured" is the
+                    // honest verb -- these are plaintext bytes chunked, not bytes uploaded (dedup + compression
+                    // shrink the wire copy), and claiming upload size would overstate the cost and understate
+                    // the dedup win in the same breath.
+                    long lsb = o.optLong("lastSaveB", 0), lsn = o.optLong("lastSaveN", 0);
+                    if (lsb > 0 && lsn > 0 && lastOK > 0) {
+                        d.append("That save captured ~").append(fmtBytes(lsb)).append(" across ")
+                         .append(lsn).append(lsn == 1 ? " area. " : " areas. ");
+                    }
+                    if ("refused".equals(verdict)) {
+                        // NWP-20261113-11 (case 2): name the refused scope and its guard from SEAL-DELTA's scopes. An
+                        // older daemon sends none, and the old sentence stands.
+                        String held = lastSaveHeldText(verdict, o.optString("scopes", ""), this::fmtWhen);
+                        d.append(held != null ? held + " "
+                                : "The last save was held back to protect your stored copy: this profile "
+                                + "changed while the save was running. This usually clears on its own. ");
+                    } else if ("nocredit".equals(verdict)) {
+                        d.append("The last save failed: your storage plan is out of credit. ");
+                        if (!reason.isEmpty()) {
+                            d.append("The storage service said: ").append(reason).append(reason.endsWith(".") ? " " : ". ");
+                        }
+                    } else if ("fail".equals(verdict)) {
+                        d.append("The last save failed — check your connection. ");
+                    }
+                    if (blind != null && blind.length() > 0) {
+                        d.append("Blocked by: ");
+                        for (int i = 0; i < blind.length() && i < 3; i++) {
+                            if (i > 0) d.append(", ");
+                            d.append(keptLabel(blind.optString(i)));
+                        }
+                        d.append(". ");
+                    }
+                    // NWP-20260903-05: this read "Auto-save deferred N× this session." unconditionally.
+                    // That is a SCHEDULER STATISTIC, not news. Every deferral reason (syncDeferReason,
+                    // main.go) is the system behaving CORRECTLY: "seal-in-flight" means a save is running
+                    // right now, and "user-op-waiting" means a human is blocked on the worker and we are
+                    // deliberately staying out of their way. There is no action the owner can take and no
+                    // consequence -- the next cycle picks it up. Meanwhile "deferred" READS as "your data
+                    // did not get saved", three lines above a sentence promising automatic saves, so it
+                    // contradicted its own neighbour and alarmed for nothing. The screen already answers
+                    // the only question that matters three separate ways: when the last save was, how much
+                    // has changed since, and which app specifically is not safe yet.
+                    //
+                    // Deferrals become news only when they are STARVING the save -- many skipped cycles
+                    // AND nothing landed for a long time. That pair is what is reported, in outcome
+                    // language, right beside the "Back up now" button that fixes it.
+                    //
+                    // ⚠ lastOK > 0 IS LOAD-BEARING. lastOK == 0 means "nothing landed this daemon
+                    // lifetime", which is the NORMAL state for the first minutes of every session -- and
+                    // the login window (loginWindowCap 180s) defers cycles during exactly that period. So
+                    // firing on lastOK == 0 would put a scary line on every fresh login: the same false
+                    // alarm class as the "No save since you signed in." headline -01 had to reword. The
+                    // headline already covers the nothing-saved-yet case; this line only adds the REASON.
+                    long staleAfter = Math.max(5L * syncSec, 600L);   // 5 missed cycles, floor 10 minutes
+                    if (deferrals > 0 && lastOK > 0
+                            && (System.currentTimeMillis() / 1000L - lastOK) > staleAfter) {
+                        d.append("Saves are being postponed while the phone is busy.");
+                    }
+
+                    String a = null;
+                    // NWP-20260903-04: carried as a BOOLEAN, not re-derived by string-matching the rendered
+                    // sentence. The previous form asked `fa.startsWith("Not in your store")` to decide the
+                    // colour -- so when -01 reworded that sentence to "Not saved yet: ", the predicate went
+                    // silently false and the one line telling you to act before power-off became the DIMMEST
+                    // text on the screen, while a neutral byte count kept the accent. Nothing failed: it
+                    // compiled, ran, and looked deliberate. Prose is for humans; branch on state.
+                    boolean aWarn = false;
+                    if (!"local".equals(o.optString("session"))) {
+                        // NWP-20261026-18: the keep-set is read FIRST, whatever the store says. A profile with no keep-set
+                        // never seals #apps (appcode_seal's first guard in nowhere_roamd.sh returns before staging), so it
+                        // has no #apps head and storedMeasured stays false for it for ever (superseded by NWP-20261027-09: a
+                        // definitely absent #apps head now reads measured and empty; the keep-set still decides first): asked
+                        // of the store, this line
+                        // read "unknown right now" on every visit and could never resolve (lynx 0.5.48, 2026-10-19). An
+                        // EMPTY keep-set answers the question without the store. A keep-set that could not be read
+                        // (keptSetForDelta returns null) is "unknown", never "none" -- the NWP-20260903-01 rule.
+                        java.util.Set<String> kept = keptSetForDelta();
+                        java.util.List<String> unsaved = null;
+                        if (kept != null && measured) {
+                            java.util.Set<String> left = new java.util.HashSet<>(kept);
+                            if (sa != null) {
+                                for (java.util.Iterator<String> it = sa.keys(); it.hasNext(); ) left.remove(it.next());
+                            }
+                            unsaved = new java.util.ArrayList<>();
+                            for (String pk : left) unsaved.add(keptLabel(pk).toString());
+                        }
+                        final boolean leftApps = o.optString("parts", "").contains("apps="); // NWP-20261113-11: case (1)
+                        final ReplyCopy.AppsLine al = ReplyCopy.storedAppsLine(kept != null, kept == null ? 0 : kept.size(), measured, unsaved, leftApps);
+                        a = al.text;
+                        aWarn = al.warn;
+                    }
+                    final String fh = h, fd = d.toString().trim(), fa = a;
+                    final boolean faWarn = aWarn;
+                    runOnUiThread(() -> {
+                        if (savedHeadTv == null) return;
+                        savedHeadTv.setText(fh);
+                        if (!fd.isEmpty()) { savedSubTv.setText(fd); savedSubTv.setVisibility(View.VISIBLE); }
+                        else savedSubTv.setVisibility(View.GONE);
+                        if (fa != null) {
+                            unsavedAppsTv.setText(fa);
+                            unsavedAppsTv.setTextColor(faWarn ? ACCENT : MUTED);
+                            unsavedAppsTv.setVisibility(View.VISIBLE);
+                        } else unsavedAppsTv.setVisibility(View.GONE);
+                    });
+                } catch (Throwable t) {
+                    Log.w("NowhereChooser", "loadSealDelta", t);
+                    runOnUiThread(() -> { if (savedHeadTv != null) savedHeadTv.setText(
+                            "Can't check what's saved right now."); });
+                }
+                // #145 S5 (NWP-20260901-29): Signal 3, painted AFTER Signals 1+2 -- it triggers a bounded worker
+                // walk (15s slot cap + the walk), so it must never gate the headline. The figure is PLAINTEXT
+                // BYTES ON THIS PHONE and the copy says so ("~", "on this phone") -- it is not upload size, and
+                // a blind path is flagged, never folded in.
+                try {
+                    String[] wr = daemonLenReply("SEAL-DELTA-WALK\n", 45000);
+                    final String token = wr[0] == null ? "" : wr[0].trim();
+                    String line = null;
+                    boolean active = false;
+                    if (wr[1] != null && !wr[1].isEmpty()) {
+                        org.json.JSONObject w = new org.json.JSONObject(wr[1]);
+                        long cb = w.optLong("changedBytes", 0) + w.optLong("deferredChangedBytes", 0);
+                        long cf = w.optLong("changedFiles", 0) + w.optLong("deferredChangedFiles", 0);
+                        long bl = w.optLong("blind", 0);
+                        // Deleted files count too (#media head lists, the vault and #de scan caches); a scope whose
+                        // deletions were not checked is said; the second line says small app-file deletions are not
+                        // counted (DeltaLine, h56 #6, NWP-20261128-11).
+                        long db = w.optLong("deletedBytes", 0);
+                        long df = w.optLong("deletedFiles", 0);
+                        org.json.JSONArray du = w.optJSONArray("deletedUnknown");
+                        boolean dun = du != null && du.length() > 0;
+                        line = DeltaLine.line(cb, cf, bl, db, df, dun, ProfileActivity::fmtBytes);
+                        active = DeltaLine.active(cb, cf, df);
+                    } else if (token.startsWith("ERR-WORKER-BUSY")) {
+                        line = "The phone is busy \u2014 the change count will show next time.";
+                    } // NOBASE / LOCAL / NONE: the headline already tells that story; no row.
+                    final String fl = line;
+                    final boolean fact = active;
+                    runOnUiThread(() -> {
+                        if (changedTv == null) return;
+                        if (fl == null) { changedTv.setVisibility(View.GONE); return; }
+                        changedTv.setText(fl);
+                        changedTv.setTextColor(fact ? ACCENT : MUTED);
+                        changedTv.setVisibility(View.VISIBLE);
+                    });
+                } catch (Throwable t) {
+                    Log.w("NowhereChooser", "seal-delta-walk", t);
+                }
+                // The cadence sentence, patched from the daemon so the copy can never drift again.
+                try {
+                    int sec = syncSec;
+                    final String cad = sec >= 120 ? "about every " + (sec / 60) + " minutes"
+                            : sec >= 45 ? "about every minute" : "about every " + sec + " seconds";
+                    runOnUiThread(() -> { if (syncNoteTv != null) syncNoteTv.setText(
+                            "Saved to your store automatically, " + cad + ". Back up to capture your latest "
+                            + "changes now, or export a portable copy to take elsewhere."); });
+                } catch (Throwable ignore) { /* generic sentence stands */ }
+            } finally {
+                deltaLoading.set(false);
+            }
+        }).start();
+    }
+
+    /** NWP-20261121-04: while this Your data screen is open and in front, read GET-SEAL-LANDED every POLL_MS and
+     *  repaint the save lines once a save has landed since they were painted. Stops for good when the screen is left
+     *  (another view, detached) or the activity finishes. One read at a time: the next tick is posted after it. */
+    private void startSaveLinesPoll(final TextView mine) {
+        final android.os.Handler h = new android.os.Handler(android.os.Looper.getMainLooper());
+        h.postDelayed(new Runnable() {
+            @Override public void run() {
+                if (!SaveLinesRefresh.keepPolling(savedHeadTv == mine, mine.isAttachedToWindow(), isFinishing())) return;
+                final Runnable next = this;
+                new Thread(() -> {
+                    long stamp = SaveLinesRefresh.parseLanded(sendDaemon("GET-SEAL-LANDED\n"));
+                    if (savedHeadTv == mine && saveLines.due(stamp, deltaLoading.get() || paused)) loadSealDelta();
+                    h.postDelayed(next, SaveLinesRefresh.POLL_MS);
+                }).start();
+            }
+        }, SaveLinesRefresh.POLL_MS);
+    }
+
+    // #88 progress-bar helpers -- all post to the UI thread and no-op if the Your-data screen has been left
+    // (dataBar cleared). Determinate for a known %, indeterminate for "working, no ETA", hide when idle/done.
+    private void dataBarDeterminate(final int pct) {
+        runOnUiThread(() -> { if (dataBar == null) return;
+            dataBar.setIndeterminate(false); dataBar.setProgress(Math.max(0, Math.min(100, pct)));
+            dataBar.setVisibility(View.VISIBLE); });
+    }
+    private void dataBarIndeterminate() {
+        runOnUiThread(() -> { if (dataBar == null) return;
+            dataBar.setIndeterminate(true); dataBar.setVisibility(View.VISIBLE); });
+    }
+    private void dataBarHide() {
+        runOnUiThread(() -> { if (dataBar == null) return;
+            dataBar.setIndeterminate(false); dataBar.setVisibility(View.GONE); });
+    }
+    /** #88: update the shared status line to the current export phase, from a worker thread. */
+    private void runPhase(final TextView st, final String text) {
+        runOnUiThread(() -> { st.setTextColor(ACCENT); st.setText(text); });
+    }
+
+    /** "Back up now": force an immediate seal to the store + poll SEAL-STATUS for a progress line + bar (#88). */
+    private void doBackup() {
+        final TextView st = dataStatusTv;
+        st.setTextColor(ACCENT);
+        st.setText("Backing up…");
+        dataBarIndeterminate(); // #88: show activity immediately; flips to determinate once the seal reports a %
+        new Thread(() -> {
+            final DaemonReply br = sendDaemonReply("BACKUP\n");
+            final String r = br.failed() ? "" : br.text.trim();
+            if (r.startsWith("OK")) {
+                // NWP-20260901-28: the poll's exits are now HONEST. The old loop treated null (a failed status
+                // read) identically to DONE and then unconditionally painted "Backed up just now." -- a false
+                // save claim on the one screen whose job is to answer "is it saved?" (design "what it must NOT
+                // do" #3). null now keeps polling with a miss counter and a deadline; ONLY a seen DONE prints
+                // success, and a DONE PARTIAL: names what was left behind instead of claiming a clean save.
+                String done = null;
+                int misses = 0, lastScopeIdx = -1;
+                long deadline = System.currentTimeMillis() + 15 * 60 * 1000L; // > the worker's own ceilings
+                while (System.currentTimeMillis() < deadline) {
+                    String s = sealStatus();
+                    if (s == null) {
+                        if (++misses == 5) runOnUiThread(() -> { st.setTextColor(MUTED);
+                                st.setText("Can't read save progress — the save may still be running."); });
+                        try { Thread.sleep(1000); } catch (InterruptedException ie) { break; }
+                        continue;
+                    }
+                    misses = 0;
+                    if (s.startsWith("DONE")) { done = s; break; }
+                    if (s.startsWith("FAILED")) { done = s; break; }
+                    if (s.startsWith("SEALING")) {
+                        long[] dt = sealBytes(s);
+                        if (dt != null && dt[1] > 0) { // only frames with a real total (no number-less flicker, DIA-20260701-03)
+                            final int pct = sealPct(s);
+                            // #113: the bar keeps its percent (a determinate bar needs one), the TEXT carries the
+                            // truth -- real bytes, named scope -- so "Back up now" can never sit on a lying "100%".
+                            final String scope = sealScope(s);
+                            final int idx = sealScopeIndex(scope);
+                            if (idx >= 0 && idx < lastScopeIdx) dataBarDeterminate(0); // round restart: never jump backwards silently
+                            if (idx >= 0) lastScopeIdx = idx;
+                            final String label = sealScopeLabel(scope);
+                            // NWP-20260903-07: the progress channel carries NO UNIT, and not every frame in
+                            // it is bytes. The seal's one-time #85 size migration reports CHUNK INDICES, and
+                            // byte-rendering those produced "Backing up your data... 1 KB of 3 KB" while the
+                            // seal moved gigabytes -- on the screen whose job is saying whether it is safe to
+                            // power off, a figure that reads as "nearly nothing to do". The agent now labels
+                            // that stretch with the "sizes" phase; the FRACTION it carries is honest (the bar
+                            // below stays correct), so only the byte TEXT is dropped.
+                            final String head = "sizes".equals(sealPhase(s))
+                                    ? "Backing up " + label + "…"
+                                    : "Backing up " + label + "…  " + fmtBytes(dt[0]) + " of " + fmtBytes(dt[1]);
+                            dataBarDeterminate(pct); // #88
+                            runOnUiThread(() -> st.setText(head));
+                        }
+                    }
+                    try { Thread.sleep(400); } catch (InterruptedException ie) { break; }
+                }
+                dataBarHide(); // #88
+                final String verdict = done;
+                // NWP-20261113-11 (case 2): a manual seal never sets sealFail, so a refused data scope reads DONE
+                // PARTIAL, and the claim that the data areas were saved was false for it. Which scope and which guard
+                // come from SEAL-DELTA's scopes, read once here, off the UI thread.
+                boolean dataRefused = false;
+                String held = null;
+                if (verdict != null && verdict.startsWith("DONE PARTIAL:")) {
+                    for (String p : verdict.substring("DONE PARTIAL:".length()).trim().split(",")) {
+                        int eq = p.indexOf('=');
+                        if (eq > 0 && blockingScope(p.substring(0, eq).trim())
+                                && "refused".equals(p.substring(eq + 1).trim())) dataRefused = true;
+                    }
+                    if (dataRefused) {
+                        try {
+                            String[] lr = daemonLenReply("SEAL-DELTA\n", 15000);
+                            if (lr != null && lr[1] != null && !lr[1].isEmpty()) {
+                                held = lastSaveHeldText("refused",
+                                        new org.json.JSONObject(lr[1]).optString("scopes", ""), this::fmtWhen);
+                            }
+                        } catch (Throwable t) { Log.w("NowhereChooser", "doBackup SEAL-DELTA", t); }
+                    }
+                }
+                final boolean fDataRefused = dataRefused;
+                final String fHeld = held;
+                runOnUiThread(() -> {
+                    if (verdict == null) {
+                        st.setTextColor(MUTED);
+                        st.setText("The save is taking unusually long. It may still finish — check back before signing out.");
+                    } else if (verdict.startsWith("DONE PARTIAL:")) {
+                        st.setTextColor(ACCENT);
+                        // NWP-20261008-07: name the parts in the user's terms; this printed the raw token
+                        // ("Backed up — except sys=pending-placement").
+                        st.setText("Backed up — except " + partialWhat(verdict.substring("DONE PARTIAL:".length()).trim())
+                                + (fDataRefused ? (fHeld != null ? ". " + fHeld : ".") : ". Your data areas are saved."));
+                    // NWP-20260907-07: THIS MESSAGE ASKS THE READER FOR NOTHING, AND THAT IS THE POINT.
+                    // It read "If another device is signed in to this profile, sign out there and try again",
+                    // and Chester rejected it on 2026-09-07 for three reasons, all of which stand:
+                    //   1. IT MADE OUR RACE THE USER'S ERRAND. A refusal is the stale-publish guard working
+                    //      correctly. That evening the errand was also IMPOSSIBLE -- the other handset could
+                    //      not sign out, because a FIDO2 enrolment had left it unable to seal at all.
+                    //   2. IT NAMED ONE CAUSE FOR A VERDICT WITH SEVERAL. Another device is only one way the
+                    //      head moves; ANY local keyslot change does it too (enrol/revoke a key, set a PIN,
+                    //      rotate the passphrase -- each bumps the version and re-publishes). What actually
+                    //      happened is that he enrolled a key ON THIS HANDSET and was told to go and sign out
+                    //      of a different one.
+                    //   3. IT ASSERTED A PRODUCT CLAIM IN AN ERROR STRING. Nowhere roams state ACROSS devices;
+                    //      "sign out of your other device" reads as "multi-device does not work".
+                    // ⚠ TWO PHRASINGS THAT LOOK BETTER AND ARE NOT, both caught by review before shipping:
+                    //   - "Nothing has been lost" OVERPROMISES. The stored copy is intact, but changes since
+                    //     it are still only on this handset, and on an amnesiac device that is exactly what
+                    //     does not survive power-off. Say the stored copy is safe; do not say nothing is lost.
+                    //   - "Something else changed this profile" RE-IMPLIES ANOTHER ACTOR, which is defect 2
+                    //     wearing a disguise -- and it is wrong for the local-keyslot case that prompted this.
+                    //     "This profile changed" is cause-neutral and covers both.
+                    } else if (verdict.startsWith("FAILED")) {
+                        st.setTextColor(MUTED);
+                        st.setText(verdict.contains("REFUSED")
+                                ? "Your stored copy is safe: this profile changed while the save was running, so "
+                                  + "the save was held back rather than overwrite the newer version. This usually "
+                                  + "clears on its own — if it keeps happening, please report it."
+                                : verdict.contains("NOCREDIT")
+                                ? "The save failed: your storage plan is out of credit."
+                                : verdict.contains("TIMEOUT") // NWP-20261113-18: ERR-TIMEOUT / ERR-STALLED
+                                ? "The save stopped making progress — your stored copy is intact. Try again in a moment."
+                                : "The save failed — check your connection and try again.");
+                    } else {
+                        st.setTextColor(ACCENT);
+                        st.setText("Backed up just now.");
+                    }
+                });
+                loadSealDelta(); // refresh the headline ("Last saved just now") + the unsaved-apps row
+            } else {
+                final String msg = r.startsWith("LOCAL")
+                        ? "This profile is a throwaway — it lives only on this phone, so there's nothing to back up."
+                        : r.startsWith("BUSY") ? ReplyCopy.backupBusy(r)
+                        : r.startsWith("NONE") ? "No active session to back up."
+                        : br.failed() ? "Couldn't reach the save service (" + br.reason() + ") — try again in a moment."
+                        : "Couldn't back up — check your connection and try again.";
+                dataBarHide(); // #88
+                runOnUiThread(() -> { st.setTextColor(MUTED); st.setText(msg); });
+            }
+        }).start();
+    }
+
+    /** "Export a copy": contacts (vCard) + calendar (iCal) + messages/calls (XML) -> one zip, sealed under the
+     *  profile key into the store (web-retrievable with the passphrase). Reads via the providers under runtime
+     *  permissions requested on demand; whatever you grant gets exported, the rest is silently skipped. */
+    private void startExport() {
+        for (String p : EXPORT_PERMS) {
+            if (checkSelfPermission(p) != PackageManager.PERMISSION_GRANTED) {
+                requestPermissions(EXPORT_PERMS, REQ_EXPORT); // request all the missing ones at once
+                return;
+            }
+        }
+        runExport();
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int req, String[] perms, int[] results) {
+        super.onRequestPermissionsResult(req, perms, results);
+        if (req == REQ_EXPORT) runExport(); // export whatever was granted; each builder tolerates a denied grant
+    }
+
+    /** Build the standard files (vCard + iCal), package them as one zip bundle, and hand it to the daemon to seal
+     *  under the profile key and file as the profile's export, at keys only the name and passphrase derive
+     *  (NWP-20261010-02). A roamed session is a secondary Android user with no usable shared storage / MTP, so the
+     *  store (retrieved later from the web with your passphrase) is the destination. */
+    private void runExport() {
+        final TextView st = dataStatusTv;
+        if (st == null) return;
+        st.setTextColor(ACCENT);
+        st.setText("Exporting…");
+        // #88: an export runs BUILD (read each provider) -> PACKAGE -> UPLOAD. Each provider read can be slow for a
+        // large history, so name the phase as we go; the bar is indeterminate because a single-blob upload has no %
+        // (real % arrives with the chunked media export, #52). runPhase() updates the status line off the UI thread.
+        dataBarIndeterminate();
+        new Thread(() -> {
+            // out[0] = count, out[1] = 1 when that read FAILED with its permission granted (NWP-20261112-24)
+            final int[] cN = {0, 0}, eN = {0, 0}, sN = {0, 0}, lN = {0, 0};
+            runPhase(st, "Reading contacts…");
+            byte[] vcf = buildContactsVCard(cN);
+            runPhase(st, "Reading calendar…");
+            byte[] ics = buildCalendarICal(eN);
+            runPhase(st, "Reading messages…");
+            byte[] sms = buildSmsXml(sN);
+            runPhase(st, "Reading calls…");
+            byte[] calls = buildCallLogXml(lN);
+            if (cN[1] == 1) Log.w("NowhereChooser", "export: contacts could not be read");
+            if (eN[1] == 1) Log.w("NowhereChooser", "export: calendar could not be read");
+            if (sN[1] == 1) Log.w("NowhereChooser", "export: messages could not be read");
+            if (lN[1] == 1) Log.w("NowhereChooser", "export: calls could not be read");
+            java.util.LinkedHashMap<String, byte[]> entries = new java.util.LinkedHashMap<>();
+            if (vcf != null) entries.put("contacts.vcf", vcf);
+            if (ics != null) entries.put("calendar.ics", ics);
+            if (sms != null) entries.put("messages.xml", sms);
+            if (calls != null) entries.put("calls.xml", calls);
+            // An EMPTY docs bundle is NOT the end of the export: a profile can hold photos/files and no
+            // contacts/calendar/messages/calls at all (take a picture on a fresh profile -- exactly the case
+            // that used to dead-end here with "Nothing to export yet", never reaching EXPORT-MEDIA below).
+            // So the docs half is now conditional and the media half ALWAYS runs.
+            final boolean haveDocs = !entries.isEmpty();
+            String docsResult = ""; // "" = no documents to send, so nothing was attempted
+            if (haveDocs) {
+                String manifest = "{\"version\":2,\"contacts\":" + cN[0] + ",\"events\":" + eN[0]
+                        + ",\"messages\":" + sN[0] + ",\"calls\":" + lN[0] + ",\"created\":\"" + dateStamp() + "\"}\n";
+                runPhase(st, "Packaging…");
+                byte[] bundle;
+                try {
+                    bundle = buildBundleZip(entries, manifest);
+                } catch (Throwable t) {
+                    Log.w("NowhereChooser", "buildBundle", t);
+                    dataBarHide(); // #88
+                    runOnUiThread(() -> { st.setTextColor(MUTED); st.setText("Couldn't package the export — try again."); });
+                    return;
+                }
+                runPhase(st, "Uploading your copy…");
+                docsResult = sendExport(bundle);
+            }
+            final String r = docsResult;
+            // #52: pin the media/files export -- one tiny ref write (the media already roams as
+            // content-addressed chunks, so nothing re-uploads). It reflects the LAST backup; NOMEDIA (nothing
+            // sealed yet) just means the docs export stands alone.
+            runPhase(st, "Adding your photos & files…");
+            // NWP-20261124-21: read for ExportCopy.READ_MS, past the EXPORT-MEDIA arm's deadline, not sendDaemon's 90 s
+            final String mr0 = DaemonSocket.roundTrip("EXPORT-MEDIA\n", ExportCopy.READ_MS);
+            final String mr = mr0 == null ? "" : mr0.trim();
+            dataBarHide(); // #88
+            runOnUiThread(() -> {
+                final boolean docsOk = r.startsWith("OK"), mediaOk = mr.startsWith("OK");
+                if (docsOk || mediaOk) { // either half landing is a real export
+                    java.util.List<String> parts = new java.util.ArrayList<>();
+                    if (docsOk) {
+                        if (cN[0] > 0) parts.add(cN[0] + (cN[0] == 1 ? " contact" : " contacts"));
+                        if (eN[0] > 0) parts.add(eN[0] + (eN[0] == 1 ? " event" : " events"));
+                        if (sN[0] > 0) parts.add(sN[0] + (sN[0] == 1 ? " message" : " messages"));
+                        if (lN[0] > 0) parts.add(lN[0] + (lN[0] == 1 ? " call" : " calls"));
+                    }
+                    if (mediaOk) { // "OK files=<n> bytes=<n>" -> photos & files count (#52)
+                        int mf = 0;
+                        try { mf = Integer.parseInt(mr.replaceAll("(?s).*files=(\\d+).*", "$1")); } catch (Exception ignore) {}
+                        if (mf > 0) parts.add(mf + (mf == 1 ? " media file" : " media files"));
+                    }
+                    if (parts.isEmpty()) parts.add("your files"); // e.g. media that all rides the small-file region
+                    // NWP-20261007-05: say which half did NOT land. Either half landing reads as an export, and this
+                    // line used to list only what landed -- so a documents export whose photos failed read as a whole
+                    // one, and someone exporting before leaving would find their photos missing only later. NOMEDIA
+                    // is "nothing sealed yet", not a failure, so it is not reported; any other non-OK media reply
+                    // (ERR-STORE, ERR-KEY -- photos in the store this session could not open, NWP-20261010-02) is.
+                    // NWP-20261124-21: no reply ("") is not a failure on record -- the daemon may still land that half
+                    // after the read gave up -- so it says the half may still export. A partial result is drawn in
+                    // ink, not the success accent.
+                    final boolean mediaFailed = !mediaOk && !mr.startsWith("NOMEDIA");
+                    final boolean docsFailed = haveDocs && !docsOk;
+                    String missing = mediaFailed
+                            ? (mr.isEmpty() ? ExportCopy.MEDIA_UNANSWERED
+                                    : " Your photos & files didn't export — try again.")
+                            : docsFailed
+                            ? (r.isEmpty() ? ExportCopy.DOCS_UNANSWERED
+                                    : " Your contacts, calendar, messages and calls didn't export — try again.")
+                            : "";
+                    // NWP-20261112-24: a kind whose read FAILED with its permission granted is named too; a denied
+                    // one is omitted silently (startExport).
+                    missing += ExportCopy.unreadLine(cN[1] == 1, eN[1] == 1, sN[1] == 1, lN[1] == 1);
+                    st.setTextColor(missing.isEmpty() ? ACCENT : INK);
+                    st.setText(ExportCopy.doneText(android.text.TextUtils.join(", ", parts), missing,
+                            exportWhereLine(docsOk ? r : null, mediaOk ? mr : null)));
+                } else {
+                    // Report on whichever half we actually attempted: with no documents, the media reply is the
+                    // only signal we have.
+                    final String s = haveDocs ? r : mr;
+                    final String unread = ExportCopy.unreadText(cN[1] == 1, eN[1] == 1, sN[1] == 1, lN[1] == 1);
+                    final String msg = s.startsWith("LOCAL")
+                            ? "This profile is a throwaway — there's no store to export to."
+                            : s.startsWith("NONE") ? "No active session to export."
+                            : s.startsWith("NOMEDIA")
+                                // NWP-20261112-24: nothing landed because a kind could not be read: say which
+                                ? (!unread.isEmpty() ? unread
+                                    : "Nothing to export yet — back up first, then export.")
+                            // NWP-20261010-02: the store answered, but this session's keys do not open what is
+                            // there -- not a connection problem, so do not say it is one.
+                            : s.startsWith("ERR-KEY")
+                                ? "Couldn't export — your stored copy could not be opened on this phone."
+                            // NWP-20261124-21: no reply is not a failure on record; the copy may still finish
+                            : s.isEmpty() ? ExportCopy.unansweredText()
+                                : "Couldn't export — check your connection and try again.";
+                    st.setTextColor(MUTED);
+                    // NWP-20261124-21: the documents half failed and the media half got no reply: it may still land
+                    st.setText(msg + ExportCopy.lostMediaClause(haveDocs, r, mr));
+                }
+            });
+        }).start();
+    }
+
+    /** NWP-20261010-02: what the export's result line may promise, read from the daemon's EXPORT and EXPORT-MEDIA
+     *  replies, which end in " words=<0|1> expire=<0|1> store=<managed|self>". Each argument is the reply of a half
+     *  that landed, or null. "About 7 days" only when the gateway applied the expiry to EVERY half that landed. On a
+     *  self-hosted store neither the 7 days nor the website, which reads only our store. The 12 words when the vault has
+     *  no passphrase slot (tied, or with security keys): the website cannot open the export without them. A reply from
+     *  a daemon that predates the flags promises no 7 days. */
+    static String exportWhereLine(String docsReply, String mediaReply) {
+        boolean self = false, words = false, expire = true, any = false;
+        for (String r : new String[] { docsReply, mediaReply }) {
+            if (r == null) continue;
+            any = true;
+            self |= "self".equals(exportFlag(r, "store"));
+            words |= "1".equals(exportFlag(r, "words"));
+            expire &= "1".equals(exportFlag(r, "expire"));
+        }
+        if (!any || self) return "";
+        return " Download it from the nowhere website with your passphrase"
+                + (words ? " and your 12-word recovery code" : "")
+                + (expire ? " — it stays available for about 7 days." : ".");
+    }
+
+    /** One " key=value" field of a daemon reply line, or null when it has none. */
+    static String exportFlag(String reply, String key) {
+        for (String f : reply.trim().split("\\s+")) {
+            if (f.startsWith(key + "=")) return f.substring(key.length() + 1);
+        }
+        return null;
+    }
+
+    /** Build every contact as one vCard via the provider's OWN multi-vCard stream (the path the Contacts app's
+     *  export uses -- robust, no hand-rolled formatting). Returns the vCard bytes (null when none/error); count -> out[0]. */
+    private byte[] buildContactsVCard(int[] out) {
+        if (checkSelfPermission(Manifest.permission.READ_CONTACTS) != PackageManager.PERMISSION_GRANTED) {
+            out[0] = 0; out[1] = 0; return null; // denied: omitted silently, as startExport promises
+        }
+        try {
+            java.util.LinkedHashSet<String> keys = new java.util.LinkedHashSet<>();
+            try (Cursor c = getContentResolver().query(ContactsContract.Contacts.CONTENT_URI,
+                    new String[]{ ContactsContract.Contacts.LOOKUP_KEY }, null, null, null)) {
+                if (c == null) { out[0] = 0; out[1] = 1; return null; }
+                while (c.moveToNext()) {
+                    String k = c.getString(0);
+                    if (k != null && !k.isEmpty()) keys.add(k);
+                }
+            }
+            out[0] = keys.size();
+            if (keys.isEmpty()) return null;
+            Uri uri = Uri.withAppendedPath(ContactsContract.Contacts.CONTENT_MULTI_VCARD_URI,
+                    Uri.encode(android.text.TextUtils.join(":", keys)));
+            ByteArrayOutputStream bos = new ByteArrayOutputStream();
+            try (InputStream in = getContentResolver().openInputStream(uri)) {
+                if (in == null) { out[0] = 0; out[1] = 1; return null; }
+                byte[] buf = new byte[8192];
+                int n;
+                while ((n = in.read(buf)) > 0) bos.write(buf, 0, n);
+            }
+            return bos.toByteArray();
+        } catch (Throwable t) {
+            // t is not logged: its text can carry a URI or content; runExport logs the kind (NWP-20261112-24)
+            out[0] = 0;
+            out[1] = 1; // NWP-20261112-24: a failed read, not "none"
+            return null;
+        }
+    }
+
+    /** Build the calendar as a standard iCalendar (VCALENDAR/VEVENT). Returns the iCal bytes (null when none/error);
+     *  event count -> out[0]. The rows -> iCalendar rules (a series' DURATION, its exceptions as EXDATEs) are
+     *  IcsExport.build (NWP-20261109-03), which a javac suite executes. */
+    private byte[] buildCalendarICal(int[] out) {
+        if (checkSelfPermission(Manifest.permission.READ_CALENDAR) != PackageManager.PERMISSION_GRANTED) {
+            out[0] = 0; out[1] = 0; return null; // denied: omitted silently, as startExport promises
+        }
+        try {
+            String[] cols = { CalendarContract.Events._ID, CalendarContract.Events.TITLE,
+                    CalendarContract.Events.DTSTART, CalendarContract.Events.DTEND,
+                    CalendarContract.Events.EVENT_LOCATION, CalendarContract.Events.DESCRIPTION,
+                    CalendarContract.Events.ALL_DAY, CalendarContract.Events.RRULE,
+                    CalendarContract.Events.DURATION, CalendarContract.Events.EXDATE,
+                    CalendarContract.Events.ORIGINAL_ID, CalendarContract.Events.ORIGINAL_INSTANCE_TIME,
+                    CalendarContract.Events.DELETED, CalendarContract.Events.STATUS };
+            java.util.List<IcsExport.Row> rows = new java.util.ArrayList<>();
+            try (Cursor c = getContentResolver().query(CalendarContract.Events.CONTENT_URI, cols,
+                    null, null, CalendarContract.Events.DTSTART + " ASC")) {
+                if (c == null) { out[0] = 0; out[1] = 1; return null; }
+                int iId = c.getColumnIndex(CalendarContract.Events._ID);
+                int iTitle = c.getColumnIndex(CalendarContract.Events.TITLE);
+                int iStart = c.getColumnIndex(CalendarContract.Events.DTSTART);
+                int iEnd = c.getColumnIndex(CalendarContract.Events.DTEND);
+                int iLoc = c.getColumnIndex(CalendarContract.Events.EVENT_LOCATION);
+                int iDesc = c.getColumnIndex(CalendarContract.Events.DESCRIPTION);
+                int iAllDay = c.getColumnIndex(CalendarContract.Events.ALL_DAY);
+                int iRrule = c.getColumnIndex(CalendarContract.Events.RRULE);
+                int iDur = c.getColumnIndex(CalendarContract.Events.DURATION);
+                int iEx = c.getColumnIndex(CalendarContract.Events.EXDATE);
+                int iOrigId = c.getColumnIndex(CalendarContract.Events.ORIGINAL_ID);
+                int iOrigTime = c.getColumnIndex(CalendarContract.Events.ORIGINAL_INSTANCE_TIME);
+                int iDel = c.getColumnIndex(CalendarContract.Events.DELETED);
+                int iStatus = c.getColumnIndex(CalendarContract.Events.STATUS);
+                while (c.moveToNext()) {
+                    IcsExport.Row r = new IcsExport.Row();
+                    r.id = iId >= 0 ? c.getLong(iId) : 0;
+                    r.title = calStr(c, iTitle);
+                    r.dtstart = calLong(c, iStart);
+                    r.dtend = calLong(c, iEnd);
+                    r.location = calStr(c, iLoc);
+                    r.description = calStr(c, iDesc);
+                    r.allDay = iAllDay >= 0 && c.getInt(iAllDay) == 1;
+                    r.rrule = calStr(c, iRrule);
+                    r.duration = calStr(c, iDur);
+                    r.exdate = calStr(c, iEx);
+                    r.originalId = calLong(c, iOrigId);
+                    r.originalInstanceTime = calLong(c, iOrigTime);
+                    r.deleted = iDel >= 0 && c.getInt(iDel) == 1;
+                    r.status = iStatus >= 0 && !c.isNull(iStatus) ? c.getInt(iStatus) : 0;
+                    rows.add(r);
+                }
+            }
+            IcsExport.Result res = IcsExport.build(rows);
+            out[0] = res.events;
+            return res.text == null ? null : res.text.getBytes("UTF-8");
+        } catch (Throwable t) {
+            // t is not logged: its text can carry a URI or content; runExport logs the kind (NWP-20261112-24)
+            out[0] = 0;
+            out[1] = 1; // NWP-20261112-24: a failed read, not "none"
+            return null;
+        }
+    }
+
+    private static String calStr(Cursor c, int i) {
+        return i >= 0 && !c.isNull(i) ? c.getString(i) : null;
+    }
+
+    private static Long calLong(Cursor c, int i) {
+        return i >= 0 && !c.isNull(i) ? Long.valueOf(c.getLong(i)) : null;
+    }
+
+    /** Build the text messages (SMS) as portable XML -- the de-facto "SMS Backup & Restore" shape: a <smses> root
+     *  with one <sms> per message (address/date/type/read/body). MMS (multipart) is not included. Returns the bytes
+     *  (null when none/error); count -> out[0]. Reads content://sms under READ_SMS; a denied grant just omits this. */
+    private byte[] buildSmsXml(int[] out) {
+        if (checkSelfPermission(Manifest.permission.READ_SMS) != PackageManager.PERMISSION_GRANTED) {
+            out[0] = 0; out[1] = 0; return null; // denied: omitted silently, as startExport promises
+        }
+        try {
+            StringBuilder body = new StringBuilder();
+            int n = 0;
+            String[] cols = { "address", "date", "type", "read", "body" };
+            try (Cursor c = getContentResolver().query(Uri.parse("content://sms"), cols, null, null, "date ASC")) {
+                if (c == null) { out[0] = 0; out[1] = 1; return null; }
+                int iA = c.getColumnIndex("address"), iD = c.getColumnIndex("date"),
+                        iT = c.getColumnIndex("type"), iR = c.getColumnIndex("read"), iB = c.getColumnIndex("body");
+                while (c.moveToNext()) {
+                    body.append("  <sms address=\"").append(ExportXml.attr(iA >= 0 ? c.getString(iA) : ""))
+                            .append("\" date=\"").append(iD >= 0 ? c.getLong(iD) : 0L)
+                            .append("\" type=\"").append(iT >= 0 ? c.getInt(iT) : 0)
+                            .append("\" read=\"").append(iR >= 0 ? c.getInt(iR) : 1)
+                            .append("\" body=\"").append(ExportXml.attr(iB >= 0 ? c.getString(iB) : "")).append("\" />\n");
+                    n++;
+                }
+            }
+            out[0] = n;
+            if (n == 0) return null;
+            return ("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<smses count=\"" + n + "\">\n" + body + "</smses>\n")
+                    .getBytes("UTF-8");
+        } catch (Throwable t) {
+            // t is not logged: its text can carry a URI or content; runExport logs the kind (NWP-20261112-24)
+            out[0] = 0;
+            out[1] = 1; // NWP-20261112-24: a failed read, not "none"
+            return null;
+        }
+    }
+
+    /** Build the call log as portable XML (<calls> root, one <call> per entry: number/date/duration/type). Returns
+     *  the bytes (null when none/error); count -> out[0]. Reads CallLog under READ_CALL_LOG. */
+    private byte[] buildCallLogXml(int[] out) {
+        if (checkSelfPermission(Manifest.permission.READ_CALL_LOG) != PackageManager.PERMISSION_GRANTED) {
+            out[0] = 0; out[1] = 0; return null; // denied: omitted silently, as startExport promises
+        }
+        try {
+            StringBuilder body = new StringBuilder();
+            int n = 0;
+            String[] cols = { android.provider.CallLog.Calls.NUMBER, android.provider.CallLog.Calls.DATE,
+                    android.provider.CallLog.Calls.DURATION, android.provider.CallLog.Calls.TYPE };
+            try (Cursor c = getContentResolver().query(android.provider.CallLog.Calls.CONTENT_URI, cols,
+                    null, null, android.provider.CallLog.Calls.DATE + " ASC")) {
+                if (c == null) { out[0] = 0; out[1] = 1; return null; }
+                while (c.moveToNext()) {
+                    body.append("  <call number=\"").append(ExportXml.attr(c.getString(0)))
+                            .append("\" date=\"").append(c.getLong(1))
+                            .append("\" duration=\"").append(c.getLong(2))
+                            .append("\" type=\"").append(c.getInt(3)).append("\" />\n");
+                    n++;
+                }
+            }
+            out[0] = n;
+            if (n == 0) return null;
+            return ("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<calls count=\"" + n + "\">\n" + body + "</calls>\n")
+                    .getBytes("UTF-8");
+        } catch (Throwable t) {
+            // t is not logged: its text can carry a URI or content; runExport logs the kind (NWP-20261112-24)
+            out[0] = 0;
+            out[1] = 1; // NWP-20261112-24: a failed read, not "none"
+            return null;
+        }
+    }
+
+    /** Zip the given files (name -> bytes) + a manifest into one portable bundle (what the web download hands back). */
+    private byte[] buildBundleZip(java.util.LinkedHashMap<String, byte[]> entries, String manifestJson)
+            throws java.io.IOException {
+        ByteArrayOutputStream bos = new ByteArrayOutputStream();
+        try (java.util.zip.ZipOutputStream zos = new java.util.zip.ZipOutputStream(bos)) {
+            for (java.util.Map.Entry<String, byte[]> e : entries.entrySet()) {
+                zos.putNextEntry(new java.util.zip.ZipEntry(e.getKey()));
+                zos.write(e.getValue());
+                zos.closeEntry();
+            }
+            zos.putNextEntry(new java.util.zip.ZipEntry("manifest.json"));
+            zos.write(manifestJson.getBytes("UTF-8"));
+            zos.closeEntry();
+        }
+        return bos.toByteArray();
+    }
+
+    /** Send the bundle to the daemon's length-prefixed EXPORT ("EXPORT\n<len>\n<bytes>") -> it seals + stores it. */
+    private String sendExport(byte[] bundle) {
+        try {
+            LocalSocket s = DaemonSocket.connect(); // NWP-20261005-19: bounded connect
+            if (s == null) throw new java.io.IOException("daemon connect timed out");
+            s.setSoTimeout(ExportCopy.READ_MS); // NWP-20261124-21: outlasts the EXPORT arm's deadline
+            OutputStream os = s.getOutputStream();
+            os.write(("EXPORT\n" + bundle.length + "\n").getBytes("UTF-8"));
+            os.write(bundle);
+            os.flush();
+            String line = new BufferedReader(new InputStreamReader(s.getInputStream(), "UTF-8")).readLine();
+            s.close();
+            return line == null ? "" : line.trim();
+        } catch (Exception e) {
+            Log.w("NowhereChooser", "sendExport", e);
+            return "";
+        }
+    }
+
+    /** Multi-line daemon request: returns the whole reply (every line) -- for verbs like GET-SNAPSHOTS that
+     *  stream a list. (sendDaemon reads only the first line.) */
+    private String sendDaemonMulti(String msg) {
+        try {
+            LocalSocket s = DaemonSocket.connect(); // NWP-20261005-19: bounded connect
+            if (s == null) throw new java.io.IOException("daemon connect timed out");
+            s.setSoTimeout(90000);
+            OutputStream os = s.getOutputStream();
+            os.write(msg.getBytes("UTF-8"));
+            os.flush();
+            BufferedReader br = new BufferedReader(new InputStreamReader(s.getInputStream(), "UTF-8"));
+            StringBuilder sb = new StringBuilder();
+            String line;
+            while ((line = br.readLine()) != null) sb.append(line).append('\n');
+            s.close();
+            return sb.toString();
+        } catch (Exception e) {
+            Log.w("NowhereChooser", "sendDaemonMulti", e);
+            return "";
+        }
+    }
+
+    /** "Restore a snapshot" (#58): list the profile's retained earlier heads; picking one rolls the store head
+     *  back to it and signs out WITHOUT saving, so the next login lands on that earlier good version. */
+    private void showSnapshots() {
+        LinearLayout ll = menuScreen("Restore a snapshot", "go back to an earlier saved version");
+
+        final TextView status = new TextView(this);
+        StatusLine.busy(status, "Loading…");
+        status.setTextColor(MUTED);
+        status.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        status.setGravity(Gravity.CENTER);
+        status.setLineSpacing(dp(4), 1f);
+        LinearLayout.LayoutParams stlp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        stlp.topMargin = dp(20);
+        stlp.bottomMargin = dp(16);
+        ll.addView(status, stlp);
+
+        final LinearLayout rows = new LinearLayout(this);
+        rows.setOrientation(LinearLayout.VERTICAL);
+        ll.addView(rows, new LinearLayout.LayoutParams(MATCH, WRAP));
+
+        TextView back = new TextView(this); // Back -> Your data (NOT the profile menu)
+        back.setText("Back");
+        back.setTextColor(ACCENT);
+        back.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        back.setGravity(Gravity.CENTER);
+        back.setPadding(dp(8), dp(22), dp(8), dp(8));
+        ll.addView(back, new LinearLayout.LayoutParams(MATCH, WRAP));
+        back.setOnClickListener(v -> showYourData());
+
+        android.widget.ScrollView sc = new android.widget.ScrollView(this);
+        sc.setBackgroundColor(BG);
+        sc.addView(ll);
+        setContentView(sc);
+
+        new Thread(() -> {
+            final String resp = sendDaemonMulti("GET-SNAPSHOTS\n");
+            runOnUiThread(() -> {
+                String head = resp.trim();
+                if (head.startsWith("NONE")) { status.setText("No active session."); return; }
+                if (head.startsWith("LOCAL")) {
+                    status.setText("This profile is a throwaway — nothing is saved to your store to restore.");
+                    return;
+                }
+                if (head.startsWith("EMPTY")) {
+                    status.setText("No earlier versions yet. Snapshots build up as you use the phone.");
+                    return;
+                }
+                if (!head.startsWith("SNAP ")) {
+                    // NWP-20261006-23: no reply, or ERR (a store read that failed). These used to share the
+                    // EMPTY sentence above, hiding the one way back to a good save behind "No earlier versions".
+                    StatusLine.error(status, "Couldn't load your saved versions just now. Go back and open this screen "
+                            + "again in a moment.");
+                    return;
+                }
+                status.setText("Pick a version to restore. Your current data on this device will be replaced, "
+                        + "and you'll sign in again.");
+                for (String line : resp.split("\n")) {
+                    if (!line.startsWith("SNAP ")) continue;
+                    String[] p = line.split(" ");
+                    if (p.length < 3) continue;
+                    final long ver, t;
+                    try { ver = Long.parseLong(p[1]); t = Long.parseLong(p[2]); }
+                    catch (NumberFormatException nfe) { continue; }
+                    boolean manual = p.length >= 4 && "manual".equals(p[3]); // #58: pinned manual save vs auto-save
+                    final String when = snapDate(t);
+                    Button b = secondaryButton((manual ? "Backup · " : "Auto-save · ") + when, () -> confirmRollback(ver, when));
+                    if (!manual) b.setTextColor(MUTED); // auto-saves are muted; manual saves keep the accent
+                    LinearLayout row = new LinearLayout(this); // NWP-20261027-07: restore on the left, a small Delete on the right
+                    row.setOrientation(LinearLayout.HORIZONTAL);
+                    row.setGravity(Gravity.CENTER_VERTICAL);
+                    row.addView(b, new LinearLayout.LayoutParams(0, WRAP, 1f));
+                    TextView del = new TextView(this);
+                    del.setText("Delete");
+                    del.setTextColor(MUTED);
+                    del.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+                    del.setGravity(Gravity.CENTER);
+                    del.setMinimumHeight(dp(48));
+                    del.setMinimumWidth(dp(48));
+                    del.setPadding(dp(12), 0, dp(4), 0);
+                    del.setContentDescription("Delete the version saved " + when);
+                    del.setOnClickListener(v -> confirmDeleteSnapshot(ver, when));
+                    row.addView(del, new LinearLayout.LayoutParams(WRAP, WRAP));
+                    rows.addView(row, btnLp(dp(8)));
+                }
+            });
+        }).start();
+    }
+
+    private static String snapDate(long unixSecs) {
+        if (unixSecs <= 0) return "earlier";
+        return new java.text.SimpleDateFormat("MMM d, h:mm a", java.util.Locale.getDefault())
+                .format(new java.util.Date(unixSecs * 1000L));
+    }
+
+    private void confirmRollback(final long version, final String label) {
+        new android.app.AlertDialog.Builder(this)
+                .setTitle("Restore this version?")
+                .setMessage("This rolls your data back to the version saved " + label + ". Your current data on "
+                        + "this device will be discarded and you'll be signed out — sign in again to load the "
+                        + "earlier version.")
+                .setPositiveButton("Restore", (d, w) -> doRollback(version))
+                .setNegativeButton("Cancel", null)
+                .show();
+    }
+
+    /** Send ROLLBACK; on OK the daemon rolls the store head + queues the switch+reap, so the user-0 watcher
+     *  pulls us to the gate (no seal -> the current data can't clobber the snapshot). */
+    private void doRollback(final long version) {
+        TextView tv = new TextView(this);
+        tv.setText("Restoring an earlier version…");
+        tv.setTextColor(ACCENT);
+        tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 24);
+        tv.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
+        tv.setGravity(Gravity.CENTER);
+        tv.setBackgroundColor(BG);
+        setContentView(tv);
+        getWindow().addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        new Thread(() -> {
+            final String r = sendDaemon("ROLLBACK\n" + version + "\n").trim();
+            if (!SnapshotCopy.rolledBack(r)) {
+                // NWP-20261016-21: the session survives a failed rollback. An arrival that came in during its store
+                // round trip was sealed (the marker was down), and the daemon staged it into this session's mailbox
+                // before replying; start this session's delivery run so it shows now, not at the next login. An empty
+                // reply (the daemon dropped the connection) counts: it may have staged before it went. Best-effort.
+                try {
+                    startService(new android.content.Intent(this, CredentialService.class).putExtra("telingest", true));
+                } catch (Throwable t) { android.util.Log.w("NowhereChooser", "rollback telingest kick", t); }
+            }
+            runOnUiThread(() -> {
+                if (SnapshotCopy.rolledBack(r)) {
+                    tv.setText("Restoring an earlier version…\nSigning you out"); // the reap switches us to the gate
+                } else {
+                    getWindow().clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                    android.widget.Toast.makeText(this, SnapshotCopy.rollbackReply(r), android.widget.Toast.LENGTH_LONG).show();
+                    showSnapshots(); // refresh -- the list may have changed since it was shown
+                }
+            });
+        }).start();
+    }
+
+    /** Ask before deleting ONE retained version (docs/product-decisions.md 2026-10-19): never the current state, and
+     *  the message promises no size. */
+    private void confirmDeleteSnapshot(final long version, final String label) {
+        new android.app.AlertDialog.Builder(this)
+                .setTitle(SnapshotCopy.confirmTitle())
+                .setMessage(SnapshotCopy.confirmMessage(label))
+                .setPositiveButton("Delete", (d, w) -> doDeleteSnapshot(version))
+                .setNegativeButton("Cancel", null)
+                .show();
+    }
+
+    /** Send DELETE-SNAPSHOT. The session carries on (no sign-out), and showSnapshots() runs on EVERY reply so the
+     *  list is redrawn from the daemon, never edited locally on a guess. */
+    private void doDeleteSnapshot(final long version) {
+        new Thread(() -> {
+            final String r = sendDaemon("DELETE-SNAPSHOT\n" + version + "\n").trim();
+            runOnUiThread(() -> {
+                android.widget.Toast.makeText(this, SnapshotCopy.deleteReply(r), android.widget.Toast.LENGTH_LONG).show();
+                showSnapshots();
+            });
+        }).start();
+    }
+
+    private static String dateStamp() {
+        return new java.text.SimpleDateFormat("yyyyMMdd-HHmmss", java.util.Locale.US).format(new java.util.Date());
+    }
+
+    /** #98: hand this session's saved Wi-Fi configs to the daemon so the user-0 GATE can adopt them.
+     *  Shared with ReloginReceiver (the "Load my saved data" exit never touches this activity -- Chester's
+     *  build-262 repro) via WifiMirror; here it just rides a worker thread. Best-effort. */
+    private void mirrorWifiToGate() {
+        new Thread(() -> WifiMirror.capture(this), "nowhere-wifi-mirror").start();
+    }
+
+    /** NWP-20260825-13: the package(s) whose unreadable data made the last seal refuse, or empty.
+     *
+     *  Lock-free on the daemon side (GET-SEAL-BLIND is on the concurrentSafeCmd allowlist) precisely because
+     *  we ask it the instant a logoff is refused -- exactly when a worker may hold sessionMu. Serialising the
+     *  question behind the operation it is asking about would leave the dialog blank when it matters most. */
+    private String[] sealBlindPkgs() {
+        try {
+            // NWP-20261006-23: the reply is "OK\n<pkg>\n…", and sendDaemon returns only its FIRST line, so this
+            // read "OK" and nothing else: the dialog that names the blocking app has never named one.
+            String r = sendDaemonMulti("GET-SEAL-BLIND\n");
+            if (r == null || !r.startsWith("OK")) return new String[0];
+            java.util.ArrayList<String> out = new java.util.ArrayList<>();
+            for (String ln : r.split("\n")) {
+                ln = ln.trim();
+                if (ln.isEmpty() || "OK".equals(ln)) continue;
+                out.add(ln);
+            }
+            return out.toArray(new String[0]);
+        } catch (Throwable t) {
+            android.util.Log.w("NowhereChooser", "GET-SEAL-BLIND", t);
+            return new String[0];
+        }
+    }
+
+    /** NWP-20260825-13: a REFUSED sign-out, with the blocking app NAMED and a way forward.
+     *
+     *  ⚠ WHY THIS REPLACED A TOAST (Chester): a refused logoff used to surface as
+     *  "Couldn't save this session -- but your last saved copy is safe and unchanged." True, but it named no
+     *  app and offered no action, and the toast is gone in seconds. That stranded him for the whole Tesla
+     *  episode, and Tesla was the THIRD app to do it (AliExpress lnk_file, Tesla fifo_file) -- so the next one
+     *  is a question of when, not if. The daemon already knew which app; nothing carried it to the user.
+     *
+     *  ⚠ THE REFUSAL IS CORRECT AND IS NOT OVERRIDDEN HERE. Everything else in the session really did seal;
+     *  what "sign out without X" does is switch X OFF for this profile (recordTurnedOff -- which as of
+     *  NWP-20260825-22 the Your-apps toggle finally does too; this comment asserted it did from the day the
+     *  tri-state landed, and that false assertion is a fair part of why the gap survived four months and cost
+     *  Chester 406 MB of plan on an app he had removed), so the next seal legitimately excludes it instead of
+     *  publishing a short manifest. The
+     *  message says plainly that X's data from this session is not kept -- that is a real deletion and the user
+     *  must be told before they choose it, not after.
+     *
+     *  "Stay signed in" is deliberately kept even though it fixes nothing: if the app whose data would be
+     *  dropped is one the user cares about, waiting for a real fix is a legitimate choice, and a dialog whose
+     *  only exits are "lose data" or "report it" would be coercive. */
+    /** NWP-20260825-14: the SECOND step before dropping an app's data.
+     *
+     *  ⚠ WHY THIS EXISTS (Chester caught it): the first cut of this flow ran recordTurnedOff + doLogoff
+     *  straight off the dialog's positive button. One tap, and a real deletion -- the previous dialog only
+     *  DESCRIBED the consequence, it did not ask. That is the wrong default for an irreversible action a user
+     *  reaches while already frustrated that they cannot sign out.
+     *
+     *  The two steps say DIFFERENT things on purpose. The first explains the situation and what is safe; this
+     *  one states only the loss, in the narrowest words available, and makes the destructive button say what
+     *  it does rather than "OK". "Back" returns to the choice instead of dismissing the whole flow -- a
+     *  mis-tap must not cost the user the explanation they were reading.
+     *
+     *  ⚠ The switch-off is per-PROFILE, not per-session: until it is turned back on in Your apps, later
+     *  sessions will not carry it either. That is stated here, because "its data from this session" alone
+     *  would understate what the user is agreeing to. */
+    private void confirmDropAndSignOut(String[] pkgs, String who, String one, boolean restSaved) {
+        new android.app.AlertDialog.Builder(this)
+                .setTitle("Sign out without " + one + "?")
+                .setMessage(who + "'s data from this session will NOT be saved, and cannot be recovered.\n\n"
+                        + one + " stays switched off for this profile until you turn it back on in Your apps, "
+                        + "so later sessions will not carry it either."
+                        // NWP-20261010-10: claimed only when the refusal named nothing but unreadable apps.
+                        + (restSaved ? "\n\nEverything else in this session is saved either way." : ""))
+                // NWP-20261029-19 (row "Three UI-thread paths still wait on `APPKEEP_LOCK`"): recordTurnedOff takes
+                // StoreInstaller.APPKEEP_LOCK, a leaf held for milliseconds -- but this path must not wait on it
+                // from the main thread, so the records run on a worker and the logoff (it builds views) follows
+                // the LAST record back on the UI thread.
+                .setPositiveButton("Drop " + one + " and sign out", (d2, w2) -> new Thread(() -> {
+                    for (String pkg : pkgs) recordTurnedOff(pkg);
+                    runOnUiThread(this::doLogoff); // the next seal excludes them via the drop list -- no override, a real re-seal
+                }, "nowhere-dropsignout").start())
+                .setNegativeButton("Back", (d2, w2) -> showSealRefusedDialog(pkgs, restSaved))
+                .show();
+    }
+
+    /**
+     * NWP-20260912-06 — what this device has claimed, and the one action that lets go of it.
+     *
+     * READ-ONLY PLUS ONE ACTION, the shape decided in NWP-20260912-05. It lists what THIS handset holds, with
+     * a Release for each. Since NWP-20261120-15 it also lists, read-only, what the claim record says another
+     * device holds. Since NWP-20261128-23 each holder is named per the 2026-09-12 rule (the record's name column,
+     * h54 #1), else "your other device" (HeldElsewhereCopy.WHERE). It cannot take a hold back from that device —
+     * a remote release is a request the holder honours, and it is its own slice (docs/backlog.md).
+     *
+     * ⚠ EVERY SENTENCE HERE IS LOAD-BEARING AND FOUR OF THEM WERE WRONG IN THE FIRST DRAFT, caught by review
+     * before this shipped. The rules they now obey: (a) do not claim the other device HAS been told -- the
+     * file is written just after a save and read by the NEXT one, so a freshly held app is not published yet;
+     * (b) do not promise "nothing stops working here", because releasing is exactly what lets the other
+     * device take the app, after which AppClaim suspends it HERE; (c) one latency number, not two; (d) an
+     * empty list must say WHICH empty it is; (e) an unreadable claim record says so, and never reads as
+     * "nothing held elsewhere".
+     */
+    private void showHeldApps() {
+        LinearLayout ll = menuScreen("Apps this device is holding",
+                "what this device has claimed since you signed in");
+
+        // ⚠ OFF THE MAIN THREAD. heldNow/hasRun/clear all take AppHeld’s static lock, and refresh() holds
+        // that same lock across a usage-stats query and one binder call per candidate package -- so reading
+        // it on the UI thread is an ANR waiting for a 120s tick to coincide with a tap. The screen renders
+        // from a snapshot taken here; a list that is one tick stale is exactly what the seal will publish
+        // anyway, so nothing is lost by not holding the lock while drawing.
+        final java.util.List<String> held = new java.util.ArrayList<>();
+        final boolean[] ranBox = new boolean[1];
+        // What another device holds, in record order; null = the claim record is present but unreadable.
+        final String[][] elsewhereBox = new String[1][];
+        // The holder's name per package (h54 #1); empty until read, so a timed-out snapshot names nobody.
+        final java.util.concurrent.atomic.AtomicReference<java.util.Map<String, String>> namesBox =
+                new java.util.concurrent.atomic.AtomicReference<>(java.util.Collections.<String, String>emptyMap());
+        Thread snap = new Thread(() -> {
+            // FIRST, before heldNow: the claim read takes no lock, but heldNow can wait on AppHeld's lock past the
+            // 2000 ms join below. A claim read queued behind it would then leave the box null, and the screen would
+            // say UNREADABLE about a record that reads fine.
+            try {
+                java.util.LinkedHashMap<String, String> c = AppClaim.claimsForScreen(this);
+                if (c != null) elsewhereBox[0] = c.keySet().toArray(new String[0]);
+                namesBox.set(AppClaim.namesForScreen(this));
+            } catch (Throwable t) {
+                // A throw is an unreadable record, never an empty one: the box stays null. A throw in the names
+                // read comes after elsewhereBox is set, so it leaves the names empty and the list readable.
+            }
+            held.addAll(AppHeld.heldNow(this));
+            ranBox[0] = AppHeld.hasRun(this);
+        }, "nowhere-heldsnap");
+        snap.start();
+        try { snap.join(2000); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
+        boolean ran = ranBox[0];
+
+        TextView body = new TextView(this);
+        body.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        body.setTextColor(MUTED);
+        body.setLineSpacing(dp(4), 1f);
+        body.setPadding(dp(8), dp(4), dp(8), dp(4));
+        if (!held.isEmpty()) {
+            StringBuilder sb = new StringBuilder();
+            for (String pkg : held) {
+                sb.append("\u2022 ").append(appLabel(pkg)).append("\n");
+            }
+            // "Each save tells" rather than "is told": the set on screen may not be published yet. The
+            // file is written just after a save and read by the NEXT one, so a freshly held app is still
+            // unpublished, and asserting otherwise would be false for a whole seal cycle.
+            sb.append("\nEach save tells your other device these are in use here, so it won\'t ")
+              .append("open them. Letting go reaches it a few minutes later.");
+            body.setText(sb.toString());
+        } else if (ran) {
+            // ⚠ NOT "until this device is offline for fifteen minutes". The held list has no time
+            // component -- nothing ages an entry out of it. The fifteen minutes expires the CLAIM in the
+            // store, so the app frees up only while this device is not saving, and is claimed again on the
+            // next save. Saying otherwise promised a release that comes back.
+            body.setText("Nothing is held from this device right now." + "\n\n"
+                    + "An app becomes held when you open it here, and stays held until you sign out, "
+                    + "release it, or uninstall it.");
+        } else {
+            // The OTHER empty, and telling them apart is the whole reason AppHeld.hasRun exists: an empty
+            // list because nothing was opened reads identically to one because the producer never ran, and
+            // that exact ambiguity is what let NWP-20260911-01 ship inert for a day.
+            body.setText("Nothing recorded yet." + "\n\n"
+                    + "This list is written just after each save, so it fills in within a couple of "
+                    + "minutes of signing in.");
+        }
+        ll.addView(body, new LinearLayout.LayoutParams(MATCH, WRAP));
+
+        if (!held.isEmpty()) {
+            final int n = held.size();
+            // ONE ROW PER APP, because releasing is a per-app decision. The first cut offered only
+            // "Release all", and Chester named the gap the moment he saw it: "i was thinking it will at app
+            // level not generic?". He was right twice -- you could not free ONE app for your other device,
+            // and the single global floor meant releasing anything quietly freed everything else too.
+            String[] labels = new String[n];
+            Runnable[] actions = new Runnable[n];
+            for (int i = 0; i < n; i++) {
+                final String pkg = held.get(i);
+                labels[i] = "Release " + appLabel(pkg);
+                actions[i] = () -> confirmRelease(pkg, appLabel(pkg), false);
+            }
+            sectionCard(ll, null, labels, actions, false);
+
+            // Only when it saves taps. With one app held it would be the same action twice, and a control
+            // that duplicates the one above it reads as a different, more drastic thing than it is.
+            if (n > 1) {
+                sectionCard(ll, null, new String[]{"Release all " + n + " apps"},
+                        new Runnable[]{() -> confirmRelease(null, n + " apps", true)}, false);
+            }
+        }
+
+        // NWP-20261120-15: what another device holds, READ-ONLY -- no Release, no card. Releasing it is that
+        // device's to do (NWP-20260912-05). An empty record draws nothing, so a one-device profile sees no change.
+        // NWP-20261128-23: one heading per holder, grouped by the rule the tap dialog uses (AppClaim.holdGroups).
+        final String[] elsewhere = elsewhereBox[0];
+        if (elsewhere == null) {
+            TextView unread = new TextView(this);
+            unread.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+            unread.setTextColor(MUTED);
+            unread.setLineSpacing(dp(4), 1f);
+            unread.setPadding(dp(8), dp(12), dp(8), dp(4));
+            unread.setText(HeldElsewhereCopy.UNREADABLE);
+            ll.addView(unread, new LinearLayout.LayoutParams(MATCH, WRAP));
+        } else if (elsewhere.length > 0) {
+            java.util.Map<String, String> names = namesBox.get();
+            for (java.util.Map.Entry<String, java.util.List<String>> g
+                    : AppClaim.holdGroups(java.util.Arrays.asList(elsewhere), names, HeldElsewhereCopy.WHERE).entrySet()) {
+                java.util.List<String> labels = new java.util.ArrayList<>();
+                for (String pkg : g.getValue()) labels.add(appLabel(pkg));
+                TextView heading = new TextView(this);
+                heading.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16);
+                heading.setTextColor(INK);
+                heading.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
+                heading.setPadding(dp(8), dp(16), dp(8), dp(4));
+                heading.setText(HeldElsewhereCopy.heading(g.getKey()));
+                ll.addView(heading, new LinearLayout.LayoutParams(MATCH, WRAP));
+                TextView list = new TextView(this);
+                list.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+                list.setTextColor(MUTED);
+                list.setLineSpacing(dp(4), 1f);
+                list.setPadding(dp(8), dp(4), dp(8), dp(4));
+                list.setText(HeldElsewhereCopy.body(labels, g.getKey()));
+                ll.addView(list, new LinearLayout.LayoutParams(MATCH, WRAP));
+            }
+        }
+        finishMenuScreen(ll, this::showPreferences);
+    }
+
+    /**
+     * Confirm a release. {@code pkg} null means all of them.
+     *
+     * ⚠ The message states the CONSEQUENCE rather than reassuring past it: nothing is deleted, but if the
+     * other device then opens the app it becomes held THERE and this one cannot open it until that device
+     * lets go. An earlier draft said "nothing stops working here", which denied the designed outcome of the
+     * very action being confirmed.
+     */
+    private void confirmRelease(final String pkg, String what, boolean all) {
+        final String it = all ? "them" : "it";
+        new android.app.AlertDialog.Builder(this)
+                .setTitle(all ? "Release " + what + "?" : "Release " + what + "?")
+                .setMessage("Your other device will be able to open " + it + ". Nothing is deleted and "
+                        + what + " keeps working here." + "\n\n"
+                        + "If your other device then opens " + it + ", " + it + " becomes held THERE — and "
+                        + "you won't be able to open " + it + " here until that device lets go." + "\n\n"
+                        + "Either way it takes a few minutes to reach your other device.")
+                .setPositiveButton("Release", (d, w) -> {
+                    new Thread(() -> {
+                        AppHeld.release(this, pkg);
+                        runOnUiThread(this::showHeldApps);
+                    }, "nowhere-heldrelease").start();
+                    android.widget.Toast.makeText(this, "Released. It takes a few minutes to reach your "
+                            + "other device.", android.widget.Toast.LENGTH_LONG).show();
+                })
+                .setNegativeButton("Keep holding", null)
+                .show();
+    }
+
+    private void showSealRefusedDialog(String[] pkgs, boolean restSaved) {
+        StringBuilder names = new StringBuilder();
+        for (int i = 0; i < pkgs.length; i++) {
+            if (i > 0) names.append(i == pkgs.length - 1 ? " and " : ", ");
+            names.append(appLabel(pkgs[i]));
+        }
+        final String who = names.toString();
+        final String one = pkgs.length == 1 ? who : "these apps";
+        new android.app.AlertDialog.Builder(this)
+                .setTitle(who + (pkgs.length == 1 ? " is blocking sign-out" : " are blocking sign-out"))
+                .setMessage("Nowhere couldn't read some of " + who + "'s files, so it can't save this session "
+                        + "safely and has not signed you out.\n\n"
+                        // NWP-20261010-10: "IS saved" only when the refusal named nothing else (blindRestSaved), and
+                        // "intact" rather than "unchanged": the scopes that sealed in this attempt changed it.
+                        + (restSaved ? "Everything else in your session IS saved, and your stored copy is intact.\n\n"
+                                     : "Not everything else in your session could be saved either, but your stored "
+                                       + "copy is intact.\n\n")
+                        + "You can sign out without " + one + ". If you do, " + one + " is switched off for this "
+                        + "profile and its data from this session is NOT kept.")
+                .setPositiveButton("Sign out without " + one, (d, w) -> confirmDropAndSignOut(pkgs, who, one, restSaved))
+                .setNeutralButton("Report this", (d, w) -> showReportIssue())
+                .setNegativeButton("Stay signed in", null)
+                .show();
+    }
+
+    /** NWP-20261010-10: the daemon's account of the session's last refused sign-out and its run of failed media
+     *  sweeps (GET-LOGOFF-REFUSAL), or null. Lock-free and store-free on the daemon side for the GET-SEAL-BLIND
+     *  reason: it is asked the instant a sign-out fails.
+     *  ACCEPTED RISK: a daemon OLDER than the verb does not know it, takes it for a legacy login and waits up to its
+     *  60 s request deadline for a passphrase line that never comes, then answers BLANK -- so this call can hold the
+     *  failure dialog back by a minute, and the answer is null (the old message, no control). Low risk: the chooser
+     *  and the daemon ship in the same image; only a hand-patched pairing can meet it. */
+    private String logoffRefusal() {
+        try {
+            String r = sendDaemonMulti("GET-LOGOFF-REFUSAL\n");
+            return r != null && (r.startsWith("REFUSED ") || mediaStuckCount(r) > 0 || pushStuckCount(r) > 0) ? r : null;
+        } catch (Throwable t) {
+            android.util.Log.w("NowhereChooser", "GET-LOGOFF-REFUSAL", t);
+            return null;
+        }
+    }
+
+    /** NWP-20261010-10: a failed sign-out, in a dialog that stays until it is answered. {@code exit} is
+     *  failedDialogExit's choice: "END" offers "End session without saving", "KEY-END" offers "Use your security
+     *  key" and then "End session without saving" (Q016), "RESTART" offers "Restart without saving", "LOCK" offers
+     *  Lock first, "LOCK-END" Lock and then "End session without saving" (no network: Q070), "" offers neither.
+     *  {@code reply} is the GET-LOGOFF-REFUSAL reply it was chosen from. */
+    private void showLogoffFailedDialog(String msg, boolean reportable, String reply, String exit) {
+        boolean end = "END".equals(exit), keyEnd = "KEY-END".equals(exit), restart = "RESTART".equals(exit);
+        boolean lock = "LOCK".equals(exit), lockEnd = "LOCK-END".equals(exit);
+        android.app.AlertDialog.Builder b = new android.app.AlertDialog.Builder(this)
+                .setTitle(end || keyEnd || restart ? "Can't save this session" : "You're still signed in")
+                .setMessage(msg)
+                .setCancelable(false);
+        if (restart) {
+            b.setPositiveButton("Restart without saving", (d, w) -> confirmRestartUnsaved(msg));
+            b.setNeutralButton("Report this", (d, w) -> showReportIssue());
+            b.setNegativeButton("Stay signed in", null);
+        } else if (end) {
+            b.setPositiveButton("End session without saving", (d, w) -> confirmEndUnsaved(msg));
+            b.setNeutralButton("Report this", (d, w) -> showReportIssue());
+            b.setNegativeButton("Stay signed in", null);
+        } else if (keyEnd) {
+            // Q016 (NWP-20261111-07): the key exit first; three buttons is AlertDialog's limit, so no "Report this".
+            b.setPositiveButton("Use your security key", (d, w) -> {
+                // A failed adopt shows this dialog again with its reason first: drop an earlier one so they never stack.
+                String base = msg;
+                for (String p : new String[]{adoptFailMessage("ERR-NOKEY"), adoptFailMessage(null)}) {
+                    if (base.startsWith(p + "\n\n")) base = base.substring(p.length() + 2);
+                }
+                final String again = base;
+                final android.app.AlertDialog working = showWorking("Plug in your security key and touch it when it blinks.");
+                // Read past the daemon's 90 s ADOPT-FIDO2 deadline, which starts when it has READ the request:
+                // sendDaemon's fixed 90 s starts earlier, so it could give up on a key the daemon just adopted.
+                new Thread(() -> {
+                    final String r = DaemonSocket.roundTrip("ADOPT-FIDO2\n", 100000);
+                    runOnUiThread(() -> {
+                        working.dismiss();
+                        if ("OK".equals(r)) {
+                            doLogoff(); // the key is adopted: the normal sign-out seals with it
+                            return;
+                        }
+                        showLogoffFailedDialog(adoptFailMessage(r) + "\n\n" + again, reportable, reply, "KEY-END");
+                    });
+                }, "nowhere-fido2-adopt").start();
+            });
+            b.setNeutralButton("End session without saving", (d, w) -> confirmEndUnsaved(msg));
+            b.setNegativeButton("Stay signed in", null);
+        } else if (lock || lockEnd) {
+            // Q070: no network. Lock needs none and loses nothing until the 12-hour wipe, so it comes first.
+            b.setPositiveButton("Lock", (d, w) -> doColdLock());
+            if (lockEnd) b.setNeutralButton("End session without saving", (d, w) -> confirmEndUnsaved(msg));
+            b.setNegativeButton("Stay signed in", null);
+        } else {
+            b.setPositiveButton("OK", null);
+            if (reportable) b.setNeutralButton("Report this", (d, w) -> showReportIssue());
+        }
+        b.show();
+    }
+
+    /** A plain message dialog that stays until it is answered. */
+    private void showNotice(String msg) {
+        new android.app.AlertDialog.Builder(this).setMessage(msg).setCancelable(false).setPositiveButton("OK", null).show();
+    }
+
+    /** NWP-20261010-10: the busy state while a sign-out exit runs. Without it the screen showed nothing for up to the
+     *  90 s the daemon may take (the wallet save is a store round trip). Not cancelable: the request cannot be. */
+    private android.app.AlertDialog showWorking(String msg) {
+        return new android.app.AlertDialog.Builder(this).setMessage(msg).setCancelable(false).show();
+    }
+
+    /** NWP-20261010-10: the second step, stating only what is lost and what is kept (endUnsavedConfirmText).
+     *  The refusal is asked for AGAIN here, because the dialog before it may have been open for an hour while
+     *  periodic saves kept storing the rest: the times must be the daemon's now, not the moment of the refusal.
+     *  "Back" returns to the choice rather than dismissing it, as confirmDropAndSignOut does. */
+    private void confirmEndUnsaved(String msg) {
+        new Thread(() -> {
+            final String fresh = logoffRefusal();
+            runOnUiThread(() -> {
+                // Final refusal, or (Q070) two sign-outs in a row that could not reach the store.
+                final boolean offline = !refusalFinal(fresh);
+                if (offline && pushStuckCount(fresh) < 2) { // a save has landed since, or this is no longer the refused session
+                    showNotice(endUnsavedReplyMessage("ERR-NOTREFUSED"));
+                    return;
+                }
+                new android.app.AlertDialog.Builder(this)
+                        .setTitle("End this session without saving?")
+                        .setMessage(offline ? endUnsavedOfflineText(refusalRestSaved(fresh), this::fmtWhen)
+                                            : endUnsavedConfirmText(fresh, this::fmtWhen))
+                        .setCancelable(false)
+                        .setPositiveButton("End without saving", (d, w) -> endUnsaved(msg, offline))
+                        .setNegativeButton("Back", (d, w) -> showLogoffFailedDialog(msg, true, fresh, offline ? "LOCK-END" : "END"))
+                        .show();
+            });
+        }, "nowhere-endconfirm").start();
+    }
+
+    /** NWP-20261010-10: END-UNSAVED. On OK the daemon has queued the switch+reap, which tears this screen down.
+     *  THE TIMEOUTS ARE ONE BUDGET: sendDaemon reads for 90 s; the daemon's socket deadline is 75 s and it starts
+     *  its last irreversible step by 70 s (end_unsaved.go, endUnsavedCommitBy), so it never tears down after this
+     *  read has given up and told the user they are still signed in. Change one only with the others.
+     *  On ERR-MEDIA the daemon has counted one more failed sweep, so the choice is asked for again: at two in a row
+     *  it becomes "Restart without saving" (failedDialogExit). */
+    private void endUnsaved(String msg, boolean offline) {
+        // Offline (Q070): no wallet save is attempted, so the text must not promise one.
+        final android.app.AlertDialog working = showWorking(offline ? "Ending this session without saving…"
+                : "Saving your storage credit, then ending this session…");
+        new Thread(() -> {
+            final String r = sendDaemon("END-UNSAVED\n");
+            final String err = endUnsavedReplyMessage(r);
+            final String lost = creditLostWarning(r);
+            final boolean again = err != null && endUnsavedMayRetry(r);
+            final boolean media = "ERR-MEDIA".equals(r == null ? "" : r.trim());
+            final String fresh = again ? logoffRefusal() : null;
+            runOnUiThread(() -> {
+                working.dismiss();
+                if (err == null) {
+                    showEndingSession(false, lost);
+                    return;
+                }
+                if (!again) {
+                    showNotice(err);
+                    return;
+                }
+                String why = media ? "MEDIA" : offline ? "" : "REFUSED";
+                String exit = failedDialogExit(why, fresh);
+                showLogoffFailedDialog(media ? logoffFailMessage("MEDIA", fresh, null, this::fmtWhen) : err, true, fresh, exit);
+            });
+        }, "nowhere-endunsaved").start();
+    }
+
+    /** NWP-20261010-10 (round 3): the confirmation before RESTART-UNSAVED, from a fresh reply, as for END-UNSAVED. */
+    private void confirmRestartUnsaved(String msg) {
+        new Thread(() -> {
+            final String fresh = logoffRefusal();
+            runOnUiThread(() -> {
+                // The SAME decision the dialog made (failedDialogExit), not a second copy of its threshold.
+                if (!"RESTART".equals(failedDialogExit("MEDIA", fresh))) {
+                    showNotice(restartUnsavedReplyMessage("ERR-NOTSTUCK"));
+                    return;
+                }
+                new android.app.AlertDialog.Builder(this)
+                        .setTitle("Restart without saving?")
+                        .setMessage(restartUnsavedConfirmText(fresh, this::fmtWhen))
+                        .setCancelable(false)
+                        .setPositiveButton("Restart without saving", (d, w) -> restartUnsaved())
+                        .setNegativeButton("Back", (d, w) -> showLogoffFailedDialog(msg, true, fresh, "RESTART"))
+                        .show();
+            });
+        }, "nowhere-restartconfirm").start();
+    }
+
+    /** NWP-20261010-10 (round 3): RESTART-UNSAVED. On OK the daemon reboots the phone; the boot wipe discards the
+     *  session. Same time budget as END-UNSAVED. */
+    private void restartUnsaved() {
+        final android.app.AlertDialog working = showWorking("Saving your storage credit, then restarting…");
+        new Thread(() -> {
+            final String r = sendDaemon("RESTART-UNSAVED\n");
+            final String err = restartUnsavedReplyMessage(r);
+            final String lost = creditLostWarning(r);
+            runOnUiThread(() -> {
+                working.dismiss();
+                if (err == null) {
+                    showEndingSession(true, lost);
+                    watchRestart();
+                    return;
+                }
+                showNotice(err);
+            });
+        }, "nowhere-restartunsaved").start();
+    }
+
+    /** Unix seconds as a local time, with the date when it is not today. */
+    private String fmtWhen(long unix) {
+        long ms = unix * 1000L;
+        int flags = android.text.format.DateUtils.FORMAT_SHOW_TIME;
+        if (!android.text.format.DateUtils.isToday(ms)) flags |= android.text.format.DateUtils.FORMAT_SHOW_DATE;
+        return android.text.format.DateUtils.formatDateTime(this, ms, flags);
+    }
+
+    /** NWP-20261010-10: the session is being discarded -- by the reap (END-UNSAVED) or by a restart. Unescapable like
+     *  "Logging off…", and with the same backstop: the reap or the reboot normally ends this process; if it does
+     *  not, go to the gate rather than hang here.
+     *  NWP-20261013-20: a non-null warning (creditLostWarning) is shown under the heading for as long as this screen
+     *  stands, which is until the reap or the reboot ends it. */
+    private void showEndingSession(boolean restart, String warning) {
+        loggingOff = true;
+        getWindow().addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        TextView tv = new TextView(this);
+        if (restart) {
+            tv.setText("Restarting…");
+        } else {
+            tv.setText("Ending session…");
+        }
+        if (warning != null) {
+            String heading = tv.getText().toString();
+            android.text.SpannableString t = new android.text.SpannableString(heading + "\n\n" + warning);
+            t.setSpan(new android.text.style.RelativeSizeSpan(0.55f), heading.length(), t.length(), 0);
+            tv.setText(t);
+            tv.setPadding(dp(24), 0, dp(24), 0);
+        }
+        tv.setTextColor(ACCENT);
+        tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 28);
+        tv.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
+        tv.setGravity(Gravity.CENTER);
+        tv.setBackgroundColor(BG);
+        setContentView(tv);
+        if (restart) return; // round 5: no backstop -- watchRestart reports the outcome instead of dropping the user
+        tv.postDelayed(() -> {
+            if (isFinishing() || isDestroyed()) return;
+            try {
+                startActivity(new Intent(this, ChooserActivity.class)
+                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TASK));
+            } catch (Throwable ignore) {}
+            finish();
+        }, 18000);
+    }
+
+    /** NWP-20261010-10 (round 5): after RESTART-UNSAVED's OK, wait for the reboot that should end this process, and
+     *  never let its failure be silent. Polls RESTART-STATUS; restartWatchAction decides: ask PowerManager for the
+     *  reboot ourselves once (as doLogoff does when the daemon is unreachable), and when the daemon has given up --
+     *  or nothing has happened within the bound -- leave the "Restarting…" screen and say so plainly. */
+    private void watchRestart() {
+        new Thread(() -> {
+            final long t0 = android.os.SystemClock.elapsedRealtime();
+            boolean selfTried = false;
+            while (true) {
+                try {
+                    Thread.sleep(2000);
+                } catch (InterruptedException e) {
+                    return;
+                }
+                String act = restartWatchAction(sendDaemon("RESTART-STATUS\n"),
+                        android.os.SystemClock.elapsedRealtime() - t0, selfTried);
+                if ("REBOOT".equals(act)) {
+                    selfTried = true;
+                    try {
+                        ((android.os.PowerManager) getSystemService(POWER_SERVICE)).reboot(null);
+                    } catch (Throwable t) {
+                        android.util.Log.w("NowhereChooser", "restart without saving: PowerManager.reboot", t);
+                    }
+                } else if ("FAILED".equals(act) || "UNKNOWN".equals(act)) {
+                    final String msg = "FAILED".equals(act) ? restartFailedMessage() : restartUnknownMessage();
+                    runOnUiThread(() -> {
+                        loggingOff = false;
+                        getWindow().clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                        showConfirm();
+                        showNotice(msg);
+                    });
+                    return;
+                }
+            }
+        }, "nowhere-restartwatch").start();
+    }
+
+    /** NWP-20261105-02 (Q117): the "Profile deleted" screen's watchdog. The daemon ends that screen by switching to the
+     *  gate and removing this user; if it dies after its reply nothing does, and the deleted session stays decrypted
+     *  until a manual power-off. Polls the lock-free GET-SYNC-STATUS (an empty reply is the daemon not answering:
+     *  roundTrip never returns null); DeletedWatch.action decides: after 3 misses in a row or 60 s ask PowerManager
+     *  for the reboot once, and 15 s later (or when the request throws) say plainly to hold the power button.
+     *  Read-only: it never shortens the daemon's own holds. Q117 covers a screen that is still up, so once this user
+     *  is no longer the foreground user (the gate took the switch) it ends with no reboot and no message: a removal
+     *  that stalls after the switch is the daemon's own open row, and a reboot then would land under the gate. */
+    private void watchDeleted(final TextView done) {
+        new Thread(() -> {
+            final long t0 = android.os.SystemClock.elapsedRealtime();
+            int misses = 0;
+            boolean asked = false, threw = false;
+            long tAsk = 0;
+            while (!isFinishing() && !isDestroyed()) {
+                try {
+                    Thread.sleep(DeletedWatch.POLL_MS);
+                } catch (InterruptedException e) {
+                    return;
+                }
+                if (isFinishing() || isDestroyed()) return;
+                String r = DaemonSocket.roundTrip("GET-SYNC-STATUS\n", 3000);
+                if (r == null || r.isEmpty()) misses++;
+                else misses = 0;
+                long now = android.os.SystemClock.elapsedRealtime();
+                // The gate's switch moved this user to the background: end here, with no reboot and no message. A
+                // throw keeps it watching, toward the decided reboot.
+                try {
+                    if (android.app.ActivityManager.getCurrentUser() != android.os.UserHandle.myUserId()) return;
+                } catch (Throwable ignore) {}
+                String act = DeletedWatch.action(now - t0, misses, asked, asked ? now - tAsk : 0, threw);
+                if ("REBOOT".equals(act)) {
+                    asked = true;
+                    tAsk = now;
+                    try {
+                        ((android.os.PowerManager) getSystemService(POWER_SERVICE)).reboot(null);
+                    } catch (Throwable t) {
+                        threw = true;
+                        android.util.Log.w("NowhereChooser", "deleted screen: PowerManager.reboot", t);
+                    }
+                } else if ("POWER".equals(act)) {
+                    runOnUiThread(() -> done.setText(DeletedWatch.POWER_MESSAGE));
+                    return;
+                }
+            }
+        }, "nowhere-deletewatch").start();
+    }
+
+    /** A sign-out that is NOT the install request's own: withdraws any pending "Sign out &amp; install" request before
+     *  LOGOUT (NWP-20261017-17), so a request whose sign-out never happened cannot start an install at this one. */
+    private void doLogoff() {
+        doLogoffImpl(false);
+    }
+
+    /** The "Sign out &amp; install" button's own sign-out: its request was just recorded, so it must NOT withdraw. */
+    private void doLogoffForInstall() {
+        doLogoffImpl(true);
+    }
+
+    private void doLogoffImpl(final boolean forInstall) {
+        mirrorWifiToGate(); // #98: capture BEFORE the session stops (best-effort)
+        DozeAppsMirror.capture(this); // NWP-20261002-02: seal this profile's own Doze-exempt apps. Removes nothing
+                                      // (NWP-20261002-03): the gate drops them when this user is removed, so a
+                                      // logoff that fails and keeps the session cannot de-exempt it. SYNCHRONOUS so
+                                      // the file is written before LOGOUT seals the CE.
+        // NWP-20261109-06 (Q116): a sign-out stops the Auto sweep. Raised before the captures and the LOGOUT write,
+        // so no new MATERIALIZE-APP starts while this screen captures; only the failed-seal branch and the branch for
+        // a LOGOUT refused while a cold lock lands (Q067) lower it.
+        SignOutGate.begin();
+        // NWP-20261122-11 (h51 #1): a sign-out forgets the remembered taps, so they never come back at a later sign-in.
+        if (!TapMemory.clear(TapMemory.file(getFilesDir()))) Log.w("NowhereChooser", "tap memory clear failed (NWP-20261122-11)");
+        String pn = profileName();
+        TextView tv = new TextView(this);
+        tv.setText(pn == null ? "Logging off…" : "Logging off " + pn + "…");
+        tv.setTextColor(ACCENT);
+        tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 28);
+        tv.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
+        tv.setGravity(Gravity.CENTER);
+        // DIA-20260813-02: the per-scope text answers "what is it doing right now"; the segmented bar under it
+        // answers "how far through the WHOLE logoff am I" -- one segment per seal leg in roamd's fixed order
+        // (vault, #de, #media, #sys, #apps). Chester's ask, after watching a truthful-but-context-free
+        // "Saving your apps — 12 MB of 402 MB": the text alone can't say whether apps is leg 1 of 5 or the last.
+        LinearLayout lo = new LinearLayout(this);
+        lo.setOrientation(LinearLayout.VERTICAL);
+        lo.setGravity(Gravity.CENTER);
+        lo.setBackgroundColor(BG);
+        lo.addView(tv, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+        // NWP-20261107-08 (Q116, dn-1106 #3): while LOGOUT answers WAIT -- the daemon's session lock is held by an app
+        // download -- say why the screen is waiting. GONE until LogoutAck sees the first WAIT line.
+        final TextView waitLine = new TextView(this);
+        waitLine.setTextColor(MUTED);
+        waitLine.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        waitLine.setGravity(Gravity.CENTER);
+        waitLine.setVisibility(View.GONE);
+        LinearLayout.LayoutParams wlp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        wlp.topMargin = dp(12);
+        wlp.leftMargin = dp(56);
+        wlp.rightMargin = dp(56);
+        lo.addView(waitLine, wlp);
+        SealBar bar = new SealBar(this);
+        bar.setVisibility(View.INVISIBLE); // shown on the first scoped frame; an old agent's lines never show it
+        LinearLayout.LayoutParams bp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(8));
+        bp.topMargin = dp(28);
+        bp.leftMargin = dp(56);
+        bp.rightMargin = dp(56);
+        lo.addView(bar, bp);
+        setContentView(lo);
+        getWindow().addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON); // don't sleep mid-logoff
+        loggingOff = true; // from here on, block Back + re-front on Home/recents until the reap tears this down
+        // ...and drop this task from Recents so it can't be swipe-CLOSED there mid-seal. #143 made the seal
+        // SYNCHRONOUS, so this screen now lives for the whole upload (not ~1.5 s) -- long enough to wander into
+        // recents and kill it. With Recents-exclusion + onUserLeaveHint (re-front) + Back-swallow, the screen
+        // can't be escaped until the reap switches to the gate. (DIA-20260625-04)
+        try {
+            android.app.ActivityManager am = (android.app.ActivityManager) getSystemService(ACTIVITY_SERVICE);
+            for (android.app.ActivityManager.AppTask t : am.getAppTasks()) t.setExcludeFromRecents(true);
+        } catch (Throwable ignore) {}
+        // NO PINNING HERE, AND THIS IS A DECISION RATHER THAN AN OVERSIGHT -- read before re-proposing it.
+        //
+        // The note that stood here for a year -- "No Lock Task: it needs device-owner affiliation, and
+        // affiliating the device breaks roam-in" -- was TRUE only of allowlisted KIOSK LockTask
+        // (LOCK_TASK_MODE_LOCKED, what DIA-48 tried and reverted) and said nothing about SCREEN PINNING
+        // (LOCK_TASK_MODE_PINNED), which needs no device owner, no allowlist and no affiliation. #78 chased
+        // that gap and it is REAL: ActivityTaskManager.getInstance().startSystemLockTaskMode(getTaskId())
+        // clears calling identity, so LockTaskController takes isSystemCaller=true, skips the consent prompt,
+        // and pins unattended in a roamed secondary user on the platform cert alone. It was BUILT
+        // (NWP-20260822-16), device-PROVEN (2026082108: shade sealed mDisabled1=0x69f0000, held the whole
+        // logoff, released cleanly), and then REVERTED (NWP-20260822-22). Both halves of that are worth keeping.
+        //
+        // ⚠ WHY IT WAS REVERTED -- two costs, both device-measured, neither fixable on our side:
+        //   1. IT BRICKED THE GATE. Letting the pin ride the reap's user switch orphaned the INCOMING user:
+        //      the gate came up with a DEAD SOFT KEYBOARD, so no passphrase could be typed and only a reboot
+        //      recovered it. This repo already knew the rule in the mirror direction -- #130 drops the gate's
+        //      kiosk BEFORE switching in, "even though LockTaskModeState ends up NONE"
+        //      (ChooserActivity.java:2607-2610) -- and that clause is why the state dumps looked healthy while
+        //      the device was unusable. NWP-20260822-18 fixed it by unpinning before the switch, and the fix
+        //      held; the episode is recorded because the same trap is one edit away in either direction.
+        //   2. A TOAST ON EVERY VISIBILITY SWEEP. "To unpin this app, swipe up & hold" fired ~5/sec for the
+        //      whole logoff (532 events in 108s), and instrumentation (NWP-20260822-21) named the path:
+        //      isLockTaskModeViolation -> showLockTaskToast, called from
+        //      WindowContainerVisibilityHelperImpl.isPermittedInLockTask <- TaskFragment.getVisibility. It is a
+        //      QUERY WITH A USER-VISIBLE SIDE EFFECT on the window manager's hot path, provoked by nothing more
+        //      than a pinned task coexisting with other tasks in the same user -- i.e. every roamed session.
+        //      Nothing we launch, finish or re-front changes it.
+        //
+        // So the pin bought a sealed notification shade during logoff, and cost a bricked gate once and a toast
+        // storm always. What shipped before #78 -- Back-swallow + onUserLeaveHint re-front + Recents-exclusion +
+        // the reap's ~250ms switch to the gate -- remains in force below and is what holds the screen today.
+        //
+        // ⚠ IF YOU RE-PROPOSE PINNING: the blocker is cost 2, and the only real fix is a framework patch taking
+        // the toast out of the predicate so it fires on genuine escape attempts and not on the visibility sweep.
+        // Cost 1 is already solved (unpin before the switch, both directions). Do not re-derive either.
+        new Thread(() -> {
+            // NWP-20260912-06: let go of every app this handset holds, FIRST -- before the LOGOUT write below
+            // starts the logoff seal. Without it this handset publishes a fresh 15-minute claim on everything
+            // it used as its LAST act, and strands those apps on the other phone for the whole of claimTTL
+            // after a CLEAN sign-out. ⚠ NOT clear(): a sign-out that is REFUSED (a shrink guard, a stale
+            // base) leaves the session SIGNED IN, and clear() would move the floor too -- so the user would
+            // be left using apps they had silently released, with no way for a refresh to put them back.
+            // releaseForSignOut leaves the floor alone; the sealFailed and lockLanding branches below rebuild.
+            AppHeld.releaseForSignOut(this);
+            captureAppList(); // snapshot the user's apps so they roam + reprovision on the next login
+            captureAppCode(); // #199: snapshot the CODE (APK paths) of opted-in user-installed apps so they roam too
+            captureAppDrops(); // DIA-20260804-04: name the switched-OFF apps so the seal stops carrying their data
+            if (clearedStorageThisSession) {
+                // DIA-20260804-05: re-declare the shrink intent right before the seal that can act on it. A
+                // keep-set drop cannot shrink anything until captureAppCode above rewrites the code list, so
+                // THIS is the seal that shrinks -- and the marker the user's confirm recorded may be minutes
+                // old by now. Never blocks logoff and its failure is not surfaced: the worst case is that
+                // #apps keeps its old head, the Off choice still roams (it lives in the sealed keep-set), and
+                // the next logoff tries again.
+                sendDaemon("EXPECT-SHRINK\n");
+            }
+            if (!inferredOrphanedThisSession.isEmpty()) {
+                // NWP-20260903-13: the inference declares ITSELF, scoped and named -- never the user verb.
+                // Same never-blocks-logoff posture as the re-declare above: on failure the #apps seal is
+                // refused, the old head survives (the safe direction), and the next logoff retries.
+                StringBuilder ip = new StringBuilder("EXPECT-SHRINK-INFERRED\n");
+                boolean first = true;
+                synchronized (inferredOrphanedThisSession) {
+                    for (String sp : inferredOrphanedThisSession) {
+                        if (!first) ip.append(' ');
+                        ip.append(sp); first = false;
+                    }
+                }
+                sendDaemon(ip.append('\n').toString());
+            }
+            capturePrefs();   // snapshot this user's timezone + locale so they roam too (DIA-20260616-58)
+            capturePerms(this, readAppModesStrictIn(getFilesDir()), false); // snapshot granted runtime perms (location etc.) so they roam too (DIA-20260625-06)
+            GosState.capture(this); // NWP-20260821-17: and the GrapheneOS per-app hardening flags (compat mode
+                                    // et al). Sits beside capturePerms because it is the same shape of problem
+                                    // -- per-app state that a brand-new user starts without -- and no-ops on
+                                    // Diaspore, where GosPackageState does not exist. Receipt-gated: it will
+                                    // NOT touch the sealed file unless this session proved it can write.
+            captureNextAlarm(); // #151: relay this session's next alarm TIME to the gate so it can still wake the user
+            if (!forInstall) {
+                // NWP-20261017-17: BEFORE LOGOUT, never after -- the daemon ignores a bare "0" while a sign-out is in
+                // flight. A request recorded by a Profile screen that died before its sign-out would otherwise start
+                // an install at THIS one. Best-effort: a failed withdrawal does not block the sign-out (the 2 h TTL
+                // still bounds it).
+                boolean withdrawn = sendDaemon("OTA-AFTER-LOGOFF\n0\n").trim().startsWith("OK");
+                if (!withdrawn) Log.w("NowhereProfile", "install-after-logoff withdrawal not acknowledged; signing out anyway");
+            }
+            boolean acked = false;
+            String reply = null;
+            // NWP-20261116-11 (h46 #4, docs/product-decisions.md 2026-10-28): LOGOUT goes through LogoutRetry. A send
+            // whose connect returned no socket or whose write failed was never delivered, and LogoutRetry sends it
+            // once more when the restarted daemon answers, by one deadline LogoutRetry.TOTAL_MS after the first
+            // failure; a delivered one never is.
+            final LogoutRetry.Sender sendLogout = (capMs, deadlineMs) -> {
+                LocalSocket s = DaemonSocket.connect(); // NWP-20261005-19: bounded connect
+                if (s == null) return new LogoutRetry.Result(false, null); // never delivered
+                try {
+                    // RF-001: a connect that ended past the resend's deadline writes nothing (never delivered).
+                    if (android.os.SystemClock.elapsedRealtime() >= deadlineMs) {
+                        return new LogoutRetry.Result(false, null);
+                    }
+                    try {
+                        OutputStream os = s.getOutputStream(); // LOGOUT acks AT ONCE now (switch-first): the gate
+                        os.write("LOGOUT\n".getBytes("UTF-8")); // reclaims the foreground and shows the "Saving…"
+                        os.flush();                               // progress; the seal runs behind it.
+                    } catch (java.io.IOException e) {
+                        return new LogoutRetry.Result(false, null); // the write failed: never delivered
+                    }
+                    // Q116: WAIT lines may come ahead of the answer while LOGOUT waits for the session lock.
+                    // byDeadline sets the per-read timeout (90 s, less when the deadline is nearer) before every read
+                    // and ends the reads at deadlineMs; LogoutAck stops skipping WAIT lines after capMs; the first
+                    // shows dn-1106 #3's line.
+                    String r = LogoutAck.answer(new BufferedReader(new InputStreamReader(LogoutAck.byDeadline(
+                                    s.getInputStream(), android.os.SystemClock::elapsedRealtime, deadlineMs,
+                                    s::setSoTimeout), "UTF-8")),
+                            android.os.SystemClock::elapsedRealtime, () -> runOnUiThread(() -> {
+                                waitLine.setText(LogoutAck.WAIT_LINE);
+                                waitLine.setVisibility(View.VISIBLE);
+                            }), capMs);
+                    return new LogoutRetry.Result(true, r);
+                } catch (java.io.IOException e) {
+                    return new LogoutRetry.Result(true, null); // written, then the stream failed: delivered
+                } finally {
+                    try { s.close(); } catch (Throwable ignore) {}
+                }
+            };
+            try {
+                reply = LogoutRetry.run(sendLogout, android.os.SystemClock::elapsedRealtime,
+                        android.os.SystemClock::sleep).reply;
+                acked = LogoutAck.acked(reply);
+            } catch (Exception ignore) {
+                // an unexpected runtime failure -> fall through to the reboot fallback below.
+            }
+            runOnUiThread(() -> waitLine.setVisibility(View.GONE)); // the answer (or none) arrived: the wait is over
+            if (LogoutAck.lockLanding(reply)) {
+                // NWP-20261111-08, Q067 (DECIDED 2026-10-20, docs/product-decisions.md): a key-bound cold lock holds
+                // this session, so the daemon refused the sign-out until the lock lands or aborts -- the owner's wrong
+                // tries at the keyguard they cannot type (AdminReceiver's five, via the AutoLogoff alias) must not sign
+                // them out. NOT the reboot below: a reboot wipes this ephemeral user, and with it a session the
+                // decision keeps resumable at the gate, losing whatever its last save missed. Nothing to poll either:
+                // no seal runs. Lowered as a failed sign-out lowers it: this one did not happen, and if the lock
+                // aborts the session keeps its Auto sweep. The lock's switch to the gate and its stop tear this
+                // screen down. This reader ships before the daemon sends the token, as LogoutAck's WAIT reader did.
+                SignOutGate.end();
+                // Refused, so still signed in: put back what releaseForSignOut emptied before the LOGOUT write, as the
+                // sealFailed branch does, or the lock's save publishes an empty held list.
+                new Thread(() -> AppHeld.refresh(this), "nowhere-heldrebuild").start();
+                Log.i("NowhereProfile", "sign-out refused while a cold lock lands; standing down without a reboot (Q067)");
+                runOnUiThread(() -> {
+                    loggingOff = false;
+                    finish();
+                });
+                return;
+            }
+            if (acked) {
+                // Stay in the SESSION showing "Saving your data… N%" while the background seal uploads: poll the
+                // daemon (SEAL-STATUS) until DONE, then "Signing off…" + wait for the reap to switch+tear this
+                // down. The user is NOT dumped to the gate during the upload. (DIA-20260625-04)
+                // A logoff seals THREE parts in sequence (vault + #de + #media), each reporting its OWN 0->100
+                // -- so the raw % ticked backward ("100 -> 99 -> 100") when the tiny tail parts started. Make it
+                // MONOTONIC: ratchet Preparing up, then latch into Saving and ratchet that up only, ignoring the
+                // tail parts' brief re-scans, so the bar never moves backward. (DIA-20260701-09)
+                boolean sealFailed = false;
+                String failWhy = ""; // #111: the cause the daemon named in "FAILED <WHY>"; "" = generic failure
+                String failReason = null; // NWP-20261017-16: the gateway's text behind "FAILED NOCREDIT", null when none
+                String partial = ""; // #118: scopes that did NOT seal even though the logoff SUCCEEDED
+                // #128 (DIA-20260813-13): SEAL-STATUS relays whatever round is running -- and at logoff-start
+                // that is often a BACKGROUND periodic round already deep in its scope list. Its first frame
+                // back-filled every pill left of it, so when the logoff's OWN round then started at vault the
+                // bar had nothing left to show: it sat latched full while the text cycled whole rounds
+                // (Chester, 2026-08-13: "step 5 progress bar"). roamd's scope order is FIXED, so within one
+                // round the segment index never decreases -- an index that goes BACKWARD is proof a new round
+                // began. Reset the pills there: the adopted in-flight round renders its tail honestly, then
+                // the bar clears and walks the logoff's round from vault like it always should have.
+                int lastSeg = -1;
+                // DIA-20260818-07: #128 made the BAR honest about the two rounds; nothing ever said there WERE
+                // two. A logoff that lands while the 120s periodic seal is mid-flight cannot cancel it -- it
+                // queues behind it on workerMu and then runs its own round -- so the user watches a full save
+                // complete and start over. Chester, 2026-08-18: "it does redraw but that also can be thought as
+                // a bug.. i am hoping for something like 1 out of 2, 2 out of 2". The behaviour is deliberate
+                // and stays; the missing thing is a COUNT, which turns a restart into a position.
+                //
+                // Both signals already exist, and each is claimed only for what it proves:
+                //   adoptedRound -- the FIRST frame of this logoff was already past vault (index 0), so a round
+                //                   was running before we asked to sign out and we joined it mid-list.
+                //   ownRoundSeen -- the scope index went BACKWARD, which in roamd's fixed scope order can only
+                //                   happen at a round boundary: the logoff's own round has begun.
+                // Only when we adopted one is the total knowable (2). A logoff that starts clean shows no
+                // counter at all rather than a fake "1 of 1".
+                boolean adoptedRound = false;
+                boolean ownRoundSeen = false;
+                while (true) {
+                    String st = sealStatus();
+                    if (st == null || st.startsWith("DONE")) {
+                        // #118: "DONE" or "DONE PARTIAL:apps=refused,sys=timeout". The data is saved and the
+                        // reap is coming either way -- but on a partial this is the LAST moment anything can
+                        // tell the user that part of their profile was not stored, because the session is
+                        // about to be wiped. Parsed here rather than branching the loop: DONE still means DONE.
+                        if (st != null) partial = partialOf(st);
+                        break;
+                    }
+                    if (st.startsWith("FAILED")) { // #86: daemon kept us signed in -> un-stick below
+                        sealFailed = true;
+                        // #111: "FAILED", "FAILED REFUSED" or "FAILED NOCREDIT". Absent/unknown suffix keeps
+                        // the generic message, so an older daemon behaves exactly as before.
+                        String[] f = st.trim().split("\\s+");
+                        if (f.length > 1) failWhy = f[1];
+                        failReason = sealStatusReason;
+                        break;
+                    }
+                    // DIA-20260813-01 (#113): REAL BYTES, PER SCOPE. The old rendering ratcheted one percent
+                    // MONOTONICALLY ACROSS ALL FIVE SCOPES (DIA-20260701-09) -- so the moment the first scope
+                    // hit 100%, the bar read "100%" for every scope after it. On 2026-08-12 that meant a ~400MB
+                    // #apps upload -- the LARGEST and LAST leg of the logoff -- ran entirely behind a frozen
+                    // "Saving your data… 100%", and the user reasonably concluded the phone was hung. A percent
+                    // of an unnamed whole was the wrong instrument: the agent has sent exact byte counts all
+                    // along, and now names the scope too, so a reset between scopes is LEGIBLE ("Saving your
+                    // apps -- 12 MB of 402 MB") instead of something to paper over with a latch.
+                    // Still skip empty frames (total<=0): the writer already suppresses them, this is the belt.
+                    if (st.startsWith("SEALING")) {
+                        long[] dt = sealBytes(st);
+                        if (dt != null && dt[1] > 0) {
+                            final boolean sv = "save".equals(sealPhase(st));
+                            final String scope = sealScope(st);
+                            final String label = sealScopeLabel(scope);
+                            // NWP-20260903-07: same unit-less-channel rule as the sibling site above --
+                            // a "sizes" frame is chunk indices, so it gets no byte text. Its fraction is
+                            // real, so the segment bar below is unaffected.
+                            final String head = "sizes".equals(sealPhase(st))
+                                    ? (sv ? "Saving " : "Preparing ") + label + "\u2026"
+                                    : (sv ? "Saving " : "Preparing ") + label + "\u2026\n"
+                                            + fmtBytes(dt[0]) + " of " + fmtBytes(dt[1]);
+                            // DIA-20260813-02: overall position = which leg + how far through it. Each scope
+                            // runs prepare (scan/hash) then save (upload); save is where the minutes go, so
+                            // prepare spans the segment's first 30% and save the rest -- monotonic within a
+                            // segment without the cross-scope latch #113 removed. A scope that never emits
+                            // (e.g. #sys refused) is back-filled to full when the NEXT leg's first frame lands.
+                            final int segIdx = sealScopeIndex(scope);
+                            final float segFill = (float) Math.min(1.0, (double) dt[0] / dt[1]);
+                            final float segF = sv ? 0.3f + 0.7f * segFill : 0.3f * segFill;
+                            final boolean newRound = segIdx >= 0 && lastSeg >= 0 && segIdx < lastSeg; // #128
+                            if (segIdx >= 0 && lastSeg < 0 && segIdx > 0) adoptedRound = true; // joined a round in flight
+                            if (newRound) ownRoundSeen = true;                                 // our own round started
+                            // DIA-20260818-18: drive this off the round BOUNDARY, not off adoption alone.
+                            // #749 keyed the counter on adoptedRound ("we joined a periodic round already in
+                            // flight") because that was the only mechanism I had evidence for. Chester,
+                            // 2026-08-18: "but it did twice" -- and roam.log shows the LOGOFF running two
+                            // complete rounds ITSELF, 13:33:37 and 13:34:20, both after the session was gone
+                            // and far too close together to be periodic. adoptedRound is false in that case, so
+                            // the counter stayed hidden through exactly the restart it exists to explain.
+                            //
+                            // newRound (the scope index going BACKWARD, which in roamd's fixed order can only
+                            // happen at a boundary) proves a second round in BOTH shapes. When we adopted one we
+                            // know the total up front and can say "1 of 2". When the logoff produced both, its
+                            // first round is indistinguishable from a single-round logoff while it is running,
+                            // so it stays unlabelled and becomes "2 of 2" at the boundary -- which is the exact
+                            // moment the user watches the bar reset and wonders what went wrong.
+                            //
+                            // 2 remains a real ceiling, not an assumption: syncLoop will not start a periodic
+                            // round while a seal is in flight, so a third cannot appear.
+                            final String roundOf = ownRoundSeen ? "Save 2 of 2\n"
+                                    : (adoptedRound ? "Save 1 of 2\n" : "");
+                            if (segIdx >= 0) lastSeg = segIdx;
+                            runOnUiThread(() -> {
+                                if (segIdx >= 0) {
+                                    bar.setVisibility(View.VISIBLE);
+                                    if (newRound) bar.reset(); // #128: round boundary -> walk this round from zero
+                                    bar.set(segIdx, segF);
+                                }
+                                tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 26);
+                                String warn = "\n\nKeep this screen open until it's done.\nLeaving now can lose your latest changes.";
+                                // DIA-20260818-07: the counter leads, so a restart reads as "2 of 2".
+                                final String full = roundOf + head;
+                                android.text.SpannableString ss = new android.text.SpannableString(full + warn);
+                                int hs = full.length(), he = ss.length();
+                                // warning: ~0.55x of the 26sp head (≈14sp) + MUTED grey -- the saving line keeps the tv's
+                                // base ACCENT teal/large so the two read as primary vs secondary. (DIA-20260625-05c)
+                                ss.setSpan(new android.text.style.RelativeSizeSpan(0.55f), hs, he, android.text.Spannable.SPAN_EXCLUSIVE_EXCLUSIVE);
+                                ss.setSpan(new android.text.style.ForegroundColorSpan(MUTED), hs, he, android.text.Spannable.SPAN_EXCLUSIVE_EXCLUSIVE);
+                                tv.setText(ss);
+                            });
+                        }
+                    }
+                    try { Thread.sleep(400); } catch (InterruptedException ie) { break; }
+                }
+                if (sealFailed) {
+                    SignOutGate.end(); // NWP-20261109-06: still signed in, so a later sweep must run (Q116)
+                    // NWP-20261019-04 (an arrival during a logoff's seal reaches the session only at its next login or
+                    // resume when the logoff fails or stalls): the daemon re-arms the session and stages the RAM-only
+                    // inbox for it, but it does so AFTER SEAL-STATUS says FAILED, so one delivery run can claim an
+                    // empty mailbox. Re-kick every 2 s, 8 times, from a thread that outlives this activity; each run
+                    // claims its mailbox atomically, so overlapping runs take disjoint sets.
+                    final android.content.Context kickApp = getApplicationContext();
+                    new Thread(() -> TelKick.repeat(() -> {
+                        try {
+                            kickApp.startService(new android.content.Intent(kickApp, CredentialService.class).putExtra("telingest", true));
+                        } catch (Throwable t) { android.util.Log.w("NowhereChooser", "logoff telingest kick", t); }
+                    }, 8, 2000, Thread::sleep), "nowhere-logoff-telkick").start();
+                    // NWP-20261011-05: and a "Sign out & install" request goes with it. The user asked for an install
+                    // AFTER a sign-out; this sign-out did not happen, so the request must not wait for some later one.
+                    sendDaemon("OTA-AFTER-LOGOFF\n0 " + otaReqNonce + "\n"); // only THIS screen's request
+                    // NWP-20260912-06: the sign-out did NOT happen and we stay signed in, so put back what
+                    // releaseForSignOut emptied. The floor was left alone precisely so this can rebuild the
+                    // true set from usage rather than stranding the user with nothing held.
+                    new Thread(() -> AppHeld.refresh(this), "nowhere-heldrebuild").start();
+                    // #86: the daemon's logoff seal FAILED and it kept the session SIGNED IN (did NOT reap unsealed
+                    // data). Un-stick this screen -- re-enable Back/recents, drop keep-awake -- and return to the
+                    // Profile menu with an error, instead of hanging on "Saving…" with no reap ever coming.
+                    // NWP-20261010-10: ask WHY a refusal happened, while still off the main thread -- whether a
+                    // retry can clear it decides both the advice and whether "End session without saving" is
+                    // offered. null from an older daemon reads as "a retry may clear it": no control appears.
+                    final boolean refusedFail = "REFUSED".equals(failWhy);
+                    // Round 3: asked after a FAILED MEDIA too -- an earlier licence survives it, and two failed sweeps in a
+                    // row license "Restart without saving" (failedDialogExit).
+                    // Q070: also after the generic FAILED an ERR-PUSH sign-out reads (failWhy ""), for the PUSH line.
+                    final String refusal = refusedFail || "MEDIA".equals(failWhy) || failWhy.isEmpty() ? logoffRefusal() : null;
+                    final String failMsg = logoffFailMessage(failWhy, refusal, failReason, this::fmtWhen); // #111: advice that matches the cause
+                    final String exit = failedDialogExit(failWhy, refusal);
+                    final boolean reportable = refusedFail || "MEDIA".equals(failWhy); // read in the lambda below
+                    // NWP-20260825-13: ask WHICH app blocked it, while still off the main thread. A refusal
+                    // used to be a toast with no app named and no way forward -- see showSealRefusedDialog.
+                    final String[] blocked = refusedFail ? sealBlindPkgs() : new String[0];
+                    runOnUiThread(() -> {
+                        loggingOff = false;
+                        getWindow().clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                        try {
+                            android.app.ActivityManager am2 = (android.app.ActivityManager) getSystemService(ACTIVITY_SERVICE);
+                            for (android.app.ActivityManager.AppTask tk : am2.getAppTasks()) tk.setExcludeFromRecents(false);
+                        } catch (Throwable ignore) {}
+                        // NWP-20261010-10: the blind dialog only when an unreadable app is the WHOLE reason; with another
+                        // final guard on a blocking scope, dropping the app cannot finish the sign-out (useBlindDialog).
+                        if (useBlindDialog(blocked.length, refusal)) {
+                            showSealRefusedDialog(blocked, blindRestSaved(refusal));
+                        } else {
+                            // NWP-20261010-10: a dialog, never a toast. The toast lasted ~3.5 s, and the failure it
+                            // carried is one the user has to act on (Chester, 2026-09-12: "unless you are glued to
+                            // the screen, you will miss it").
+                            showLogoffFailedDialog(failMsg, reportable, refusal, exit);
+                        }
+                        showConfirm();
+                    });
+                    return; // no reap is coming -> do NOT fall through to "Signing off…"/reap-wait
+                }
+                if (!partial.isEmpty()) {
+                    // #118: the logoff SUCCEEDED -- do not block it, do not alarm -- but name what was not
+                    // stored. Before this the same logoff was reported as an unqualified success, and #apps is
+                    // exactly the scope whose loss the user meets later as "all my apps are gone".
+                    final String pm = partialMessage(partial);
+                    runOnUiThread(() -> android.widget.Toast.makeText(this, pm, android.widget.Toast.LENGTH_LONG).show());
+                }
+                runOnUiThread(() -> {
+                    bar.done(); // DIA-20260813-02: the seal is DONE -- all five segments full, whatever emitted
+                    tv.setText("Signing off…");
+                    // Backstop (DIA-20260705-91b): normally the reap tears this screen down by STOPPING the
+                    // ephemeral roamed user it runs on -- which kills this process (and this handler) well before
+                    // the timeout, so it never fires. But if this logout screen is on USER 0 (there is no
+                    // ephemeral user to reap) or a switch/reap race leaves it un-reaped, it used to hang on
+                    // "Signing off…" FOREVER (seal + reap already succeeded; only the UI was stuck). Don't hang:
+                    // after a grace period, go to the gate ourselves.
+                    tv.postDelayed(() -> {
+                        if (isFinishing() || isDestroyed()) return;
+                        try {
+                            startActivity(new Intent(this, ChooserActivity.class)
+                                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TASK));
+                        } catch (Throwable ignore) {}
+                        finish();
+                    }, 18000);
+                });
+            }
+            // On a clean ack the daemon's su:s0 worker has sealed and is reaping this profile: it switches
+            // back to the gate on user 0 and stops+wipes this ephemeral user, which tears THIS screen down.
+            // No reboot -- we just wait. Only if the daemon was unreachable do we fall back to a reboot, the
+            // one wipe this secondary-user UI can force on its own (the user is ephemeral, so a boot wipes it).
+            if (!acked) {
+                // NWP-20261116-11 (h46 #4): the reboot wipes every profile's pending RAM-only telephony records, and
+                // the session cannot count them (that count verb is gate-only), so it says so before it reboots.
+                Log.w("NowhereProfile", LogoutRetry.UNKNOWN_COST);
+                try {
+                    ((android.os.PowerManager) getSystemService(POWER_SERVICE)).reboot(null);
+                } catch (Throwable t) {
+                    startActivity(new Intent(this, ChooserActivity.class).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+                    finish();
+                }
+            }
+        }).start();
+    }
+
+    /** P3 cold-lock (DIA-20260625-13): keep the session ON the device, FBE-locked + resumable, instead of
+     *  sealing + wiping. Tell the daemon to COLD-LOCK -> it switches to the gate + STOPS (not removes) this user
+     *  (CE key evicted -> /data ciphertext at rest). The stop tears this UI down; the gate offers RESUME (P4). */
+    private void doColdLock() {
+        mirrorWifiToGate(); // #98: capture BEFORE the session stops (best-effort)
+        TextView tv = new TextView(this);
+        tv.setText("Locking…");
+        tv.setTextColor(ACCENT);
+        tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 28);
+        tv.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
+        tv.setGravity(Gravity.CENTER);
+        // NWP-20261005-09: say WHY when the lock is queued. It waits for whatever holds the worker -- a periodic
+        // backup can for most of an hour -- and this screen said only "Locking…" the whole time (frankel 0.5.41:
+        // "over 5mins but nothing is happening - not sure if its the middle of a backup").
+        TextView why = new TextView(this);
+        why.setTextColor(MUTED);
+        why.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16);
+        why.setGravity(Gravity.CENTER);
+        why.setPadding(dp(32), dp(16), dp(32), 0);
+        why.setVisibility(View.GONE);
+        LinearLayout col = new LinearLayout(this);
+        col.setOrientation(LinearLayout.VERTICAL);
+        col.setGravity(Gravity.CENTER);
+        col.setBackgroundColor(BG);
+        col.addView(tv, new LinearLayout.LayoutParams(MATCH, WRAP));
+        col.addView(why, new LinearLayout.LayoutParams(MATCH, WRAP));
+        setContentView(col);
+        getWindow().addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        loggingOff = true; // unescapable until the stop tears it down (same swallow-Back + re-front as logoff)
+        try {
+            android.app.ActivityManager am = (android.app.ActivityManager) getSystemService(ACTIVITY_SERVICE);
+            for (android.app.ActivityManager.AppTask t : am.getAppTasks()) t.setExcludeFromRecents(true);
+        } catch (Throwable ignore) {}
+        new Thread(() -> {
+            captureNextAlarm();
+            // NWP-20261006-23: the reply was discarded, so a lock the daemon never took ("" on a dead socket, a
+            // NOSESSION, an error) left this screen up for good: unescapable, keeping the screen on, and the phone
+            // never locked -- while it said "Locking…". Only LOCKING (or a logoff already in flight, whose stop
+            // ends this screen the same way) keeps it. Anything else backs out to the menu and says so. If the
+            // daemon did act after all, the stop that completes the lock still tears this screen down.
+            final String lr = sendDaemon("COLD-LOCK\n").trim();
+            if (!lr.startsWith("OK LOCKING") && !lr.startsWith("OK LOGOFF")) {
+                runOnUiThread(() -> {
+                    loggingOff = false;
+                    getWindow().clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                    try {
+                        android.app.ActivityManager am2 = (android.app.ActivityManager) getSystemService(ACTIVITY_SERVICE);
+                        for (android.app.ActivityManager.AppTask tk : am2.getAppTasks()) tk.setExcludeFromRecents(false);
+                    } catch (Throwable ignore) {}
+                    android.widget.Toast.makeText(this, "Couldn't lock this session. Try again.",
+                            android.widget.Toast.LENGTH_LONG).show();
+                    showConfirm();
+                });
+                return;
+            }
+            // The stop that completes the lock kills this process, which ends the loop; isFinishing is the backstop.
+            while (!isFinishing() && !isDestroyed()) {
+                final String s = coldLockWhy(sendDaemon("COLD-LOCK-STATUS\n").trim());
+                runOnUiThread(() -> {
+                    why.setText(s);
+                    why.setVisibility(s.isEmpty() ? View.GONE : View.VISIBLE);
+                });
+                try { Thread.sleep(3000); } catch (InterruptedException e) { return; }
+            }
+        }).start();
+    }
+
+    /** NWP-20261005-09: the line under "Locking…" for a COLD-LOCK-STATUS reply. "WAITING <op> <secs>" is a lock
+     *  queued behind the worker ("out" = a backup); anything else -- LOCKING, NONE, an older daemon that does not
+     *  know the verb, a socket error -- has nothing to explain, so the line stays hidden. */
+    static String coldLockWhy(String reply) {
+        String[] f = reply.split(" ");
+        if (f.length != 3 || !"WAITING".equals(f[0])) return "";
+        long secs;
+        try { secs = Long.parseLong(f[2]); } catch (NumberFormatException e) { return ""; }
+        String what = "out".equals(f[1]) ? "Finishing a backup first." : "Finishing another task first.";
+        long min = secs / 60;
+        String waited = min < 1 ? "under a minute" : (min == 1 ? "1 minute" : min + " minutes");
+        return what + " The phone locks itself as soon as it's done, so you can put it down.\nWaiting " + waited + ".";
+    }
+
+    /** #151 (a phone that can't wake you): relay THIS session's next alarm time to the user-0 gate before the
+     *  session stops. A stopped roamed user's AlarmManager alarms don't fire, so without this a set alarm would
+     *  silently never ring once the phone is logged off / cold-locked. We send the trigger TIME ONLY (no label,
+     *  no tone -- amnesia-safe; the time itself is just a clock reading); the daemon stashes it in the RAM tmpfs
+     *  and the gate schedules a user-0 alarm that rings generically. 0 = no alarm -> the gate clears any pending
+     *  one. Runs AS the roamed user, so getNextAlarmClock() returns this session's own next alarm directly. */
+    private void captureNextAlarm() {
+        long when = 0L;
+        String pkg = null;
+        try {
+            android.app.AlarmManager am = (android.app.AlarmManager) getSystemService(ALARM_SERVICE);
+            android.app.AlarmManager.AlarmClockInfo ac = am == null ? null : am.getNextAlarmClock();
+            if (ac != null) when = ac.getTriggerTime();
+            // NWP-20261011-04: and WHO set it, as CredentialService's relay already says. The logoff's cutoff keeps this
+            // package from being force-stopped: a force-stop cancels its alarms (AlarmManagerService removes the uid's
+            // alarms on PACKAGE_RESTARTED), the post-seal relay then reads no next alarm, and its clear wiped the gate's
+            // copy -- an alarm that never rang. This relay used to send the time alone, which also REMOVED the owner the
+            // periodic relay had recorded, right before the logoff that needs it.
+            if (ac != null && ac.getShowIntent() != null) pkg = ac.getShowIntent().getCreatorPackage();
+        } catch (Throwable t) { android.util.Log.w("NowhereChooser", "captureNextAlarm", t); }
+        final String line = CredentialService.alarmRelayLine(when, CredentialService.myUserId(), pkg);
+        // NWP-20261007-06: the reply was ignored, so a relay the daemon never took looked like one it did, and the
+        // alarm silently never rang. The daemon now answers this off its session lock; two tries cover a daemon
+        // that is restarting (each failed connect costs up to 8 s before the lock or logoff can go on). If an
+        // alarm is set and neither try landed, say so while this screen is still up.
+        boolean landed = false;
+        for (int i = 0; i < 2 && !landed; i++) {
+            try { landed = sendDaemon("SET-GATE-ALARM\n" + line + "\n").startsWith("OK"); } catch (Throwable ignore) {}
+        }
+        if (!landed && when > 0) {
+            runOnUiThread(() -> android.widget.Toast.makeText(this,
+                    "Your next alarm couldn't be handed to the locked phone, so it may not ring.",
+                    android.widget.Toast.LENGTH_LONG).show());
+        }
+    }
+
+    /** #4 (DIA-20260626-04): promote the throwaway into a real, roaming profile. The daemon creates its store
+     *  vault + recovery code, drops the local-only flag, and seals the live data in the background; the session
+     *  keeps running. On success we show the recovery code once. */
+    /** #101 (credential-tiers P1b): "Save to your store" opens the CEREMONY instead of silently reusing the
+     *  session's casually-typed passphrase -- the user must TYPE the passphrase their data will be sealed
+     *  under (proving they can reproduce it), and may pick a DIFFERENT, stronger one (free: a throwaway has
+     *  nothing in the store; the daemon re-keys the live keyguard when it changes). The #79 floor applies. */
+    private void doPromote() {
+        showSaveCeremony();
+    }
+
+    private String pendingSavePass; // #101: the ceremony's typed pass -- survives the Add-credits detour
+
+    private void showSaveCeremony() {
+        LinearLayout ll = menuScreen("Save to your store",
+                "choose the passphrase this profile opens with — you'll type it at every sign-in");
+
+        final EditText passF = ceremonyField("passphrase");
+        LinearLayout.LayoutParams flp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        flp.topMargin = dp(26);
+        final Object cerRevGrp = new Object(); // #96: ceremony pass + confirm reveal together
+        ll.addView(PassReveal.wrap(passF, MUTED, cerRevGrp), flp);      // #81 ceremony passphrase
+
+        final EditText confF = ceremonyField("confirm passphrase");
+        LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        clp.topMargin = dp(12);
+        ll.addView(PassReveal.wrap(confF, MUTED, cerRevGrp), clp);      // #81 ceremony confirm
+
+        final TextView hint = new TextView(this);
+        hint.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        hint.setVisibility(android.view.View.GONE);
+        LinearLayout.LayoutParams hlp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        hlp.topMargin = dp(8);
+        ll.addView(hint, hlp);
+
+        // Live strength hint: the daemon's CHECK-PASSPHRASE (debounced) = the SAME floor PROMOTE2 enforces.
+        final android.os.Handler h = new android.os.Handler(android.os.Looper.getMainLooper());
+        final Runnable check = () -> {
+            final String pw = passF.getText().toString();
+            if (pw.isEmpty()) { hint.setVisibility(android.view.View.GONE); return; }
+            new Thread(() -> {
+                final String nm = profileName();
+                final String r = sendDaemon("CHECK-PASSPHRASE\n" + (nm == null ? "" : nm) + "\n" + pw + "\n");
+                runOnUiThread(() -> {
+                    final ReplyCopy.Strength st = ReplyCopy.strength(r);
+                    hint.setText((st.state == ReplyCopy.State.STRONG ? "✓ " : st.state == ReplyCopy.State.WEAK ? "• " : "")
+                            + st.text);
+                    hint.setTextColor(st.state == ReplyCopy.State.STRONG ? ACCENT : MUTED);
+                    hint.setVisibility(android.view.View.VISIBLE);
+                });
+            }).start();
+        };
+        passF.addTextChangedListener(new android.text.TextWatcher() {
+            public void beforeTextChanged(CharSequence s, int a, int b, int c) {}
+            public void onTextChanged(CharSequence s, int a, int b, int c) {}
+            public void afterTextChanged(android.text.Editable e) {
+                h.removeCallbacks(check);
+                h.postDelayed(check, 350);
+            }
+        });
+
+        // Generate: fill both fields from the shared wordlist and REVEAL them (nothing secret was typed;
+        // the user must be able to read what they're about to commit to -- same lesson as the gate form).
+        TextView gen = new TextView(this);
+        gen.setText("Generate a strong passphrase");
+        gen.setTextColor(ACCENT);
+        gen.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        gen.setPadding(dp(4), dp(10), dp(8), dp(4));
+        ll.addView(gen, new LinearLayout.LayoutParams(WRAP, WRAP));
+        gen.setOnClickListener(v -> new Thread(() -> {
+            String r = sendDaemon("GEN-PASSPHRASE\n").trim();
+            if (!r.startsWith("OK ")) return;
+            final String pw = r.substring(3).trim();
+            runOnUiThread(() -> {
+                for (EditText f : new EditText[] {passF, confF}) {
+                    f.setInputType(android.text.InputType.TYPE_CLASS_TEXT
+                            | android.text.InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD);
+                    f.setTransformationMethod(null);
+                    f.setText(pw);
+                }
+                hint.setText("✓ strong — write these words down, in order");
+                hint.setTextColor(ACCENT);
+                hint.setVisibility(android.view.View.VISIBLE);
+            });
+        }).start());
+
+        final Button save = accentBtn("Save");
+        LinearLayout.LayoutParams alp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        alp.topMargin = dp(18);
+        ll.addView(save, alp);
+        save.setOnClickListener(v -> {
+            String pw = passF.getText().toString();
+            if (!pw.equals(confF.getText().toString())) {
+                hint.setText("• passphrases don't match");
+                hint.setTextColor(MUTED);
+                hint.setVisibility(android.view.View.VISIBLE);
+                return;
+            }
+            if (pw.isEmpty()) {
+                hint.setText("• type a passphrase (or generate one)");
+                hint.setTextColor(MUTED);
+                hint.setVisibility(android.view.View.VISIBLE);
+                return;
+            }
+            save.setEnabled(false);
+            save.setText("Saving…");
+            sendPromote(pw);
+        });
+
+        TextView back = new TextView(this);
+        back.setText("Back");
+        back.setTextColor(ACCENT);
+        back.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        back.setGravity(Gravity.CENTER);
+        back.setPadding(dp(8), dp(20), dp(8), dp(8));
+        ll.addView(back, new LinearLayout.LayoutParams(MATCH, WRAP));
+        back.setOnClickListener(v -> showConfirm());
+
+        android.widget.ScrollView sc = new android.widget.ScrollView(this);
+        sc.setBackgroundColor(BG);
+        sc.addView(ll);
+        setContentView(sc);
+    }
+
+    /** A masked passphrase field styled like the other Profile inputs. */
+    private EditText ceremonyField(String hintText) {
+        EditText f = new SafeEdit(this); // DIA-20260811-09: a bare EditText dies on long-press -- see SafeEdit
+        f.setHint(hintText);
+        f.setTextColor(FIELD_TX);
+        f.setHintTextColor(HINT);
+        f.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16);
+        f.setSingleLine(true);
+        f.setInputType(android.text.InputType.TYPE_CLASS_TEXT
+                | android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD);
+        GradientDrawable fbg = new GradientDrawable();
+        fbg.setColor(FIELD_BG);
+        fbg.setCornerRadius(dp(12));
+        fbg.setStroke(dp(1), FIELD_LN);
+        f.setBackground(fbg);
+        f.setPadding(dp(16), dp(14), dp(16), dp(14));
+        return f;
+    }
+
+    /** Send the promote with the ceremony's typed pass (PROMOTE2) and handle every reply. */
+    private void sendPromote(final String pw) {
+        pendingSavePass = pw;
+        new Thread(() -> {
+            final String r = sendDaemon("PROMOTE2\n" + pw + "\n").trim();
+            runOnUiThread(() -> handlePromoteReply(r));
+        }).start();
+    }
+
+    private void handlePromoteReply(String r) {
+        // NWP-20261116-15: every PROMOTE2 reply renders through PromoteCopy (pinned by test-promote-copy-java.sh).
+        switch (PromoteCopy.kind(r)) {
+            case SAVED:
+                sessionType = "STORED";
+                pendingSavePass = null;
+                showRecovery(PromoteCopy.recovery(r));
+                break;
+            case CEREMONY:
+                // #79/#101: WEAK is below the floor -- back to the ceremony with the reason. #101: ERR-REKEY means the
+                // keyguard re-key failed -> nothing changed; retry. The same for no reply and for every code with no
+                // copy of its own. A FRESH ceremony: the Save handler disabled its button ("Saving…"), so leaving the
+                // old screen up left nothing to tap.
+                android.widget.Toast.makeText(this, PromoteCopy.text(r), android.widget.Toast.LENGTH_LONG).show();
+                showSaveCeremony();
+                break;
+            case BACK:
+                // NOSTORE, and #49: an offline-started session is an existing stored profile, not a throwaway --
+                // saving it would collide with the real one. (The menu hides Save for offline; this is a fallback.)
+                // A retry cannot succeed, so back to the Profile hub.
+                android.widget.Toast.makeText(this, PromoteCopy.text(r), android.widget.Toast.LENGTH_LONG).show();
+                showConfirm();
+                break;
+            case EXISTS:
+                // NWP-20261003-02: the same next step as the gate's EXISTS message (ChooserActivity), same vocabulary
+                // as the storefront's restore page. A DIALOG, not a Toast: Android 12+ cuts a text toast to two lines,
+                // which drops exactly the next step this message exists to give. The ceremony reopens when it is
+                // dismissed (OK or back), so a different passphrase still saves and the two never stack.
+                new android.app.AlertDialog.Builder(this)
+                        .setMessage(PromoteCopy.text(r))
+                        .setPositiveButton("OK", null)
+                        .setOnDismissListener(d -> showSaveCeremony())
+                        .show();
+                break;
+            case ALREADY:
+                sessionType = "STORED"; showConfirm(); // already saved -> just refresh
+                break;
+            case CREDIT:
+                // Saving a throwaway to the store costs storage credit and this device has none yet.
+                // Fold straight into Add-credits: redeem a claim code, then complete the save (the typed
+                // pass rides pendingSavePass through the detour). (DIA-20260629-06)
+                showAddCreditsForSave();
+                break;
+            case SPLIT:
+                // ERR-SESSION: the screen lock took the NEW passphrase and the session marker did not; nothing was
+                // saved. A retry would re-key from the old passphrase and fail for ever, so say what happened (a
+                // dialog, for the same two-line reason as EXISTS) and return to the Profile hub.
+                pendingSavePass = null;
+                new android.app.AlertDialog.Builder(this)
+                        .setMessage(PromoteCopy.text(r))
+                        .setPositiveButton("OK", null)
+                        .setOnDismissListener(d -> showConfirm())
+                        .show();
+                break;
+        }
+    }
+
+    /** Show the 12-word recovery code once after a promote -- the ONLY way back in if the passphrase is forgotten
+     *  (it's never stored). "Done" returns to the (now STORED) Profile screen. */
+    private void showRecovery(String words) {
+        LinearLayout ll = new LinearLayout(this);
+        ll.setOrientation(LinearLayout.VERTICAL);
+        ll.setGravity(Gravity.CENTER_HORIZONTAL);
+        ll.setBackgroundColor(BG);
+        ll.setPadding(dp(32), dp(48), dp(32), dp(36));
+
+        TextView t = new TextView(this);
+        t.setText("Saved — write this down");
+        t.setTextColor(INK);
+        t.setTextSize(TypedValue.COMPLEX_UNIT_SP, 24);
+        t.setGravity(Gravity.CENTER);
+        ll.addView(t);
+
+        TextView sub = new TextView(this);
+        sub.setText("This is your recovery code — the only way back into this profile if you forget your "
+                + "passphrase. No one, including us, can recover it for you. Keep it somewhere safe.");
+        sub.setTextColor(MUTED);
+        sub.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        sub.setGravity(Gravity.CENTER);
+        sub.setLineSpacing(dp(3), 1f);
+        LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        slp.topMargin = dp(14);
+        slp.bottomMargin = dp(22);
+        ll.addView(sub, slp);
+
+        TextView code = new TextView(this);
+        code.setText(words);
+        code.setTextColor(ACCENT);
+        code.setTextSize(TypedValue.COMPLEX_UNIT_SP, 18);
+        code.setGravity(Gravity.CENTER);
+        code.setTypeface(android.graphics.Typeface.MONOSPACE);
+        code.setLineSpacing(dp(6), 1f);
+        GradientDrawable cbg = new GradientDrawable();
+        cbg.setColor(FIELD_BG);
+        cbg.setCornerRadius(dp(13));
+        cbg.setStroke(dp(1), FIELD_LN);
+        code.setBackground(cbg);
+        code.setPadding(dp(18), dp(20), dp(18), dp(20));
+        LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        clp.bottomMargin = dp(28);
+        ll.addView(code, clp);
+
+        Button done = new Button(this);
+        done.setText("Done");
+        done.setAllCaps(false);
+        done.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
+        done.setTextColor(ON_ACCENT);
+        GradientDrawable dbg = new GradientDrawable();
+        dbg.setColor(ACCENT);
+        dbg.setCornerRadius(dp(13));
+        done.setBackground(dbg);
+        done.setStateListAnimator(null);
+        done.setPadding(0, dp(14), 0, dp(14));
+        ll.addView(done, new LinearLayout.LayoutParams(MATCH, WRAP));
+        done.setOnClickListener(v -> showConfirm());
+
+        android.widget.ScrollView sc = new android.widget.ScrollView(this);
+        sc.setBackgroundColor(BG);
+        sc.addView(ll);
+        setContentView(sc);
+    }
+
+    /**
+     * NWP-20261017-16: the gateway's refusal text from the SEAL-STATUS call that last returned "FAILED NOCREDIT",
+     * null when the daemon sent none (an older daemon, a 402 with no body, any other status). Written by
+     * sealStatus() on every call, so it always belongs to the reply sealStatus() just returned.
+     */
+    private volatile String sealStatusReason;
+
+    /** Ask the daemon for the background logoff seal's status: "SEALING <phase> <done> <total>" or "DONE". */
+    private String sealStatus() {
+        sealStatusReason = null;
+        try {
+            LocalSocket s = DaemonSocket.connect(); // NWP-20261005-19: bounded connect
+            if (s == null) throw new java.io.IOException("daemon connect timed out");
+            s.setSoTimeout(8000);
+            s.getOutputStream().write("SEAL-STATUS\n".getBytes("UTF-8"));
+            s.getOutputStream().flush();
+            BufferedReader in = new BufferedReader(new InputStreamReader(s.getInputStream(), "UTF-8"));
+            String line = in.readLine();
+            // NWP-20261017-16: a FAILED verdict may carry a second line, "REASON <gateway text>". Bounded by the
+            // socket timeout above; a daemon that sends nothing more yields null.
+            if (line != null && line.startsWith("FAILED")) {
+                try { sealStatusReason = sealReasonOf(in.readLine()); } catch (Exception ignore) {}
+            }
+            s.close();
+            return line;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /** NWP-20261017-16: the text of a SEAL-STATUS "REASON <text>" line; null for anything else, or an empty text. */
+    private static String sealReasonOf(String line) {
+        if (line == null || !line.startsWith("REASON ")) return null;
+        String r = line.substring("REASON ".length()).trim();
+        return r.isEmpty() ? null : r;
+    }
+
+    /** NWP-20261014-30: the DELETE reply is a success only when it starts with OK ("OK" or "OK GONE"). */
+    static boolean deleteSucceeded(String r) {
+        return r.startsWith("OK");
+    }
+
+    /**
+     * #140: the copy for a failed DELETE reply. NOTFOUND is the ONLY reply that blames the passphrase; every failure
+     * says "nothing was deleted" except the no-answer one, which cannot claim it (NWP-20261007-09: DELETE can outlast
+     * the 90 s read and still finish).
+     */
+    static String deleteFailCopy(String r) {
+        if (r.startsWith("BUSY")) {
+            return "the phone is busy saving your data — nothing was deleted. Try again in a moment.";
+        } else if (r.startsWith("ERR-STORE")) {
+            return "couldn't reach your storage — nothing was deleted. Check your connection and try again.";
+        } else if (r.startsWith("NOTFOUND")) {
+            return "that passphrase doesn't match this profile — nothing was deleted.";
+        } else if (r.isEmpty()) {
+            return "the phone didn't answer, so the delete may or may not have gone through. "
+                    + "If the phone goes back to the start screen, it was deleted; if not, try again.";
+        }
+        return "couldn't delete — nothing was deleted. Try again.";
+    }
+
+    /**
+     * NWP-20261028-03 (docs/product-decisions.md, 2026-10-19 item 5): with no network at all the Delete is not sent.
+     * No session type is exempt -- the Delete link is shown only to non-throwaway sessions, and the daemon's DELETE
+     * reads the store whatever the type, so with no network nothing can answer it. {@code activeNetwork} is this app's
+     * default network; {@code anyInternetNetwork} is any non-VPN network with INTERNET, which a session's lockdown VPN
+     * that is down leaves standing although it hides the default network from this app.
+     */
+    static boolean deleteSkipsStore(boolean activeNetwork, boolean anyInternetNetwork) {
+        return !activeNetwork && !anyInternetNetwork;
+    }
+
+    /**
+     * The two reads {@link #deleteSkipsStore} takes: {the default network exists, some non-VPN network has INTERNET}.
+     * Fail-open like ChooserActivity.hasInternet: a null manager or any throw counts as a network. Not validated --
+     * a portal or a no-upstream Wi-Fi still sends DELETE and the daemon's answer covers it.
+     */
+    private boolean[] hasAnyNetwork() {
+        try {
+            android.net.ConnectivityManager cm =
+                    (android.net.ConnectivityManager) getSystemService(CONNECTIVITY_SERVICE);
+            if (cm == null) return new boolean[] {true, true};
+            boolean active = cm.getActiveNetwork() != null;
+            boolean any = false;
+            for (android.net.Network n : cm.getAllNetworks()) {
+                android.net.NetworkCapabilities nc = cm.getNetworkCapabilities(n);
+                if (nc != null && nc.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                        && !nc.hasTransport(android.net.NetworkCapabilities.TRANSPORT_VPN)) {
+                    any = true;
+                    break;
+                }
+            }
+            return new boolean[] {active, any};
+        } catch (Throwable t) {
+            return new boolean[] {true, true};
+        }
+    }
+
+    /**
+     * DIA-20260812-08 (#111): the message for a FAILED logoff seal, chosen by the cause the daemon named.
+     *
+     * All three keep the session signed in, so all three must say that. What differs is what the user should
+     * DO, and the old single message gave the connection answer to every one of them:
+     *   REFUSED  -- a seal guard withheld the write to protect the stored copy. The store was reachable, so
+     *               "check your connection" is wrong. This used to add that the guard is "deterministic, so
+     *               every retry reproduces it", and route the user to reporting instead of retrying.
+     *
+     *               NWP-20260906-25: THAT PREMISE DIED WHEN NWP-20260906-04 ADDED A RACE-TRIGGERED REFUSAL.
+     *               A stale-publish refusal fires because ANOTHER DEVICE moved the head mid-seal, and it is
+     *               transient by construction. Observed twice on 2026-09-06, the second time clearing while
+     *               the competing device was still signed in and still sealing. So the old copy told the
+     *               user to stop doing the one thing that works.
+     *
+     *               ⚠ THE COPY MUST STAY TRUE FOR BOTH CLASSES, because this verdict cannot tell them
+     *               apart -- the deterministic guards (#111 blind walk, the restore receipt, the shrink
+     *               net, the #144 fence) arrive here too, and for those a retry really is futile. So it
+     *               promises neither: it states what is true always (the stored copy is safe), gives the
+     *               action that resolves the transient case, and falls through to reporting otherwise.
+     *               ⚠ AND IT DOES NOT ASSERT "another device" AS FACT: the guard knows only that the value
+     *               moved, and a same-device daemon write (a security-key enroll or revoke, a PIN change,
+     *               a rollback, a repoint) can move it mid-seal just as well.
+     *
+     *               ⚠⚠ NWP-20260907-07: THAT PARAGRAPH WAS WRITTEN ON 2026-09-06 AND THE STRING BELOW IT
+     *               BROKE IT THE SAME DAY. The copy read "If another device is signed in to this profile,
+     *               sign out there and try again" -- conditional, so it did not technically ASSERT another
+     *               device, but it made that the only path offered and sent the reader to a different
+     *               handset. On 2026-09-07 Chester enrolled a security key on frankel -- the FIRST item in
+     *               the same-device list above -- and was told to go and sign out of lynx, which by then
+     *               could not sign out at all (the enrolment had dropped the pass-only slot, so lynx could
+     *               no longer open the vault to seal). A guard rail in a comment is not a guard rail.
+     *               ⚠ THE RULE, STATED SO IT CAN BE CHECKED: this message may ask the reader to retry the
+     *               thing they were already doing ON THIS DEVICE, and nothing else. No instruction that
+     *               involves another handset, because we cannot know another handset is involved and the
+     *               reader may not be able to act on it. The same fix was applied to all four strings that
+     *               carried it -- this one, the Storage status line, the Storage detail line, and the
+     *               ongoing notification. Grep for "sign out there" before adding a fifth.
+     *   NOCREDIT -- the plan is out. Retrying never fixes it either, but the user CAN: add storage.
+     *   TIMEOUT  -- NWP-20261113-18: the save stopped making progress (ERR-TIMEOUT, ERR-STALLED). A retry on this
+     *               device may work; never name the network or the store as the cause, because the store may
+     *               have been reachable throughout.
+     *   other    -- ERR-PUSH and friends: genuinely transient, so the original advice stands.
+     *
+     * NWP-20261010-10: THE VERDICT CAN NOW TELL THE TWO REFUSAL CLASSES APART, so the copy no longer has to
+     * promise neither. {@code refusal} is the daemon's GET-LOGOFF-REFUSAL reply (null when it has none, or is
+     * older than the verb). FINAL says so and names the device-local cause -- the stored copy is intact, signing
+     * out again will most likely fail the same way -- and never advises a retry. MEDIA (FAILED MEDIA) is a logoff
+     * that never sealed because a media mount survived the sweep: below two failed sweeps in a row a retry is the
+     * advice; from two the phone has already retried (NWP-20261117-03), so the text names the restart instead. RETRY keeps the advice above, except for the
+     * one guard it is false for (the stored copy could not be READ, which is not "changed while the save was
+     * running"). With no reply the text is byte-identical to before, which is what an older daemon gets.
+     * {@code at} renders unix seconds as a time for the cause line (the activity passes {@code this::fmtWhen}).
+     */
+    private static String logoffFailMessage(String why, String refusal, String reason,
+                                            java.util.function.LongFunction<String> at) {
+        if ("REFUSED".equals(why)) {
+            if (refusalFinal(refusal)) {
+                // "most likely": a shrink can be the walk's artefact rather than a loss (Chester's wording call,
+                // relayed by the review of NWP-20261010-10). "intact", not "unchanged": scopes that sealed in this
+                // same attempt DID change the stored copy.
+                return "Couldn't save this session, and signing out again will most likely fail the same way.\n\n"
+                     + refusalCause(refusal, at) + "\n\n"
+                     + "Your stored copy is intact, and you're still signed in. You can keep using this session, "
+                     + "or end it without saving.";
+            }
+            if (refusalNames(refusal, "unreadable-head")) {
+                return "Couldn't save this session — Nowhere couldn't read your stored copy to check it first, so "
+                     + "it didn't save over it. Your stored copy is intact and you're still signed in. "
+                     + "Signing out again may work. If it keeps happening, please report it.";
+            }
+            return "Couldn't save this session — but your last saved copy is safe and unchanged. "
+                 + "You're still signed in. This profile changed while the save was running; signing out "
+                 + "again usually works. If it keeps happening, please report it.";
+        }
+        if ("MEDIA".equals(why)) { // NWP-20261010-10: the sweep left a media mount, so the logoff never sealed
+            // NWP-20261117-03: from the second failed sweep in a row (restartUnsavedAfter, the count failedDialogExit
+            // offers "Restart without saving" at) the daemon has already retried the sweep, so "try again" is no
+            // advice: say it tried, and what the restart it offers ends and loses.
+            if (mediaStuckCount(refusal) >= 2) {
+                return "Couldn't finish signing out — this phone tried several times but couldn't close your photos "
+                     + "and media safely, so nothing was saved over your stored copy. You're still signed in.\n\n"
+                     + "Restarting your phone ends this session and loses whatever this phone hasn't saved since its "
+                     + "last good save. Your stored copy stays safe. "
+                     + "Texts and calls this phone is still holding for delivery are lost.";
+            }
+            // Round 3: say that a restart is SAFE for the stored copy -- when the sweep keeps failing, a restart is the
+            // way out, and nothing else on screen would tell the user they may take it.
+            return "Couldn't finish signing out — this phone couldn't close your photos and media safely, so "
+                 + "nothing was saved over your stored copy. You're still signed in. Try again in a minute.\n\n"
+                 + "Restarting your phone is safe for your stored copy: it only discards what this phone hasn't "
+                 + "saved yet. Texts and calls this phone is still holding for delivery are lost.";
+        }
+        if ("NOCREDIT".equals(why)) {
+            // NWP-20261017-16: "your storage plan is out" is the daemon's guess; when the gateway said why, quote it,
+            // because a refusal that adding storage does not fix would otherwise send the user to buy storage.
+            String base = "Couldn't save your data — your storage plan is out. You're still signed in. "
+                        + "Add storage, then sign out again.";
+            if (reason == null || reason.trim().isEmpty()) return base;
+            return base + " The storage service said: \"" + reason.trim() + "\".";
+        }
+        String lock = "Tap Lock to keep this session safe: it locks with no connection needed and stays on this phone, "
+                    + "encrypted, until you come back, or until it's wiped 12 hours after locking. Nothing is lost. ";
+        if ("TIMEOUT".equals(why)) { // NWP-20261113-18: ERR-TIMEOUT / ERR-STALLED -- the save stalled, the store was not named
+            // "intact", not "unchanged": roamd keeps running behind a timed-out save and may still finish it, and scopes
+            // that sealed before the stall in this same attempt DID change the stored copy.
+            return "Couldn't save your data — the save stopped making progress, and you're still signed in. "
+                 + "Your stored copy is intact.\n\n"
+                 + lock
+                 + "Or sign out again in a moment.";
+        }
+        return "Couldn't save your data — Nowhere couldn't reach your storage, and you're still signed in.\n\n"
+             + lock
+             + "Or sign out again once you're online.";
+    }
+
+    // ---- NWP-20261010-10: a refused sign-out, read from the daemon's GET-LOGOFF-REFUSAL reply ----
+    //
+    // The reply is "REFUSED <FINAL|RETRY> <unix>", then "SCOPE <scope> <cause>[:<guard>] <unix or 0>" for each
+    // scope roamd named. Every helper from here to endUnsavedMayRetry is PURE (java.lang and java.util only), so
+    // the decision can be lifted out and run under plain javac. null, "" and anything malformed read as "no
+    // refusal on record" -- RETRY -- the side that never offers the control that discards data.
+
+    /** True when the daemon classed the refusal FINAL: no retry of this session's seal can succeed. */
+    private static boolean refusalFinal(String refusal) {
+        if (refusal == null) return false;
+        String[] f = refusal.split("\n", 2)[0].trim().split("\\s+");
+        return f.length >= 2 && "REFUSED".equals(f[0]) && "FINAL".equals(f[1]);
+    }
+
+    /** Whether "End session without saving" may be offered: only after a guard REFUSED a sign-out of this session
+     *  and the daemon says no retry can clear it. Round 3: also after a FAILED MEDIA sign-out, which reaches no
+     *  verdict and so leaves an earlier licence standing (the reply still says REFUSED FINAL). Never as a menu item,
+     *  never for a network failure. */
+    private static boolean offerEndUnsaved(String why, String refusal) {
+        return ("REFUSED".equals(why) || "MEDIA".equals(why)) && refusalFinal(refusal);
+    }
+
+    /** The reply's MEDIA line: the session's run of consecutive failed media sweeps, 0 when absent. */
+    private static int mediaStuckCount(String reply) {
+        if (reply == null) return 0;
+        for (String ln : reply.split("\n")) {
+            String[] f = ln.trim().split("\\s+");
+            if (f.length == 2 && "MEDIA".equals(f[0])) return (int) parseUnix(f[1]);
+        }
+        return 0;
+    }
+
+    /** The reply's PUSH line (Q070): the session's run of consecutive sign-outs that could not reach the store, 0
+     *  when absent or malformed. */
+    private static int pushStuckCount(String reply) {
+        if (reply == null) return 0;
+        for (String ln : reply.split("\n")) {
+            String[] f = ln.trim().split("\\s+");
+            if (f.length == 2 && "PUSH".equals(f[0])) return (int) parseUnix(f[1]);
+        }
+        return 0;
+    }
+
+    /**
+     * NWP-20261010-10 (round 3): which exit a failed sign-out's dialog offers. "RESTART" once the media sweep has
+     * failed twice in a row for this session -- END-UNSAVED needs a verified sweep too, so it cannot help then, and
+     * the restart is the one teardown that needs none. Otherwise "END" when offerEndUnsaved allows it -- "KEY-END"
+     * when a blocking scope was refused by a guard naming a security-key slot (Q016) -- else "". NWP-20261113-18: a
+     * save that stopped making progress (TIMEOUT) gets "LOCK", as a first failure to reach the store does.
+     */
+    private static String failedDialogExit(String why, String reply) {
+        if (("REFUSED".equals(why) || "MEDIA".equals(why)) && mediaStuckCount(reply) >= 2) return "RESTART";
+        if (offerEndUnsaved(why, reply)) {
+            // Q016 (NWP-20261111-07): the stored head carries a security-key slot this session cannot open, so the
+            // key this phone's user holds can adopt it and the session saves. Without "-key" (a tie made on another
+            // phone, or a lost stash with no key slot) the end is the only exit.
+            for (String[] s : refusalScopes(reply)) {
+                if (blockingScope(s[0]) && "refused".equals(s[1])
+                        && ("locks-changed-key".equals(s[2]) || "unlock-lost-key".equals(s[2]))) return "KEY-END";
+            }
+            return "END";
+        }
+        if ("TIMEOUT".equals(why)) return "LOCK"; // NWP-20261113-18: a stalled save: Lock, as a first network failure
+        // Q070: a sign-out that could not reach the store (why ""): Lock first, the end after the second failure.
+        if (why.isEmpty()) return pushStuckCount(reply) >= 2 ? "LOCK-END" : "LOCK";
+        return "";
+    }
+
+    /** NWP-20261111-07 (Q016): what a failed "Use your security key" says, from the ADOPT-FIDO2 reply. Only ERR-NOKEY
+     *  means a key answered and did not open this profile; every other reply (no session, not stored, another
+     *  user's caller, a worker error, no answer) gets the same plain sentence. Never names another phone. */
+    private static String adoptFailMessage(String reply) {
+        String r = reply == null ? "" : reply.trim();
+        if ("ERR-NOKEY".equals(r)) return "That key didn't unlock this profile. Try the key you added, or end the session without saving.";
+        return "Couldn't use a security key here. You can end the session without saving.";
+    }
+
+    /** The SAVED line: the oldest last save among the scopes the refusal did NOT name, 0 when absent or unknown. */
+    private static long refusalRestSaved(String refusal) {
+        if (refusal == null) return 0;
+        for (String ln : refusal.split("\n")) {
+            String[] f = ln.trim().split("\\s+");
+            if (f.length == 2 && "SAVED".equals(f[0])) return parseUnix(f[1]);
+        }
+        return 0;
+    }
+
+    /** The SCOPE lines, each as {scope, cause, guard ("" when none), unix seconds it last saved}. */
+    private static java.util.List<String[]> refusalScopes(String refusal) {
+        java.util.List<String[]> out = new java.util.ArrayList<>();
+        if (refusal == null) return out;
+        for (String ln : refusal.split("\n")) {
+            String[] f = ln.trim().split("\\s+");
+            if (f.length != 4 || !"SCOPE".equals(f[0])) continue;
+            String cause = f[2], guard = "";
+            int c = cause.indexOf(':');
+            if (c >= 0) {
+                guard = cause.substring(c + 1);
+                cause = cause.substring(0, c);
+            }
+            out.add(new String[]{f[1], cause, guard, f[3]});
+        }
+        return out;
+    }
+
+    /** Whether any scope was refused by the named guard. */
+    private static boolean refusalNames(String refusal, String guard) {
+        for (String[] s : refusalScopes(refusal)) {
+            if (guard.equals(s[2])) return true;
+        }
+        return false;
+    }
+
+    private static long parseUnix(String s) {
+        try {
+            return Long.parseLong(s.trim());
+        } catch (Exception e) {
+            return 0;
+        }
+    }
+
+    /** "a", "a and b", "a, b and c". */
+    private static String joinAnd(java.util.List<String> xs) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < xs.size(); i++) {
+            if (i > 0) sb.append(i == xs.size() - 1 ? " and " : ", ");
+            sb.append(xs.get(i));
+        }
+        return sb.toString();
+    }
+
+    /** Whether the daemon's store check says this profile is deleted (a DELETED line). Never inferred from a guard
+     *  token: the fence fires on a live profile too (NWP-20260921-06). */
+    private static boolean refusalDeleted(String refusal) {
+        if (refusal == null) return false;
+        for (String ln : refusal.split("\n")) {
+            if ("DELETED".equals(ln.trim())) return true;
+        }
+        return false;
+    }
+
+    /** The guards the daemon classes FINAL (end_unsaved.go refusalReasonFinal), mirrored for the dialog choice. */
+    private static boolean guardFinal(String g) {
+        return "shrink".equals(g) || "no-receipt".equals(g) || "stale-base".equals(g) || "blind".equals(g)
+                || "deleted".equals(g) || "apps-vanished".equals(g)
+                || "locks-changed".equals(g) || "locks-changed-key".equals(g)
+                || "unlock-lost".equals(g) || "unlock-lost-key".equals(g);
+    }
+
+    private static boolean blockingScope(String scope) {
+        return "vault".equals(scope) || "de".equals(scope) || "media".equals(scope);
+    }
+
+    /** A scope in the words of the refusal dialogs. The progress bar's "your files" for the CE scope hides what a
+     *  discard of it costs, so here it is named: every app's data, texts and call history live there. */
+    private static String refusalScopeLabel(String scope) {
+        if ("vault".equals(scope)) return "your app data, texts and call history";
+        return sealScopeLabel(scope);
+    }
+
+    /**
+     * NWP-20261010-10: which dialog a refused sign-out with blocking packages gets. The blind dialog ("sign out
+     * without X") is the right one only when an unreadable app is the WHOLE reason -- when no other blocking scope
+     * holds a final guard. Otherwise dropping X cannot complete the sign-out, and the dialog that offers "End session
+     * without saving" must show instead. With no reply (an older daemon) it stays as it was.
+     */
+    private static boolean useBlindDialog(int blocked, String refusal) {
+        if (blocked <= 0) return false;
+        if (refusal == null) return true;
+        for (String[] s : refusalScopes(refusal)) {
+            if (blockingScope(s[0]) && "refused".equals(s[1]) && guardFinal(s[2]) && !"blind".equals(s[2])) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** Whether the blind dialog may say everything else IS saved: only when every scope the refusal names was
+     *  refused for being unreadable. With no reply (an older daemon) it keeps the claim it always made. */
+    private static boolean blindRestSaved(String refusal) {
+        if (refusal == null) return true;
+        for (String[] s : refusalScopes(refusal)) {
+            if (!"refused".equals(s[1]) || !"blind".equals(s[2])) return false;
+        }
+        return true;
+    }
+
+    /**
+     * The device-local CAUSE of a FINAL refusal, one sentence per guard, naming only the scopes that block a
+     * sign-out (#sys and #apps never do). Each sentence states what the guard measured on THIS phone and
+     * nothing it did not: no guess at why, and -- NWP-20260907-07 -- no errand on another handset. "Deleted" is
+     * said only when the daemon checked the store (refusalDeleted), never on the fence's token alone.
+     * Q016: a stranded vault gets one of two lines -- the sign-in was changed (locks-changed[-key]) or this phone lost
+     * its own unlock information (unlock-lost[-key]) -- each with the vault's last save, which {@code at} formats.
+     */
+    private static String refusalCause(String refusal, java.util.function.LongFunction<String> at) {
+        java.util.LinkedHashMap<String, java.util.List<String>> byGuard = new java.util.LinkedHashMap<>();
+        long vaultSaved = 0;
+        for (String[] s : refusalScopes(refusal)) {
+            if ("vault".equals(s[0])) vaultSaved = parseUnix(s[3]);
+            if (!"refused".equals(s[1])) continue;
+            if (!blockingScope(s[0])) continue;
+            java.util.List<String> l = byGuard.get(s[2]);
+            if (l == null) {
+                l = new java.util.ArrayList<>();
+                byGuard.put(s[2], l);
+            }
+            l.add(refusalScopeLabel(s[0]));
+        }
+        boolean deleted = refusalDeleted(refusal);
+        String since = "Changes made here since " + (vaultSaved > 0 ? at.apply(vaultSaved) : "it was last saved")
+                     + " aren't saved.";
+        StringBuilder sb = new StringBuilder();
+        for (java.util.Map.Entry<String, java.util.List<String>> e : byGuard.entrySet()) {
+            String what = joinAnd(e.getValue());
+            String s;
+            switch (e.getKey()) {
+                case "shrink":
+                    s = "This phone's copy of " + what + " is missing data that your stored copy has, so Nowhere "
+                      + "won't save it over the stored copy.";
+                    break;
+                case "no-receipt":
+                    // Two causes leave no receipt: a load that never finished at sign-in, and a passphrase change
+                    // made in this session (the receipts stay keyed to the old one -- docs/backlog.md NWP-20260916-03).
+                    s = "This phone's copy of " + what + " can't be matched to your stored copy — it didn't finish "
+                      + "loading when you signed in, or your passphrase changed during this session — so Nowhere "
+                      + "won't save it over the stored copy.";
+                    break;
+                case "stale-base":
+                    s = "Your stored copy of " + what + " changed after this phone loaded it, so saving this "
+                      + "phone's copy would undo that change.";
+                    break;
+                case "blind":
+                    s = "Nowhere couldn't read some of " + what + " on this phone, so its copy would be incomplete.";
+                    break;
+                case "locks-changed":
+                case "locks-changed-key":
+                    // Q016: the stored head's locks are not the ones this session opened.
+                    s = "This profile's sign-in was changed after this phone signed in (for example, a security key "
+                      + "was added), so this phone can't save to it. " + since;
+                    break;
+                case "unlock-lost":
+                case "unlock-lost-key":
+                    // Q016: the locks are the ones this session opened and none opens -- this phone lost its own
+                    // unlock material (a cleared chip stash), so the sign-in-changed sentence would be false here.
+                    s = "This phone can no longer unlock this profile to save it: its own unlock information for "
+                      + "this profile was cleared. " + since;
+                    break;
+                case "deleted":
+                case "fence":
+                    s = deleted ? "This profile was deleted, so there is nothing to save it to."
+                                : "A safety check stopped Nowhere from saving " + what + ".";
+                    break;
+                default:
+                    s = "A safety check stopped Nowhere from saving " + what + ".";
+                    break;
+            }
+            if (sb.indexOf(s) >= 0) continue; // two guards that end in the same sentence say it once
+            if (sb.length() > 0) sb.append(' ');
+            sb.append(s);
+        }
+        if (sb.length() == 0) sb.append("A safety check stopped Nowhere from saving part of this session.");
+        return sb.toString();
+    }
+
+    /** NWP-20261113-11 (row "Your data's save copy says the wrong thing in four cases", case 2): the words for a
+     *  refused last save, from SEAL-DELTA's scope lines -- the same sentence a refused sign-out gives for that guard
+     *  (refusalCause). null when the verdict is not "refused" or no data scope was refused (an older daemon sends no
+     *  scopes; an #apps or #sys refusal blocks nothing): the caller then keeps its own text. */
+    private static String lastSaveHeldText(String verdict, String scopes, java.util.function.LongFunction<String> at) {
+        if (!"refused".equals(verdict) || scopes == null || scopes.isEmpty()) return null;
+        for (String[] s : refusalScopes(scopes)) {
+            if (blockingScope(s[0]) && "refused".equals(s[1])) return refusalCause("REFUSED RETRY 0\n" + scopes, at);
+        }
+        return null;
+    }
+
+    /**
+     * The confirmation before ending a session without saving. It is a DELETION, so it says exactly what goes
+     * and what stays, from the daemon's record AT THE MOMENT OF ASKING -- no promise the code cannot back:
+     *   - each scope roamd named, with the last time that scope saved when the daemon saw one this session
+     *     ("any changes since it was last saved" when it did not -- e.g. a daemon restarted mid-session);
+     *   - everything else, which periodic saves keep storing while the session runs: what changed after the
+     *     OLDEST of their last saves (the SAVED line) goes too, so that is the time stated;
+     *   - this session's app sign-ins: END-UNSAVED deliberately does NOT push #keys (handleEndUnsaved);
+     *   - kept: the stored copy as last saved, and the storage credit, which the daemon saves first and refuses
+     *     to end the session without -- unless the STORE says the profile is deleted (a DELETED line).
+     * {@code at} renders unix seconds as a time; javac callers pass any formatter.
+     */
+    private static String endUnsavedConfirmText(String refusal, java.util.function.LongFunction<String> at) {
+        return discardText("This can't be undone. Ending the session now throws away everything this phone hasn't "
+                + "saved:\n", "", "the session ends", refusal, at);
+    }
+
+    /** Q070: END-UNSAVED's confirmation when the store could not be reached twice in a row. The phone cannot tell
+     *  whether credit is pending a save, so the credit sentence is always shown. {@code savedAt} is the last save
+     *  that landed, 0 when none is on record. */
+    private static String endUnsavedOfflineText(long savedAt, java.util.function.LongFunction<String> at) {
+        return "Ending without saving discards everything this session changed since "
+             + (savedAt > 0 ? at.apply(savedAt) : "you signed in")
+             + ". Storage credit added in this session that wasn't saved to your store is lost.";
+    }
+
+    /** NWP-20261010-10 (round 3): RESTART-UNSAVED's confirmation -- the same list as END-UNSAVED's, and that the
+     *  phone restarts. Round 4: a restart ALSO clears the state tmpfs, where every profile's undelivered texts and
+     *  calls wait (the sealed telephony inbox, the owner inbox, the pending copies) -- END-UNSAVED's reap keeps them.
+     *  Said in one STATIC line: a count would tell this session about other profiles' messages (blind login). */
+    private static String restartUnsavedConfirmText(String reply, java.util.function.LongFunction<String> at) {
+        return discardText("This can't be undone. Your phone restarts, and everything it hasn't saved is thrown "
+                + "away:\n", "\n• Texts and calls this phone is still holding for delivery", "the phone restarts",
+                reply, at);
+    }
+
+    /** The shared body of both confirmations: what is discarded (plus {@code extra}, a bullet only one of them has),
+     *  then what is kept. */
+    private static String discardText(String head, String extra, String when, String refusal,
+                                      java.util.function.LongFunction<String> at) {
+        StringBuilder sb = new StringBuilder(head);
+        for (String[] s : refusalScopes(refusal)) {
+            String label = refusalScopeLabel(s[0]);
+            long t = parseUnix(s[3]);
+            sb.append("\n• ").append(Character.toUpperCase(label.charAt(0))).append(label.substring(1));
+            sb.append(t > 0 ? " — not saved since " + at.apply(t) : " — any changes since it was last saved");
+        }
+        long rest = refusalRestSaved(refusal);
+        String anything = refusalScopes(refusal).isEmpty() ? "Anything" : "Anything else"; // media-only: no list above
+        sb.append(rest > 0 ? "\n• " + anything + " you changed after " + at.apply(rest)
+                           : "\n• " + anything + " you changed since it was last saved");
+        sb.append("\n• Sign-ins your apps made during this session — those apps may ask you to sign in again");
+        sb.append(extra);
+        if (refusalDeleted(refusal)) {
+            sb.append("\n\nThis profile was deleted, so nothing from this session can be kept.");
+            return sb.toString();
+        }
+        sb.append("\n\nKept: your stored copy, exactly as it was last saved. Your storage credit is saved before ")
+          .append(when).append('.');
+        return sb.toString();
+    }
+
+    /**
+     * NWP-20261010-10 (round 5): what the "Restarting…" screen does next, from a RESTART-STATUS answer and how long it
+     * has waited. "FAILED" ONLY when the daemon says FAILED: it has given the session back, so the FAILED copy is
+     * true. Round 6: our own 90 s bound (elapsedRealtime) is NOT the daemon's verdict -- it may still be PENDING, the
+     * session still local and unsaved, a sign-out still a reboot -- so it yields "UNKNOWN", whose copy claims nothing
+     * about saving. "REBOOT" -- ask PowerManager ourselves, once -- after 15 s; else "WAIT".
+     */
+    private static String restartWatchAction(String status, long waitedMs, boolean selfTried) {
+        String s = status == null ? "" : status.trim();
+        if ("FAILED".equals(s)) return "FAILED";
+        if (waitedMs >= 90000) return "UNKNOWN";
+        if (!selfTried && waitedMs >= 15000) return "REBOOT";
+        return "WAIT";
+    }
+
+    /** What the user is told when the outcome could not be confirmed (round 6): only what is certain -- the phone has
+     *  not restarted, and a restart discards what this phone hasn't saved. Never that the session is being saved. */
+    private static String restartUnknownMessage() {
+        return "Your phone hasn't restarted, and Nowhere couldn't confirm what happened. Restarting the phone yourself "
+             + "discards everything this phone hasn't saved.";
+    }
+
+
+    /** NWP-20261014-33: what the claim screen says once CLAIM is OK, from the GET-BILLING reply read right after it.
+     *  A claim only FUNDS the wallet; the plan starts after the activation-jitter window (up to two days), so this
+     *  never says "active". Pending with no term yet -> it starts shortly; pending on a live term -> it extends;
+     *  anything else (unreadable, or no pending= because the balance is below the plan cost) -> just "redeemed".
+     *  The jitter's reason is deliberately not explained, and the retired metered unit is not named. */
+    static String claimDoneText(String billingReply) {
+        if (billingReply == null || !billingReply.trim().startsWith("OK")) return "Code redeemed.";
+        long through = -1, epochsec = 604800, pending = 0;
+        for (String tok : billingReply.trim().split("\\s+")) {
+            int eq = tok.indexOf('=');
+            if (eq < 0) continue;
+            try {
+                long v = Long.parseLong(tok.substring(eq + 1));
+                switch (tok.substring(0, eq)) {
+                    case "through":  through = v;  break;
+                    case "epochsec": epochsec = v; break;
+                    case "pending":  pending = v;  break;
+                }
+            } catch (NumberFormatException ignore) {}
+        }
+        if (pending > 0 && through <= 0) {
+            return "Code redeemed \u2014 your plan starts shortly. Its term is measured from when it starts.";
+        }
+        if (pending > 0 && epochsec > 0 && through >= System.currentTimeMillis() / 1000L / epochsec) {
+            return "Code redeemed \u2014 your plan will be extended shortly; Storage shows the new end date once it applies.";
+        }
+        return "Code redeemed.";
+    }
+
+    /** The Add-credits screen's line for a CLAIM reply that is not OK. Lifted out of the screen so the javac suite can
+     *  pin it (round 9). ERR-RESTARTING (NWP-20261010-10): a restart without saving is pending, so this session is
+     *  about to end; the daemon refused before redeeming, and the code belongs in the NEXT session, not "in a minute". */
+    private static String claimFailMessage(String r) {
+        if (r == null) r = "";
+        // No LOCAL case: handleClaim credits a throwaway locally and answers OK ... UNSAVED, so the branch that used to
+        // sit here was unreachable, not merely mis-worded. Same vocabulary as the progress line: the user is redeeming
+        // a CODE, and on every one of these paths no plan was started, so saying so would be false as well as
+        // inconsistent. NWP-20261007-09: no answer is not "couldn't redeem". The daemon may have redeemed the code after
+        // this read gave up -- and then a retry answers "already been used", telling someone who has just paid that
+        // their code failed twice while the plan is active. So the no-answer case says the outcome is unknown and where
+        // to look, and "already used" says the same.
+        if (r.startsWith("ERR-NOCODE")) {
+            return "That code isn't valid, or it's already been used. If you just redeemed it on this phone, your plan "
+                 + "shows on the Storage screen.";
+        }
+        if (r.startsWith("NONE")) return "No active session to redeem a code into.";
+        if (r.startsWith("ERR-RESTARTING")) {
+            return "The phone is restarting without saving, so the code wasn't redeemed. Nothing was charged and your "
+                 + "code is still good — redeem it after the phone restarts and you sign in.";
+        }
+        // NWP-20261010-04: the daemon refused BEFORE redeeming -- another save held the wallet.
+        if (r.startsWith("ERR-BUSY")) {
+            return "The phone is busy saving. Nothing was charged and your code is still good — try again in a minute.";
+        }
+        if (r.isEmpty()) {
+            return "The phone didn't answer, so the code may or may not have been redeemed. Check your plan on the "
+                 + "Storage screen before trying it again.";
+        }
+        return "Couldn't redeem that code — check your connection and try again.";
+    }
+
+    /** What the user is told when the restart did not happen. True by construction: the daemon gave the session
+     *  back (signed in, sealing again) and discarded nothing -- the wallet save it made first only adds. */
+    private static String restartFailedMessage() {
+        return "Your phone didn't restart. You're still signed in, and this session is being saved again as usual — "
+             + "nothing was discarded. To discard it, restart the phone yourself.";
+    }
+
+    /** NWP-20261013-20 (decided 2026-10-15, "Allow, warn"): the warning an END-UNSAVED or RESTART-UNSAVED that went
+     *  ahead WITHOUT saving the storage credit carries, or null for every other reply. The daemon answers
+     *  OK-CREDIT-LOST when this session never read its stored wallet at sign-in and a second read failed too: the
+     *  session still ends, the credit saved before it is untouched, and credit added during it is gone. */
+    private static String creditLostWarning(String reply) {
+        String r = reply == null ? "" : reply.trim();
+        if (!"OK-CREDIT-LOST".equals(r)) return null;
+        return "Storage credit you added during this session couldn't be saved, and is lost. "
+             + "Credit you had before this session is safe.";
+    }
+
+    /** The RESTART-UNSAVED reply as something to tell the user, or null for OK (the phone is restarting). */
+    private static String restartUnsavedReplyMessage(String reply) {
+        String r = reply == null ? "" : reply.trim();
+        if ("OK".equals(r) || "OK-CREDIT-LOST".equals(r)) return null;
+        if ("ERR-NOTSTUCK".equals(r)) {
+            return "The phone wasn't restarted: signing out is no longer blocked by your photos and media. You're "
+                 + "still signed in. Try signing out again.";
+        }
+        if ("BUSY".equals(r) || r.startsWith("BUSY ")) {
+            // NWP-20261117-32: the daemon names the cause in one token; a bare BUSY (the dispatcher's) or a token
+            // this chooser does not know reads as plain "busy", never as a save.
+            String why = r.length() > 4 ? r.substring(5).trim() : "";
+            if ("seal".equals(why)) {
+                return "A save is running right now, so the phone wasn't restarted. You're still signed in. "
+                     + "Try again in a minute.";
+            }
+            if ("teardown".equals(why)) {
+                return "This session is already being signed out or locked, so the phone wasn't restarted. "
+                     + "You're still signed in. Try again in a minute.";
+            }
+            if ("rent".equals(why)) {
+                return "The phone is paying for your storage right now, so the phone wasn't restarted. You're still "
+                     + "signed in. Try again in a minute.";
+            }
+            if ("slot".equals(why)) {
+                return "The phone is busy with another task, so the phone wasn't restarted. You're still signed in. "
+                     + "Try again in a minute.";
+            }
+            return "The phone is busy, so the phone wasn't restarted. You're still signed in. Try again in a minute.";
+        }
+        if ("ERR-WALLET".equals(r)) {
+            return "Your storage credit couldn't be saved first, so the phone wasn't restarted. You're still "
+                 + "signed in. Check your connection and try again.";
+        }
+        if ("ERR-SLOW".equals(r)) {
+            return "Saving your storage credit took too long, so the phone wasn't restarted. You're still signed "
+                 + "in. Try again.";
+        }
+        return "Couldn't restart without saving. You're still signed in.";
+    }
+
+    /** The END-UNSAVED reply as something to tell the user, or null for OK (the session is ending). */
+    private static String endUnsavedReplyMessage(String reply) {
+        String r = reply == null ? "" : reply.trim();
+        if ("OK".equals(r) || "OK-CREDIT-LOST".equals(r)) return null;
+        if ("BUSY".equals(r) || r.startsWith("BUSY ")) {
+            // NWP-20261117-32: the daemon names the cause in one token; a bare BUSY (the dispatcher's) or a token
+            // this chooser does not know reads as plain "busy", never as a save.
+            String why = r.length() > 4 ? r.substring(5).trim() : "";
+            if ("seal".equals(why)) {
+                return "A save is running right now, so the session wasn't ended. You're still signed in. "
+                     + "Try again in a minute.";
+            }
+            if ("teardown".equals(why)) {
+                return "This session is already being signed out or locked, so it wasn't ended. You're still "
+                     + "signed in. Try again in a minute.";
+            }
+            if ("rent".equals(why)) {
+                return "The phone is paying for your storage right now, so the session wasn't ended. You're still "
+                     + "signed in. Try again in a minute.";
+            }
+            if ("slot".equals(why)) {
+                return "The phone is busy with another task, so the session wasn't ended. You're still signed in. "
+                     + "Try again in a minute.";
+            }
+            return "The phone is busy, so the session wasn't ended. You're still signed in. Try again in a minute.";
+        }
+        if ("ERR-WALLET".equals(r)) {
+            return "Your storage credit couldn't be saved first, so the session wasn't ended. You're still "
+                 + "signed in. Check your connection and try again.";
+        }
+        if ("ERR-MEDIA".equals(r)) {
+            return "This phone couldn't close your photos and media safely, so the session wasn't ended. You're "
+                 + "still signed in. Try again in a minute.";
+        }
+        if ("ERR-SLOW".equals(r)) {
+            return "Ending the session took too long, so it wasn't ended. You're still signed in. Try again.";
+        }
+        if ("ERR-NOTREFUSED".equals(r)) {
+            return "The session wasn't ended: the refused save it answered is no longer current. You're still "
+                 + "signed in. Try signing out again.";
+        }
+        return "Couldn't end the session. You're still signed in.";
+    }
+
+    /** Whether the END-UNSAVED reply leaves the refusal standing, so the control may be offered again. Every BUSY
+     *  does, bare or with its cause (NWP-20261117-32). */
+    private static boolean endUnsavedMayRetry(String reply) {
+        String r = reply == null ? "" : reply.trim();
+        return "BUSY".equals(r) || r.startsWith("BUSY ")
+            || "ERR-WALLET".equals(r) || "ERR-MEDIA".equals(r) || "ERR-SLOW".equals(r);
+    }
+
+    /**
+     * DIA-20260812-10 (#118): pull the per-scope detail out of any daemon verdict carrying " PARTIAL:<list>".
+     * "" when absent, which is every verdict an older daemon can produce -- so this degrades to the previous
+     * behaviour rather than to a wrong message.
+     */
+    private static String partialOf(String line) {
+        if (line == null) return "";
+        int i = line.indexOf(" PARTIAL:");
+        return i < 0 ? "" : line.substring(i + " PARTIAL:".length()).trim();
+    }
+
+    /**
+     * Turn "apps=refused,sys=timeout" into something a person can act on. Deliberately names the SCOPE in the
+     * user's terms rather than ours, and does NOT say "try again": for a refused scope the cause is
+     * deterministic, and for a timed-out #apps push the retry ladder has already run three times.
+     */
+    private static String partialMessage(String parts) {
+        return "Signed out, and your files are saved — but " + partialWhat(parts) + " couldn't be saved this time, "
+             + "so they may be missing when you next sign in. Please report this.";
+    }
+
+    /** The scopes a " PARTIAL:" detail names, in the user's terms ("your apps and your Google account"). Shared by
+     *  the sign-out toast and the "Back up now" line (NWP-20261008-07). */
+    private static String partialWhat(String parts) {
+        boolean apps = parts.contains("apps="), sys = parts.contains("sys="), keys = parts.contains("keys=");
+        StringBuilder what = new StringBuilder();
+        if (apps) what.append("your apps");
+        if (sys) { if (what.length() > 0) what.append(" and "); what.append("your Google account"); }
+        if (keys) { if (what.length() > 0) what.append(" and "); what.append("your saved sign-ins"); }
+        if (what.length() == 0) what.append("part of your profile"); // unknown scope token: stay truthful
+        return what.toString();
+    }
+
+    /** "SEALING <phase> <done> <total>" -> the phase token ("prepare"|"save"|…), or "" if absent. */
+    private static String sealPhase(String line) {
+        try {
+            String[] p = line.trim().split("\\s+");
+            return p.length >= 4 ? p[1] : ""; // [SEALING, phase, done, total]
+        } catch (Throwable t) {
+            return "";
+        }
+    }
+
+    /**
+     * DIA-20260813-01 (#113): the line is now "SEALING <phase> <done> <total>[ <scope>]" -- the agent appends
+     * a trailing scope keyword. Locate the TRAILING ADJACENT NUMERIC PAIR rather than assuming the last two
+     * fields are numbers, so both the old 4-field and the new 5-field shape parse under one reader.
+     * Returns {done, total} in bytes, or null when the line carries no such pair.
+     */
+    private static long[] sealBytes(String line) {
+        try {
+            String[] p = line.trim().split("\\s+");
+            for (int i = p.length - 2; i >= 1; i--) {
+                try {
+                    long done = Long.parseLong(p[i]), total = Long.parseLong(p[i + 1]);
+                    return new long[]{done, total};
+                } catch (NumberFormatException keepScanning) { /* not the pair; step left */ }
+            }
+        } catch (Throwable t) { /* fall through */ }
+        return null;
+    }
+
+    /** The trailing scope keyword ("vault"|"de"|"media"|"sys"|"apps"|"keys"|"wallet"; pre-DIA-20260813-02
+     *  agents sent "files"/"account"), "" on an old-format line. */
+    private static String sealScope(String line) {
+        try {
+            String[] p = line.trim().split("\\s+");
+            String last = p[p.length - 1];
+            Long.parseLong(last);
+            return ""; // last field numeric -> old 4-field line, no scope
+        } catch (NumberFormatException notANumber) {
+            String[] p = line.trim().split("\\s+");
+            return p.length >= 5 ? p[p.length - 1] : "";
+        } catch (Throwable t) {
+            return "";
+        }
+    }
+
+    /** Scope keyword -> what the person watching the bar calls it. Unknown keywords say "data", never lie.
+     *  DIA-20260813-02 split the agent's "files" into "vault"/"de" and renamed "account" to "sys" so the
+     *  segmented bar can tell the legs apart; the OLD tokens stay mapped so a mixed image (hot-patched agent,
+     *  older chooser or vice versa) still labels instead of degrading to "your data". */
+    private static String sealScopeLabel(String scope) {
+        switch (scope) {
+            case "vault":                  return "your files";
+            case "de":                     return "your settings";
+            case "media":                  return "your photos & media";
+            case "sys": case "account":    return "your account";
+            case "apps":                   return "your apps";
+            case "keys":                   return "your sign-ins";
+            case "wallet":                 return "your wallet";
+            case "files":                  return "your files"; // pre-split agent: vault AND #de both said this
+            default:                       return "your data";
+        }
+    }
+
+    /** Scope keyword -> its segment in the overall logoff bar, matching roamd's fixed seal order. -1 = not a
+     *  logoff leg (keys seals at reap, wallet on its own ops) or an old/unknown token -- the bar just holds.
+     *  A segment index also asserts ORDER: the first "media" frame proves vault + #de are behind us, so
+     *  SealBar.set back-fills everything left of the active segment (that is what absorbs silent legs like a
+     *  refused #sys, which emits no frames at all). */
+    private static int sealScopeIndex(String scope) {
+        switch (scope) {
+            case "vault": return 0;
+            case "de":    return 1;
+            case "media": return 2;
+            case "sys":   return 3;
+            case "apps":  return 4;
+            default:      return -1;
+        }
+    }
+
+    /** Bytes -> a human figure with ONE unit and no false precision: 862 KB, 4.2 MB, 145 MB, 1.3 GB. */
+    private static String fmtBytes(long b) {
+        if (b < 0) b = 0;
+        if (b < 1024 * 1024) return Math.max(1, b / 1024) + " KB";
+        double mb = b / (1024.0 * 1024.0);
+        if (Math.round(mb * 10) < 100) return String.format(java.util.Locale.US, "%.1f MB", mb);
+        if (Math.round(mb) < 1024) return Math.round(mb) + " MB";
+        return String.format(java.util.Locale.US, "%.1f GB", mb / 1024.0);
+    }
+
+    /**
+     * DIA-20260813-02: the OVERALL logoff bar -- five pill segments, one per seal leg in roamd's order
+     * (vault, #de, #media, #sys, #apps). set(idx, f) back-fills every segment LEFT of idx to full (their legs
+     * are behind us -- done or skipped) and ratchets segment idx up to f, so the bar as a whole never moves
+     * backward even though each leg's own byte counter restarts at zero. Track = FIELD_BG (the house recessed
+     * surface), fill = ACCENT, matching the determinate bar on Back-up-now.
+     */
+    private static final class SealBar extends View {
+        static final int SEGS = 5;
+        private final float[] fill = new float[SEGS];
+        private final android.graphics.Paint paint = new android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG);
+
+        SealBar(android.content.Context c) { super(c); }
+
+        void set(int idx, float f) {
+            if (idx < 0 || idx >= SEGS) return;
+            for (int i = 0; i < idx; i++) fill[i] = 1f;
+            if (f > fill[idx]) fill[idx] = Math.min(1f, f);
+            invalidate();
+        }
+
+        /** #128 (DIA-20260813-13): a NEW seal round begins -- clear every segment so the bar walks this
+         *  round honestly instead of sitting latched-full from the previous one. */
+        void reset() {
+            java.util.Arrays.fill(fill, 0f);
+            invalidate();
+        }
+
+        void done() {
+            for (int i = 0; i < SEGS; i++) fill[i] = 1f;
+            invalidate();
+        }
+
+        @Override protected void onDraw(android.graphics.Canvas cv) {
+            float h = getHeight(), gap = h * 0.75f, r = h / 2f;
+            float seg = (getWidth() - gap * (SEGS - 1)) / SEGS;
+            if (seg <= 0) return; // absurdly narrow view: draw nothing rather than overlap
+            for (int i = 0; i < SEGS; i++) {
+                float x = i * (seg + gap);
+                paint.setColor(FIELD_BG);
+                cv.drawRoundRect(x, 0, x + seg, h, r, r, paint);
+                if (fill[i] > 0f) {
+                    paint.setColor(ACCENT);
+                    // a just-started leg still shows a full-height dot: visible beats proportional at 1%
+                    cv.drawRoundRect(x, 0, x + Math.max(h, seg * fill[i]), h, r, r, paint);
+                }
+            }
+        }
+    }
+
+    /** "SEALING <phase> <done> <total>[ <scope>]" (bytes) -> a 0–100 percent (long math). */
+    private static int sealPct(String line) {
+        long[] dt = sealBytes(line);
+        if (dt == null || dt[1] <= 0) return 0;
+        long pct = dt[0] * 100 / dt[1];
+        return pct < 0 ? 0 : (pct > 100 ? 100 : (int) pct);
+    }
+
+    /** Once logoff has started the screen is unescapable: Back is swallowed... */
+    @Override
+    public void onBackPressed() {
+        if (loggingOff) return; // swallow Back during logoff (before that, Back == Cancel/normal)
+        super.onBackPressed();
+    }
+
+    /** ...and a Home/recents attempt bounces the screen straight back to the front, so you can't drop into
+     *  the session that's being sealed + wiped. The reap (switch to the gate on user 0) is what ends it. */
+    @Override
+    protected void onUserLeaveHint() {
+        super.onUserLeaveHint();
+        if (loggingOff) {
+            startActivity(new Intent(this, ProfileActivity.class)
+                    .addFlags(Intent.FLAG_ACTIVITY_REORDER_TO_FRONT | Intent.FLAG_ACTIVITY_SINGLE_TOP));
+        }
+    }
+
+    private int dp(float v) {
+        return Math.round(v * getResources().getDisplayMetrics().density);
+    }
+
+    /** The "Change passphrase" screen for the logged-in profile: current + new + confirm -> daemon ROTATE. */
+    private void showChangePass(final String name) {
+        // The caller's gate (showSecurity) already requires a name, because ROTATE carries it on the wire. This
+        // is the same invariant asserted where it is USED rather than only where it is decided 300 lines away:
+        // without it a regressed gate ships the literal string "null" to the daemon, and the user is told their
+        // correct passphrase "doesn't match" -- a device-state accident wearing the costume of a wrong password.
+        if (name == null) { showConfirm(); return; }
+        LinearLayout ll = new LinearLayout(this);
+        ll.setOrientation(LinearLayout.VERTICAL);
+        ll.setGravity(Gravity.CENTER_HORIZONTAL);
+        ll.setBackgroundColor(BG);
+        ll.setPadding(dp(32), dp(48), dp(32), dp(36));
+
+        TextView t = new TextView(this);
+        t.setText("Change passphrase");
+        t.setTextColor(INK);
+        t.setTextSize(TypedValue.COMPLEX_UNIT_SP, 24);
+        t.setGravity(Gravity.CENTER);
+        ll.addView(t);
+
+        TextView sub = new TextView(this);
+        sub.setText("for " + name);
+        sub.setTextColor(MUTED);
+        sub.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        sub.setGravity(Gravity.CENTER);
+        LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(WRAP, WRAP);
+        slp.topMargin = dp(4);
+        slp.bottomMargin = dp(8);
+        ll.addView(sub, slp);
+
+        // NWP-20261111-14 (Q011): a lost phone is answered here, by this change. NWP-20261114-22 (#45): which of the
+        // two decided texts shows when, why each is true, and what neither claims, is LostPhoneCopy's comment.
+        final TextView lost = new TextView(this);
+        lost.setText(LostPhoneCopy.line(null));
+        lost.setTextColor(MUTED);
+        lost.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        lost.setGravity(Gravity.CENTER);
+        lost.setLineSpacing(dp(3), 1f);
+        LinearLayout.LayoutParams llp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        llp.bottomMargin = dp(8);
+        ll.addView(lost, llp);
+        // NWP-20261114-22 (#45): the tied text needs SE-STATUS to say this profile is tied to this phone's chip. The
+        // not-tied text, true of every shape, shows until then; a timeout, an error or an untied reply leaves it.
+        new Thread(() -> {
+            final String st = DaemonSocket.roundTrip("SE-STATUS\n", 15000);
+            runOnUiThread(() -> {
+                if (isFinishing() || isDestroyed() || !ll.isAttachedToWindow()) return; // the user left this screen
+                lost.setText(LostPhoneCopy.line(st));
+            });
+        }).start();
+
+        // NWP-20260915-10: say the consequence BEFORE the act, because afterwards the user can no longer
+        // choose. Unconditional, so it has to be true of every shape: on a pass-only Diaspore vault the
+        // other phone genuinely needs only the new passphrase (its `pass` slot is re-wrapped), the second
+        // clause is conditional so it is not false there, and with one phone both clauses are vacuous.
+        // "This phone keeps working" is unconditionally true ONLY because rotateVault now refuses rather
+        // than publishing a vault this handset cannot open -- do not keep this line without that refusal.
+        TextView warn = new TextView(this);
+        warn.setText("This phone keeps working. Any other phone needs the new passphrase, and one that is "
+                + "locked to its own secure chip also needs your 12-word recovery code to get back in — "
+                + "have that ready before you change this.");
+        warn.setTextColor(MUTED);
+        warn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        warn.setGravity(Gravity.CENTER);
+        warn.setLineSpacing(dp(3), 1f);
+        LinearLayout.LayoutParams wlp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        wlp.bottomMargin = dp(24);
+        ll.addView(warn, wlp);
+
+        final EditText oldP = passField("current passphrase");
+        ll.addView(PassReveal.wrap(oldP, MUTED), fieldLp(dp(11)));      // #81 current passphrase (#96: deliberately ungrouped -- a different secret)
+        final Object chgRevGrp = new Object(); // #96: NEW + confirm reveal together
+        final EditText newP = passField("new passphrase");
+        ll.addView(PassReveal.wrap(newP, MUTED, chgRevGrp), fieldLp(dp(11)));   // #81 new passphrase
+        // NWP-20261116-25: a live strength hint for the new passphrase (docs/credential-tiers.md tier 1a: a refusal is
+        // never the first feedback). CHECK-PASSPHRASE is passphraseStrong, the floor ROTATE applies, and it carries
+        // the same name ROTATE does. ROTATE stays the authority: the Change button does not change.
+        final TextView hint = new TextView(this);
+        hint.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        hint.setVisibility(android.view.View.GONE);
+        ll.addView(hint, fieldLp(dp(11)));
+        final android.os.Handler h = new android.os.Handler(android.os.Looper.getMainLooper());
+        final Runnable check = () -> {
+            final String pw = newP.getText().toString();
+            if (pw.isEmpty()) { hint.setVisibility(android.view.View.GONE); return; }
+            new Thread(() -> {
+                final String r = DaemonSocket.roundTrip("CHECK-PASSPHRASE\n" + name + "\n" + pw + "\n", 10000);
+                runOnUiThread(() -> {
+                    if (isFinishing() || isDestroyed() || !ll.isAttachedToWindow()) return; // the screen is gone
+                    if (!pw.equals(newP.getText().toString())) return; // an answer for an older text
+                    hint.setText(StrengthHint.line(r));
+                    hint.setTextColor(StrengthHint.strong(r) ? ACCENT : MUTED);
+                    hint.setVisibility(android.view.View.VISIBLE);
+                });
+            }).start();
+        };
+        newP.addTextChangedListener(new android.text.TextWatcher() {
+            public void beforeTextChanged(CharSequence s, int a, int b, int c) {}
+            public void onTextChanged(CharSequence s, int a, int b, int c) {}
+            public void afterTextChanged(android.text.Editable e) {
+                h.removeCallbacks(check);
+                h.postDelayed(check, 350);
+            }
+        });
+        final EditText confP = passField("confirm new passphrase");
+        ll.addView(PassReveal.wrap(confP, MUTED, chgRevGrp), fieldLp(dp(20)));  // #81 confirm new passphrase
+
+        final Button change = accentBtn("Change passphrase");
+        ll.addView(change, new LinearLayout.LayoutParams(MATCH, WRAP));
+
+        final TextView msg = new TextView(this);
+        msg.setTextColor(MUTED);
+        msg.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        msg.setGravity(Gravity.CENTER);
+
+        TextView cancel = new TextView(this);
+        cancel.setText("Cancel");
+        cancel.setTextColor(ACCENT);
+        cancel.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        cancel.setGravity(Gravity.CENTER);
+        cancel.setPadding(dp(8), dp(18), dp(8), dp(8));
+        ll.addView(cancel, new LinearLayout.LayoutParams(MATCH, WRAP));
+        cancel.setOnClickListener(v -> showSecurity());
+
+        // status/error message goes BELOW Cancel so it doesn't push the button + Cancel apart
+        LinearLayout.LayoutParams mlp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        mlp.topMargin = dp(12);
+        ll.addView(msg, mlp);
+
+        change.setOnClickListener(v -> {
+            final String op = oldP.getText().toString();
+            final String np = newP.getText().toString();
+            final String cp = confP.getText().toString();
+            if (op.isEmpty() || np.isEmpty()) { msg.setTextColor(MUTED); StatusLine.error(msg, "fill in all fields"); return; }
+            if (!np.equals(cp)) { msg.setTextColor(MUTED); StatusLine.error(msg, "new passphrases don't match"); return; }
+            change.setEnabled(false);
+            msg.setTextColor(ACCENT);
+            StatusLine.busy(msg, "changing…");
+            new Thread(() -> {
+                String r = sendDaemon("ROTATE\n" + name + "\n" + op + "\n" + np + "\n");
+                runOnUiThread(() -> {
+                    if (r.startsWith("OK")) {
+                        oldP.setEnabled(false);
+                        newP.setEnabled(false);
+                        confP.setEnabled(false);
+                        msg.setTextColor(ACCENT);
+                        // "OK <n>" -- n = other handsets whose keyslot had to be retired. Parsed defensively:
+                        // an agent that predates NWP-20260915-10 answers a bare "OK", and the hedged line is
+                        // the right answer then, not a wrong number.
+                        msg.setText(RotateCopy.changed(RotateCopy.retired(r)));
+                        change.setText("Done");
+                        change.setEnabled(true);
+                        change.setOnClickListener(w -> showSecurity());
+                    } else {
+                        // Every code's copy, and why it matches by equality, live in RotateCopy.failText.
+                        change.setEnabled(true);
+                        msg.setTextColor(MUTED);
+                        if (RotateCopy.failIsError(r)) StatusLine.error(msg, RotateCopy.failText(r));
+                        else msg.setText(RotateCopy.failText(r));
+                    }
+                });
+            }).start();
+        });
+
+        setContentView(ll);
+    }
+
+    // ---- Storage (DIA-20260628-05). The roaming-store credit + lease state for this profile,
+    // from the daemon's GET-BILLING (LOCAL wallet only -- no passphrase, no network, so it can't hang). Credit
+    // is GB-months of unspent capacity; "paid through" is when rent is next due. GB-USED (the footprint) is a
+    // later increment. Accountless by design: paid storage is just the local wallet + lease, nothing
+    // server-side.
+    private void showStorage() {
+        LinearLayout ll = new LinearLayout(this);
+        ll.setOrientation(LinearLayout.VERTICAL);
+        ll.setBackgroundColor(BG);
+        ll.setPadding(dp(32), dp(48), dp(32), dp(36));
+
+        TextView t = new TextView(this);
+        t.setText("Storage");
+        t.setTextColor(INK);
+        t.setTextSize(TypedValue.COMPLEX_UNIT_SP, 24);
+        t.setGravity(Gravity.CENTER);
+        ll.addView(t, new LinearLayout.LayoutParams(MATCH, WRAP));
+
+        final TextView usage = new TextView(this); // GB used -- loads async (GET-USAGE is a store round-trip)
+        StatusLine.busy(usage, "Calculating usage…");
+        usage.setTextColor(ACCENT);
+        usage.setTextSize(TypedValue.COMPLEX_UNIT_SP, 22);
+        usage.setGravity(Gravity.CENTER);
+        LinearLayout.LayoutParams ulp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        ulp.topMargin = dp(24);
+        ll.addView(usage, ulp);
+
+        // Phase 5: the plan's coverage denominator (free + entitled) so "X GB stored" reads against an allowance.
+        // Loads async from GET-ENTITLEMENT (gateway-authoritative); removes itself when there's no plan to show.
+        final TextView coverage = new TextView(this);
+        coverage.setTextColor(MUTED);
+        coverage.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        coverage.setGravity(Gravity.CENTER);
+        // NWP-20260918-09: A BLANK LINE IS INDISTINGUISHABLE FROM AN ABSENT ONE.
+        //
+        // This view stayed empty until GET-ENTITLEMENT answered, which the call site budgets at "tens of
+        // seconds (30s client, 90s socket)". Chester read the gap as a missing figure -- "it says free tier
+        // but doesnt say 1gb" -- and he built this screen. The usage figure two lines above already says
+        // "Calculating usage..." while its own walk runs and nobody misreads that one; the idiom simply was
+        // not applied here. The second paint overwrites this or removes the view, so a placeholder costs
+        // nothing and is never left behind.
+        StatusLine.busy(coverage, "Checking your plan…");
+        LinearLayout.LayoutParams cvlp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        cvlp.topMargin = dp(6);
+        ll.addView(coverage, cvlp);
+
+        // Device storage (#82): the store usage above is the roaming quota; THIS is how full the phone is (the
+        // profile's local copy lives in /data). Distinct number, local statfs (no network), amber when nearly
+        // full -- the guardrail for a store quota bigger than the device (e.g. 250GB profile on a 64GB phone).
+        final TextView device = new TextView(this);
+        device.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        device.setGravity(Gravity.CENTER);
+        paintDeviceLine(device);
+        LinearLayout.LayoutParams dvlp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        dvlp.topMargin = dp(8);
+        ll.addView(device, dvlp);
+
+        // #201: the kept app CODE portion of the account footprint (local estimate from the kept apps' APK
+        // sizes; the billed number is the deduped seal, which is <= this). Managed in Preferences → Your apps.
+        final TextView appsLine = new TextView(this);
+        appsLine.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        appsLine.setGravity(Gravity.CENTER);
+        appsLine.setTextColor(MUTED);
+        try {
+            android.content.pm.PackageManager pm = getPackageManager();
+            // #201/DIA-20260727-01: count EVERY kept app, including on-demand apps sitting as ARCHIVED placeholders.
+            // Resolving with flags=0 threw NameNotFoundException for an archived pkg (no on-device APK) so the count
+            // silently dropped them and disagreed with "Your apps" -- which resolves the SAME keep-set with the widest
+            // match (showYourApps' keptFlags). Its APK bytes live in the store, so on-device apkSize is ~0; the COUNT is
+            // what must line up. Mirror keptFlags here so both screens agree.
+            final long keptFlags = android.content.pm.PackageManager.MATCH_ARCHIVED_PACKAGES
+                    | android.content.pm.PackageManager.MATCH_UNINSTALLED_PACKAGES
+                    | android.content.pm.PackageManager.MATCH_ANY_USER;
+            long tot = 0; int n = 0;
+            for (String p : readAppKeep()) {
+                if (isBundledSystem(pm, p)) continue; // stale entry for a now-bundled app -- "Your apps" hides it, so must we (5-vs-4)
+                try {
+                    android.content.pm.ApplicationInfo ai = pm.getApplicationInfo(p,
+                            android.content.pm.PackageManager.ApplicationInfoFlags.of(keptFlags)); // throws only if truly gone
+                    n++;
+                    try { tot += apkSize(ai); } catch (Throwable ignore) {}
+                } catch (Throwable ignore) {}
+            }
+            // GONE, not just empty text. An empty TextView still occupies its line height AND its 6dp top
+            // margin, so a profile with no kept apps showed a blank band between "This device: …" and the
+            // plan summary that read as a layout bug. Setting the text to "" hides the words, not the view.
+            setAppsLine(appsLine, n, tot);
+        } catch (Throwable ignore) { setAppsLine(appsLine, 0, 0); }
+        LinearLayout.LayoutParams aplp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        aplp.topMargin = dp(6);
+        ll.addView(appsLine, aplp);
+
+        final TextView body = new TextView(this); // plan summary -- local GET-BILLING first, then the size (2 paints)
+        StatusLine.busy(body, "Loading…");
+        body.setTextColor(MUTED);
+        body.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
+        body.setGravity(Gravity.CENTER);
+        body.setLineSpacing(dp(5), 1f);
+        LinearLayout.LayoutParams blp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        blp.topMargin = dp(28);
+        blp.bottomMargin = dp(28);
+        ll.addView(body, blp);
+
+        // "Start or extend a plan": redeem a claim code from a purchase into this profile's wallet
+        // (DIA-20260629-04). The mechanism is unchanged; the LABEL is, because "Add credits" describes
+        // topping up a balance and there is no balance any more -- a claim code starts a term, or stacks
+        // one onto a term already running. The screen it opens was retitled to match: a button reading
+        // "Start or extend a plan" leading to a screen headed "Add credits" was visible incoherence, and
+        // it was caught on the FLASHED build rather than in review.
+        ll.addView(accentButton("Start or extend a plan", () -> showAddCredits()), btnLp(0));
+        // #48: the plan ladder + the buy path (deep-link/QR OUT to the web checkout -- the payment moment is
+        // never co-located with the profile session; the ZK air-gap decision).
+        ll.addView(secondaryButton("Plans & buying storage", () -> showPlans()), btnLp(dp(10)));
+
+        // DIA-20260804-05: the ranked "what is actually using space" list. Replaces the old "Free up space"
+        // button here -- that button's ONE action (purge the streamed-media cache) now lives on that screen as
+        // a row alongside everything else competing for the same space, which is the comparison the user
+        // actually needs. The name was also carrying three different meanings across this app.
+        ll.addView(secondaryButton("What's using space", () -> showStorageBreakdown()), btnLp(dp(10)));
+
+        TextView back = new TextView(this);
+        back.setText("Back");
+        back.setTextColor(ACCENT);
+        back.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        back.setGravity(Gravity.CENTER);
+        back.setPadding(dp(8), dp(20), dp(8), dp(8));
+        ll.addView(back, new LinearLayout.LayoutParams(MATCH, WRAP));
+        back.setOnClickListener(v -> showConfirm());
+
+        android.widget.ScrollView sc = new android.widget.ScrollView(this);
+        sc.setBackgroundColor(BG);
+        sc.addView(ll);
+        setContentView(sc);
+
+        // NWP-20260826-01: a failed read must not render as an ANSWER. formatUsage returns "—" for anything
+        // that is not "OK ...", which is the SAME glyph it shows for a genuine zero -- so when GET-USAGE timed
+        // out behind the contended worker lock, this screen quietly claimed the profile stores nothing.
+        // Chester's read of it was "is that because of timeout?", which is the right question and one the
+        // screen gave him no way to answer.
+        // NWP-20260826-09 (Chester, on seeing it fire): the first cut put the whole explanation INTO this
+        // field, which is the 22sp accent HEADLINE -- the slot that normally holds "992 MB stored". A sentence
+        // there renders as three lines of shouting, and it buried the plan figures underneath it. An error is
+        // not the headline; it replaces a number with a reason, so it should look like a reason.
+        //
+        // "Tap to try again" on the text was also the wrong affordance: nothing about a line of prose says it
+        // is tappable, and this screen already has a real Try-again button on its sibling (the storage
+        // breakdown's failure branch). Use the same one.
+        final Runnable[] loadUsage = new Runnable[1];
+        final Button[] retry = new Button[1];
+        final Button[] reportPlan = new Button[1]; // NWP-20260915-19: added only in the uncorroborated state
+        final Button[] repair = new Button[1]; // NWP-20261103-06: added only after a CHECK that answered DAMAGED
+        final TextView[] repairNote = new TextView[1];
+        // NWP-20261028-04: the plan summary's last paint (reply, entitled), so GET-USAGE can repaint it. UI thread only.
+        final String[] lastBill = new String[1];
+        final long[] lastEnt = {-1};
+        final Runnable restoreHeadline = () -> {
+            if (retry[0] != null) { ll.removeView(retry[0]); retry[0] = null; }
+            usage.setTextColor(ACCENT);
+            usage.setTextSize(TypedValue.COMPLEX_UNIT_SP, 22);
+        };
+        // One renderer for every arm below that replaces the number with a reason: the MUTED 13sp body plus the
+        // same Try-again button, so a reason looks the same whichever failure produced it.
+        final java.util.function.Consumer<String> showReason = why -> {
+            usage.setTextColor(MUTED);
+            usage.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+            StatusLine.error(usage, why);
+            if (retry[0] == null) {
+                retry[0] = secondaryButton("Try again", () -> {
+                    restoreHeadline.run();
+                    StatusLine.busy(usage, "Calculating usage…");
+                    loadUsage[0].run();
+                });
+                ll.addView(retry[0], ll.indexOfChild(usage) + 1, btnLp(dp(8)));
+            }
+        };
+        loadUsage[0] = () -> new Thread(() -> {
+            final DaemonReply u = sendDaemonReply("GET-USAGE\n");
+            runOnUiThread(() -> {
+                if (isFinishing() || isDestroyed()) return;
+                // NWP-20261019-18: one decision for both screens that read GET-USAGE (usageReason). Its arms, in
+                // order: a failed read (timed out / unreachable); UNMEASURED (NWP-20260915-15 -- the daemon can
+                // resolve this profile's heads but not open them, so the only total it could offer is the size of
+                // the heads themselves; deliberately NOT routed through formatUsage, whose em-dash is also a
+                // genuine zero); and usageNoAnswer (NWP-20261011-21 -- NONE, or an OK without a usable bytes=).
+                // A reason lands in the MUTED 13sp body, never the 22sp accent headline (NWP-20260826-09).
+                final String why = usageReason(u.text, u.reason());
+                if (why != null) {
+                    showReason.accept(why);
+                } else {
+                    restoreHeadline.run();
+                    usage.setText(formatUsage(u.text));
+                }
+                // NWP-20261028-04: the same bytes= formatUsage reads is the occupied total the free allowance is
+                // measured against; -1 = no usable figure. Repaint the plan summary if it has already painted.
+                long occ = -1;
+                if (why == null && u.text != null && u.text.startsWith("OK")) {
+                    for (String tok : u.text.split("\\s+")) {
+                        if (tok.startsWith("bytes=")) {
+                            try { occ = Long.parseLong(tok.substring(6)); } catch (NumberFormatException ignore) { }
+                        }
+                    }
+                    if (occ < 0) occ = -1;
+                }
+                occupiedBytes = occ;
+                if (lastBill[0] != null) body.setText(formatBilling(lastBill[0], lastEnt[0]));
+            });
+        }).start();
+        occupiedBytes = -1;
+        loadUsage[0].run();
+        // GET-BILLING (local wallet read) paints the plan summary; GET-ENTITLEMENT (gateway) fills the coverage
+        // line above it. They share one thread so the local read always lands FIRST and the screen is never
+        // blank waiting on the network -- the gateway leg is fail-open and can take tens of seconds (30s client,
+        // 90s socket), which on an amnesiac phone is a routine state, not an edge case. GET-BILLING is on the
+        // daemon's concurrent-safe allowlist, so this first paint also cannot queue behind a long materialise.
+        // ⚠ TWO PAINTS, AND THE FIRST ONE MAY NOT ACCUSE. The local read lands first so the screen is never
+        // blank on the network; it passes entitled = -1, which formatBilling reads as "not asked yet". Nor may
+        // it promise: a live wallet term renders in the PAST TENSE only ("N GB plan — bought through <date>": no
+        // days left, no "Expires", no wallet sentence) until the gateway answers, because a pending state must
+        // never render as a settled answer (NWP-20260918-08/-09; the backlog's section D row "Before the gateway
+        // answers, the Storage screen states the wallet's term in the present tense", NWP-20261117-22). Only the
+        // second paint, once the gateway has actually answered, can say that a plan is uncorroborated --
+        // otherwise every slow network would accuse a paying customer of having no plan (NWP-20260915-19).
+        // GET-USAGE repaints the body through the same formatBilling with the last values (NWP-20261028-04):
+        // whichever lands last paints last, and neither waits for the other.
+        new Thread(() -> {
+            final String billReply = sendDaemon("GET-BILLING\n").trim();
+            runOnUiThread(() -> { lastBill[0] = billReply; lastEnt[0] = -1; body.setText(formatBilling(billReply, -1)); });
+            final String entReply = sendDaemon("GET-ENTITLEMENT\n").trim();
+            final CharSequence cov = formatCoverage(entReply);
+            final long ent = entitledFrom(entReply);
+            runOnUiThread(() -> {
+                if (cov != null) coverage.setText(cov); else ll.removeView(coverage);
+                lastBill[0] = billReply;
+                lastEnt[0] = ent;
+                body.setText(formatBilling(billReply, ent));
+                // The affordance is a REPORT, not a retry: nothing the user taps on this device moves a grant that
+                // lives on the server under a key this profile no longer presents. ProfileActivity's own rule is
+                // that a message may ask the reader to retry the thing they were doing ON THIS DEVICE and nothing
+                // else, so "Try again" would be a lie about what is possible. showReportIssue scrubs device-side and
+                // is the only diagnostic channel a locked user build has.
+                if (PlanReport.offer(billReply, ent, System.currentTimeMillis() / 1000L) && reportPlan[0] == null) {
+                    reportPlan[0] = secondaryButton("Report this", () -> showReportIssue());
+                    ll.addView(reportPlan[0], ll.indexOfChild(body) + 1, btnLp(dp(8)));
+                }
+            });
+            // NWP-20261103-06 (Q153): LAST on this thread, so a CHECK waiting on the session lock never holds a paint
+            // back, and only a proven DAMAGED shows anything -- OK, UNKNOWN, NONE, an error or no reply show nothing
+            // (an unproven state must not accuse). Never automatic, never at the gate: the user taps, reads, confirms.
+            final String repairCheck = sendDaemon(WalletRepairCopy.CHECK_REQUEST);
+            if (WalletRepairCopy.offerRepair(repairCheck)) runOnUiThread(() -> {
+                if (isFinishing() || isDestroyed() || repair[0] != null) return;
+                repair[0] = secondaryButton(WalletRepairCopy.BUTTON_LABEL, () -> {
+                    android.app.AlertDialog dlg = new android.app.AlertDialog.Builder(this)
+                            .setTitle(WalletRepairCopy.TITLE)
+                            .setMessage(WalletRepairCopy.MESSAGE)
+                            .setNegativeButton(WalletRepairCopy.NEGATIVE, (d, w) -> {})
+                            // Disabled here, on the UI thread, BEFORE CONFIRM is sent: a second dialog (a double
+                            // tap) sends nothing while a CONFIRM is in flight, nor after a repair removed the button.
+                            .setPositiveButton(WalletRepairCopy.POSITIVE, (d, w) -> {
+                                if (repair[0] == null || !repair[0].isEnabled()) return;
+                                repair[0].setEnabled(false);
+                                new Thread(() -> {
+                                    final String r = sendDaemon(WalletRepairCopy.CONFIRM_REQUEST);
+                                    runOnUiThread(() -> {
+                                        if (isFinishing() || isDestroyed() || repair[0] == null) return;
+                                        final boolean keep = WalletRepairCopy.keepButton(r);
+                                        if (repairNote[0] != null) { ll.removeView(repairNote[0]); repairNote[0] = null; }
+                                        if (WalletRepairCopy.repaired(r)) {
+                                            // CONFIRM writes only the proof and the seen-set, never the wallet,
+                                            // so the summary repaints from its last reply. A second GET-BILLING
+                                            // that failed ("") would paint a live plan as the free tier, and
+                                            // every GET-USAGE repaint after it would repeat that.
+                                            if (lastBill[0] != null) body.setText(formatBilling(lastBill[0], lastEnt[0]));
+                                        } else {
+                                            repairNote[0] = new TextView(this);
+                                            repairNote[0].setTextColor(MUTED);
+                                            repairNote[0].setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+                                            repairNote[0].setGravity(Gravity.CENTER);
+                                            StatusLine.error(repairNote[0], WalletRepairCopy.reasonLine(r));
+                                            final int at = keep ? ll.indexOfChild(repair[0]) : ll.indexOfChild(body);
+                                            ll.addView(repairNote[0], at + 1, btnLp(dp(8)));
+                                        }
+                                        if (keep) { repair[0].setEnabled(true); return; }
+                                        ll.removeView(repair[0]);
+                                        repair[0] = null;
+                                    });
+                                }, "nowhere-wallet-repair").start();
+                            })
+                            .show();
+                    android.widget.Button neg = dlg.getButton(android.content.DialogInterface.BUTTON_NEGATIVE);
+                    if (neg != null) neg.requestFocus(); // Cancel is the default
+                });
+                ll.addView(repair[0], ll.indexOfChild(body) + 1, btnLp(dp(8)));
+            });
+        }).start();
+    }
+
+    /** Set when this session shrinks the keep-set: the user stops keeping an app from the storage screen, or
+     *  (NWP-20260821-15) captureAppCode prunes a line for an app that was uninstalled outside "Your apps".
+     *  doLogoff re-declares the shrink intent immediately before LOGOUT, because the logoff seal is the ONLY
+     *  seal a keep-set change can shrink -- captureAppCode has a single caller (doLogoff) and rewrites
+     *  nowhere-appcode.list there. The prune's setter is safe for the same reason: captureAppCode runs at
+     *  :2123 and the flag is read at :2125, sequentially on that one thread. */
+    private volatile boolean clearedStorageThisSession = false;
+    /** NWP-20260903-13: packages the INFERRED play-stack-orphan reconcile dropped this session. Kept apart
+     *  from clearedStorageThisSession on purpose: that flag carries the USER's authority to disarm the
+     *  shrink guard profile-wide, and an inference must never borrow it -- borrowing it is exactly how a
+     *  3-pkg->2-pkg #apps seal went unchallenged in the same logoff where #sys refused its shrink. These
+     *  are declared to the daemon at logoff via EXPECT-SHRINK-INFERRED, which arms a SCOPED #apps marker
+     *  the guard verifies against the manifest's own package index. */
+    private final java.util.Set<String> inferredOrphanedThisSession =
+            java.util.Collections.synchronizedSet(new java.util.LinkedHashSet<String>());
+
+    // ---- "What's using space" (DIA-20260804-05). The ranked LOCAL per-app cost, beside the billed footprint.
+    //
+    // THE TWO NUMBERS DO NOT RECONCILE, AND BOTH ARE SHOWN (Chester's call). GET-USAGE is what the plan counts:
+    // deduped, compressed, across five scopes, plus every retained snapshot. The breakdown is what is on this
+    // phone right now: raw bytes, before any of that. They will differ, often by a lot, and the screen says so
+    // plainly rather than inviting the user to discover it and conclude we are counting wrong. Deliberately NO
+    // difference, percentage or "free up N more" arithmetic anywhere -- any such number would be fiction.
+    //
+    // WHAT AN ACTION HERE DOES, EXACTLY: turning an app off changes what comes back on the NEXT phone. It
+    // deletes nothing now and frees nothing on this device today. Since DIA-20260804-04 that choice does
+    // genuinely stop the app's data being carried (before it, "Off" only dropped the APK and the data was
+    // sealed and billed forever anyway) -- but it still takes effect at the LOGOFF seal, not on this screen.
+    // Saying otherwise would be the same class of mistake as DIA-20260804-01's "size you bought" headline.
+    private void showStorageBreakdown() {
+        final LinearLayout ll = menuScreen("What's using space", "what's on this phone, and what your plan counts");
+
+        final TextView stored = new TextView(this);
+        StatusLine.busy(stored, "Calculating…");
+        stored.setTextColor(ACCENT);
+        stored.setTextSize(TypedValue.COMPLEX_UNIT_SP, 22);
+        LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        slp.topMargin = dp(10);
+        ll.addView(stored, slp);
+        final TextView storedSub = new TextView(this);
+        storedSub.setText("what your plan counts");
+        storedSub.setTextColor(MUTED);
+        storedSub.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        ll.addView(storedSub, new LinearLayout.LayoutParams(MATCH, WRAP));
+
+        // NWP-20261014-35: the plan warning, hidden until GET-ENTITLEMENT says the profile is past 80% of what it covers.
+        final TextView planWarn = new TextView(this);
+        planWarn.setTextColor(WARN);
+        planWarn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        planWarn.setVisibility(android.view.View.GONE);
+        LinearLayout.LayoutParams pwlp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        pwlp.topMargin = dp(8);
+        ll.addView(planWarn, pwlp);
+
+        final TextView local = new TextView(this);
+        StatusLine.busy(local, "Adding up what's on this phone…");
+        local.setTextColor(INK);
+        local.setTextSize(TypedValue.COMPLEX_UNIT_SP, 22);
+        LinearLayout.LayoutParams llp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        llp.topMargin = dp(16);
+        ll.addView(local, llp);
+        final TextView localSub = new TextView(this);
+        localSub.setTextColor(MUTED);
+        localSub.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        ll.addView(localSub, new LinearLayout.LayoutParams(MATCH, WRAP));
+
+        // Shown only when the daemon reports it could not read part of the tree. An undercount presented as a
+        // total would send someone deleting the wrong thing.
+        final TextView blindLine = new TextView(this);
+        blindLine.setTextColor(WARN);
+        blindLine.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        blindLine.setVisibility(android.view.View.GONE);
+        LinearLayout.LayoutParams bllp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        bllp.topMargin = dp(8);
+        ll.addView(blindLine, bllp);
+
+        final TextView device = new TextView(this);
+        device.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        paintDeviceLine(device);
+        LinearLayout.LayoutParams dvlp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        dvlp.topMargin = dp(10);
+        ll.addView(device, dvlp);
+
+        final TextView explain = new TextView(this);
+        // DIA-20260805-13: stop asserting a DIRECTION. The previous wording said the plan figure is "often
+        // larger", written from odtest4 (581 MB stored vs 281 MB local) -- but frankel and lynx both showed the
+        // opposite (748 MB stored vs 2.1 GB local), so the claim was wrong as often as it was right. Which way
+        // it lands depends on how compressible the data is against how many backups are being kept, and we
+        // cannot know that before measuring. Name both forces, claim neither.
+        //
+        // The list itself no longer needs this paragraph to explain the difference: since DIA-20260805-12 each
+        // row carries BOTH numbers and the leftover has its own line, so the arithmetic is on screen.
+        explain.setText("These two rarely match, and that's normal. Your plan counts your data after it's "
+                + "compressed and de-duplicated, which makes it smaller — and it also keeps recent backups of "
+                + "your profile, which makes it bigger. It only changes when this phone saves your profile. "
+                + "Each app below shows both: what it uses of your plan, and its raw size on this phone.");
+        explain.setTextColor(MUTED);
+        explain.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        explain.setLineSpacing(dp(4), 1f);
+        LinearLayout.LayoutParams exlp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        exlp.topMargin = dp(14);
+        ll.addView(explain, exlp);
+
+        final TextView actNote = new TextView(this);
+        actNote.setText("Turning an app off decides what comes back on your next phone. It doesn't delete "
+                + "anything here, and it won't make this phone emptier today.");
+        actNote.setTextColor(MUTED);
+        actNote.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        actNote.setLineSpacing(dp(4), 1f);
+        LinearLayout.LayoutParams anlp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        anlp.topMargin = dp(12); anlp.bottomMargin = dp(6);
+        ll.addView(actNote, anlp);
+
+        final LinearLayout list = new LinearLayout(this);
+        list.setOrientation(LinearLayout.VERTICAL);
+        ll.addView(list, new LinearLayout.LayoutParams(MATCH, WRAP));
+
+        final android.widget.ProgressBar spin = new android.widget.ProgressBar(this);
+        spin.setIndeterminateTintList(android.content.res.ColorStateList.valueOf(ACCENT)); // NWP-20261007-13
+        LinearLayout.LayoutParams splp = new LinearLayout.LayoutParams(WRAP, WRAP);
+        splp.gravity = Gravity.CENTER; splp.topMargin = dp(20);
+        ll.addView(spin, splp);
+
+        TextView back = new TextView(this);
+        back.setText("Back");
+        back.setTextColor(ACCENT);
+        back.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        back.setGravity(Gravity.CENTER);
+        back.setPadding(dp(8), dp(20), dp(8), dp(8));
+        ll.addView(back, new LinearLayout.LayoutParams(MATCH, WRAP));
+        back.setOnClickListener(v -> showStorage()); // NOT finishMenuScreen -- its Back goes to showConfirm
+
+        android.widget.ScrollView sc = new android.widget.ScrollView(this);
+        sc.setBackgroundColor(BG);
+        sc.addView(ll);
+        setContentView(sc);
+
+        // Liveness for BOTH workers below: setContentView detaches the previous root, so a reply arriving
+        // after the user navigated away has root.getParent() == null. isFinishing/isDestroyed cannot see
+        // that -- this Activity swaps screens with setContentView and never finishes between them. Declared
+        // here, above both threads, because both capture it.
+        final android.view.View root = sc;
+
+        // A slow walk is the NORMAL case on the phones this screen is for, so say so rather than looking hung.
+        final android.os.Handler slow = new android.os.Handler(android.os.Looper.getMainLooper());
+        slow.postDelayed(() -> localSub.setText("A full phone can take a minute."), 8000);
+
+        // Two INDEPENDENT threads: the billed figure is a store round-trip and must not sit behind the walk.
+        new Thread(() -> {
+            // NWP-20261019-18: sendDaemonReply, so a timeout or an unreachable daemon says so instead of the dash.
+            final DaemonReply u = sendDaemonReply("GET-USAGE\n");
+            final String why = usageReason(u.text, u.reason()); // NWP-20261011-21: a reason, in the body style
+            runOnUiThread(() -> {
+                if (isFinishing() || root.getParent() == null) return;
+                if (why == null) { stored.setText(formatUsage(u.text)); return; }
+                stored.setTextColor(MUTED);
+                stored.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+                StatusLine.error(stored, why);
+            });
+        }).start();
+        // One more round trip (a footprint plus a gateway call), so its own thread: it must not sit behind the
+        // walk or the GET-USAGE read. Nothing is shown on a non-OK reply.
+        new Thread(() -> {
+            final String warn = planWarning(sendDaemon("GET-ENTITLEMENT\n"));
+            if (warn == null) return;
+            runOnUiThread(() -> {
+                if (isFinishing() || root.getParent() == null) return;
+                planWarn.setText(warn);
+                planWarn.setVisibility(android.view.View.VISIBLE);
+            });
+        }).start();
+        new Thread(() -> {
+            final StorageScreen v = new StorageScreen(root, ll, spin, slow, local, localSub, blindLine, list, device);
+            // NWP-20261120-09 (h48 #6): a fresh count starts every time the screen opens; the reply is not needed.
+            sendDaemon("STORAGE-COUNT-START\n");
+            if (showKeptStorageCount(v)) return;
+            final String[] reply = getStorageBreakdown(); // an older daemon: today's walk, unchanged
+            renderStorageReply(v, reply[0], parseStorageBreakdown(reply[1]));
+        }).start();
+    }
+
+    /** Fill the breakdown list: the app rows the daemon ranked, then your own files, then the streamed-media
+     *  cache (the one row with an immediate device-space action). Split out so "Try again" and a post-drop
+     *  repaint can rebuild it without re-running the whole screen. */
+    private void renderStorageList(final LinearLayout list, final StorageInfo si, final TextView device,
+                                   final java.util.Map<String,CharSequence> labels,
+                                   final java.util.Map<String,Boolean> droppable,
+                                   // DIA-20260806-13: resolved on the worker with labels/droppable, for the
+                                   // same reason -- getApplicationInfo is a binder call and this renders on
+                                   // the main thread. Threaded through rather than recomputed per repaint.
+                                   final java.util.Map<String,Boolean> bundled,
+                                   final java.util.Map<String,Boolean> installed) {
+        list.removeAllViews();
+        if (si.apps.isEmpty() && si.mediaBytes == 0 && si.cacheBytes == 0 && si.folders.isEmpty()) {
+            TextView empty = new TextView(this);
+            empty.setText("Nothing much is using space yet — apps and files you add show up here.");
+            empty.setTextColor(MUTED);
+            empty.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+            list.addView(empty, new LinearLayout.LayoutParams(MATCH, WRAP));
+            return;
+        }
+        final Runnable repaint = () -> renderStorageList(list, si, device, labels, droppable, bundled, installed);
+        // Cheap, live, re-read every render so a row the user just turned Off flips its wording at once.
+        final java.util.Set<String> turnedOff = explicitlyTurnedOff();
+        // Modes come from the LIVE keep-set, not the mode the daemon reported when it walked: after a drop the
+        // JSON is stale, and the keep-set is the thing that actually decides what gets sealed. Read once for
+        // the whole list rather than per row (each readAppModes call re-reads the file).
+        final java.util.Map<String,String> live = readAppModes();
+        // DIA-20260806-13: rank and filter on the number this screen LEADS WITH.
+        //
+        // The daemon sorts by local bytes, under a comment explaining that the screen answers "what do I
+        // delete". It no longer does: since DIA-20260805-13 every row leads with what the app costs the PLAN,
+        // and those two numbers diverge hard. hold_ondemand leaves near-empty local dirs for kept apps whose
+        // sealed data is large; on-demand media is deferred, so local is a fraction of what the plan holds;
+        // and the daemon explicitly attributes plan bytes to packages with no local presence at all. Ranking
+        // by local bytes therefore buried exactly the rows this screen exists to surface.
+        //
+        // Observed on lynx: 3 rows shown out of 224, and Thunderbird -- in nowhere-apps.list, and proven to
+        // roam -- was in the 221 hidden, because 542 KB of local data is under a 1 MB local floor.
+        //
+        // A KEPT app is never hidden regardless of size. It is the row the user has expressed intent about
+        // and the only row the turn-off action applies to; hiding it makes the list disagree with "Your apps".
+        final java.util.List<StorageRow> ranked = new java.util.ArrayList<>(si.apps);
+        final boolean rankByPlan = si.storeMeasured;
+        java.util.Collections.sort(ranked, (a, b) -> {
+            boolean ka = live.containsKey(a.pkg), kb = live.containsKey(b.pkg);
+            if (ka != kb) return ka ? -1 : 1;                       // kept first, never dropped by the floor
+            long va = rankByPlan ? a.store : a.bytes, vb = rankByPlan ? b.store : b.bytes;
+            if (va != vb) return va > vb ? -1 : 1;
+            if (a.bytes != b.bytes) return a.bytes > b.bytes ? -1 : 1;  // plan ties: fall back to local
+            return a.pkg.compareTo(b.pkg);                          // stable across refreshes
+        });
+        int shown = 0, hidden = 0;
+        for (StorageRow raw : ranked) {
+            // The daemon lists EVERY data dir, and hold_ondemand leaves a 0-byte installd skeleton for each
+            // kept app, so an unfiltered list is mostly noise on a screen meant for ranking. The floor now
+            // measures the same axis the list is ranked on -- and a row that is empty on BOTH axes is the
+            // skeleton noise the floor exists to remove, so nothing that matters is dropped.
+            boolean keptRow = live.containsKey(raw.pkg);
+            long rank = rankByPlan ? raw.store : raw.bytes;
+            if (!keptRow && rank < STORAGE_ROW_MIN_BYTES && raw.bytes < STORAGE_ROW_MIN_BYTES) {
+                hidden = ranked.size() - shown;
+                break;
+            }
+            String liveMode = live.get(raw.pkg);
+            StorageRow r = new StorageRow(raw.pkg, raw.bytes, liveMode == null ? "" : liveMode, raw.store, raw.code);
+            // Actionable exactly when the row is in the keep-set AND is not a launcher-less Play provider.
+            // That makes the actionable set identical to "Your apps", so the two screens can never disagree --
+            // and it keeps gms/gsf off-limits, since turning those off strands every Play-Services client
+            // (showYourApps refuses the same two, for the same reason). gms is routinely the largest data dir
+            // on the phone, so it WILL sort to the top of this list.
+            // VENDING joins gms/gsf as non-actionable: reconcilePlayStack re-adds a stack member that still
+            // has a kept client, so the drop would be silently reverted while the toast reported success.
+            boolean actionable = (MODE_INSTALLED.equals(r.mode) || deferredMode(r.mode))
+                    && !GMS_PKG.equals(r.pkg) && !GSF_PKG.equals(r.pkg) && !VENDING_PKG.equals(r.pkg);
+            boolean stops = !live.containsKey(r.pkg)
+                    && (turnedOff.contains(r.pkg) || Boolean.TRUE.equals(droppable.get(r.pkg)));
+            // NWP-20260825-22: THE RECOVERY PATH, and the only one that reaches bytes already stuck.
+            //
+            // `actionable` needs a live keep mode, so the instant a keep line went the chip went with it --
+            // leaving a row, a number, and nothing to press. That is a one-way trap, and Chester is in it: an
+            // on-demand Tesla he turned Off in "Your apps" left 406 MB sealed, leased and billed, rendered as
+            // "broken com.teslamotors.tesla" because PM no longer knows the package to label it.
+            //
+            // An orphan row is one the profile is still CARRYING for an app that is no longer kept. Excluded:
+            // bundled apps (their data IS the profile), the launcher-less Play providers and the Play Store
+            // (reconcilePlayStack owns those and would revert the drop), ourselves, rows already heading for
+            // the drop (`stops`), and anything below the row threshold -- a chip promising to free nothing is
+            // just noise.
+            boolean orphan = !actionable && !stops
+                    && !live.containsKey(r.pkg)
+                    && !Boolean.TRUE.equals(bundled.get(r.pkg))
+                    && !getPackageName().equals(r.pkg)
+                    && !GMS_PKG.equals(r.pkg) && !GSF_PKG.equals(r.pkg) && !VENDING_PKG.equals(r.pkg)
+                    && r.store >= STORAGE_ROW_MIN_BYTES;
+            list.addView(storageAppRow(r, actionable, orphan, stops, labels.get(r.pkg), si.storeMeasured,
+                            si.appsMeasured, Boolean.TRUE.equals(bundled.get(r.pkg)),
+                            Boolean.TRUE.equals(installed.get(r.pkg)), repaint),
+                    new LinearLayout.LayoutParams(MATCH, WRAP));
+            if (++shown >= MAX_STORAGE_ROWS) { hidden = si.apps.size() - shown; break; }
+        }
+        if (hidden > 0) {
+            // DIA-20260806-13: this is a footnote about the LIST, but it was styled exactly like a row's
+            // subtitle -- same MUTED colour, same 12sp, 8dp below the last row -- so it read as a second
+            // description line belonging to whichever app happened to be last. On a real screen that came
+            // out as "Launcher / 199 KB of your plan · 1 MB on this phone · carried with your profile /
+            // 221 smaller items not shown", i.e. the count looked like a property of Launcher.
+            // Smaller, italic and properly separated: unmistakably about the list, not the row. Left-aligned
+            // like everything else on the screen -- centring it made it a different KIND of element again.
+            //
+            // DIA-20260806-17, the wording: "N smaller items not shown" states a fact and leaves the reader
+            // to guess what it means, and the available guess is the alarming one -- that those apps are not
+            // carried, or not counted. Neither is true. Their bytes are inside BOTH totals at the top of this
+            // screen; only their ROWS are omitted, and only because a ranking list with 222 sub-megabyte
+            // entries ranks nothing. So say exactly that: what was left out, how small, and that the space is
+            // still accounted for above. A screen that asks people to decide what to turn off cannot afford
+            // an omission that reads as a disappearance.
+            TextView more = new TextView(this);
+            more.setText(hidden + (hidden == 1 ? " item" : " items") + " under " + humanBytes(STORAGE_ROW_MIN_BYTES)
+                    + " not listed — their space is included in the totals above");
+            more.setTextColor(MUTED);
+            more.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
+            more.setTypeface(null, android.graphics.Typeface.ITALIC);
+            more.setPadding(dp(4), dp(20), dp(4), dp(6));
+            list.addView(more, new LinearLayout.LayoutParams(MATCH, WRAP));
+        }
+        // NWP-20261125-09 (h51 #4 A1): one row per top-level folder, plus one for the files outside them, in the
+        // daemon's order, each with its plan and phone figures. A store-only folder (0 bytes here) is drawn too.
+        // A reply with no folders (an older daemon) keeps the one row.
+        if (StorageFolders.useFolderRows(si.folders.size())) {
+            for (StorageFolder f : si.folders) {
+                list.addView(storageInfoRow(StorageFolders.title(f.name),
+                        StorageFolders.line(humanBytes(f.bytes), humanBytes(f.store), si.foldersMeasured), null),
+                        new LinearLayout.LayoutParams(MATCH, WRAP));
+            }
+        } else if (si.mediaBytes > 0) {
+            list.addView(storageInfoRow("Your photos, videos and files", humanBytes(si.mediaBytes)
+                    + " on this phone · always comes with you", null),
+                    new LinearLayout.LayoutParams(MATCH, WRAP));
+        }
+        // DIA-20260805-13: the remainder, as its own row. Without it the app rows quietly under-sum the plan
+        // total and the difference reads as slack the user could reclaim by turning things off -- when in fact
+        // it is recent backups plus data shared between apps, which no single row can free. Showing it is what
+        // lets the arithmetic on this screen be checked rather than taken on trust.
+        if (si.storeMeasured && si.storeOther > 0) {
+            list.addView(storageInfoRow("Recent backups and shared data", humanBytes(si.storeOther)
+                    + " of your plan · not any one app's, so turning apps off won't free it", null),
+                    new LinearLayout.LayoutParams(MATCH, WRAP));
+        }
+        if (si.cacheBytes > 0) {
+            // The one row that frees device space RIGHT NOW. These bytes are derived -- every one of them can
+            // be re-streamed from the store -- so clearing is safe and reversible, unlike everything above it.
+            list.addView(storageInfoRow("Streamed maps and photos", humanBytes(si.cacheBytes)
+                    + " held on this phone · re-downloads when you open it again", () -> {
+                new Thread(() -> {
+                    final String r = sendDaemon("FREE-MEDIA-CACHE\n").trim();
+                    runOnUiThread(() -> {
+                        if (isFinishing() || isDestroyed()) return;
+                        String msg;
+                        if (r.startsWith("OK")) {
+                            long freed = 0;
+                            String[] p = r.split("\\s+");
+                            if (p.length > 1) { try { freed = Long.parseLong(p[1]); } catch (NumberFormatException ignore) {} }
+                            msg = freed > 0 ? "Freed " + humanBytes(freed) + " of streamed media"
+                                            : "Media cache already clear";
+                        } else {
+                            msg = r.startsWith("NONE") ? "No active session" : "Couldn't free space — try again";
+                        }
+                        android.widget.Toast.makeText(this, msg, android.widget.Toast.LENGTH_LONG).show();
+                        // NWP-20261016-49: MEASURE AGAIN rather than set this row to 0. Clear deletes only the
+                        // complete cache entries: a partly fetched file, the tombstone lists and anything streamed
+                        // since all stay, so a zeroed row claimed the phone was emptier than it is, while the
+                        // total above it was never re-measured. Re-running the screen re-walks both together, and
+                        // a walk that fails shows the screen's own error. Only while this screen is still the one
+                        // showing: setContentView detaches it, and the user must not be pulled back to it.
+                        if (r.startsWith("OK") && list.isAttachedToWindow()) {
+                            showStorageBreakdown();
+                            return;
+                        }
+                        paintDeviceLine(device); // the reclaimed space should show at once
+                    });
+                }).start();
+            }), new LinearLayout.LayoutParams(MATCH, WRAP));
+        }
+    }
+
+    /** A non-app row: a label, a sub-line, and an optional action link (used for the clearable media cache). */
+    private LinearLayout storageInfoRow(String label, String sub, final Runnable action) {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(dp(4), dp(10), dp(4), dp(10));
+        LinearLayout col = new LinearLayout(this);
+        col.setOrientation(LinearLayout.VERTICAL);
+        TextView lab = new TextView(this);
+        lab.setText(label);
+        lab.setTextColor(INK);
+        lab.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
+        col.addView(lab);
+        TextView s = new TextView(this);
+        s.setText(sub);
+        s.setTextColor(MUTED);
+        s.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        col.addView(s);
+        row.addView(col, new LinearLayout.LayoutParams(0, WRAP, 1f));
+        if (action != null) {
+            TextView act = new TextView(this);
+            act.setText("Clear");
+            act.setTextColor(ACCENT);
+            act.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+            act.setPadding(dp(14), dp(7), dp(14), dp(7));
+            act.setOnClickListener(v -> action.run());
+            LinearLayout.LayoutParams alp = new LinearLayout.LayoutParams(WRAP, WRAP);
+            alp.leftMargin = dp(8);
+            row.addView(act, alp);
+        }
+        return row;
+    }
+
+    /** One app row: label, measured size + what happens to it on the next phone, (when actionable) the
+     *  keep-mode chip that opens the stop-keeping confirm, and, for a downloaded On-demand app whose code is in
+     *  the store, Free on this phone. Size has NO "~" prefix -- unlike the estimate in
+     *  "Your apps", this is a measured walk. */
+    private LinearLayout storageAppRow(final StorageRow r, final boolean actionable, final boolean orphan,
+                                       final boolean stopsCarrying,
+                                       final CharSequence label, final boolean storeMeasured,
+                                       final boolean appsMeasured, final boolean bundled,
+                                       final boolean installedNow, final Runnable repaint) {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(dp(4), dp(10), dp(4), dp(10));
+        LinearLayout col = new LinearLayout(this);
+        col.setOrientation(LinearLayout.VERTICAL);
+        TextView lab = new TextView(this);
+        lab.setText(label != null ? label : r.pkg);
+        lab.setTextColor(INK);
+        lab.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
+        col.addView(lab);
+        TextView sub = new TextView(this);
+        String fate;
+        boolean kept = MODE_INSTALLED.equals(r.mode) || deferredMode(r.mode);
+        // DIA-20260806-06 established the principle and DIA-20260806-13 fixed the execution: the keep-set is
+        // INTENT, #apps is CAPABILITY, and only claim a restore when the bytes to perform it exist. But the
+        // original test -- kept && storeMeasured && !code -> "it won't come back" -- was wrong more often
+        // than it was right, and wrong in the direction that frightens people. Four things, all verified:
+        //
+        //  - storeMeasured is true as soon as ANY scope has an index; only #apps populates `code`. A profile
+        //    that has sealed data but not yet code therefore accused EVERY kept app. Now gated on
+        //    appsMeasured, which the daemon sets only when the #apps scope itself resolved.
+        //  - a BUNDLED app can never have sealed code: both seal paths refuse system packages by design, and
+        //    it comes back anyway via install-existing. Claiming otherwise was permanently false for it.
+        //  - a kept app that is STILL INSTALLED self-heals: roamd re-resolves its live code dir and stages the
+        //    APK on the next periodic seal (observed every ~2.5 min on lynx, not merely at logoff). So the
+        //    honest line is a state -- "not saved yet" -- not a verdict. This also covers the case that used
+        //    to be a guaranteed false alarm: switching keep ON re-renders from a cached breakdown, so the row
+        //    would announce doom for the very app the user had just chosen to protect.
+        //  - on-demand apps fail differently: the tap returns ERR-FETCH. Naming the next phone would send the
+        //    user looking for the problem in the wrong place.
+        if (kept && appsMeasured && !r.code && !bundled) {
+            if (installedNow)
+                fate = "kept — its app files haven't been saved yet";
+            else if (deferredMode(r.mode))
+                fate = "kept, but its app files are missing — it won't download when you tap it";
+            else
+                fate = "kept, but its app files are missing — it won't come back by itself";
+        }
+        else if (MODE_INSTALLED.equals(r.mode)) fate = "comes back installed on your next phone";
+        else if (MODE_AUTO.equals(r.mode))      fate = "comes back on its own after you sign in";
+        else if (MODE_ONDEMAND.equals(r.mode))  fate = "comes back as an icon, downloads when you tap it";
+        else if (stopsCarrying)                 fate = "not kept — gone when you log off";
+        // NOT kept, but the logoff seal still carries it: bundled apps (Messages, the browser, Settings)
+        // whose data IS the profile, and orphan data dirs with no app left. The daemon lists every data dir
+        // it finds, with NO keep-set filter, so these are the MAJORITY of rows -- and calling them "gone
+        // when you log off" was the exact inverse of the truth, on the screen whose whole job is being
+        // honest about what survives. Erring toward "carried" is also the safe direction: it is the claim
+        // that never sends someone deleting something they needed.
+        // NWP-20260825-22: an orphan is NOT the reassuring catch-all case below. "carried with your profile"
+        // reads as a service being done for you; for a row whose app you removed it is a charge you did not
+        // agree to and could not see. Say which it is.
+        else if (orphan)                        fate = installedNow
+                ? "not kept — but its data is still being carried"
+                : "no longer installed — its data is still being carried";
+        else                                    fate = "carried with your profile";
+        // DIA-20260805-13: lead with the PLAN figure, which is the question users actually ask ("how much of
+        // my plan is this app using"), and keep the on-phone figure beside it because that is what a delete
+        // frees. Until DIA-20260805-11 the plan number did not exist per app at all, so the row could only
+        // show local bytes. A measured-but-tiny app reads "under 1 MB", never "0 B": zero is reserved for the
+        // unmeasured case, which says so.
+        String size;
+        if (!storeMeasured) {
+            size = humanBytes(r.bytes) + " on this phone · plan use not measured yet";
+        } else if (r.store <= 0) {
+            size = "under 1 MB of your plan · " + humanBytes(r.bytes) + " on this phone";
+        } else {
+            size = humanBytes(r.store) + " of your plan · " + humanBytes(r.bytes) + " on this phone";
+        }
+        sub.setText(size + " · " + fate);
+        sub.setTextColor(MUTED);
+        sub.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        col.addView(sub);
+        // h51 #4 B2, NWP-20261125-11: a downloaded On-demand app whose code is in the store can be freed now, as
+        // the idle reclaim would free it later (FreeOnPhone.offer says which). No confirm: the archive keeps the
+        // app's data and icon, and a tap brings it back. No repaint after it: repaint redraws from the cached walk
+        // and installed map while requestArchive completes later, so it would offer the freed app again.
+        boolean playStack = GMS_PKG.equals(r.pkg) || GSF_PKG.equals(r.pkg) || VENDING_PKG.equals(r.pkg);
+        if (FreeOnPhone.offer(r.mode, installedNow, bundled, appsMeasured, r.code, playStack)) {
+            final TextView free = new TextView(this);
+            free.setText(FreeOnPhone.LINK);
+            free.setTextColor(ACCENT);
+            free.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+            free.setPadding(0, dp(6), 0, dp(2));
+            free.setOnClickListener(v -> {
+                free.setEnabled(false);
+                new Thread(() -> {
+                    String verdict = ReArchiveReceiver.freeNow(getApplicationContext(), r.pkg);
+                    runOnUiThread(() -> {
+                        if (isFinishing() || isDestroyed()) return;
+                        if ("ok".equals(verdict)) {
+                            free.setText(FreeOnPhone.DONE);
+                            free.setTextColor(MUTED);
+                            free.setClickable(false);
+                        } else {
+                            android.widget.Toast.makeText(this, FreeOnPhone.message(verdict),
+                                    android.widget.Toast.LENGTH_LONG).show();
+                            free.setEnabled(true);
+                        }
+                    });
+                }, "nowhere-free-on-phone").start();
+            });
+            col.addView(free);
+        }
+        row.addView(col, new LinearLayout.LayoutParams(0, WRAP, 1f));
+        if (actionable) {
+            final TextView chip = new TextView(this);
+            chip.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+            chip.setPadding(dp(14), dp(7), dp(14), dp(7));
+            chip.setMinWidth(dp(96));
+            chip.setGravity(Gravity.CENTER);
+            paintModeChip(chip, r.mode);
+            chip.setOnClickListener(v -> confirmStopKeeping(r.pkg, repaint));
+            LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(WRAP, WRAP);
+            clp.leftMargin = dp(8);
+            row.addView(chip, clp);
+        } else if (orphan) {
+            final TextView chip = new TextView(this);
+            chip.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+            chip.setPadding(dp(14), dp(7), dp(14), dp(7));
+            chip.setMinWidth(dp(96));
+            chip.setGravity(Gravity.CENTER);
+            // ⚠ A LITERAL LABEL, NOT paintModeChip. That paints a null mode as "Off" -- and an "Off" chip that
+            // performs a drop is a lie twice over: the app is already off, and pressing it does something the
+            // word does not describe. This chip is the only control that can release bytes already stuck, so
+            // it has to say what it does.
+            chip.setText("Stop carrying");
+            chip.setTextColor(ACCENT);
+            chip.setOnClickListener(v -> confirmStopCarrying(r.pkg, repaint));
+            LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(WRAP, WRAP);
+            clp.leftMargin = dp(8);
+            row.addView(chip, clp);
+        }
+        return row;
+    }
+
+    /** The stop-keeping confirm. Its whole job is to be accurate about a change that LOOKS destructive and is
+     *  not: nothing is deleted, the app keeps working, and the effect lands at logoff. */
+    private void confirmStopKeeping(final String pkg, final Runnable repaint) {
+        new android.app.AlertDialog.Builder(this)
+                .setTitle("Stop keeping " + keptLabel(pkg) + "?")
+                // "stops counting" would be false even when everything works: the vault keeps recent
+                // snapshots (#58 rollback) and those still lease the dropped chunks, so what the plan counts
+                // falls gradually as they age out -- not at the next logoff.
+                .setMessage("It stays on this phone and keeps working until you log off. It just won't come "
+                        + "back on your next phone. Its data stops being carried when you log off — what "
+                        + "your plan counts then takes a few days to drop, because recent backups are kept "
+                        + "for a while.")
+                .setPositiveButton("Stop keeping it", (d, w) -> applyStorageDrop(pkg, repaint))
+                .setNegativeButton("Cancel", null)
+                .show();
+    }
+
+    /** The ORPHAN variant of the stop-keeping confirm (NWP-20260825-22). Different words for a genuinely
+     *  different situation: confirmStopKeeping reassures that the app keeps working, which is meaningless here
+     *  because there is no app left -- only data the profile is still paying to carry.
+     *
+     *  It reuses applyStorageDrop UNCHANGED. That already does the whole correct sequence: EXPECT-SHRINK first
+     *  (so the logoff seal is allowed to shrink), setAppMode(null) -- a harmless no-op for a row that has no
+     *  keep line -- recordTurnedOff, and the session flag. Nothing is deleted here: on an
+     *  amnesiac device the tap records INTENT, and the release happens in the logoff seal by the new manifest
+     *  not referencing those chunks. */
+    private void confirmStopCarrying(final String pkg, final Runnable repaint) {
+        new android.app.AlertDialog.Builder(this)
+                .setTitle("Stop carrying " + keptLabel(pkg) + "?")
+                .setMessage("This app is not on your phone any more, but your profile is still carrying its "
+                        + "data — and still counting it against your plan. Stopping means the data is not "
+                        + "kept when you log off. What your plan counts takes a few days to drop, because "
+                        + "recent backups are kept for a while.")
+                .setPositiveButton("Stop carrying it", (d, w) -> applyStorageDrop(pkg, repaint))
+                .setNegativeButton("Cancel", null)
+                .show();
+    }
+
+    /** Off-thread: declare the shrink intent FIRST, and only change the keep-set if the daemon accepted it.
+     *  Order matters -- a keep-set change whose intent was never recorded can have its logoff seal refused by
+     *  the shrink guard, which would silently undo the user's choice. Off the UI thread because EXPECT-SHRINK
+     *  is deliberately not on the daemon's concurrent-safe list, so it can queue behind a materialise. */
+    private void applyStorageDrop(final String pkg, final Runnable repaint) {
+        new Thread(() -> {
+            // NWP-20260826-01: name the failure. This gate is correct -- a keep-set change whose shrink intent
+            // was never recorded can have its logoff seal REFUSED -- but "" meant the user got a vanishing
+            // toast reading "Couldn't prepare that change" for a 90s TIMEOUT, indistinguishable from a real
+            // refusal, while the chip repainted unchanged and nothing was written. Chester tapped it, saw no
+            // change, and had no way to know the tap had not reached the code at all. The identical tap
+            // succeeded later the same evening on a quieter daemon.
+            final DaemonReply rep = sendDaemonReply("EXPECT-SHRINK\n");
+            final String r = rep.text;
+            final boolean ok = r.startsWith("OK"); // "" is a dead socket, NOT success
+            if (ok) {
+                // setAppMode, never writeAppModes: it also maintains nowhere-playdeps and reconciles the Play
+                // stack, so writing the map directly would strand gms/gsf/vending kept with no client left.
+                setAppMode(pkg, null);
+                recordTurnedOff(pkg);   // so captureAppDrops can name it even once PM stops presenting it
+                clearedStorageThisSession = true;
+            }
+            runOnUiThread(() -> {
+                if (isFinishing() || isDestroyed()) return;
+                if (ok) repaint.run();
+                android.widget.Toast.makeText(this,
+                        ok ? "Stopped keeping " + keptLabel(pkg) + ". It's still here until you log off."
+                           : r.startsWith("NONE") ? "No active session."
+                           // NWP-20260826-05: the daemon now answers BUSY rather than blocking, so this is
+                           // the case that used to reach us as a 90s timeout -- or, before -01, as nothing
+                           // at all. Same words as the timeout branch on purpose: from where the user is
+                           // standing they ARE the same event, and the difference (we gave up vs the daemon
+                           // declined) is ours to log, not theirs to parse.
+                           : r.startsWith("BUSY") ? "The phone is busy saving or downloading. Nothing "
+                                   + "changed — tap it again in a moment."
+                           : rep.failed() ? "Nothing changed — " + rep.reason() + ". Tap it again in a moment."
+                           : "Couldn't prepare that change — try again.",
+                        android.widget.Toast.LENGTH_LONG).show();
+            });
+        }).start();
+    }
+
+    /** Paint the "Kept apps: N · ~size" line, or take it out of the layout entirely when there are none.
+     *  Collapsing the view (GONE) rather than blanking the text is the whole point: an empty TextView keeps
+     *  its height and its top margin, which is what produced the stray blank band on the Storage screen. */
+    private void setAppsLine(TextView appsLine, int n, long tot) {
+        if (n == 0) {
+            appsLine.setText("");
+            appsLine.setVisibility(android.view.View.GONE);
+            return;
+        }
+        appsLine.setText("Kept apps: " + n + " · ~" + humanBytes(tot));
+        appsLine.setVisibility(android.view.View.VISIBLE);
+    }
+
+    /** "This device: X free of Y · N% used" -- the LOCAL disk state (statfs, no network), amber when nearly
+     *  full. Distinct from the store usage above it: that is the roaming quota, this is how full the phone is.
+     *  Factored out because both the Storage screen and "What's using space" paint it, and the cache-clear
+     *  callback repaints it in place. */
+    private void paintDeviceLine(TextView device) {
+        try {
+            android.os.StatFs sf = new android.os.StatFs(getFilesDir().getPath());
+            long total = sf.getTotalBytes(), free = sf.getAvailableBytes();
+            int pct = total > 0 ? (int) ((total - free) * 100 / total) : 0;
+            device.setText("This device: " + humanBytes(free) + " free of " + humanBytes(total) + " · " + pct + "% used");
+            device.setTextColor(pct >= 80 ? WARN : MUTED); // amber when nearly full
+        } catch (Throwable ignore) { // NOT `t` -- collides with the `TextView t` in showStorage (the #82 fix)
+            device.setText("");
+        }
+    }
+
+    /** Render a GET-ENTITLEMENT reply into the Storage screen's plan-coverage line: the ceiling the usage is
+     *  measured against, which is `covered` = max(free, plan) and NEVER their sum. Returns null (line hidden)
+     *  when there's no plan to show.
+     *
+     *  `free` is deliberately no longer read: it existed only to render "1.0 GB free + 10.0 GB added", which
+     *  was both arithmetically wrong (it printed 11.0 GB for a 10 GB plan) and the wrong thing to say. */
+    /** entitledFrom pulls the gateway's entitled= figure out of a GET-ENTITLEMENT reply, or -1 when there
+     *  is no answer to read. Split out from formatCoverage because the plan block needs the NUMBER while
+     *  the coverage line needs the SENTENCE, and a screen that renders one from the other would make the
+     *  two disagree the first time either changed. */
+    private static long entitledFrom(String e) {
+        if (e == null || !e.startsWith("OK")) return -1;
+        for (String tok : e.split("\\s+")) {
+            if (!tok.startsWith("entitled=")) continue;
+            try {
+                return Long.parseLong(tok.substring("entitled=".length()));
+            } catch (NumberFormatException ignore) {
+                return -1;
+            }
+        }
+        return -1;
+    }
+
+    private CharSequence formatCoverage(String e) {
+        if (e == null || !e.startsWith("OK")) return null;
+        long entitled = -1, covered = -1;
+        for (String tok : e.split("\\s+")) {
+            int eq = tok.indexOf('=');
+            if (eq < 0) continue;
+            try {
+                long v = Long.parseLong(tok.substring(eq + 1));
+                switch (tok.substring(0, eq)) {
+                    case "entitled": entitled = v; break;
+                    case "covered":  covered = v;  break;
+                }
+            } catch (NumberFormatException ignore) {}
+        }
+        if (covered <= 0) return null;
+        StringBuilder s = new StringBuilder("Plan covers ").append(humanBytes(covered));
+        // THE FREE TIER IS NAMED ONLY WHEN IT IS WHAT COVERS YOU.
+        //
+        // A paying customer gets the number and nothing else. This briefly read "— the free allowance is
+        // included, not added on top", which explains an internal mechanic to answer a question nobody
+        // asked -- and naming the free plan on a PAID screen invites the very doubt it was meant to settle
+        // ("wait, should I have had 11?"). Inclusive sizing belongs where someone is CHOOSING a plan, and
+        // it is already on the buy page: "the plan size is the total, not an extra".
+        //
+        // Before that it read "— 1.0 GB free + 10.0 GB added" and rendered 11.0 GB, which was wrong twice:
+        // the sum is not the coverage (the gateway admits against max(free, plan)), and the phrasing
+        // promised an allowance that was never additive.
+        if (entitled <= 0) {
+            s.append(" (free tier)");
+        }
+        return s;
+    }
+
+    // #48: where the plans live + how buying works. ZK DECISION (do not re-litigate): the payment moment is
+    // NEVER co-located with the profile session -- this screen shows the ladder and points OUT to the web
+    // checkout (open in the browser, or scan the QR with any device); pay there -> bearer claim code ->
+    // redeem here via Add credits. The gateway can't tie the payment to this profile.
+    // URL (Chester, 2026-07-04): /buy is what exists today (currently served by the pilot host); when the
+    // storefront lands (#36) it renames/aliases /buy -> /plans -- update this constant then (noted on #36).
+    // NWP-20260921-11: the ORIGIN is no longer a constant -- it comes from the daemon's MERGED conf, so a
+    // beta image buys against beta. Chester, 2026-09-21: "on beta os, Profile->Storage->Plans & buying
+    // storage is all pointing to prod." It was not a misconfiguration: this line WAS the whole mechanism,
+    // and no ring-aware storefront key existed anywhere in the tree.
+    //
+    // ⚠ THE DEFAULT IS PROD AND THAT IS LOAD-BEARING: prod bakes no ring, so an unset STOREFRONT_URL must
+    // keep behaving exactly as this constant always did. The key is additive, not a change to prod.
+    private static final String PLANS_BASE_DEFAULT = "https://nowhere.mobile";
+
+    /** Learned once from the daemon; null until it answers. volatile because the fetch is off-thread. */
+    private volatile String storefrontBase = null;
+
+    /** The full plans URL. The PATH lives here and only here, so the origin and the path cannot drift
+     *  apart the way two constants would. */
+    private String plansUrl() {
+        String b = storefrontBase;
+        if (b == null || b.isEmpty()) b = PLANS_BASE_DEFAULT;
+        return b + "/buy";
+    }
+
+    /** Ask the daemon for the ring's storefront origin, OFF the main thread.
+     *
+     *  ⚠ IT MUST NOT RUN ON THE UI THREAD. showPlans() builds its views synchronously, and a LocalSocket
+     *  round-trip there is an ANR of exactly the shape #151 already produced in this app (the gate alarm
+     *  rang on the main thread). So the screen renders immediately with the default and repaints if the
+     *  daemon says otherwise -- which is also the correct behaviour when the daemon is not answering.
+     *
+     *  Anything that is not an https origin -- "ERR", "NONE", a blank line, a truncated read -- leaves the
+     *  default standing. A dead or blank buy button is worse than one pointing at prod. */
+    private void fetchStorefrontBase(Runnable onChange) {
+        new Thread(() -> {
+            try {
+                String r = sendDaemon("GET-STOREFRONT\n").trim();
+                if (!r.startsWith("https://")) return;
+                String b = r.replaceAll("/+$", "");
+                if (b.equals(storefrontBase)) return;
+                storefrontBase = b;
+                if (onChange != null) runOnUiThread(onChange);
+            } catch (Throwable t) {
+                android.util.Log.w("NowhereChooser", "GET-STOREFRONT", t);
+            }
+        }).start();
+    }
+
+    private void showPlans() {
+        LinearLayout ll = new LinearLayout(this);
+        ll.setOrientation(LinearLayout.VERTICAL);
+        ll.setBackgroundColor(BG);
+        ll.setGravity(Gravity.CENTER_HORIZONTAL);
+        ll.setPadding(dp(32), dp(48), dp(32), dp(36));
+
+        TextView t = new TextView(this);
+        t.setText("Plans");
+        t.setTextColor(INK);
+        t.setTextSize(TypedValue.COMPLEX_UNIT_SP, 24);
+        t.setGravity(Gravity.CENTER);
+        ll.addView(t, new LinearLayout.LayoutParams(MATCH, WRAP));
+
+        TextView ladder = new TextView(this);
+        ladder.setText("Free — 1 GB\nkept 90 days between sign-ins\n\n10 GB — $2.99 for 3 months\n50 GB — $8.99 for 3 months\n\nBigger plans up to 1 TB, and 12-month\nterms for about 17% less\nsee the website for current pricing");
+        ladder.setTextColor(FIELD_TX);
+        ladder.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16);
+        ladder.setGravity(Gravity.CENTER);
+        ladder.setLineSpacing(dp(4), 1f);
+        LinearLayout.LayoutParams llp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        llp.topMargin = dp(22);
+        ll.addView(ladder, llp);
+
+        // The personalised over-plan warning (NWP-20261014-34): the footprint is known only here, so it is stated
+        // here, before the hand-off to checkout. Added only when the daemon answers with a number.
+        final LinearLayout planRoot = ll;
+        new Thread(() -> {
+            try {
+                final String note = plansFootprintNote(sendDaemon("GET-ENTITLEMENT\n"));
+                if (note == null) return;
+                runOnUiThread(() -> {
+                    TextView n = new TextView(this);
+                    n.setText(note);
+                    n.setTextColor(FIELD_TX);
+                    n.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+                    n.setGravity(Gravity.CENTER);
+                    n.setLineSpacing(dp(4), 1f);
+                    LinearLayout.LayoutParams nlp = new LinearLayout.LayoutParams(MATCH, WRAP);
+                    nlp.topMargin = dp(14);
+                    planRoot.addView(n, planRoot.indexOfChild(ladder) + 1, nlp);
+                });
+            } catch (Throwable e) { // not `t`: the lambda sits inside showPlans(), whose title is a local `t`
+                android.util.Log.w("NowhereChooser", "GET-ENTITLEMENT (plans)", e);
+            }
+        }).start();
+
+        TextView how = new TextView(this);
+        how.setText("Buying happens on the nowhere website — never in this app, so your payment can't be "
+                // Curly quotes, NOT \" -- this renders as prose, and escaped ASCII quotes read as code on a
+                // phone screen. They also cannot repeat the mistake that broke this line: I pasted bare "
+                // inside the literal, which balances (so the literal checker passed) but does not PARSE.
+                + "linked to this profile. Pay there, get a claim code, then redeem it here with "
+                + "“Start or extend a plan”.");
+        how.setTextColor(MUTED);
+        how.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        how.setGravity(Gravity.CENTER);
+        how.setLineSpacing(dp(4), 1f);
+        LinearLayout.LayoutParams hlp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        hlp.topMargin = dp(18);
+        ll.addView(how, hlp);
+
+        // The QR of the plans page -- scan with ANY device (buy on a laptop/other phone; the claim code comes
+        // back to this one). White quiet-zone frame so it scans off the dark theme.
+        android.widget.ImageView qr = new android.widget.ImageView(this);
+        android.graphics.Bitmap bmp = qrBitmap(plansUrl(), dp(160));
+        if (bmp != null) {
+            qr.setImageBitmap(bmp);
+            qr.setBackgroundColor(GatePalette.active().qrLight);
+            int pad = dp(8);
+            qr.setPadding(pad, pad, pad, pad);
+            LinearLayout.LayoutParams qlp = new LinearLayout.LayoutParams(dp(176), dp(176));
+            qlp.topMargin = dp(20);
+            qlp.gravity = Gravity.CENTER_HORIZONTAL;
+            ll.addView(qr, qlp);
+        }
+
+        TextView url = new TextView(this);
+        url.setText(plansUrl().replaceFirst("https://", ""));
+        url.setTextColor(MUTED);
+        url.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        url.setGravity(Gravity.CENTER);
+        LinearLayout.LayoutParams ulp2 = new LinearLayout.LayoutParams(MATCH, WRAP);
+        ulp2.topMargin = dp(6);
+        ulp2.bottomMargin = dp(18);
+        ll.addView(url, ulp2);
+
+        // The screen has already rendered against the default; repaint the two places the origin is VISIBLE
+        // if the daemon names a different one. The "Open the website" button needs no handling -- its lambda
+        // calls plansUrl() at click time, so it is correct either way. qrBitmap here is a few-dozen-module
+        // matrix for a short URL, which is why it is acceptable on the UI thread; the SOCKET call, which is
+        // not, stays on the worker inside fetchStorefrontBase.
+        final android.widget.ImageView qrView = qr;
+        final TextView urlView = url;
+        fetchStorefrontBase(() -> {
+            String u = plansUrl();
+            android.graphics.Bitmap nb = qrBitmap(u, dp(160));
+            if (nb != null) qrView.setImageBitmap(nb);
+            urlView.setText(u.replaceFirst("https://", ""));
+        });
+
+        ll.addView(accentButton("Open the website", () -> {
+            try { // the roamed session has a browser; a missing handler must not crash the Profile app
+                startActivity(new android.content.Intent(android.content.Intent.ACTION_VIEW,
+                        android.net.Uri.parse(plansUrl())));
+            } catch (Throwable e) {
+                android.widget.Toast.makeText(this, "No browser here — scan the QR with another device",
+                        android.widget.Toast.LENGTH_LONG).show();
+            }
+        }), btnLp(0));
+
+        TextView back = new TextView(this);
+        back.setText("Back");
+        back.setTextColor(ACCENT);
+        back.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        back.setGravity(Gravity.CENTER);
+        back.setPadding(dp(8), dp(20), dp(8), dp(8));
+        ll.addView(back, new LinearLayout.LayoutParams(MATCH, WRAP));
+        back.setOnClickListener(v -> showStorage());
+
+        android.widget.ScrollView sc = new android.widget.ScrollView(this);
+        sc.setBackgroundColor(BG);
+        sc.addView(ll);
+        setContentView(sc);
+    }
+
+    /** Render text as a QR bitmap via the bundled ZXing core (offline; same library the scanner uses). Black
+     *  modules on white for scannability. Null on any encode failure -- callers just skip the image. (#48) */
+    private static android.graphics.Bitmap qrBitmap(String text, int px) {
+        try {
+            java.util.Map<com.google.zxing.EncodeHintType, Object> hints = new java.util.HashMap<>();
+            hints.put(com.google.zxing.EncodeHintType.MARGIN, 1);
+            com.google.zxing.common.BitMatrix mx = new com.google.zxing.qrcode.QRCodeWriter()
+                    .encode(text, com.google.zxing.BarcodeFormat.QR_CODE, px, px, hints);
+            android.graphics.Bitmap bmp = android.graphics.Bitmap.createBitmap(px, px,
+                    android.graphics.Bitmap.Config.RGB_565);
+            for (int y = 0; y < px; y++) {
+                for (int x = 0; x < px; x++) {
+                    bmp.setPixel(x, y, mx.get(x, y) ? GatePalette.active().qrDark : GatePalette.active().qrLight);
+                }
+            }
+            return bmp;
+        } catch (Throwable t) {
+            android.util.Log.w("NowhereChooser", "qrBitmap", t);
+            return null;
+        }
+    }
+
+    // ---- Add credits (DIA-20260629-04; throwaway-save fold-in DIA-20260629-06): redeem a paid claim code
+    // into this session's wallet. The user buys storage on the nowhere storefront, which shows a one-time
+    // claim code; they paste it here and the daemon (CLAIM) drains it into zero-knowledge blind tokens
+    // (1 token = 1 GB-month). Two entry points share the screen: a STORED top-up (from Storage), and the
+    // throwaway "Save to your store" path, where getting credit is immediately followed by the promote so
+    // it's one flow. Accountless + unlinkable: the device redeems the code, the gateway can't tie the
+    // credit to the payment.
+    private void showAddCredits() { // STORED top-up, from Storage
+        // NWP-20260821-14 (Chester): Back returned to the Profile hub though the user arrived from Storage.
+        // The SUCCESS path here has always gone back to Storage ("back to the refreshed Storage view"), so the
+        // screen already knew its parent -- only Back disagreed.
+        addCreditsScreen("Start or extend a plan", "scan the QR code, or paste the code, from your purchase",
+                false, this::showStorage);
+    }
+
+    private void showAddCreditsForSave() { // throwaway: get credit, then complete Save-to-store
+        // Deliberately the Profile hub, NOT Storage: this variant is not reached from a screen at all -- it
+        // interrupts the save ceremony (showSaveCeremony -> sendPromote -> handlePromoteReply) when the
+        // profile turns out to need credit. There is no "back" to the ceremony, so the hub is the honest
+        // destination and today's behaviour is already right. Left unchanged rather than changed on a guess.
+        addCreditsScreen("Save to your store", "saving needs a storage plan — scan the QR code or paste the code from your purchase",
+                true, this::showConfirm);
+    }
+
+    // QR scan (DIA-20260630-16): Add-credits can scan a code instead of typing it. QrScanActivity returns the
+    // decoded text; we drop it into the field that launched the scan.
+    private static final int REQ_SCAN = 4243;
+    private EditText scanTargetField;
+
+    @Override
+    protected void onActivityResult(int req, int res, Intent data) {
+        super.onActivityResult(req, res, data);
+        if (req == REQ_SCAN && res == RESULT_OK && data != null && scanTargetField != null) {
+            String code = data.getStringExtra(QrScanActivity.EXTRA_CODE);
+            if (code != null && !code.trim().isEmpty()) scanTargetField.setText(code.trim());
+        }
+    }
+
+    /** One option of the Add credit screen's convert-or-keep question (NWP-20261031-11). */
+    private android.widget.RadioButton planChoiceRadio(String label) {
+        android.widget.RadioButton rb = new android.widget.RadioButton(this);
+        rb.setText(label);
+        rb.setTextColor(MUTED);
+        rb.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        return rb;
+    }
+
+    /** The grey line under one option of that question (h51 #5): MUTED, smaller, indented under the option's words. */
+    private TextView planChoiceNote(String text) {
+        TextView tv = new TextView(this);
+        tv.setText(text);
+        tv.setTextColor(MUTED);
+        tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        tv.setPadding(dp(32), 0, 0, dp(6));
+        return tv;
+    }
+
+    private void addCreditsScreen(String title, String subtitle, final boolean thenSave, final Runnable onBack) {
+        LinearLayout ll = menuScreen(title, subtitle);
+
+        // NWP-20261114-21 (Q041): paste only while ClipboardManager is reachable; the clipboard_service grant is the follow-up.
+        final EditText codeF = SafeEdit.withPaste(this);
+        codeF.setHint("claim code");
+        codeF.setTextColor(FIELD_TX);
+        codeF.setHintTextColor(HINT);
+        codeF.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16);
+        codeF.setSingleLine(true);
+        GradientDrawable fbg = new GradientDrawable();
+        fbg.setColor(FIELD_BG);
+        fbg.setCornerRadius(dp(12));
+        fbg.setStroke(dp(1), FIELD_LN);
+        codeF.setBackground(fbg);
+        codeF.setPadding(dp(16), dp(14), dp(16), dp(14));
+        LinearLayout.LayoutParams flp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        flp.topMargin = dp(26);
+        ll.addView(codeF, flp);
+
+        // NWP-20261031-11: the convert-or-keep question (docs/product-decisions.md, 2026-10-20). The phone cannot know
+        // the size of the code before it redeems it, so the two options appear whenever a paid plan is live; since
+        // h51 #5 (NWP-20261125-12) their words fit a code of either size. Each option's grey line sits INSIDE the group,
+        // directly after it, so it hides and shows with the options. CONVERT is preselected. The billing line is read off
+        // the UI thread; until it answers (or when it says no live plan) the options stay hidden and Redeem sends a plain
+        // CLAIM.
+        final android.widget.RadioGroup planGroup = new android.widget.RadioGroup(this);
+        final android.widget.RadioButton convertRb = planChoiceRadio(PlanChoice.CONVERT);
+        final android.widget.RadioButton keepRb = planChoiceRadio(PlanChoice.KEEP);
+        planGroup.addView(convertRb);
+        planGroup.addView(planChoiceNote(PlanChoice.CONVERT_NOTE));
+        planGroup.addView(keepRb);
+        planGroup.addView(planChoiceNote(PlanChoice.KEEP_NOTE));
+        convertRb.setChecked(true);
+        planGroup.setVisibility(View.GONE);
+        final boolean[] planAsked = {false};
+        final boolean[] planRead = {false};
+        LinearLayout.LayoutParams plp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        plp.topMargin = dp(14);
+        ll.addView(planGroup, plp);
+
+        // NWP-20260821-09 (Chester): the action here is REDEEMING a claim code, not starting anything.
+        // "Start plan" was wrong for half its own screen -- the entry is titled "Start or EXTEND a plan",
+        // and someone already on a plan is extending it. The screen's own subtitle ("scan the QR code, or
+        // paste the code, from your purchase") and the help text at :3674 ("then REDEEM it here") already
+        // named the action correctly; only the button disagreed. The TITLES are deliberately left alone --
+        // they name the DESTINATION ("Start or extend a plan" / "Save to your store") while the button
+        // names the ACTION, which is the split the :3011 incoherence note asks for.
+        final Button add = accentBtn(thenSave ? "Redeem & save" : "Redeem");
+        LinearLayout.LayoutParams alp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        alp.topMargin = dp(14);
+        ll.addView(add, alp);
+        // NWP-20261031-11: Redeem stays off until the billing read has answered, else a tap before it would be
+        // captured as a plain CLAIM on what may be a live plan and the customer could never choose keep.
+        add.setEnabled(false);
+        new Thread(() -> {
+            final boolean ask = PlanChoice.shouldAsk(sendDaemon("GET-BILLING\n"), System.currentTimeMillis() / 1000L);
+            runOnUiThread(() -> {
+                planAsked[0] = ask;
+                planRead[0] = true;
+                add.setEnabled(true);
+                if (ask) planGroup.setVisibility(View.VISIBLE);
+            });
+        }).start();
+
+        // Scan a QR instead of typing (DIA-20260630-16): launches the Camera2 + ZXing scanner, drops the
+        // decoded code into the field. Camera permission is requested on demand by QrScanActivity.
+        final TextView scan = new TextView(this);
+        scan.setText("Scan a QR code instead");
+        scan.setTextColor(ACCENT);
+        scan.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        scan.setGravity(Gravity.CENTER);
+        scan.setPadding(0, dp(14), 0, dp(2));
+        LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        slp.topMargin = dp(2);
+        ll.addView(scan, slp);
+        scan.setOnClickListener(v -> {
+            scanTargetField = codeF;
+            try { startActivityForResult(new Intent(this, QrScanActivity.class), REQ_SCAN); }
+            catch (Throwable t) {
+                android.widget.Toast.makeText(this, "Couldn't open the scanner.", android.widget.Toast.LENGTH_SHORT).show();
+            }
+        });
+
+        final TextView msg = new TextView(this);
+        msg.setTextColor(MUTED);
+        msg.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        msg.setGravity(Gravity.CENTER);
+        msg.setLineSpacing(dp(4), 1f);
+        LinearLayout.LayoutParams mlp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        mlp.topMargin = dp(16);
+        ll.addView(msg, mlp);
+
+        add.setOnClickListener(v -> {
+            final String code = codeF.getText().toString().trim();
+            if (code.isEmpty()) { msg.setTextColor(MUTED); StatusLine.error(msg, "Paste your code first."); return; }
+            if (!planRead[0]) return;
+            // Every code is now a one-time claim code. The 32-char subscription key it used to be checked
+            // against no longer exists -- subscriptions were withdrawn, so there is nothing to discriminate.
+            add.setEnabled(false);
+            codeF.setEnabled(false);
+            convertRb.setEnabled(false);
+            keepRb.setEnabled(false);
+            final String claimReq = PlanChoice.claimRequest(code, planAsked[0], keepRb.isChecked());
+            msg.setTextColor(ACCENT);
+            // NWP-20260825-21 (Chester): "Starting your plan…" described the OUTCOME while the user waits on
+            // the ACTION, which is redeeming the claim code they just pasted -- and if it fails, nothing was
+            // started at all. He asked for "Redeeming token or something like that"; the artifact is named
+            // "code" rather than "token" deliberately. Round 8 (Chester, 2026-08-09) retired the metered unit
+            // from user-facing copy -- the comment ~20 lines below removed this very flow's token count for
+            // naming it -- and "code" is what the customer actually holds and what the errors here already
+            // call it.
+            StatusLine.busy(msg, "Redeeming code…");
+            new Thread(() -> {
+                final String r = sendDaemon(claimReq); // may take a few seconds
+                runOnUiThread(() -> {
+                    if (!r.startsWith("OK")) {
+                        add.setEnabled(true);
+                        codeF.setEnabled(true);
+                        convertRb.setEnabled(true);
+                        keepRb.setEnabled(true);
+                        final String m = claimFailMessage(r); // the copy, and why each line says what it does
+                        msg.setTextColor(MUTED);
+                        StatusLine.error(msg, m);
+                        return;
+                    }
+                    // The reply's token count is no longer parsed or shown. It was rendered as "Added N
+                    // GB-months of storage", which names the retired metered unit -- and a customer who
+                    // chose "10 GB for 3 months" has no use for "30". What they want to know is that the
+                    // plan is on, which is what the messages below say.
+                    if (thenSave) {
+                        // credit is now in the throwaway's wallet -> complete the save (promote pays with it)
+                        StatusLine.busy(msg, "Saving to your store…");
+                        new Thread(() -> {
+                            // #101: complete the save with the CEREMONY's typed pass (kept through this
+                            // detour); a missing pass (shouldn't happen) falls back to re-running the ceremony.
+                            final String sp = pendingSavePass;
+                            final String pr = sp == null ? "NOPASS"
+                                    : sendDaemon("PROMOTE2\n" + sp + "\n").trim();
+                            runOnUiThread(() -> {
+                                if (pr.startsWith("OK RECOVERY ")) {
+                                    sessionType = "STORED";
+                                    pendingSavePass = null;
+                                    showRecovery(pr.substring("OK RECOVERY ".length()).trim());
+                                } else {
+                                    add.setEnabled(true);
+                                    add.setText("Save to your store");
+                                    add.setOnClickListener(w2 -> doPromote());
+                                    msg.setTextColor(MUTED);
+                                    StatusLine.error(msg, "Your code is redeemed, but saving didn't finish — tap to try again.");
+                                }
+                            });
+                        }).start();
+                    } else {
+                        // NWP-20261014-33: a claim only FUNDS the wallet; the plan starts after the activation-jitter
+                        // window, so what to say depends on what the wallet reports now (read off the UI thread).
+                        new Thread(() -> {
+                            final String doneText = claimDoneText(sendDaemon("GET-BILLING\n"));
+                            sendDaemon("BACKUP\n"); // roam the new credit at once
+                            runOnUiThread(() -> {
+                                msg.setTextColor(ACCENT);
+                                msg.setText(doneText);
+                                add.setText("Done");
+                                add.setEnabled(true);
+                                add.setOnClickListener(w -> showStorage()); // back to the refreshed Storage view
+                            });
+                        }).start();
+                    }
+                });
+            }).start();
+        });
+
+        finishMenuScreen(ll, onBack); // NWP-20260821-14: the REAL parent, per entry point (see the wrappers)
+    }
+
+    /** "OK bytes=N" -> "X.X GB stored"; NONE/LOCAL/parse-fail -> a quiet dash. */
+    private CharSequence formatUsage(String u) {
+        // ⚠ UNMEASURED IS NOT A ZERO, and this function cannot say so in the space it has -- it returns a
+        // headline figure. The em-dash below is the honest "no answer" glyph, and the caller that HAS room
+        // for a reason renders one instead of calling this (NWP-20260915-15). Named here so the next reader
+        // does not add an UNMEASURED case that reads as "0 bytes stored".
+        if (u == null || !u.startsWith("OK")) return "—";
+        long bytes = -1;
+        for (String tok : u.split("\\s+")) {
+            if (tok.startsWith("bytes=")) {
+                try { bytes = Long.parseLong(tok.substring(6)); } catch (NumberFormatException ignore) {}
+            }
+        }
+        return bytes < 0 ? "—" : humanBytes(bytes) + " stored";
+    }
+
+    /** NWP-20261019-18: the one decision both GET-USAGE screens make -- a reason to show in place of the figure, or
+     *  null when formatUsage should render it. A failed read (failReason non-null: the socket timed out or the
+     *  daemon was unreachable) comes first, since its text is "" and says nothing; then UNMEASURED
+     *  (NWP-20260915-15); then usageNoAnswer's NONE / incomplete-OK. */
+    private static String usageReason(String text, String failReason) {
+        if (failReason != null) return "Couldn't read this — " + failReason + ".";
+        if (text != null && text.startsWith("UNMEASURED")) {
+            return "Couldn't measure this on this phone — sign out and sign in again, then try once more.";
+        }
+        return usageNoAnswer(text);
+    }
+
+    /** NWP-20261011-21: why a GET-USAGE reply the daemon DID send carries no number, or null to render it through
+     *  formatUsage exactly as before. Two replies get a reason: NONE (the daemon holds no record of the signed-in
+     *  session -- the absent .roamsession of NWP-20260910-02, which it now also logs as GET-USAGE -> NONE) and an
+     *  OK whose bytes= formatUsage cannot use. Everything else is null: an OK with a usable figure; LOCAL, which
+     *  keeps today's dash because what a throwaway session should say here is not decided in this slice; null and
+     *  "", which a caller reaches only through usageReason, where a failed read has already been given its reason
+     *  (NWP-20261019-18: both screens route a failed read and UNMEASURED through usageReason, so nothing keeps the
+     *  bare dash for a failed read); and any other reply. The copy names only this session, never whether any
+     *  other profile exists. */
+    private static String usageNoAnswer(String reply) {
+        if (reply == null) return null;
+        String r = reply.trim();
+        if (r.equals("NONE")) {
+            return "Couldn't read this — this phone has no record of the signed-in session. Try again in a moment.";
+        }
+        if (!r.startsWith("OK")) return null;
+        // Read bytes= the way formatUsage does (the last parseable token wins), so the two never disagree about
+        // which replies carry a number.
+        long bytes = -1;
+        for (String tok : r.split("\\s+")) {
+            if (tok.startsWith("bytes=")) {
+                try { bytes = Long.parseLong(tok.substring(6)); } catch (NumberFormatException ignore) {}
+            }
+        }
+        return bytes < 0 ? "Couldn't read this — the reply was incomplete." : null;
+    }
+
+    /** Compact app-store storage-headroom line from a GET-ENTITLEMENT reply ("OK used=.. free=.. entitled=..
+     *  covered=.. through=.. credit=.. gbpertoken=.." | NONE | LOCAL). Returns null when there's nothing useful
+     *  to show (no gateway/plan, free path off) so the header hides itself. */
+    static CharSequence formatHeadroom(String e, boolean withManage) {
+        if (e == null || !e.startsWith("OK")) return null;
+        long used = -1, covered = -1, credit = -1;
+        for (String tok : e.split("\\s+")) {
+            int eq = tok.indexOf('=');
+            if (eq < 0) continue;
+            try {
+                long v = Long.parseLong(tok.substring(eq + 1));
+                switch (tok.substring(0, eq)) {
+                    case "used":    used = v;    break;
+                    case "covered": covered = v; break;
+                    case "credit":  credit = v;  break;
+                }
+            } catch (NumberFormatException ignore) {}
+        }
+        if (covered <= 0) return null; // free path off / no coverage figure -> nothing meaningful
+        StringBuilder s = new StringBuilder("Storage: ");
+        s.append(humanBytes(Math.max(0, used))).append(" of ").append(humanBytes(covered)).append(" used");
+        // FULL is worth saying here, because this header sits above the store and being full is exactly
+        // what stops an install. The GB-mo credit clause it replaces was doubly wrong now: the unit is
+        // retired, and after activation the wallet is empty BY DESIGN, so the clause simply vanished for
+        // every paying customer while the Storage screen still quoted a balance.
+        if (used > covered) s.append(" · full");
+        // NWP-20261014-35: warn from >80% of covered bytes (docs/billing-plan-model.md, "Nag from >80%"), before the
+        // wall. Integer math; "full" wins past 100%. Not the local-disk colour, which is a different number.
+        else if (used * 5 > covered * 4) s.append(" · nearly full");
+        if (withManage) s.append("   Manage ›");
+        return s;
+    }
+
+    /** The "What's using space" plan warning from a GET-ENTITLEMENT reply (NWP-20261014-35): one line once the profile
+     *  has used more than 80% of what its plan covers. Null on anything but an OK with a parseable used= and a
+     *  positive covered= -- NONE, LOCAL, a blank or a malformed reply say nothing. */
+    private static String planWarning(String entitlementReply) {
+        if (entitlementReply == null) return null;
+        String r = entitlementReply.trim();
+        if (!r.startsWith("OK")) return null;
+        long used = -1, covered = -1;
+        for (String tok : r.split("\\s+")) {
+            try {
+                if (tok.startsWith("used=")) used = Long.parseLong(tok.substring(5));
+                else if (tok.startsWith("covered=")) covered = Long.parseLong(tok.substring(8));
+            } catch (NumberFormatException ignore) {}
+        }
+        if (covered <= 0 || used < 0 || used * 5 <= covered * 4) return null;
+        return "You've used " + (used * 100 / covered) + "% of your plan. Delete something or choose a larger plan "
+                + "before it fills.";
+    }
+
+    /** The Plans screen's footprint line, from a GET-ENTITLEMENT reply (NWP-20261014-34). docs/billing-plan-model.md
+     *  ("Over-plan purchases are ACCEPTED") puts the personalised warning on the DEVICE, because only the device knows
+     *  the footprint and the storefront is the identified side. Null unless the reply is an OK carrying a parseable,
+     *  non-negative used= -- NONE, LOCAL, UNKNOWN, a blank or a malformed reply say nothing rather than a guessed number. */
+    private static String plansFootprintNote(String entitlementReply) {
+        if (entitlementReply == null) return null;
+        String r = entitlementReply.trim();
+        if (!r.startsWith("OK")) return null;
+        long used = -1;
+        for (String tok : r.split("\\s+")) {
+            if (tok.startsWith("used=")) {
+                try { used = Long.parseLong(tok.substring(5)); } catch (NumberFormatException ignore) {}
+            }
+        }
+        if (used < 0) return null;
+        return "This profile stores " + humanBytes(used) + ". A plan smaller than that is full from the start: "
+                + "you can't add more until you delete something or choose a larger plan.";
+    }
+
+    private static String humanBytes(long b) {
+        if (b >= (1L << 30)) return String.format(java.util.Locale.US, "%.1f GB", b / (double) (1L << 30));
+        if (b >= (1L << 20)) return String.format(java.util.Locale.US, "%.0f MB", b / (double) (1L << 20));
+        if (b >= (1L << 10)) return String.format(java.util.Locale.US, "%.0f KB", b / (double) (1L << 10));
+        return b + " B";
+    }
+
+    // 1 GB as this screen counts it: humanBytes is binary (1.0 GB = 2^30), and the gateway's free allowance is 1 GiB per ref. The decided measure (docs/product-decisions.md 2026-10-19 item 4) is the WHOLE profile, so it is compared with the phone's own GET-USAGE total, never a gateway figure.
+    private static final long FREE_ALLOWANCE_BYTES = 1L << 30;
+
+    /** The free-tier line for a stored profile with no local wallet (NWP-20261028-04). At or under the allowance, or
+     *  not measured yet (occupied &lt; 0), it is the old line. Over it, with the gateway answered and no plan
+     *  (entitled == 0), it says the profile is over and what to do. Over it at entitled -1 (the first paint, not
+     *  asked) it is a fact about size only -- no tier, no plan -- so the two-paint rule's "the first one may not
+     *  accuse" holds. What being over DOES is the open question of docs/product-decisions.md 2026-10-19 item 4,
+     *  and nothing here says. */
+    private static String freeTierLine(long occupied, long entitled) {
+        if (occupied <= FREE_ALLOWANCE_BYTES) {
+            return "On the free tier — this profile roams within the free allowance, at no cost. "
+                    + "Start a plan to store more, or to keep it longer.";
+        }
+        if (entitled != 0) {
+            return "This profile holds " + humanBytes(occupied) + ", more than the 1 GB free allowance.";
+        }
+        return "On the free tier — this profile holds " + humanBytes(occupied) + ", over the 1 GB free allowance. "
+                + "Free up space, or start a plan to store more.";
+    }
+
+    /** What this profile may still ADD, from the phone's own occupied total (NWP-20261103-10, Q082 in
+     *  docs/product-decisions.md 2026-10-20). Read-only on a lapsed plan IS the over-limit size gate: coverage falls
+     *  to the free allowance, so over it nothing new may be added (viewing and deleting always stay), and at or
+     *  under it the profile keeps adding up to 1 GB, as a free one does. Same threshold as freeTierLine, so the two
+     *  never disagree about one total. Not measured yet (occupied &lt; 0, GET-USAGE has not answered) says nothing:
+     *  the first paint may neither accuse nor promise, and the GET-USAGE repaint fills it in. */
+    private static String addAllowanceLine(long occupied) {
+        if (occupied < 0) return "";
+        if (occupied > FREE_ALLOWANCE_BYTES) return "Read-only — you can view and delete, but not add.";
+        return "The free allowance covers this profile: you can keep adding up to 1 GB.";
+    }
+
+    /** Render a GET-BILLING reply ("OK credit=N through=E epochsec=S sub=0" | "NONE") into the Storage body.
+     *
+     *  WORDING (round 8, Chester, 2026-08-09): the screen states a SIZE and a TIME REMAINING, and never a
+     *  balance. The customer bought "10 GB for 3 months"; that is what they are shown.
+     *
+     *  The history, because the reasoning is easy to redo and land back where this started:
+     *  - It used to close with "Renews weekly", which described the internal RENT EPOCH but read as a
+     *    recurring CHARGE. Gone with subscriptions.
+     *  - It then presented "N GB-months" with a gloss defining the unit, on the argument that the balance is
+     *    the only quantity surviving offline. That argument was sound and is now moot: a term is bought
+     *    OUTRIGHT, so the wallet is empty by design and the balance has nothing left to say to its owner.
+     *    Worse, the unit is what made elastic duration legible -- anyone doing arithmetic on "30 GB-months"
+     *    could work out their "3 months" was not 3 months.
+     *  - What survives offline now is `through`/`deadline`/`plangb`, all cached in the wallet by the agent,
+     *    so the screen still renders with no gateway round-trip.
+     *  ⚠ `credit=` is STILL on the wire and is deliberately ignored here. It carries remaining plan
+     *  GB-months purely so a chooser OLDER than v45 does not tell a customer who just bought a year that
+     *  they have "No credit left". Delete the shim only after the whole fleet is past v44.
+     *  Every plan is a one-time purchase of a fixed term (round 5), so the phone states the type without
+     *  needing to know anything the gateway knows: there is only one type. The `sub=` field the agent still
+     *  sends is a compatibility literal for OLDER choosers and is ignored here. Payment stays decoupled from
+     *  the profile (the ZK note above showPlans), so nothing on this screen costs unlinkability -- the wallet
+     *  is the user's own device state.
+     *
+     *  ⚠ THE PARAGRAPH THAT STOOD HERE WAS WRONG AGAINST THE CURRENT SERVER, AND IT COST A DAY.
+     *  It said: do not source a "size you bought" headline from GET-ENTITLEMENT's `entitled`, because that is
+     *  capacity the gateway has already CHARGED -- "ledger.go RedeemEntitled accumulates only the tokens a lease
+     *  consumed", so "a 10 GB purchase with 3 GB stored reports ~2 GB". That describes a ledger shape that was
+     *  REMOVED. RedeemEntitled now APPENDS the DECLARED purchase size and never counts consumed tokens
+     *  (nowhere-cloud internal/ledger/ledger.go, whose own comment reads "APPEND, never accumulate. The old shape
+     *  did `e.GB += addGB`"), and `entitled_bytes = LiveGB(now) * GBPerToken * GiB` where LiveGB is the largest
+     *  LIVE grant. So `entitled` IS the purchased plan size, account-level, identical on every handset.
+     *  Only the clause "it zeroes when the window lapses" survives -- LiveGB filters on ThroughEpoch >= now.
+     *  The stale paragraph was quoted forward into docs/backlog.md on 2026-09-07 as guidance for the very fix
+     *  it would have blocked; both were corrected the same day (NWP-20260907-02). Two caveats for whoever does
+     *  source a headline from it: `covered` is max(free, plan), so a free profile reads 1 GiB rather than 0; and
+     *  a lapsed plan reads 0, which must not be rendered as "0 GB plan".
+     *
+     *  The purchased size IS held on the device now -- round 8 added `Wallet.PlanGB`, the agent ships it on the
+     *  billing line as `plangb=`, and this method renders it as "N GB plan" a few lines below. (This comment
+     *  used to end "the purchased size is not a number this device currently holds ... filed as a follow-up",
+     *  sitting thirty lines above the code that reads exactly that number.) */
+    /** entitled is the gateway's own answer from GET-ENTITLEMENT, or -1 when it has not answered yet.
+     *
+     *  ⚠ -1 IS NOT 0, AND THE DIFFERENCE IS THE WHOLE POINT. -1 means "not asked yet, or could not ask";
+     *  0 means the gateway answered and holds no entitlement for this profile. Collapsing them would
+     *  accuse a paying customer of having no plan every time the network was slow -- the two-states-one-
+     *  glyph bug NWP-20260826-01 exists to prevent, and the exact inverse of the fix at :2803 that
+     *  established "couldn't check" must mean it actually could not, NOW.
+     *
+     *  And -1 is not "> 0" either (NWP-20261117-22). With a live wallet term it renders only the past-tense
+     *  "bought through" line -- no days left, no "Expires", no wallet sentence -- until the gateway answers, so
+     *  the first paint states nothing the second may have to withdraw (NWP-20260918-08/-09's rule: a pending
+     *  state never renders as a settled answer). An unreachable gateway keeps -1, and so keeps that line. */
+    private CharSequence formatBilling(String r, long entitled) {
+        if (r == null || !r.startsWith("OK")) {
+            // ⚠ `r` IS THE LOCAL WALLET READ (GET-BILLING), NOT THE GATEWAY. See :4236 -- "GET-BILLING
+            // (local wallet read) paints the plan summary; GET-ENTITLEMENT (gateway) fills the coverage line
+            // above it". Reaching here means THIS PHONE holds no purchased term. It says nothing whatever
+            // about what the server thinks, and `entitled` is the parameter that does.
+            //
+            // NWP-20260918-06: THIS BRANCH USED TO IGNORE `entitled` ENTIRELY and claim the free tier, with
+            // the gateway's own answer sitting unread in the next parameter.
+            //
+            // ⚠⚠ AND IT IS REACHED BY DESIGN, NOT ONLY BY ACCIDENT. `#wallet` is deliberately excluded from
+            // profileFootprint, so EVERY RESTORED PROFILE arrives with no local wallet -- holding a live
+            // grant on the server and nothing on the phone. That is the state this used to mis-render.
+            //
+            // ⚠ NWP-20260918-02 retracted: it added an "UNKNOWN" arm here, which was dead code. UNKNOWN is a
+            // GET-ENTITLEMENT reply and can never appear in `r`. Removed rather than left sitting.
+            if (entitled > 0) {
+                // THE SERVER HOLDS A PLAN THIS PHONE DOES NOT -- the exact inverse of the state
+                // NWP-20260915-19 renders below (phone holds one the server will not stand behind).
+                //
+                // VOCABULARY, and each exclusion is a claim someone would otherwise have made:
+                //   NOT "On the free tier ... at no cost" -- they paid, and coverage is live.
+                //   NOT "couldn't check"                  -- the gateway answered, promptly and truthfully.
+                //   NOT "your data is at risk"            -- it is covered; saying otherwise would alarm for
+                //                                           nothing and invite a SECOND purchase.
+                // So: state the coverage as fact, and locate the gap where it actually is -- this handset's
+                // wallet, not the account.
+                final long gb = entitled / (1024L * 1024L * 1024L);
+                return (gb > 0 ? gb + " GB" : "A") + " plan is active for this profile on our servers, and "
+                        + "your data is covered by it. This phone isn't holding the plan itself — it lives "
+                        + "in your roaming wallet, and this device doesn't have a copy. You don't need to "
+                        + "buy anything.";
+            }
+            // entitled == 0 : the gateway answered and holds no grant -> the free tier really is the answer.
+            // entitled == -1: NOT ASKED YET (the first paint passes -1 deliberately, :4241-4245) or the
+            //                 gateway could not be reached. Render as it always has -- this is the arm the
+            //                 two-paint rule exists to protect, and accusing here is what NWP-20260915-19
+            //                 and NWP-20260826-01 both forbid.
+            //
+            // No plan -- but that is NOT "not roaming". A promoted profile roams on the free tier
+            // (token-less leases within the free allowance), so it IS kept alive without paying anything.
+            // Only a throwaway (LOCAL, not yet promoted) truly isn't stored yet.
+            //
+            // ⚠ VOCABULARY: this branch said "Add credit", which round 8 retired everywhere else and which
+            // sat one line above a button now reading "Start or extend a plan" -- caught on the flashed
+            // build, not in review, because it is the EARLY RETURN and the round-8 rewrite only touched the
+            // parsed path below. A customer buys a plan; there is no balance to add to.
+            if ("STORED".equals(sessionType)) {
+                // NWP-20261028-04 (item 4): over 1 GB of the phone's own total, the line says so (freeTierLine).
+                return freeTierLine(occupiedBytes, entitled);
+            }
+            return "Not stored yet. Save this profile and it roams on the free tier (free within the "
+                    + "included allowance); start a plan for more.";
+        }
+        // sub= is no longer parsed. Subscriptions were withdrawn, so every wallet is prepaid and there is no
+        // longer a claim to get wrong -- the agent still emits a literal sub=0 purely so that a chooser OLDER
+        // than this one keeps rendering correctly, and it is ignored here.
+        // epochsec DEFAULTS TO THE WEEKLY 604800 ON PURPOSE, even though the gateway and agent went daily
+        // in DIA-20260808-12. This default is only reachable when the field is ABSENT, which means a
+        // daemon old enough to predate `epochsec=` -- and those were weekly. Every agent that emits the
+        // field sends its own real value, so the live clock always wins. Do not "fix" this to 86400: that
+        // would mis-date exactly the old-daemon case it exists for.
+        long credit = -1, through = -1, epochsec = 604800, deadline = -1, plangb = -1;
+        long periods = -1, pending = 0, moving = 0;
+        for (String tok : r.split("\\s+")) {
+            int eq = tok.indexOf('=');
+            if (eq < 0) continue;
+            try {
+                long v = Long.parseLong(tok.substring(eq + 1));
+                switch (tok.substring(0, eq)) {
+                    case "credit":   credit = v;   break;
+                    case "through":  through = v;  break;
+                    case "epochsec": epochsec = v; break;
+                    case "deadline": deadline = v; break;
+                    case "plangb":   plangb = v;   break;
+                    case "periods":  periods = v;  break;
+                    // NWP-20260918-08: "funded and not yet activated". ABSENT means not pending, so an
+                    // agent that predates the field leaves this 0 and the screen behaves as it does today.
+                    case "pending":  pending = v;  break;
+                    // NWP-20261103-11 (Q147): a rebind is outstanding inside the cooldown (the agent's own
+                    // `moving=<unix>`, from the sealed record of the credential change alone). ABSENT or
+                    // unparsable means NOT moving, so an agent that predates it leaves this 0.
+                    case "moving":   moving = v;   break;
+                }
+            } catch (NumberFormatException ignore) {}
+        }
+        // WHAT THE CUSTOMER BOUGHT: a size and a term. Not credit, not GB-months.
+        //
+        // The screen used to state a balance in GB-months with a gloss defining the unit. That unit is what
+        // made elastic duration legible -- a customer who can do arithmetic on it can work out their "3
+        // months" is not 3 months -- and it names a metered model that no longer exists. Round 8 fixed the
+        // model; this stops the screen contradicting it.
+        final long nowEp = epochsec > 0 ? System.currentTimeMillis() / 1000L / epochsec : 0;
+        final java.text.DateFormat df = java.text.DateFormat.getDateInstance(java.text.DateFormat.MEDIUM);
+        StringBuilder sb = new StringBuilder();
+        if (through <= 0 && pending > 0) {
+            // NWP-20260918-08: A CUSTOMER WHO HAS JUST PAID MUST NOT SEE THE SAME WORDS AS ONE WHO HAS NOT.
+            //
+            // `through = 0` is "never leased", and it stays 0 for the whole activation-jitter window -- up
+            // to two days in which the purchase is recorded and simply has not started. The screen said
+            // "Not leased yet" and named nothing, which is how the first person to meet it assumed a
+            // regression. The jitter is a privacy defence (a redemption must not be matchable to a purchase
+            // by timestamp), so the fix is to SAY WHAT IS HAPPENING, never to shorten the wait.
+            //
+            // ⚠ THE REASON IS NOT EXPLAINED, DELIBERATELY. "We are hiding the link between your payment and
+            // your profile" is true and is not something to put in front of someone wondering where their
+            // money went. State the fact they need -- it is bought, it starts shortly, the wait costs them
+            // nothing -- and leave the mechanism to the docs.
+            sb.append(plangb > 0 ? plangb + " GB plan" : "Plan");
+            if (periods > 0) sb.append(" · ").append(periods).append(periods == 1 ? " month" : " months");
+            sb.append("\nPurchased — starting shortly. Your term is measured from when it starts, so "
+                    + "nothing is lost by the wait.");
+        } else if (through <= 0) {
+            sb.append("Not leased yet");
+        } else if (through >= nowEp && entitled == 0) {
+            // ⚠ THE DEVICE HOLDS A PLAN THE GATEWAY DOES NOT. Entitlement grants are keyed on
+            // profileRefV2(name, passphrase), so they do NOT follow a passphrase change: after a rotation or a
+            // recovery the profile is a stranger to the server, and the term in the wallet -- which the device
+            // correctly carried across -- is no longer coverage anyone will honour.
+            //
+            // PAST TENSE ABOUT THE PURCHASE, never present tense about coverage. "274 days left" is a claim
+            // about what the server will do; "bought through" is a fact about what the customer did, and the
+            // wallet can stand behind it.
+            sb.append(plangb > 0 ? plangb + " GB plan" : "Plan");
+            sb.append(" — bought through ").append(df.format(new java.util.Date((through + 1) * epochsec * 1000L)));
+            // The cause is NOT named. The device cannot tell a credential change from a lost grant or a
+            // divergence between two handsets, and naming one would be an inference rendered as a fact.
+            //
+            // It must not say "Plan expired" -- that is false while the grant is alive under the old key, and
+            // it routes the customer to buy a SECOND plan. Nor "On the free tier ... at no cost": they paid.
+            // Nor any "couldn't read this" wording: the gateway answered, promptly and truthfully.
+            if (moving > 0) {
+                // NWP-20261103-11 (Q147): the change is on its way, so do not say the servers do not show the
+                // plan. Still no cause named beyond the move itself, which this phone's own record states.
+                sb.append("\nYour plan is moving to your new passphrase. That can take up to 7 days after a "
+                    + "change; until then the free allowance covers your data.");
+            } else {
+                sb.append("\nOur servers don't show this plan against this profile. Until that's sorted, only the "
+                    + "free allowance is covering your data.");
+            }
+            // Q082: what it may still add follows from size, not from the plan (addAllowanceLine).
+            final String strangerAdd = addAllowanceLine(occupiedBytes);
+            if (!strangerAdd.isEmpty()) sb.append("\n").append(strangerAdd);
+            if (deadline > 0) {
+                // Straight from the gateway's ledger, same rule as the expired branch below: a date the
+                // collector disagrees with is worse than no date at all.
+                sb.append("\nYour data is kept until ")
+                    .append(df.format(new java.util.Date((deadline + 1) * epochsec * 1000L)))
+                    .append(".");
+            }
+        } else if (through >= nowEp && entitled < 0) {
+            // NWP-20261117-22: NOT ASKED YET (the first paint) OR THE GATEWAY COULD NOT BE REACHED. The wallet can
+            // stand behind the purchase and nothing more, so the term is stated in the PAST TENSE, as the arm above
+            // states it. "354 days left" here is a settled answer the gateway has not given, and the second paint
+            // withdrew it on hardware (lynx 2026102901, inside the rebind cooldown). It does NOT accuse either: no
+            // servers or moving sentence, no allowance line, no deadline -- the two-paint rule (NWP-20260915-19).
+            sb.append(plangb > 0 ? plangb + " GB plan" : "Plan");
+            sb.append(" — bought through ").append(df.format(new java.util.Date((through + 1) * epochsec * 1000L)));
+        } else if (through >= nowEp) {
+            // LIVE, and the gateway shows a plan (entitled > 0: the two arms above take 0 and -1). Lead with the
+            // time remaining, because that is the thing that runs out; the date is the detail underneath it. Days,
+            // not epochs -- epochsec is the unit the wire speaks, never the user.
+            long left = through - nowEp;
+            sb.append(plangb > 0 ? plangb + " GB plan" : "Plan");
+            sb.append(" · ").append(left <= 0 ? "expires today"
+                    : left == 1 ? "1 day left" : left + " days left");
+            sb.append("\nExpires ").append(df.format(new java.util.Date((through + 1) * epochsec * 1000L)));
+            // NWP-20261120-10 (h48 #9): the plans in the order they run, e.g. a kept 10 GB term after a 50 GB one.
+            final String runOrder = PlanRunOrder.line(r, df);
+            if (runOrder != null) sb.append("\n").append(runOrder);
+        } else {
+            // OUT OF TIME is not out of SPACE. Read-only is the over-limit size gate (Q082): coverage falls to the
+            // free allowance, so "Read-only" shows only over it, and under it the profile keeps adding up to 1 GB.
+            // Never locked out -- someone who cannot delete cannot rescue their own data, which is why deleting
+            // always stays available. An unmeasured total says nothing about adding (addAllowanceLine).
+            sb.append("Plan expired ")
+              .append(df.format(new java.util.Date((through + 1) * epochsec * 1000L)));
+            final String lapsedAdd = addAllowanceLine(occupiedBytes);
+            if (!lapsedAdd.isEmpty()) sb.append("\n").append(lapsedAdd);
+            if (deadline > 0) {
+                // The ONLY line on this screen naming a deletion date, so it comes straight from the
+                // gateway's ledger (deadline=) rather than being derived here. A date the collector
+                // disagrees with is worse than no date at all.
+                sb.append("\nYour data is kept until ")
+                  .append(df.format(new java.util.Date((deadline + 1) * epochsec * 1000L)))
+                  .append(".");
+            }
+        }
+        // Unconditional now: every plan is a one-time purchase of a fixed term, so there is no recurring case
+        // left to distinguish. This used to be gated on sub=, which had to be right in BOTH directions --
+        // telling a subscriber "nothing renews" would hide a recurring charge, and telling a prepaid buyer it
+        // renews would invent one. Only the second reading survives, and it is now always the true one.
+        // "Prepaid", not "One-time top-up": the 12-month term is also a single prepaid purchase (y10 = 120
+        // GB-months bought outright), so on-device it is indistinguishable from a 3-month one -- both are just
+        // tokens in the wallet, and only the paid-through date differs. "Prepaid" is true of both; "one-time"
+        // would read as wrong to someone who deliberately bought a year. Printing the literal plan name needs
+        // the claim to carry it and the wallet to keep it at redeem time (local-only, costs no unlinkability)
+        // -- a follow-up, not something to guess at from the credit balance.
+        // "your credit is used up as your data is stored" was the metered model stated outright, and it was
+        // the most direct contradiction of the decision on the whole device. A term is consumed by TIME.
+        sb.append("\nPrepaid — one purchase, no card kept on file, and nothing renews by itself.");
+        // The purchase quantity, from the LOCAL wallet. It has to be stated here, in this unit, because nothing
+        // else on the screen survives being offline: the "Plan covers X" line above comes from the gateway and
+        // vanishes on any error, which for an amnesiac phone is a normal state, not an edge case. The parenthetical
+        // is the whole point -- a GB-month is two-dimensional (10 GB-months is 10 GB for a month OR 1 GB for ten),
+        // and stating one concrete reading is what stops "10 GB-months" reading as "ten months of something".
+        // The GB-months balance is GONE from this screen. `credit=` is still on the wire -- a compatibility
+        // shim so a chooser OLDER than this one does not tell a customer who just bought a year that they
+        // have "No credit left" -- and it is deliberately ignored here. A term is bought outright, so a
+        // balance is an implementation detail with nothing left to say to its owner.
+        //
+        // The one case worth surfacing is a PURCHASE THAT HAS NOT STARTED: a claim was redeemed but the term has
+        // not activated yet (the jitter window, or a wallet that cannot fund the plan it recorded). Saying
+        // nothing there looks like the purchase vanished.
+        //
+        // ⚠ NWP-20261010-09: KEYED ON THE AGENT'S `pending=`, NOT ON "NO LIVE PLAN". This used to fire only for
+        // `credit > 0 && through < nowEp`, so a purchase made while a plan was LIVE -- an extension, the common
+        // case for a returning customer -- was shown nowhere for up to two days. Chester's frankel, 2026-10-10,
+        // ticket NW-27e1775efecd: "Just redeemed a 50gb 3 month plan, don't see it in storage yet", with the
+        // claim sealed durably in the same report. `pending=` is the agent's own planPending() (see the first
+        // branch above); `credit > 0 && through < nowEp` stays as the fallback for an agent predating it.
+        //
+        // And "begins the next time this profile syncs" was false: activation waits out the jitter, up to two
+        // days, so the next sync usually starts nothing. The first branch's wording is the reference.
+        boolean waiting = pending > 0 || (credit > 0 && through < nowEp);
+        if (waiting && !(through <= 0 && pending > 0)) { // that branch has already said it, as its headline
+            if (through >= nowEp) {
+                // The renewal STACKS: the gateway adds the bought term after the live one's end (nowhere-cloud
+                // handleEntitledLease, "RENEWAL STACKS from the current expiry"; the decided model the #90 row
+                // names), so the wait costs nothing.
+                sb.append("\n\nAnother purchase is waiting to start — it starts shortly and is added on after "
+                        + "your current plan, so nothing is lost by the wait.");
+            } else {
+                sb.append("\n\nA purchase is waiting to start — it starts shortly. Your term is measured from "
+                        + "when it starts, so nothing is lost by the wait.");
+            }
+        }
+        // Shown only when actionable, and deliberately NOT phrased against the paid-through date: with no credit
+        // the lease falls back to the FREE tier, which keeps the data alive for free while it fits the allowance
+        // and leaves `through` frozen -- so "keep your data past this date" would both point at a stale date and
+        // claim a loss that has not happened. The subscriber exclusion that used to be ANDed in here went with
+        // subscriptions -- but do NOT drop the credit==0 test itself, or the notice fires on every screen.
+        // The old "No credit left — top up…" notice is gone with the balance it was about. After activation
+        // the wallet is EMPTY BY DESIGN, so keying a warning on credit == 0 would fire at every paying
+        // customer on every screen. Out-of-time is already stated above, where it is true.
+        // ⚠ SUPPRESSED when the gateway does not corroborate the plan: it is the one sentence on this
+        // screen that is actively FALSE in that state. The plan does not live only on this phone -- the
+        // entitlement that backs it lives on the server, under a key this profile no longer presents, which
+        // is precisely why the screen is having to say anything at all. Held back on the first paint too
+        // (entitled -1, NWP-20261117-22): before the gateway answers it is a settled answer nobody has given.
+        if (!(through >= nowEp && entitled <= 0)) {
+            sb.append("\n\nYour plan lives on this phone, in your roaming wallet — not in an account.");
+        }
+        return sb;
+    }
+
+    // ---- Timezone picker (DIA-20260616-60; docs/timezone-model.md). Timezone follows WHERE YOU ARE -- automatic
+    // by default, with an optional per-profile OVERRIDE the user picks here. A pick is (a) written to the roamed
+    // prefs so it follows the identity (applied by the user-0 device owner on every login) AND (b) applied LIVE via
+    // the daemon -> su:s0 worker (a secondary-user app can't set the global zone; root can, immediately). Picking
+    // "Automatic" clears the override -> auto-detection (NITZ on a SIM device / geo) with the baked default as floor.
+    private java.util.List<String> zoneIds; // canonical Olson IDs, sorted (lazy)
+
+    private java.util.List<String> zones() {
+        if (zoneIds == null) {
+            java.util.ArrayList<String> z = new java.util.ArrayList<>();
+            for (String id : java.util.TimeZone.getAvailableIDs()) {
+                if (id.indexOf('/') < 0) continue;                       // drop bare "PST"/"UTC"
+                if (id.startsWith("Etc/") || id.startsWith("SystemV/")) continue;
+                z.add(id);
+            }
+            java.util.Collections.sort(z);
+            zoneIds = z;
+        }
+        return zoneIds;
+    }
+
+    /** "America/New York  (GMT-05:00)" -- current offset incl. DST. */
+    private String zoneLabel(String id) {
+        return ZoneSearch.label(id, java.util.TimeZone.getTimeZone(id).getOffset(System.currentTimeMillis()) / 60000);
+    }
+
+    private void showTimezonePicker() {
+        LinearLayout ll = new LinearLayout(this);
+        ll.setOrientation(LinearLayout.VERTICAL);
+        ll.setBackgroundColor(BG);
+        ll.setPadding(dp(24), dp(40), dp(24), dp(24));
+
+        TextView t = new TextView(this);
+        t.setText("Time zone");
+        t.setTextColor(INK);
+        t.setTextSize(TypedValue.COMPLEX_UNIT_SP, 24);
+        t.setGravity(Gravity.CENTER);
+        ll.addView(t, new LinearLayout.LayoutParams(MATCH, WRAP));
+
+        String cur = readPrefValue("tz");
+        TextView curTv = new TextView(this);
+        curTv.setText("Currently: " + (cur.isEmpty() ? "Automatic (your location)" : cur));
+        curTv.setTextColor(MUTED);
+        curTv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        curTv.setGravity(Gravity.CENTER);
+        LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        clp.topMargin = dp(4); clp.bottomMargin = dp(16);
+        ll.addView(curTv, clp);
+
+        final EditText search = textField("search a city or region — e.g. Tokyo, London");
+        ll.addView(search, fieldLp(dp(14)));
+
+        final LinearLayout list = new LinearLayout(this);
+        list.setOrientation(LinearLayout.VERTICAL);
+        ll.addView(list, new LinearLayout.LayoutParams(MATCH, WRAP));
+
+        final Runnable rebuild = new Runnable() {
+            @Override public void run() {
+                list.removeAllViews();
+                String q = search.getText().toString().trim();
+                if (ZoneSearch.automaticMatches(q)) {
+                    list.addView(zoneRow("Automatic — use your location", ""));
+                }
+                int shown = 0;
+                for (String id : zones()) {
+                    if (shown >= 60) break;
+                    if (ZoneSearch.matches(id, q)) {
+                        list.addView(zoneRow(zoneLabel(id), id));
+                        shown++;
+                    }
+                }
+                if (q.isEmpty()) {
+                    TextView more = new TextView(ProfileActivity.this);
+                    more.setText("…type to find more");
+                    more.setTextColor(MUTED);
+                    more.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+                    more.setPadding(dp(6), dp(10), dp(6), dp(2));
+                    list.addView(more);
+                }
+            }
+        };
+        search.addTextChangedListener(new android.text.TextWatcher() {
+            @Override public void afterTextChanged(android.text.Editable s) { rebuild.run(); }
+            @Override public void beforeTextChanged(CharSequence s, int a, int b, int c) {}
+            @Override public void onTextChanged(CharSequence s, int a, int b, int c) {}
+        });
+        rebuild.run();
+
+        TextView back = new TextView(this);
+        back.setText("Back");
+        back.setTextColor(ACCENT);
+        back.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        back.setGravity(Gravity.CENTER);
+        back.setPadding(dp(8), dp(20), dp(8), dp(8));
+        ll.addView(back, new LinearLayout.LayoutParams(MATCH, WRAP));
+        back.setOnClickListener(v -> showPreferences());
+
+        android.widget.ScrollView sc = new android.widget.ScrollView(this);
+        sc.setBackgroundColor(BG);
+        sc.addView(ll);
+        setContentView(sc);
+    }
+
+    /** A tappable zone row; olson="" means Automatic. */
+    private TextView zoneRow(String label, final String olson) {
+        TextView r = new TextView(this);
+        r.setText(label);
+        r.setTextColor(INK);
+        r.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
+        r.setPadding(dp(6), dp(13), dp(6), dp(13));
+        r.setOnClickListener(v -> setTzAndApply(olson));
+        return r;
+    }
+
+    /** Persist the override to the roamed prefs (so it follows the identity) AND apply it live via the daemon. */
+    private void setTzAndApply(final String olson) {
+        final boolean saved = writeTzOverride(olson);
+        // NWP-20261025-09: the toast says what happened -- applied now, saved for the next sign-in (the gate applies
+        // the roamed tz= then), or not saved -- instead of "Time zone: X" before the reply, whatever the reply was.
+        new Thread(() -> {
+            final String reply = saved ? sendDaemon("SET-TZ\n" + olson + "\n") : ""; // live: daemon -> su:s0 worker
+            runOnUiThread(() -> android.widget.Toast.makeText(this,
+                    ProfileReplies.tzToast(saved, reply, olson), android.widget.Toast.LENGTH_SHORT).show());
+        }).start();
+        showPreferences();
+    }
+
+    /** Override ONE roamed pref and rewrite nowhere-prefs whole, preserving every other key (tz / locale /
+     *  idle / wipe) -- so changing one setting can never silently drop another. (DIA-20260626-03) */
+    // ---- #159 (DIA-20260721): per-profile always-on VPN. The user picks an installed VPN app; the user-0 login path
+    //  (roamd vpnup) re-establishes it for the fresh roamed user via IVpnManager (writing the secure setting alone is
+    //  NOT honored for a not-yet-prepared roamed user). The chosen app's own tunnel config roams in its sealed CE data;
+    //  the user turns the tunnel on once so the app has a designated tunnel for always-on to bring up.
+    //
+    //  NWP-20261010-15: the always-on app AND its "Block connections without VPN" choice now roam as the user left
+    //  them (docs/product-decisions.md, 2026-10-10): roamd captures the LIVE pair at every seal into nowhere-vpn and
+    //  applies it at the next sign-in. This picker no longer writes vpn=/vpnlockdown=1 into nowhere-prefs -- a pref it
+    //  wrote there would lose to that capture, since picking does not change the live setting. It writes a one-shot
+    //  PICK, nowhere-vpn-pick, which roamd applies at the next sign-in ahead of the capture and then removes. It shows
+    //  the choice in effect (a pending pick, else the live setting, else the old pref) and keeps that choice's block
+    //  setting for whatever app is picked; a profile with no always-on VPN yet gets the block on, armed at the
+    //  tunnel's first connection (the privacy floor, never a cut-off before the tunnel is up).
+    private void showVpnPicker() {
+        // An image with no helper (Diaspore ships none) cannot apply a pick at all: say so instead of promising it.
+        String unsupported = vpnUnsupportedText(new java.io.File(VPN_HELPER_JAR).isFile());
+        if (unsupported != null) {
+            android.widget.Toast.makeText(this, unsupported, android.widget.Toast.LENGTH_LONG).show();
+            showSecurity(); return;
+        }
+        final java.util.List<String> pkgs = new java.util.ArrayList<>();
+        final java.util.List<String> labels = new java.util.ArrayList<>();
+        pkgs.add(""); labels.add("Off");
+        try {
+            android.content.Intent vi = new android.content.Intent("android.net.VpnService");
+            for (android.content.pm.ResolveInfo ri : getPackageManager().queryIntentServices(vi, 0)) {
+                if (ri.serviceInfo == null) continue;
+                if (!"android.permission.BIND_VPN_SERVICE".equals(ri.serviceInfo.permission)) continue;
+                String p = ri.serviceInfo.packageName;
+                if (!pkgs.contains(p)) { pkgs.add(p); labels.add(appLabel(p)); }
+            }
+        } catch (Throwable t) { android.util.Log.w("NowhereChooser", "vpn enum", t); }
+        if (pkgs.size() == 1) {
+            android.widget.Toast.makeText(this, "No VPN app installed yet — install one, set up a tunnel, then pick it here",
+                    android.widget.Toast.LENGTH_LONG).show();
+            showSecurity(); return;
+        }
+        final String[] current = vpnCurrent();
+        int sel = Math.max(0, pkgs.indexOf(current[0]));
+        new android.app.AlertDialog.Builder(this)
+                .setTitle("Always-on VPN")
+                .setSingleChoiceItems(labels.toArray(new String[0]), sel, null)
+                .setPositiveButton("Save", (d, w) -> {
+                    int idx = ((android.app.AlertDialog) d).getListView().getCheckedItemPosition();
+                    if (idx < 0) idx = 0;
+                    String pkg = pkgs.get(idx);
+                    String lock = vpnPickLockdown(current, pkg);
+                    android.widget.Toast.makeText(this, writeVpnPick(pkg, lock)
+                            ? vpnPickToast(labels.get(idx), pkg, lock)
+                            : "Couldn't save the VPN choice — try again",
+                            android.widget.Toast.LENGTH_LONG).show();
+                    showSecurity();
+                })
+                .setNegativeButton("Cancel", (d, w) -> showSecurity())
+                .show();
+    }
+
+    /** The always-on VPN choice in effect for this profile: {app ("" = none), block "0"/"1"}. See vpnCurrentFrom. */
+    private String[] vpnCurrent() {
+        String pick = null;
+        java.io.File f = new java.io.File(getFilesDir(), "nowhere-vpn-pick");
+        if (f.isFile()) {
+            try {
+                pick = new String(java.nio.file.Files.readAllBytes(f.toPath()), java.nio.charset.StandardCharsets.UTF_8);
+            } catch (Exception e) {
+                android.util.Log.w("NowhereChooser", "vpn pick read", e);
+            }
+        }
+        boolean liveRead = false;
+        String liveApp = null, liveLock = null, livePend = null;
+        try {
+            android.content.ContentResolver cr = getContentResolver();
+            liveApp = android.provider.Settings.Secure.getString(cr, "always_on_vpn_app");
+            liveLock = android.provider.Settings.Secure.getString(cr, "always_on_vpn_lockdown");
+            livePend = android.provider.Settings.Secure.getString(cr, "nowhere_vpn_lockdown_pending");
+            liveRead = true;
+        } catch (Throwable t) {
+            android.util.Log.w("NowhereChooser", "vpn live read", t);
+        }
+        return vpnCurrentFrom(pick, liveRead, liveApp, liveLock, livePend,
+                readPrefValue("vpn"), readPrefValue("vpnlockdown"));
+    }
+
+    /** Write the one-shot pick roamd applies at the next sign-in (rename, so roamd never reads half a file). */
+    private boolean writeVpnPick(String pkg, String lock) {
+        java.io.File dir = getFilesDir();
+        java.io.File tmp = new java.io.File(dir, "nowhere-vpn-pick.tmp");
+        try (java.io.FileOutputStream o = new java.io.FileOutputStream(tmp)) {
+            o.write(vpnPickText(pkg, lock).getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        } catch (Exception e) {
+            android.util.Log.w("NowhereChooser", "vpn pick write", e);
+            tmp.delete();
+            return false;
+        }
+        if (!tmp.renameTo(new java.io.File(dir, "nowhere-vpn-pick"))) {
+            tmp.delete();
+            return false;
+        }
+        return true;
+    }
+
+    /** NWP-20261010-15: the choice in effect, first source that has one: a well-formed pending PICK (made this
+     *  session, applied at the next sign-in); else the LIVE setting, a block deferred to the tunnel's first connection
+     *  counting as on, exactly as roamd's capture counts it; else the pre-slice vpn=/vpnlockdown= prefs, whose block
+     *  defaulted on. Returns {app ("" = none), block "0"/"1"}; no app always has block "0". */
+    private static String[] vpnCurrentFrom(String pickText, boolean liveRead, String liveApp, String liveLock,
+            String livePend, String prefsApp, String prefsLock) {
+        if (pickText != null) {
+            String app = null, lock = null;
+            for (String line : pickText.split("\n")) {
+                if (line.startsWith("app=") && app == null) app = line.substring(4);
+                else if (line.startsWith("lockdown=") && lock == null) lock = line.substring(9);
+            }
+            if (app != null && vpnPkgOk(app) && ("0".equals(lock) || "1".equals(lock))) {
+                return new String[] {app, app.isEmpty() ? "0" : lock};
+            }
+        }
+        if (liveRead) {
+            String app = liveApp == null || "null".equals(liveApp) ? "" : liveApp;
+            if (vpnPkgOk(app)) {
+                boolean on = !app.isEmpty() && ("1".equals(liveLock) || app.equals(livePend));
+                return new String[] {app, on ? "1" : "0"};
+            }
+        }
+        String app = prefsApp == null || !vpnPkgOk(prefsApp) ? "" : prefsApp;
+        return new String[] {app, app.isEmpty() || "0".equals(prefsLock) ? "0" : "1"};
+    }
+
+    /** The block setting a pick carries: none for Off; the block of the choice in effect when there is one (picking a
+     *  different app does not silently change it); on for a profile with no always-on VPN yet -- armed at the
+     *  tunnel's first connection, so it never cuts the session off before the tunnel is up. */
+    private static String vpnPickLockdown(String[] current, String picked) {
+        if (picked == null || picked.isEmpty()) return "0";
+        if (current != null && current[0] != null && !current[0].isEmpty()) return "1".equals(current[1]) ? "1" : "0";
+        return "1";
+    }
+
+    /** The pick file, in the shape roamd's vpn_choice reads. */
+    private static String vpnPickText(String pkg, String lock) {
+        String p = pkg == null ? "" : pkg;
+        return "app=" + p + "\nlockdown=" + (p.isEmpty() || !"1".equals(lock) ? "0" : "1") + "\n";
+    }
+
+    private static String vpnPickToast(String label, String pkg, String lock) {
+        if (pkg == null || pkg.isEmpty()) return "Always-on VPN off — applies next sign-in";
+        return "Always-on VPN: " + label + ("1".equals(lock)
+                ? " (blocks connections without VPN once it connects)"
+                : " (connections without VPN allowed)") + " — applies next sign-in";
+    }
+
+    /** The helper roamd's vpn_apply runs; the same path it tests for (nowhere_roamd.sh, NOWHERE_VPN_JAR's default). */
+    private static final String VPN_HELPER_JAR = "/system_ext/framework/nowhere-vpnao.jar";
+
+    /** NWP-20261010-15: null when the picker can do what it says, else what to tell the user instead. Without the
+     *  helper roamd answers OK NOHELPER at every sign-in, so "applies next sign-in" would be untrue. */
+    private static String vpnUnsupportedText(boolean helperPresent) {
+        if (helperPresent) return null;
+        return "This phone can't carry an always-on VPN to your next sign-in — set one in Settings for this session";
+    }
+
+    /** A package name as roamd accepts one ([A-Za-z0-9._]); "" is none. */
+    private static boolean vpnPkgOk(String s) {
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (!(c == '.' || c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** The roamed prefs file in getFilesDir() -- the one name setPref writes and readPrefsText reads, and the file
+     *  roamd reads as com.nowhere.chooser/files/nowhere-prefs (NWP-20261016-45 made it one constant). */
+    static final String PREFS_FILE = "nowhere-prefs";
+
+    /** A profile's saved hotspot, Hotspot.configText's "ssid=<s>\npass=<p>\n", in a SIBLING of PREFS_FILE in the same files
+     *  directory (NWP-20261028-11): sealed and roamed with the vault, as nowhere-vpn-pick is. NOT a nowhere-prefs key:
+     *  roamd copies the whole prefs file to $STATE/prefs.out at sign-in and the daemon's GET-PREFS hands it back whole, so
+     *  a passphrase there would sit in a second cleartext copy outside the session, and an older chooser's setPref drops
+     *  keys it does not know. Only saveHotspot writes it and only savedHotspot reads it. */
+    static final String HOTSPOT_FILE = "nowhere-hotspot";
+
+    /** Set one key of nowhere-prefs, keeping every other, and report whether the write landed. Only the file I/O is
+     *  here: what the new file says is prefsUpdated's, which runs under javac (core/chooser/test-loc-prefs-java.sh).
+     *  The Location services switches act on a false (NWP-20261016-45); every other caller ignores it, as before.
+     *  The write is StoreInstaller.writeAtomic's temp + rename (NWP-20261021-06), so a false means nowhere-prefs is
+     *  exactly as it was: every other pref in it is kept, and nothing is left beside it. */
+    private boolean setPref(String key, String value) {
+        String text = prefsUpdated(readPrefsText(), key, value, java.util.Locale.getDefault().toLanguageTag());
+        try {
+            StoreInstaller.writeAtomic(new java.io.File(getFilesDir(), PREFS_FILE), text);
+            return true;
+        } catch (Exception e) {
+            android.util.Log.w("NowhereChooser", "setPref " + key, e);
+            return false;
+        }
+    }
+
+    /** The nowhere-prefs text after setting key to value in cur: every other key keeps the value cur gives it, and an
+     *  empty locale becomes defaultLocale (the device's, from setPref). Pure, so it runs under javac
+     *  (core/chooser/test-loc-prefs-java.sh); NWP-20261016-45 split it out of setPref, whose rules these always were. */
+    static String prefsUpdated(String cur, String key, String value, String defaultLocale) {
+        String tz = "tz".equals(key) ? value : prefValueIn(cur, "tz");
+        String loc = "locale".equals(key) ? value : prefValueIn(cur, "locale");
+        if (loc.isEmpty()) loc = defaultLocale;
+        String idle = "idle".equals(key) ? value : prefValueIn(cur, "idle");
+        String wipe = "wipe".equals(key) ? value : prefValueIn(cur, "wipe");
+        String vpn = "vpn".equals(key) ? value : prefValueIn(cur, "vpn");                     // #159
+        String vpnlock = "vpnlockdown".equals(key) ? value : prefValueIn(cur, "vpnlockdown"); // #159
+        // NWP-20261005-02: "Hold the lock while apps install". Written ONLY when off ("0"): an absent key means
+        // on, which is the decided default, so every profile sealed before this key existed holds without a write.
+        String holdlock = "holdlock".equals(key) ? value : prefValueIn(cur, "holdlock");
+        // NWP-20261124-17: "Before standby, wait for: audio playing". Written ONLY when off ("0"), as holdlock is.
+        String holdaudio = "holdaudio".equals(key) ? value : prefValueIn(cur, "holdaudio");
+        // NWP-20261016-45: the two Location services switches -- see prefsText for the format.
+        String netloc = PREF_NETLOC.equals(key) ? value : prefValueIn(cur, PREF_NETLOC);
+        String geocoder = PREF_GEOCODER.equals(key) ? value : prefValueIn(cur, PREF_GEOCODER);
+        // NWP-20261026-07: the Mobile data switch -- see prefsText.
+        String mobiledata = MobileData.PREF.equals(key) ? value : prefValueIn(cur, MobileData.PREF);
+        // NWP-20261028-09: the Data roaming switch, beside Mobile data.
+        String dataroaming = MobileData.ROAM_PREF.equals(key) ? value : prefValueIn(cur, MobileData.ROAM_PREF);
+        // NWP-20261106-15: "Right away, once saved" (Q138) -- see prefsText.
+        String wipesaved = WipeOnSave.PREF.equals(key) ? value : prefValueIn(cur, WipeOnSave.PREF);
+        return prefsText(tz, loc, idle, wipe, holdlock, holdaudio, vpn, vpnlock, netloc, geocoder, mobiledata,
+                dataroaming, wipesaved);
+    }
+
+    /** prefsUpdated for "wipe", then for "wipesaved": the erase picker's two keys composed into ONE text, so
+     *  writeWipePref writes them in one writeAtomic and they never land apart. Pure, so it runs under javac
+     *  (core/vendor-common/bin/test-wipe-choice-java.sh). */
+    static String prefsUpdatedWipe(String cur, String wipe, String wipesaved, String defaultLocale) {
+        return prefsUpdated(prefsUpdated(cur, "wipe", wipe, defaultLocale), WipeOnSave.PREF, wipesaved, defaultLocale);
+    }
+
+    /** The whole nowhere-prefs text, in the one order this file has always been written in. Pure, so it runs under
+     *  javac (core/chooser/test-loc-prefs-java.sh). With both Location services switches off it is byte for byte what
+     *  every chooser before NWP-20261016-45 wrote, so an older reader sees exactly the file it knows; likewise with no
+     *  Mobile data choice (NWP-20261026-07), and likewise with no Data roaming choice (NWP-20261028-09), and likewise with no
+     *  erase-once-saved choice (NWP-20261106-15), and likewise with the audio wait On (NWP-20261124-17). */
+    static String prefsText(String tz, String loc, String idle, String wipe, String holdlock, String holdaudio,
+            String vpn, String vpnlock, String netloc, String geocoder, String mobiledata, String dataroaming,
+            String wipesaved) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("tz=").append(tz).append("\nlocale=").append(loc).append("\n");
+        if (!idle.isEmpty()) sb.append("idle=").append(idle).append("\n");
+        if (!wipe.isEmpty()) sb.append("wipe=").append(wipe).append("\n");
+        // NWP-20261106-15 (Q138): "Right away, once saved" -- written ONLY when chosen, as exactly "1", right after the wipe
+        // line it always travels with (wipe=1, the 1-hour bound a gate that does not know this key still applies). With no
+        // such choice the file is byte for byte what it was. ⚠ An OLDER chooser's setPref drops this line: the profile then
+        // reads "After 1 hour" -- still erased, at the bound -- and the user picks again.
+        if (WipeOnSave.on(wipesaved)) sb.append(WipeOnSave.PREF).append("=1\n");
+        if ("0".equals(holdlock)) sb.append("holdlock=0\n");
+        // NWP-20261124-17: the audio wait -- written ONLY when Off, as exactly "0"; absent is On, the decided default, so
+        // with the box On the file is byte for byte what an older chooser wrote. ⚠ An OLDER chooser's setPref drops this
+        // line: the profile then reads On at its next sign-in, and the user turns it off again.
+        if ("0".equals(holdaudio)) sb.append("holdaudio=0\n");
+        // #159: an always-on VPN package (+ kill-switch, default on), as pickers before NWP-20261010-15 wrote it.
+        // Nothing writes these keys any more (the picker writes nowhere-vpn-pick); they are carried through so
+        // the first sign-in after that slice still finds the old choice -- roamd's vpn_choice falls back to them
+        // only when there is neither a pick nor a capture.
+        if (!vpn.isEmpty()) sb.append("vpn=").append(vpn).append("\nvpnlockdown=")
+                .append(vpnlock.isEmpty() ? "1" : vpnlock).append("\n");
+        // NWP-20261016-45: network location and geocoding, each written ONLY when on, as exactly "1" -- an absent key
+        // is Off, the decided default, so every profile sealed before these existed reads Off with no write. roamd's
+        // loc_on reads them with the rule locPrefOn states. ⚠ An OLDER chooser's setPref (another phone not yet
+        // updated) rewrites this file from its own key list and drops both lines: the profile then reads Off at its
+        // next sign-in -- the safe direction, and the user switches it on again.
+        if (locPrefOn(netloc)) sb.append(PREF_NETLOC).append("=1\n");
+        if (locPrefOn(geocoder)) sb.append(PREF_GEOCODER).append("=1\n");
+        // NWP-20261026-07: mobile data, a TRI-STATE: "1" (On) or "0" (Off) is written, and no line at all is no choice,
+        // which roamd reads as the gate's own value (MobileData.choice states the rule). With no choice the file is
+        // byte for byte what it was. ⚠ An OLDER chooser's setPref drops this line: the profile then reads "no choice"
+        // at its next sign-in -- the safe direction, the phone keeps the gate's value -- and the user picks again.
+        String md = MobileData.choice(mobiledata);
+        if (!md.isEmpty()) sb.append(MobileData.PREF).append("=").append(md).append("\n");
+        // NWP-20261028-09: data roaming, the same tri-state and the same rule, written after mobiledata.
+        String dr = MobileData.roamChoice(dataroaming);
+        if (!dr.isEmpty()) sb.append(MobileData.ROAM_PREF).append("=").append(dr).append("\n");
+        return sb.toString();
+    }
+
+    /** Write the tz OVERRIDE (empty = automatic) into nowhere-prefs, preserving the other prefs; false if it did not land. */
+    private boolean writeTzOverride(String olson) { return setPref("tz", olson); }
+
+    // ---- L5 (DIA-20260623-26): per-profile idle auto-logoff timeout. Roams in nowhere-prefs (idle=<min>,
+    // 0 = Never) like tz/locale; the user-0 gate reads it at each sign-in and arms the idle watcher with
+    // it (the at-rest backstop from lock-model.md L3/L4). A high-security profile can pick a short timeout.
+    // NWP-20261119-21: a Save also sends it to the gate (sendLivePrefs), which applies it to this session at once.
+    private void showIdlePicker() {
+        // NWP-20260913-17: the shortest option is 5 MINUTES, not 2. At idle=2 the phone STOPPED SEALING.
+        // Measured on frankel 2026-09-13 in one log, either side of the change: 10 `periodic seal -> OK`
+        // in the idle=60 hour, and in the idle=2 hour ONE (itself PARTIAL) plus three `deferred: login`.
+        // The cause is arithmetic on shipped constants, not a model: a resume arms a seal-suppression
+        // window of loginWindowCap=180s (main.go:9765, armed at main.go:10451) and ONLY a login can close
+        // it early -- the sole GRANT-PERMS sender is provisionRoamedApps, inside roamLogin
+        // (ChooserActivity.java:8912, called from :3794). The cold lock fires at 120s and removes
+        // .roamsession, which stops the sync (main.go:10267). With syncIntervalDefault=120 (main.go:8231),
+        // 180 > 120 means no instant exists at which a periodic seal is both permitted AND has a live
+        // session to seal. On a phone that wipes at power-off, that is lost work, so the option was not
+        // honest to offer.
+        //
+        // ⚠ 3 MINUTES WOULD BE THE WORST CHOICE AVAILABLE: 180s IS loginWindowCap exactly, so a 3-minute
+        // idle leaves a ZERO-second seal-eligible window -- the same starvation, made intermittent. 5 min
+        // leaves 120s, one whole sync tick, which is the smallest value that is not zero.
+        //
+        // ⚠ NO MIGRATION, BY DECISION (Chester, 2026-09-13). A profile whose roamed prefs already say
+        // `idle=2` KEEPS arming 120000ms -- ChooserActivity.java:9271 parses the pref raw with no clamp --
+        // while the dialog below highlights "After 15 minutes", because the loop sets sel only on an exact
+        // match. So for those profiles this screen shows something other than what the phone does until
+        // the user picks a value again. Recorded here rather than hidden: it is the known cost of the
+        // decision, not an oversight.
+        final int[] mins = { 5, 15, 30, 60, 0 };
+        final String[] labels = { "After 5 minutes", "After 15 minutes", "After 30 minutes", "After 1 hour", "Never" };
+        int cur = 15; // matches IDLE_LOGOFF_MS: the default when no idle= pref is set (DIA-20260626-03)
+        try { String v = readPrefValue("idle"); if (!v.isEmpty()) cur = Integer.parseInt(v); } catch (Throwable ignore) {}
+        int sel = 1; // default highlight = 15 minutes
+        for (int i = 0; i < mins.length; i++) if (mins[i] == cur) sel = i;
+        // NWP-20261005-02 (Chester, 2026-10-05): "Wait for app installs" qualifies THIS setting, so it lives in this
+        // picker -- he moved it here from a separate switch under the Security card ("looks off outside"). Saved with
+        // the timeout. On by default: only holdlock=0 turns it off (setPref).
+        // NWP-20261124-17 (decision 2026-11-01, "before the idle cold lock, a session can wait for app installs and for
+        // audio playing ..."): one heading over two boxes, "app installs" (holdlock=) and "audio playing" (holdaudio=).
+        // Each is on unless its key is "0". A throwaway never sees either: showSecurity does not add this row there.
+        final TextView waitHead = new TextView(this);
+        waitHead.setText("Before standby, wait for:");
+        waitHead.setTextColor(MUTED);
+        waitHead.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        final android.widget.CheckBox holdBox = new android.widget.CheckBox(this);
+        holdBox.setText("app installs");
+        holdBox.setTextColor(INK);
+        holdBox.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        holdBox.setChecked(!"0".equals(readPrefValue("holdlock")));
+        final android.widget.CheckBox audioBox = new android.widget.CheckBox(this);
+        audioBox.setText("audio playing");
+        audioBox.setTextColor(INK);
+        audioBox.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        audioBox.setChecked(!"0".equals(readPrefValue("holdaudio")));
+        LinearLayout holdWrap = new LinearLayout(this);
+        holdWrap.setOrientation(LinearLayout.VERTICAL);
+        holdWrap.setPadding(dp(20), dp(8), dp(20), dp(4));
+        holdWrap.addView(waitHead, new LinearLayout.LayoutParams(MATCH, WRAP));
+        holdWrap.addView(holdBox, new LinearLayout.LayoutParams(MATCH, WRAP));
+        holdWrap.addView(audioBox, new LinearLayout.LayoutParams(MATCH, WRAP));
+        new android.app.AlertDialog.Builder(this)
+                .setTitle("Auto standby when idle")
+                .setSingleChoiceItems(labels, sel, null)
+                .setView(holdWrap)
+                .setPositiveButton("Save", (d, w) -> {
+                    int pick = ((android.app.AlertDialog) d).getListView().getCheckedItemPosition();
+                    if (pick < 0) pick = 0;
+                    final int idx = pick;
+                    // NWP-20261122-02: through the preset guard, which may ask before it replaces a saved Custom.
+                    presetGuard(PresetPicker.change("idle", String.valueOf(mins[idx]),
+                            "holdlock", holdBox.isChecked() ? "" : "0",
+                            "holdaudio", audioBox.isChecked() ? "" : "0"), () -> {
+                        // All three writes always run; the gate is told only when all three landed.
+                        final boolean idleOk = writeIdlePref(mins[idx]);
+                        final boolean holdOk = setPref("holdlock", holdBox.isChecked() ? "" : "0");
+                        final boolean audioOk = setPref("holdaudio", audioBox.isChecked() ? "" : "0");
+                        boolean live = false;
+                        if (idleOk && holdOk && audioOk) live = sendLivePrefs();
+                        android.widget.Toast.makeText(this, "Auto standby when idle: " + labels[idx].toLowerCase()
+                                + (live ? "" : " — applies next sign-in"), android.widget.Toast.LENGTH_LONG).show();
+                        showSecurity();
+                    }, () -> showSecurity());
+                })
+                .setNegativeButton("Cancel", (d, w) -> showSecurity())
+                .show();
+    }
+
+    /** Write idle=<min> into nowhere-prefs, preserving the other prefs, and report whether the write landed. */
+    private boolean writeIdlePref(int minutes) { return setPref("idle", String.valueOf(minutes)); }
+
+    /** NWP-20261119-21: send this session's five lock prefs to the gate (PrefsLiveReceiver, in user 0), so a Save
+     *  applies now and not only at the next sign-in. Called only after a write landed. The values are read back from
+     *  nowhere-prefs, so the gate gets what the file holds. False when the send threw: the caller's toast then keeps
+     *  "applies next sign-in", which stays true. */
+    private boolean sendLivePrefs() {
+        try {
+            sendBroadcastAsUser(new android.content.Intent(this, PrefsLiveReceiver.class)
+                    .putExtra(PrefsLiveReceiver.EXTRA_IDLE, readPrefValue("idle"))
+                    .putExtra(PrefsLiveReceiver.EXTRA_WIPE, readPrefValue("wipe"))
+                    .putExtra(PrefsLiveReceiver.EXTRA_WIPESAVED, readPrefValue(WipeOnSave.PREF))
+                    .putExtra(PrefsLiveReceiver.EXTRA_HOLDLOCK, readPrefValue("holdlock"))
+                    .putExtra(PrefsLiveReceiver.EXTRA_HOLDAUDIO, readPrefValue("holdaudio"))
+                    .putExtra(PrefsLiveReceiver.EXTRA_UID, android.os.UserHandle.myUserId()), android.os.UserHandle.SYSTEM);
+            return true;
+        } catch (Throwable t) {
+            android.util.Log.w("NowhereChooser", "sendLivePrefs", t);
+            return false;
+        }
+    }
+
+    // ---- #3 (DIA-20260626-03): per-profile hard-wipe backstop. Roams in nowhere-prefs (wipe=<hours>,
+    // 0 = keep until power-off) like idle; the user-0 gate reads it at each sign-in and arms the wipe
+    // alarm AT cold-lock. Escalates a cold-locked, un-resumed session to a full amnesiac wipe (lock-model.md).
+    // NWP-20261119-21: a Save also sends it to the gate (sendLivePrefs); the gate uses it at this session's next cold lock.
+    // NWP-20261106-15: Q138 "Right away, once saved" writes wipe=1 + wipesaved=1; the gate asks EVICT-RECHECK-SAVED at the
+    // cold lock (WipeOnSave).
+    private void showWipePicker() {
+        final int sel = WipeChoice.selected(readPrefValue("wipe"), readPrefValue(WipeOnSave.PREF));
+        new android.app.AlertDialog.Builder(this)
+                .setTitle("Erase a locked session after")
+                .setSingleChoiceItems(WipeChoice.LABELS, sel, null)
+                .setPositiveButton("Save", (d, w) -> {
+                    int pick = ((android.app.AlertDialog) d).getListView().getCheckedItemPosition();
+                    if (pick < 0) pick = sel; // nothing checked: keep the current choice, never the strongest by accident
+                    final int idx = pick;
+                    // NWP-20261122-02: through the preset guard, which may ask before it replaces a saved Custom.
+                    presetGuard(PresetPicker.change("wipe", String.valueOf(idx)), () -> {
+                        boolean live = false;
+                        if (writeWipePref(idx)) live = sendLivePrefs();
+                        // NWP-20261125-22: the toast follows the file read back, not the write's own answer.
+                        final boolean saved = SettingLanded.landed(PresetPicker.change("wipe", String.valueOf(idx)),
+                                presetCurrent());
+                        if (!saved) android.widget.Toast.makeText(this, SettingLanded.NOT_SAVED,
+                                android.widget.Toast.LENGTH_LONG).show();
+                        else android.widget.Toast.makeText(this, "Auto-wipe " + WipeChoice.LABELS[idx].toLowerCase()
+                                + (live ? "" : " — applies next sign-in"), android.widget.Toast.LENGTH_LONG).show();
+                        showSecurity();
+                    }, () -> showSecurity());
+                })
+                .setNegativeButton("Cancel", (d, w) -> showSecurity())
+                .show();
+    }
+
+    /** Write choice i of WipeChoice into nowhere-prefs, preserving the other prefs: wipe= and wipesaved= are composed
+     *  into one text (prefsUpdatedWipe) and land in ONE StoreInstaller.writeAtomic, so the two keys never land apart.
+     *  Reports whether that write landed (NWP-20261119-21: the Save tells the gate only then). */
+    private boolean writeWipePref(int i) {
+        String text = prefsUpdatedWipe(readPrefsText(), WipeChoice.wipeValue(i), WipeChoice.savedValue(i),
+                java.util.Locale.getDefault().toLanguageTag());
+        try {
+            StoreInstaller.writeAtomic(new java.io.File(getFilesDir(), PREFS_FILE), text);
+            return true;
+        } catch (Exception e) {
+            android.util.Log.w("NowhereChooser", "writeWipePref", e);
+            return false;
+        }
+    }
+
+    // ---- NWP-20261016-45: Location services -- network location and geocoding, per profile, only while signed in.
+    // GrapheneOS's two settings (Settings.Global network_location and geocoder) belong to the whole DEVICE and only
+    // user 0 may change them, which on Nowhere is the gate -- so no signed-in profile could turn either on (Jackpocket's
+    // location check failed indoors on lynx 2026101402 with GPS alone, and passed with network location on). Chester:
+    // "if a user enables it - it should just stay enabled for that session and then get disabled", and "i agree the
+    // default should be off" (docs/product-decisions.md, 2026-10-16). So the choice is this profile's own, kept in its
+    // nowhere-prefs (netloc=1 / geocoder=1, see prefsText), and it is applied only while this session is in front:
+    // roamd applies it at sign-in, at a cold-lock resume and at each switch here, and puts both back to off at
+    // sign-out, at a cold lock, at the reap and at every boot (nowhere_roamd.sh, the SESSION-SCOPED LOCATION GLOBALS
+    // block; core/agent/locglobals.go says when). On means GrapheneOS's option for each: network_location=2, its proxy
+    // to Apple's location service, and geocoder=2, the geocoding server GrapheneOS runs.
+    // OFFERED TO A STORED PROFILE ONLY (locOffered). A throwaway keeps Time zone alone under Chester's NWP-20260924-02
+    // rule ("other than timezone, nothing is applicable"), and an offline sign-in, which never seals, is treated the
+    // same: both stay at the baseline. Chester, 2026-10-17: "lets keep throwaway simple for now, so leave it out".
+
+    /** The two nowhere-prefs keys. */
+    static final String PREF_NETLOC = "netloc";
+    static final String PREF_GEOCODER = "geocoder";
+
+    /** GrapheneOS's network-location and geocoding provider. The same file roamd's loc_supported and the daemon's
+     *  locProviderAPK test, so the switches are shown exactly where something will apply them: Diaspore (LineageOS)
+     *  has neither the provider nor the two settings, and there the Preferences row is not shown at all. */
+    private static final String LOC_PROVIDER_APK = "/system/priv-app/NetworkLocation/NetworkLocation.apk";
+
+    /** One daemon request at a time, in tap order, so two quick taps' answers arrive in the order they were made. */
+    private static final java.util.concurrent.ExecutorService LOC_APPLY =
+            java.util.concurrent.Executors.newSingleThreadExecutor();
+
+    private static boolean locServicesAvailable() {
+        return new java.io.File(LOC_PROVIDER_APK).isFile();
+    }
+
+    /** Whether Preferences offers Location services: only to a STORED session that is not an offline sign-in, and only
+     *  on an image with GrapheneOS's provider. A throwaway (LOCAL) and an offline sign-in (LOCAL too) are left at the
+     *  baseline, and so is a session whose type the probe could not learn (UNKNOWN). */
+    static boolean locOffered(String sessionType, boolean offline, boolean providerPresent) {
+        return providerPresent && !offline && "STORED".equals(sessionType);
+    }
+
+    /** A stored Location services value is On only when it reads exactly "1" (blanks trimmed): an absent key -- a file
+     *  written before NWP-20261016-45 -- and any other value ("0", "2", "true") are Off. roamd's loc_on is the same. */
+    static boolean locPrefOn(String v) {
+        return v != null && "1".equals(v.trim());
+    }
+
+    /** The value roamd read back for the setting behind key -- network_location for PREF_NETLOC, geocoder for
+     *  PREF_GEOCODER -- from its "OK APPLIED network_location=<v> geocoder=<v>" answer to APPLY-LOCATION; "" for any
+     *  other answer, any other key, or an answer that does not carry it. */
+    static String locReplyValue(String reply, String key) {
+        String p = PREF_NETLOC.equals(key) ? "network_location=" : PREF_GEOCODER.equals(key) ? "geocoder=" : null;
+        if (p == null || reply == null || !reply.startsWith("OK APPLIED ")) return "";
+        for (String tok : reply.substring("OK APPLIED ".length()).split(" ")) {
+            if (tok.startsWith(p)) return tok.substring(p.length());
+        }
+        return "";
+    }
+
+    /** True when roamd read the setting behind key back as this tap asked: 2 for On (GrapheneOS's option, roamd's
+     *  LOC_NET_ON / LOC_GEO_ON), 0 for Off (LOC_OFF). Any other answer -- another value, another verdict -- is not. */
+    static boolean locApplied(String reply, String key, boolean on) {
+        return (on ? "2" : "0").equals(locReplyValue(reply, key));
+    }
+
+    /** The toast after a switch, or null for none. stillChosen says whether the profile's stored choice still is what
+     *  this tap asked when the answer comes back: when it is not, a later tap replaced it and that tap's own request
+     *  reports, so this one says nothing. Otherwise: what was applied, or -- when roamd did not read this tap's value
+     *  back -- that the choice is saved and when it takes effect at the latest. Never claims a change the daemon did
+     *  not read back. Only a stored profile is offered the switches (locOffered), so "saved with this profile" holds:
+     *  its prefs are sealed with it, and a sign-in and a resume each apply them. */
+    static String locApplyToast(String what, String key, boolean on, String reply, boolean stillChosen) {
+        if (!stillChosen) return null;
+        if (!locApplied(reply, key, on)) {
+            return what + (on ? " on" : " off") + " is saved with this profile, but the phone hasn't confirmed the "
+                    + "change yet — it takes effect when you next sign in or come back from standby, at the latest";
+        }
+        return on ? what + " on — only while you're signed in to this profile" : what + " off";
+    }
+
+    /** The toast when the switch's write to nowhere-prefs failed, or null for none. A failed write leaves the file at
+     *  its earlier value (setPref writes by temp + rename), so the screen is redrawn from the file and roamd is still
+     *  asked to apply it:
+     *  nowOn is what the FILE now holds for key, not what was tapped, and the toast says the phone is at it only when
+     *  roamd read that setting back as that value. stillChosen as in locApplyToast. */
+    static String locNotSavedToast(String what, String key, boolean nowOn, String reply, boolean stillChosen) {
+        if (!stillChosen) return null;
+        String head = what + ": the change couldn't be saved on this phone. ";
+        if (!locApplied(reply, key, nowOn)) {
+            return head + "This profile's setting is " + (nowOn ? "on" : "off") + ", but the phone hasn't confirmed it "
+                    + "yet — it takes effect when you next sign in or come back from standby, at the latest";
+        }
+        return head + what + " is now " + (nowOn ? "on, only while you're signed in to this profile" : "off");
+    }
+
+    private void showLocationServices() {
+        LinearLayout ll = menuScreen("Location services", "only while this profile is signed in");
+        TextView note = new TextView(this);
+        note.setText("Both are off unless you turn them on here. Each applies only while this profile is signed in: "
+                + "it is off for every other profile on this phone, it goes off when you sign out or your session "
+                + "goes into standby, and it comes back when you return to it.");
+        note.setTextColor(MUTED);
+        note.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        LinearLayout.LayoutParams nlp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        nlp.topMargin = dp(10);
+        nlp.bottomMargin = dp(6);
+        ll.addView(note, nlp);
+        ll.addView(locSwitchRow("Network location",
+                "Finds where you are faster, and indoors, where GPS often can't. When on, the phone sends the "
+                        + "identifiers of the Wi-Fi networks and cell towers it can see through GrapheneOS's proxy to "
+                        + "Apple, which sends back where those networks are; the phone works out its own position "
+                        + "from that.",
+                PREF_NETLOC), new LinearLayout.LayoutParams(MATCH, WRAP));
+        ll.addView(locSwitchRow("Geocoding",
+                "Lets apps turn an address or place name into a spot on the map, and a spot back into an address "
+                        + "(store finders, delivery addresses). When on, each lookup — the address, place or position "
+                        + "being looked up — is sent to a geocoding server that GrapheneOS runs.",
+                PREF_GEOCODER), new LinearLayout.LayoutParams(MATCH, WRAP));
+        finishMenuScreen(ll, () -> showPreferences());
+    }
+
+    /** One Location services row: title, what it does and what leaves the phone, and its switch. A tap writes the
+     *  choice first (it is what roamd reads) and then asks the daemon to apply it. A write that fails redraws the
+     *  screen from the file -- both switches, which are built from it and which a failed write leaves at their earlier
+     *  value -- and still asks the daemon, which applies what the file holds, so the switches, the file and the phone
+     *  agree at once. */
+    private LinearLayout locSwitchRow(final String title, String sub, final String key) {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(dp(4), dp(16), dp(4), dp(2));
+        LinearLayout col = new LinearLayout(this);
+        col.setOrientation(LinearLayout.VERTICAL);
+        TextView lab = new TextView(this);
+        lab.setText(title);
+        lab.setTextColor(INK);
+        lab.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
+        col.addView(lab);
+        TextView st = new TextView(this);
+        st.setText(sub);
+        st.setTextColor(MUTED);
+        st.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        col.addView(st);
+        LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(0, WRAP, 1f);
+        clp.rightMargin = dp(10);
+        row.addView(col, clp);
+        android.widget.Switch sw = GateSwitch.style(new android.widget.Switch(this), GatePalette.active());
+        sw.setChecked(locPrefOn(readPrefValue(key)));
+        sw.setOnCheckedChangeListener((b, on) -> {
+            final boolean saved = setPref(key, on ? "1" : "");
+            // After a failed write the choice is whatever the file holds now -- the earlier value, since a failed write
+            // leaves the file as it was -- and the redraw shows that on both switches, which are built from the file.
+            final boolean want = saved ? on : locPrefOn(readPrefValue(key));
+            if (!saved) showLocationServices();
+            LOC_APPLY.execute(() -> {
+                final String reply = sendDaemon("APPLY-LOCATION\n");
+                runOnUiThread(() -> {
+                    boolean stillChosen = locPrefOn(readPrefValue(key)) == want;
+                    String t = saved ? locApplyToast(title, key, on, reply, stillChosen)
+                            : locNotSavedToast(title, key, want, reply, stillChosen);
+                    if (t != null) android.widget.Toast.makeText(ProfileActivity.this, t,
+                            android.widget.Toast.LENGTH_LONG).show();
+                });
+            });
+        });
+        row.addView(sw, new LinearLayout.LayoutParams(WRAP, WRAP));
+        return row;
+    }
+
+    // ---- NWP-20261028-11: Hotspot & tethering. A session (user 10+) has no tethering of its own, so each switch asks
+    // the gate's HotspotService (user 0) in-process through HotspotClient. The name and passphrase are the profile's own,
+    // saved in HOTSPOT_FILE and sent only in the Binder parcel: NEVER logged, toasted or sent to the daemon socket.
+    // A hotspot is never on at sign-in: it starts only from the tap on its switch here. OFFERED TO A STORED, ONLINE
+    // PROFILE ONLY (Hotspot.offered), following the decision: "not offered to throwaway or offline sessions, as for
+    // location".
+
+    /** One gate request at a time, in tap order, for the same reason as LOC_APPLY. */
+    private static final java.util.concurrent.ExecutorService HS_APPLY =
+            java.util.concurrent.Executors.newSingleThreadExecutor();
+
+    /** {ssid, pass} as saved in HOTSPOT_FILE; an entry is null when the file is absent or that value is invalid. */
+    private String[] savedHotspot() {
+        try {
+            return Hotspot.parseConfig(new String(java.nio.file.Files.readAllBytes(
+                    new java.io.File(getFilesDir(), HOTSPOT_FILE).toPath()), java.nio.charset.StandardCharsets.UTF_8));
+        } catch (Exception ignore) {
+            return Hotspot.parseConfig(null);
+        }
+    }
+
+    /** Write the saved hotspot (the file is rewritten whole); false when it is invalid or the write failed. */
+    private boolean saveHotspot(String ssid, String pass) {
+        String text = Hotspot.configText(ssid, pass);
+        if (text == null) return false;
+        try {
+            StoreInstaller.writeAtomic(new java.io.File(getFilesDir(), HOTSPOT_FILE), text);
+            return true;
+        } catch (Exception e) {
+            android.util.Log.w("NowhereChooser", "saveHotspot failed");
+            return false;
+        }
+    }
+
+    private void showHotspot() {
+        LinearLayout ll = menuScreen("Hotspot & tethering", "only while this profile is signed in");
+        TextView note = new TextView(this);
+        note.setText("Shares this phone's connection while this profile is signed in. It turns off when you sign out "
+                + "or the phone goes into standby, and the phone forgets the hotspot's name and passphrase then; "
+                + "they're saved with this profile and come back when you sign in.");
+        note.setTextColor(MUTED);
+        note.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        LinearLayout.LayoutParams nlp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        nlp.topMargin = dp(10);
+        nlp.bottomMargin = dp(6);
+        ll.addView(note, nlp);
+
+        final String[] cfg = savedHotspot();
+        final EditText nameF = textField("Hotspot name");
+        if (cfg[0] != null) nameF.setText(cfg[0]);
+        final EditText pwF = passField("Hotspot passphrase");
+        if (cfg[1] != null) pwF.setText(cfg[1]);
+        LinearLayout.LayoutParams flp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        flp.topMargin = dp(10);
+        ll.addView(nameF, flp);
+        ll.addView(PassReveal.wrap(pwF, MUTED), flp);   // #81 hotspot passphrase
+        final Button save = accentBtn("Save");
+        LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        slp.topMargin = dp(12);
+        ll.addView(save, slp);
+        save.setOnClickListener(v -> {
+            String n = nameF.getText().toString();
+            String p = pwF.getText().toString();
+            String t;
+            if (!Hotspot.validSsid(n)) t = HS_BAD_NAME;
+            else if (!Hotspot.validPassphrase(p)) t = HS_BAD_PASS;
+            else t = saveHotspot(n, p) ? "Saved" : "Couldn't save — try again.";
+            android.widget.Toast.makeText(ProfileActivity.this, t, android.widget.Toast.LENGTH_LONG).show();
+        });
+
+        final android.widget.Switch[] sws = new android.widget.Switch[3];
+        final android.widget.CompoundButton.OnCheckedChangeListener[] ls =
+                new android.widget.CompoundButton.OnCheckedChangeListener[3];
+        for (int i = 0; i < 3; i++) {
+            final String type = Hotspot.types().get(i);
+            final int idx = i;
+            LinearLayout row = hsSwitchRow(Hotspot.label(type));
+            sws[i] = (android.widget.Switch) row.getChildAt(1);
+            ls[i] = (b, on) -> hsTap(type, on, sws[idx], ls[idx]);
+            sws[i].setOnCheckedChangeListener(ls[i]);
+            ll.addView(row, new LinearLayout.LayoutParams(MATCH, WRAP));
+        }
+        // The switches start unchecked and show what the gate says; one that cannot be asked stays unchecked.
+        HS_APPLY.execute(() -> {
+            final String st = HotspotClient.state(ProfileActivity.this);
+            runOnUiThread(() -> {
+                for (int i = 0; i < 3; i++) {
+                    hsSetChecked(sws[i], ls[i], Hotspot.switchOn(st, Hotspot.types().get(i)));
+                }
+            });
+        });
+        finishMenuScreen(ll, () -> showPreferences());
+    }
+
+    static final String HS_BAD_NAME = "The name must be 1 to 32 characters.";
+    static final String HS_BAD_PASS = "The passphrase must be 8 to 63 letters, digits or symbols.";
+
+    /** A switch's row: the label on the left, the switch (child 1) on the right. */
+    private LinearLayout hsSwitchRow(String title) {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(dp(4), dp(16), dp(4), dp(2));
+        TextView lab = new TextView(this);
+        lab.setText(title);
+        lab.setTextColor(INK);
+        lab.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
+        LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(0, WRAP, 1f);
+        clp.rightMargin = dp(10);
+        row.addView(lab, clp);
+        row.addView(GateSwitch.style(new android.widget.Switch(this), GatePalette.active()), new LinearLayout.LayoutParams(WRAP, WRAP));
+        return row;
+    }
+
+    /** Set a switch without running its tap handler. */
+    private static void hsSetChecked(android.widget.Switch sw, android.widget.CompoundButton.OnCheckedChangeListener l,
+                                     boolean on) {
+        sw.setOnCheckedChangeListener(null);
+        sw.setChecked(on);
+        sw.setOnCheckedChangeListener(l);
+    }
+
+    /** A tap: START (wifi from the SAVED name and passphrase, never the text in the fields) or STOP, off the main
+     *  thread; the switch is then drawn from the gate's reply and the answer is toasted (Hotspot.toast). */
+    private void hsTap(final String type, final boolean on, final android.widget.Switch sw,
+                       final android.widget.CompoundButton.OnCheckedChangeListener l) {
+        final String[] saved = savedHotspot();
+        if (on && Hotspot.TYPE_WIFI.equals(type) && (saved[0] == null || saved[1] == null)) {
+            // Nothing valid is saved to start with: say which part, and put the switch back.
+            hsSetChecked(sw, l, false);
+            final String why = saved[0] == null ? HS_BAD_NAME : HS_BAD_PASS;
+            android.widget.Toast.makeText(this, why, android.widget.Toast.LENGTH_LONG).show();
+            return;
+        }
+        HS_APPLY.execute(() -> {
+            final String reply = on ? HotspotClient.start(ProfileActivity.this, type, saved[0], saved[1])
+                    : HotspotClient.stop(ProfileActivity.this, type);
+            runOnUiThread(() -> {
+                boolean confirmed = on ? Hotspot.okOn(type).equals(reply) : Hotspot.okOff(type).equals(reply);
+                hsSetChecked(sw, l, confirmed ? on : !on);
+                android.widget.Toast.makeText(ProfileActivity.this, Hotspot.toast(type, on, reply),
+                        android.widget.Toast.LENGTH_LONG).show();
+            });
+        });
+    }
+    // ---- end NWP-20261028-11
+
+    // ---- NWP-20261026-07: Mobile data. Android lets only the primary user change mobile data, which on Nowhere is the
+    // gate, so no signed-in profile could turn it off (found at hand test 1.5, which then used airplane mode, and that
+    // also kills Wi-Fi and calls). Chester, 2026-10-19 (docs/product-decisions.md): a profile can turn mobile data on
+    // or off for its own session. On/off only, the phone's current data SIM. The choice is the profile's own, in its
+    // nowhere-prefs (mobiledata=1 / mobiledata=0, see prefsText and MobileData), and roamd is the only writer: it
+    // applies it while the session is in front and restores the gate's value at every release path (nowhere_roamd.sh,
+    // the SESSION-SCOPED MOBILE DATA block; core/agent/mobiledata.go). A profile stored before this has no choice and
+    // gets the gate's value. The screen says a change is applied only when roamd read it back (MobileData.applyToast).
+    // OFFERED TO A STORED, ONLINE PROFILE ONLY (MobileData.offered): a throwaway and an offline sign-in are not offered
+    // it. That follows Chester's 2026-10-17 Location services answer ("lets keep throwaway simple for now, so leave it
+    // out") as an INFERENCE the decision record asks him to confirm; he was not asked about mobile data itself.
+
+    /** One daemon request at a time, in tap order, for the same reason as LOC_APPLY. */
+    private static final java.util.concurrent.ExecutorService MD_APPLY =
+            java.util.concurrent.Executors.newSingleThreadExecutor();
+
+    /** Whether the phone's mobile data is on right now, or null when it cannot be asked. */
+    private Boolean phoneDataOn() {
+        try {
+            android.telephony.TelephonyManager tm = getSystemService(android.telephony.TelephonyManager.class);
+            return tm == null ? null : tm.isDataEnabled();
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    private void showMobileData() {
+        LinearLayout ll = menuScreen("Mobile data", "only while this profile is signed in");
+        TextView note = new TextView(this);
+        note.setText("Turns this phone's mobile data on or off while this profile is signed in. When you sign out or "
+                + "your session goes into standby, the phone goes back to its own setting, and your choice comes back "
+                + "when you return. Data roaming follows the same rule.");
+        note.setTextColor(MUTED);
+        note.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        LinearLayout.LayoutParams nlp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        nlp.topMargin = dp(10);
+        nlp.bottomMargin = dp(6);
+        ll.addView(note, nlp);
+        ll.addView(mdSwitchRow(), new LinearLayout.LayoutParams(MATCH, WRAP));
+        ll.addView(roamSwitchRow(), new LinearLayout.LayoutParams(MATCH, WRAP));
+        finishMenuScreen(ll, () -> showPreferences());
+    }
+
+    /** The Mobile data row: title, what it does, and its switch. A tap writes the choice first (it is what roamd
+     *  reads) and then asks the daemon to apply it. A write that fails redraws the screen from the file and still asks
+     *  the daemon, which applies what the file holds (locSwitchRow's rule). */
+    private LinearLayout mdSwitchRow() {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(dp(4), dp(16), dp(4), dp(2));
+        LinearLayout col = new LinearLayout(this);
+        col.setOrientation(LinearLayout.VERTICAL);
+        TextView lab = new TextView(this);
+        lab.setText("Mobile data");
+        lab.setTextColor(INK);
+        lab.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
+        col.addView(lab);
+        TextView st = new TextView(this);
+        st.setText("For the phone's current data SIM. Off stops apps using the mobile network; Wi-Fi and calls are "
+                + "not affected.");
+        st.setTextColor(MUTED);
+        st.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        col.addView(st);
+        LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(0, WRAP, 1f);
+        clp.rightMargin = dp(10);
+        row.addView(col, clp);
+        android.widget.Switch sw = GateSwitch.style(new android.widget.Switch(this), GatePalette.active());
+        sw.setChecked(MobileData.switchChecked(MobileData.choice(readPrefValue(MobileData.PREF)), phoneDataOn()));
+        sw.setOnCheckedChangeListener((b, on) -> {
+            final boolean saved = setPref(MobileData.PREF, on ? "1" : "0");
+            // After a failed write the choice is whatever the file holds now -- the earlier value, since a failed write
+            // leaves the file as it was -- and the redraw shows that.
+            final String want = saved ? (on ? "1" : "0") : MobileData.choice(readPrefValue(MobileData.PREF));
+            final boolean nowOn = saved ? on : MobileData.switchChecked(want, phoneDataOn());
+            if (!saved) showMobileData();
+            MD_APPLY.execute(() -> {
+                final String reply = sendDaemon("APPLY-MOBILE-DATA\n");
+                runOnUiThread(() -> {
+                    boolean stillChosen = MobileData.choice(readPrefValue(MobileData.PREF)).equals(want);
+                    String t = saved ? MobileData.applyToast(on, reply, stillChosen)
+                            : MobileData.notSavedToast(nowOn, reply, stillChosen);
+                    if (t != null) android.widget.Toast.makeText(ProfileActivity.this, t,
+                            android.widget.Toast.LENGTH_LONG).show();
+                });
+            });
+        });
+        row.addView(sw, new LinearLayout.LayoutParams(WRAP, WRAP));
+        return row;
+    }
+
+    /** Whether the phone's data roaming is on right now, or null when it cannot be asked. */
+    private Boolean phoneRoamingOn() {
+        try {
+            android.telephony.TelephonyManager tm = getSystemService(android.telephony.TelephonyManager.class);
+            return tm == null ? null : tm.isDataRoamingEnabled();
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    /** The Data roaming row (NWP-20261028-09), built like the Mobile data row: a tap writes the choice first and then
+     *  asks the daemon, on the same executor, to apply it; roamd claims and restores it beside mobile data. */
+    private LinearLayout roamSwitchRow() {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(dp(4), dp(16), dp(4), dp(2));
+        LinearLayout col = new LinearLayout(this);
+        col.setOrientation(LinearLayout.VERTICAL);
+        TextView lab = new TextView(this);
+        lab.setText("Data roaming");
+        lab.setTextColor(INK);
+        lab.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
+        col.addView(lab);
+        TextView st = new TextView(this);
+        st.setText("Allows mobile data on other carriers' networks. Roaming charges may apply.");
+        st.setTextColor(MUTED);
+        st.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        col.addView(st);
+        LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(0, WRAP, 1f);
+        clp.rightMargin = dp(10);
+        row.addView(col, clp);
+        android.widget.Switch sw = GateSwitch.style(new android.widget.Switch(this), GatePalette.active());
+        sw.setChecked(MobileData.switchChecked(MobileData.roamChoice(readPrefValue(MobileData.ROAM_PREF)),
+                phoneRoamingOn()));
+        sw.setOnCheckedChangeListener((b, on) -> {
+            final boolean saved = setPref(MobileData.ROAM_PREF, on ? "1" : "0");
+            final String want = saved ? (on ? "1" : "0")
+                    : MobileData.roamChoice(readPrefValue(MobileData.ROAM_PREF));
+            final boolean nowOn = saved ? on : MobileData.switchChecked(want, phoneRoamingOn());
+            if (!saved) showMobileData();
+            MD_APPLY.execute(() -> {
+                final String reply = sendDaemon("APPLY-MOBILE-DATA\n");
+                runOnUiThread(() -> {
+                    boolean stillChosen = MobileData.roamChoice(readPrefValue(MobileData.ROAM_PREF)).equals(want);
+                    String t = saved ? MobileData.roamApplyToast(on, reply, stillChosen)
+                            : MobileData.roamNotSavedToast(nowOn, reply, stillChosen);
+                    if (t != null) android.widget.Toast.makeText(ProfileActivity.this, t,
+                            android.widget.Toast.LENGTH_LONG).show();
+                });
+            });
+        });
+        row.addView(sw, new LinearLayout.LayoutParams(WRAP, WRAP));
+        return row;
+    }
+
+    /** A plain (non-password) single-line text field, styled like passField. */
+    private EditText textField(String hint) {
+        EditText e = new SafeEdit(this); // DIA-20260811-09: a bare EditText dies on long-press -- see SafeEdit
+        e.setHint(hint);
+        e.setSingleLine(true);
+        e.setTextColor(FIELD_TX);
+        e.setHintTextColor(HINT);
+        e.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
+        e.setInputType(android.text.InputType.TYPE_CLASS_TEXT);
+        GradientDrawable g = new GradientDrawable();
+        g.setColor(FIELD_BG);
+        g.setCornerRadius(dp(13));
+        g.setStroke(dp(1), FIELD_LN);
+        e.setBackground(g);
+        e.setPadding(dp(15), dp(14), dp(15), dp(14));
+        return e;
+    }
+
+    /** "Delete this profile": a destructive confirm. The typed passphrase re-authenticates, then DELETE drops
+     *  the profile (and its recovery ref) from the store and wipes the local session WITHOUT sealing -- so a
+     *  deleted profile is never re-uploaded. Permanent: the recovery code stops working too. On OK the user-0
+     *  chooser reaps this user (switch to the gate + remove), tearing this screen down like a logoff. */
+    private void showDeleteConfirm(final String name) {
+        // Same invariant as showChangePass: DELETE carries the name on the wire, so a null one cannot resolve a
+        // profile. Refuse rather than send "null" -- on THIS screen a wrong answer is a destructive one.
+        if (name == null) { showConfirm(); return; }
+        final int RED = DANGER;
+        LinearLayout ll = new LinearLayout(this);
+        ll.setOrientation(LinearLayout.VERTICAL);
+        ll.setGravity(Gravity.CENTER_HORIZONTAL);
+        ll.setBackgroundColor(BG);
+        ll.setPadding(dp(32), dp(48), dp(32), dp(36));
+
+        TextView t = new TextView(this);
+        t.setText("Delete profile");
+        t.setTextColor(INK);
+        t.setTextSize(TypedValue.COMPLEX_UNIT_SP, 24);
+        t.setGravity(Gravity.CENTER);
+        ll.addView(t);
+
+        TextView sub = new TextView(this);
+        sub.setText(name);
+        sub.setTextColor(MUTED);
+        sub.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        sub.setGravity(Gravity.CENTER);
+        LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(WRAP, WRAP);
+        slp.topMargin = dp(4);
+        ll.addView(sub, slp);
+
+        TextView warn = new TextView(this);
+        warn.setText("This permanently removes this profile from your store and this device. It can't be "
+                + "undone — the recovery code stops working too. Enter your passphrase to confirm.");
+        warn.setTextColor(MUTED);
+        warn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        warn.setGravity(Gravity.CENTER);
+        warn.setLineSpacing(dp(3), 1f);
+        LinearLayout.LayoutParams wlp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        wlp.topMargin = dp(18);
+        wlp.bottomMargin = dp(22);
+        ll.addView(warn, wlp);
+
+        final EditText passF = passField("passphrase");
+        ll.addView(PassReveal.wrap(passF, MUTED), fieldLp(dp(20)));     // #81 passphrase
+
+        final Button del = accentBtn("Delete permanently");
+        GradientDrawable rbg = new GradientDrawable(); // override the teal accent -> read destructive
+        rbg.setColor(RED);
+        rbg.setCornerRadius(dp(13));
+        del.setBackground(rbg);
+        del.setTextColor(GatePalette.active().onBtn);
+        ll.addView(del, new LinearLayout.LayoutParams(MATCH, WRAP));
+
+        final TextView msg = new TextView(this);
+        msg.setTextColor(MUTED);
+        msg.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        msg.setGravity(Gravity.CENTER);
+
+        TextView cancel = new TextView(this);
+        cancel.setText("Cancel");
+        cancel.setTextColor(ACCENT);
+        cancel.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        cancel.setGravity(Gravity.CENTER);
+        cancel.setPadding(dp(8), dp(18), dp(8), dp(8));
+        ll.addView(cancel, new LinearLayout.LayoutParams(MATCH, WRAP));
+        cancel.setOnClickListener(v -> showConfirm());
+
+        LinearLayout.LayoutParams mlp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        mlp.topMargin = dp(12);
+        ll.addView(msg, mlp);
+
+        del.setOnClickListener(v -> {
+            final String pw = passF.getText().toString();
+            if (pw.isEmpty()) { msg.setTextColor(MUTED); StatusLine.error(msg, "enter your passphrase to confirm"); return; }
+            // NWP-20261028-03 (decided 2026-10-19, item 5): no network at all -> answer at once, send nothing; the
+            // daemon would otherwise retry the store until this screen's 90 s read runs out.
+            final boolean[] net = hasAnyNetwork();
+            if (deleteSkipsStore(net[0], net[1])) {
+                msg.setTextColor(MUTED);
+                StatusLine.error(msg, deleteFailCopy("ERR-STORE"));
+                return;
+            }
+            del.setEnabled(false);
+            msg.setTextColor(RED);
+            StatusLine.busy(msg, "deleting…");
+            new Thread(() -> {
+                String r = sendDaemon("DELETE\n" + name + "\n" + pw + "\n");
+                runOnUiThread(() -> {
+                    if (deleteSucceeded(r)) {
+                        // Store ref dropped + the reap queued (no seal). Show a terminal screen and block escape;
+                        // the user-0 chooser switches to the gate and removes this user, ending this screen;
+                        // watchDeleted reboots if the switch does not come (Q117).
+                        loggingOff = true;
+                        TextView done = new TextView(this);
+                        done.setText("Profile deleted");
+                        done.setTextColor(RED);
+                        done.setTextSize(TypedValue.COMPLEX_UNIT_SP, 24);
+                        done.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
+                        done.setGravity(Gravity.CENTER);
+                        done.setBackgroundColor(BG);
+                        setContentView(done);
+                        watchDeleted(done);
+                        getWindow().addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                    } else {
+                        // #140: say what actually happened. Every non-OK reply used to render as "check your
+                        // passphrase" -- a credential accusation the code had never established, and the
+                        // reason two real failures (a busy mutex, then a dropped teardown message) were
+                        // misread as a wrong passphrase for hours. The daemon distinguishes them now, so the
+                        // screen must too. NOTFOUND is the ONLY reply that means the passphrase was wrong: it
+                        // is returned solely when the session's own creds still resolve a live head, i.e. the
+                        // profile is real and the typed confirmation did not match it. Every branch says
+                        // "nothing was deleted" -- after a failed delete the profile is always still there,
+                        // and that is the fact the user needs before deciding what to do next.
+                        del.setEnabled(true);
+                        msg.setTextColor(MUTED);
+                        StatusLine.error(msg, deleteFailCopy(r));
+                    }
+                });
+            }).start();
+        });
+
+        setContentView(ll);
+    }
+
+    private EditText passField(String hint) {
+        EditText e = new SafeEdit(this); // DIA-20260811-09: a bare EditText dies on long-press -- see SafeEdit
+        e.setHint(hint);
+        e.setSingleLine(true);
+        e.setTextColor(FIELD_TX);
+        e.setHintTextColor(HINT);
+        e.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
+        e.setInputType(android.text.InputType.TYPE_CLASS_TEXT | android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD);
+        GradientDrawable g = new GradientDrawable();
+        g.setColor(FIELD_BG);
+        g.setCornerRadius(dp(13));
+        g.setStroke(dp(1), FIELD_LN);
+        e.setBackground(g);
+        e.setPadding(dp(15), dp(14), dp(15), dp(14));
+        return e;
+    }
+
+    private Button accentBtn(String text) {
+        Button b = new Button(this);
+        b.setText(text);
+        b.setAllCaps(false);
+        b.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
+        b.setTextColor(ON_ACCENT);
+        GradientDrawable bg = new GradientDrawable();
+        bg.setColor(ACCENT);
+        bg.setCornerRadius(dp(13));
+        b.setBackground(bg);
+        b.setStateListAnimator(null);
+        b.setSoundEffectsEnabled(false);
+        b.setPadding(0, dp(14), 0, dp(14));
+        return b;
+    }
+
+    private LinearLayout.LayoutParams fieldLp(int bottom) {
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        lp.bottomMargin = bottom;
+        return lp;
+    }
+
+    /** Send one line-framed request to the root login daemon and return its reply line. */
+    private String sendDaemon(String msg) {
+        // Tripwire, not a fix: this call BLOCKS on a socket read, so on the UI thread it is an ANR waiting for a
+        // slow daemon. One such caller (applyKeepMode -> overPlan) ANR'd on lynx 2026081100. There are ~34
+        // sendDaemon call sites here and auditing them blind is its own risk, so log the offenders loudly with a
+        // stack and let a real device tell us which ones actually run on the UI thread.
+        // DELIBERATELY NOT shortening setSoTimeout for main-thread callers: silently returning "" after a few
+        // seconds would turn an ANR into a SET-PIN that quietly did nothing, which is worse. Fix call sites.
+        if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) {
+            android.util.Log.w("NowhereChooser", "sendDaemon(" + DaemonSocket.verbOf(msg)
+                    + ") on the MAIN THREAD -- can ANR", new Throwable("main-thread daemon call"));
+        }
+        try {
+            LocalSocket s = DaemonSocket.connect(); // NWP-20261005-19: bounded connect
+            if (s == null) throw new java.io.IOException("daemon connect timed out");
+            s.setSoTimeout(90000);
+            OutputStream os = s.getOutputStream();
+            os.write(msg.getBytes("UTF-8"));
+            os.flush();
+            BufferedReader br = new BufferedReader(new InputStreamReader(s.getInputStream(), "UTF-8"));
+            String line = br.readLine();
+            if (DaemonSocket.moreBuffered(br)) // NWP-20261011-63: the verb only -- later lines carry passphrases
+                android.util.Log.e("NowhereChooser", "sendDaemon(" + DaemonSocket.verbOf(msg) + "): the reply has more "
+                        + "than one line and only the first was read -- use DaemonSocket.roundTripLines");
+            s.close();
+            return line == null ? "" : line.trim();
+        } catch (Exception e) {
+            return "";
+        }
+    }
+
+    /** NWP-20260826-01: a daemon reply that remembers WHY it is empty.
+     *
+     *  ⚠ THE PROBLEM THIS EXISTS FOR. `sendDaemon` collapses every failure to `""` -- a 90s read timeout, an
+     *  unreachable socket, and a daemon that genuinely answered nothing are indistinguishable to its ~34
+     *  callers. That is fine while the timeout is unreachable in practice, and it is NOT: the worker lock is
+     *  contended for minutes at a time (`storagebreakdown ... waited 164673ms`, and a LOGOFF once waited
+     *  152019ms), so `""` now happens in ordinary use. Contention therefore stops producing SLOW answers and
+     *  starts producing WRONG ones.
+     *
+     *  It cost Chester two symptoms in one evening, both of which read as broken features: "What's using
+     *  space" rendered `—`, which `formatUsage` also renders for a genuine zero; and the `Stop carrying`
+     *  chip did nothing at all, because `applyStorageDrop` gates its writes on `startsWith("OK")`. The same
+     *  tap on the same build worked later that evening on a quieter daemon -- identical action, identical
+     *  code, opposite outcome, and nothing on screen able to tell them apart.
+     *
+     *  This does not fix the contention (filed separately). It makes the failure SAYABLE. */
+    static final class DaemonReply {
+        final String text;          // "" when nothing usable came back
+        final boolean timedOut;     // the socket read elapsed -- the daemon is alive but busy
+        final boolean unreachable;  // connect/IO failed -- no daemon on the other end
+
+        DaemonReply(String t, boolean to, boolean un) {
+            text = t == null ? "" : t.trim();
+            timedOut = to;
+            unreachable = un;
+        }
+
+        boolean failed() { return timedOut || unreachable; }
+
+        /** A user-facing reason, or null when nothing failed. Deliberately says what to DO, because "the
+         *  phone was busy" with no follow-up is only marginally better than a dash. */
+        String reason() {
+            if (timedOut) return "the phone was busy and didn't answer in time";
+            if (unreachable) return "the phone's background service isn't responding";
+            return null;
+        }
+    }
+
+    /** sendDaemon, but the caller can tell a timeout from an answer. Same socket, same 90s cap; only the
+     *  failure reporting differs, so it is safe to adopt one call site at a time. */
+    private DaemonReply sendDaemonReply(String msg) {
+        try {
+            LocalSocket s = DaemonSocket.connect(); // NWP-20261005-19: bounded connect
+            if (s == null) throw new java.io.IOException("daemon connect timed out");
+            s.setSoTimeout(90000);
+            OutputStream os = s.getOutputStream();
+            os.write(msg.getBytes("UTF-8"));
+            os.flush();
+            BufferedReader br = new BufferedReader(new InputStreamReader(s.getInputStream(), "UTF-8"));
+            String line = br.readLine();
+            s.close();
+            return new DaemonReply(line, false, false);
+        } catch (java.io.InterruptedIOException te) {
+            // SocketTimeoutException extends this; LocalSocket reports read timeouts here.
+            String verb = msg == null ? "?" : msg.split("\n", 2)[0].trim();
+            android.util.Log.w("NowhereChooser", "daemon " + verb + ": TIMED OUT after 90s"
+                    + " -- the worker lock is contended (NWP-20260826-01)");
+            return new DaemonReply("", true, false);
+        } catch (Exception e) {
+            String verb = msg == null ? "?" : msg.split("\n", 2)[0].trim();
+            android.util.Log.w("NowhereChooser", "daemon " + verb + ": unreachable (" + e.getClass().getSimpleName()
+                    + ") (NWP-20260826-01)");
+            return new DaemonReply("", false, true);
+        }
+    }
+
+    /** Snapshot the launchable apps installed for the current (roamed) user into the chooser's own files
+     *  dir, so the list rides in the sealed /data/user/N and the next login can reinstall them. */
+    private void captureAppList() {
+        try {
+            Intent launch = new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER);
+            java.util.LinkedHashSet<String> pkgs = new java.util.LinkedHashSet<>();
+            for (android.content.pm.ResolveInfo ri : getPackageManager().queryIntentActivities(launch, 0)) {
+                String p = ri.activityInfo.packageName;
+                if (!getPackageName().equals(p)) pkgs.add(p); // skip ourselves
+            }
+            StringBuilder sb = new StringBuilder();
+            for (String p : pkgs) sb.append(p).append('\n');
+            StoreInstaller.writeAtomic(new java.io.File(getFilesDir(), "nowhere-apps.list"), sb.toString());
+            android.util.Log.i("NowhereChooser", "captured " + pkgs.size() + " apps for roaming");
+        } catch (Throwable t) {
+            android.util.Log.w("NowhereChooser", "capture app list", t);
+        }
+    }
+
+    /** #199 app-persistence P1: snapshot the CODE of the user-installed apps the profile has opted to KEEP, so
+     *  the worker can seal their APK bytes into the name#apps scope and the next login can re-install them on
+     *  ANY device. install-existing only re-enables an APK that is STILL on this device, but the logoff reap
+     *  GCs a user-installed app's APK -- so without this a Thunderbird/AliExpress never comes back (docs/app-
+     *  persistence.md). We run as the ROAMED user, where PackageManager sees THIS user's installed apps and
+     *  their split paths; the su:s0 worker can't query pm (the cmd fd denial), so it needs us to resolve the
+     *  paths. We only record the PATHS + metadata here (one line per kept package) -- the worker reads the
+     *  actual apk_data_file bytes. Format of files/nowhere-appcode.list:
+     *      pkg \t versionCode \t sideloaded(0|1) \t apkPath1 [\t apkPath2 ...]   (base + every split)
+     *  Gated by the per-profile KEEP-SET (`files/nowhere-appkeep`, written by the "Your apps" screen, one pkg
+     *  per line -- it seals + roams with the profile like `nowhere-apps.list`): only opted-in packages are kept,
+     *  and NOTHING by default (amnesia preserved -- the T4 sign-off). The `persist.nowhere.appcode` system
+     *  property is a DEV override: `"all"` keeps every user-installed app (the footprint-measurement mode), or a
+     *  comma/space package list adds packages ON TOP of the keep-set. (#199 capture / #201 opt-in.) */
+    /** True when pkg resolves for THIS user as a (updated-)system app: it ships in the image and roams with
+     *  the OS, so it must never sit in the keep-set -- captureAppCode seals nothing for it, and a stale entry
+     *  just ghost-inflates the "Kept apps" count vs "Your apps" (5-vs-4, odtest4 2026-07-28: WireGuard was
+     *  user-installed once, then a later image BUNDLED it). */
+    static boolean isBundledSystem(android.content.pm.PackageManager pm, String pkg) {
+        try {
+            android.content.pm.ApplicationInfo ai = pm.getApplicationInfo(pkg, 0);
+            return (ai.flags & (android.content.pm.ApplicationInfo.FLAG_SYSTEM
+                    | android.content.pm.ApplicationInfo.FLAG_UPDATED_SYSTEM_APP)) != 0;
+        } catch (Throwable t) {
+            return false; // not installed plain (e.g. an archived placeholder) -> certainly not bundled
+        }
+    }
+
+    /** The PackageManager half of "the logoff seal will stop carrying this" -- i.e. exactly captureAppDrops'
+     *  eligibility, which it MUST stay identical to or this screen's copy starts contradicting the seal.
+     *  Kept separate because it is the EXPENSIVE half (several binder round-trips per package) and is
+     *  resolved once on a worker thread; the cheap half (keep-set / turned-off files) is re-read on every
+     *  render so a row the user just turned off flips immediately. Everything with no keep-set row that is
+     *  NOT droppable still rides the wholesale push and IS carried. */
+    /** Is this package installed for THIS user, right now, as a real package? (DIA-20260806-13)
+     *
+     *  Deliberately flags=0. The keptFlags set used elsewhere on this screen
+     *  (MATCH_ARCHIVED_PACKAGES | MATCH_UNINSTALLED_PACKAGES | MATCH_ANY_USER) would answer "yes" for an
+     *  archived placeholder or for a package installed only for a different user -- and this question exists
+     *  precisely to decide whether roamd's live code-dir re-resolve can find an APK to seal. An archived
+     *  placeholder has no APK, so counting it would put us straight back to promising a restore we cannot do.
+     *
+     *  Note this is NOT pmDroppable: that returns false for bundled AND for absent, collapsing the two cases
+     *  the fate line has to keep apart. */
+    private boolean pmInstalledNow(String pkg) {
+        if (pkg == null || pkg.isEmpty()) return false;
+        try {
+            android.content.pm.ApplicationInfo ai = getPackageManager().getApplicationInfo(pkg, 0);
+            return ai != null && ai.sourceDir != null && !ai.sourceDir.isEmpty();
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /** Does PM hold ANY record of pkg for this user -- installed, archived placeholder, or
+     *  uninstalled-but-known? NWP-20260821-15.
+     *
+     *  The deliberate MIRROR of pmInstalledNow above: that one asks "is there an APK I can seal", so flags=0
+     *  and a real sourceDir; this one asks "does the system still know about this app at all", so the WIDEST
+     *  match. An on-demand placeholder answers TRUE here and FALSE there, which is the whole point -- the
+     *  keep-set prune must never read "not materialised yet" as "the user removed it".
+     *
+     *  It resolves with the SAME keptFlags as showYourApps (:5943) and the storage count (:3011), and that
+     *  identity is load-bearing, not stylistic: "Your apps" uses that predicate to decide a row EXISTS, so the
+     *  prune must use it to decide the row is GONE. Any other predicate and the screen and the prune disagree
+     *  about the same package -- the 5-vs-4 class of bug the :3011 comment already records.
+     *
+     *  ⚠ MATCH_ARCHIVED_PACKAGES is a LONG (out of int range), so it only reaches PM through
+     *  ApplicationInfoFlags.of(). Passing keptFlags to the int overload would silently drop it and report every
+     *  archived placeholder as gone -- i.e. delete the on-demand opt-ins this method exists to protect.
+     *
+     *  ⚠ Only NameNotFoundException means "no record". Every other failure -- binder death,
+     *  TransactionTooLarge, a stopped user mid-logoff -- returns TRUE, because the cost of a false NEGATIVE is
+     *  DELETING THE USER'S CHOICE, which nothing can recover. Every other PM catch in this file resolves away
+     *  from destroying state; this one is not the exception. */
+    static boolean pmKnows(android.content.pm.PackageManager pm, String pkg) {
+        if (pkg == null || pkg.isEmpty()) return true; // never prune on a malformed line
+        final long keptFlags = android.content.pm.PackageManager.MATCH_ARCHIVED_PACKAGES
+                | android.content.pm.PackageManager.MATCH_UNINSTALLED_PACKAGES
+                | android.content.pm.PackageManager.MATCH_ANY_USER;
+        try {
+            return pm.getApplicationInfo(pkg,
+                    android.content.pm.PackageManager.ApplicationInfoFlags.of(keptFlags)) != null;
+        } catch (android.content.pm.PackageManager.NameNotFoundException nf) {
+            return false; // the ONLY path that authorises a prune
+        } catch (Throwable t) {
+            return true; // unknown => assume present => never prune
+        }
+    }
+
+    /** Remove whole lines from nowhere-appkeep BY PACKAGE, re-emitting every survivor byte for byte.
+     *
+     *  NWP-20260821-15. Deliberately NOT writeAppModes: that re-synthesizes each line from (pkg, mode) alone
+     *  (:5412-5418) and cannot re-emit the optional third `group:<name>` token that readAppGroups parses
+     *  (:5216) -- latent today, since nothing in-tree writes that token into the keep-set yet, but this change
+     *  makes the rewrite fire on ORDINARY logoffs and a removals-only path has no business round-tripping the
+     *  file through a lossy parser. Also correctly bypasses the over-plan gate: writeAppModes' own invariant
+     *  is "ADDS ARE GATED, REMOVALS NEVER ARE" (:5389). */
+    private void removeKeepLines(java.util.Set<String> drop) {
+        // NWP-20260904-07: one implementation. The login-time reconcile needs this with only a Context in
+        // hand, so the body moved to StoreInstaller (which owns APPKEEP_LOCK and writeAtomic); this stays
+        // as the logoff prune's door so neither caller can drift from the other.
+        StoreInstaller.removeKeepLines(this, drop);
+    }
+
+    private boolean pmDroppable(String pkg) {
+        if (pkg == null || pkg.isEmpty() || getPackageName().equals(pkg)) return false;
+        android.content.pm.PackageManager pm = getPackageManager();
+        if (isBundledSystem(pm, pkg)) return false;
+        try {
+            android.content.pm.ApplicationInfo ai = pm.getApplicationInfo(pkg, 0);
+            if ((ai.flags & android.content.pm.ApplicationInfo.FLAG_SYSTEM) != 0) return false;
+            if ((ai.flags & android.content.pm.ApplicationInfo.FLAG_UPDATED_SYSTEM_APP) != 0) return false;
+            if (ai.sourceDir == null || ai.sourceDir.isEmpty()) return false;
+        } catch (Throwable t) {
+            return false; // cannot confirm user-installed -> the seal will carry it
+        }
+        return true;
+    }
+
+    /** Packages the user explicitly turned Off (files/nowhere-appoff.list).
+     *
+     *  WHY THIS EXISTS: captureAppDrops finds candidates by launcher enumeration + a sourceDir check, which
+     *  an ON-DEMAND app cannot satisfy -- most of the time it is an APK-less ARCHIVED placeholder with no
+     *  resolvable launcher activity and no sourceDir. So turning off an on-demand app did NOTHING: it left
+     *  the keep-set, never reached the drop list, and its data kept being sealed and billed while the confirm
+     *  dialog promised the opposite. On-demand apps are exactly the large ones this screen ranks first.
+     *  Membership is safe to trust: only a KEPT app can be turned off here, and captureAppCode prunes bundled
+     *  apps from the keep-set, so anything that leaves it was user-installed. Re-keeping rescues it anyway --
+     *  the agent intersects the drop list with the live keep-set before dropping anything.
+     *
+     *  NWP-20260926-01: membership now means "switched Off and not kept since", not "ever switched Off". A
+     *  keep line that lands for the package retires its entry (StoreInstaller.clearTurnedOff), and while the
+     *  session lasts this file is also where "Your apps" finds an Off app that has no other row source. */
+    private java.util.LinkedHashSet<String> explicitlyTurnedOff() { return explicitlyTurnedOff(this); }
+
+    /** Static form, for AppInstallReceiver. NWP-20260825-17: the receiver now acts on EVERY non-nApps
+     *  install rather than two named stores, so it can reach an app the user has explicitly switched Off --
+     *  and re-keeping one cancels its drop outright ("the agent intersects the drop list with the live
+     *  keep-set"), which would seal data the user asked us to let go. An explicit Off is a choice, and
+     *  keepInMode's "the user's existing choice stands" rule cannot see it: Off REMOVES the keep line, so
+     *  nowhere-appkeep looks the same as never-decided. The receiver has to check here instead. */
+    static java.util.LinkedHashSet<String> explicitlyTurnedOff(android.content.Context ctx) {
+        java.util.LinkedHashSet<String> out = new java.util.LinkedHashSet<>();
+        try (java.io.BufferedReader br = new java.io.BufferedReader(
+                new java.io.FileReader(new java.io.File(ctx.getFilesDir(), "nowhere-appoff.list")))) {
+            String ln;
+            while ((ln = br.readLine()) != null) {
+                ln = ln.trim();
+                if (ln.isEmpty()) continue;
+                // NWP-20260830-08: a Play-stack row in THIS file is read as residue, never as a choice to drop the
+                // stack's code. gms/gsf are filtered out of "Your apps", so no user can put them here. vending CAN
+                // be put here: since NWP-20260827-08 its chip is live whenever no kept app needs it, and the Off
+                // branch records that Off like any other. Reading it as residue is DECIDED (Chester, 2026-09-26,
+                // "keep play store"): a user's Off of Play Store keeps its code so the stack can be rebuilt without a
+                // store -- when the stack is known to be orphaned, setAppModeLocked records it as an INFERRED orphan.
+                // The other writer was NWP-20260826-13's orphan path, which called recordTurnedOff for all three,
+                // stamping an INFERENCE into the explicit record. That stamp is what this file's consumers
+                // trust ("the user chose this"), and under -08 an explicit Off outranks an inference, so a
+                // stale stamp would gut the code retention for exactly the profiles the old bug already hurt
+                // (device-proven: odtest35 carries `com.android.vending` + `com.google.android.gms` rows dated
+                // 08:50 2026-08-30, from before the split existed). The orphan path now records through
+                // recordInferredOrphan and never writes here, so this filter heals field profiles for the chooser's readers.
+                if (VENDING_PKG.equals(ln) || GMS_PKG.equals(ln) || GSF_PKG.equals(ln)) continue;
+                out.add(ln);
+            }
+        } catch (Exception ignore) {}
+        return out;
+    }
+
+    /** Record that the user turned pkg Off, so captureAppDrops can name it even when PackageManager no longer
+     *  presents it as a launcher-visible installed app (the archived on-demand case). */
+    private void recordTurnedOff(String pkg) {
+        // NWP-20260904-07: one implementation, shared with the login-time reconcile (StoreInstaller). The
+        // write is atomic now (tmp + rename) where it used to be a bare FileWriter -- the only change.
+        StoreInstaller.recordTurnedOff(this, pkg);
+    }
+
+    /** NWP-20260830-08: the INFERRED-orphan set -- files/nowhere-apporphan.list. Deliberately NOT
+     *  nowhere-appoff.list.
+     *
+     *  ⚠ WHY THE SPLIT EXISTS. NWP-20260826-13 recorded an orphaned Play stack through recordTurnedOff, i.e.
+     *  into explicitlyTurnedOff() -- a file whose entire contract is "the USER chose this". Every consumer
+     *  then reads an INFERENCE as user intent, and the destructive one acts on it: captureAppDrops unions that
+     *  set into nowhere-appdrop.list, and the drop list defeats the #apps CARRY-FORWARD (agent main.go:3275,
+     *  "a deliberate exclusion is a deletion") -- which is the only thing preserving an archived on-demand
+     *  app's APK bytes across a roam. So a stack the user never switched off lost its CODE permanently:
+     *  resolvableForKeep then answers false in every branch and applyStackMember can never re-add it.
+     *  AppInstallReceiver was reading the same inference as a choice, for the same reason.
+     *
+     *  Chester, 2026-08-30: "if i make play store off - i've seen play store getting removed" -- and that was
+     *  always true and always fine. reconcilePlayStack removing the stack from the keep-set UNINSTALLS it; the
+     *  carry-forward kept its bytes and a later Play app brought it straight back. -13 changed what Off costs,
+     *  not what it does.
+     *
+     *  An inferred orphan therefore drops its DATA -- which is -13's entire point, gms being routinely the
+     *  largest data dir on the phone -- but KEEPS ITS CODE, so the stack stays rebuildable.
+     *
+     *  Lenient: an unreadable file reads as empty, for read-only callers (resolvableForKeep). A writer, which
+     *  rewrites the file or the drop lists from what it read, uses inferredOrphansStrict (NWP-20261123-09). */
+    private java.util.LinkedHashSet<String> inferredOrphans() {
+        java.util.LinkedHashSet<String> s = inferredOrphansStrict();
+        return s == null ? new java.util.LinkedHashSet<>() : s;
+    }
+
+    /** NWP-20261123-09: inferredOrphans, strictly. Empty when nowhere-apporphan.list is absent; NULL when it exists
+     *  but cannot be read whole -- unknown, never "no orphans" and never the lines read before the failure. Same rule
+     *  as readAppModesStrictIn. recordInferredOrphan and captureAppDrops read this; they rewrite files from it. */
+    private java.util.LinkedHashSet<String> inferredOrphansStrict() {
+        String text = SettingsText.read(new java.io.File(getFilesDir(), "nowhere-apporphan.list"));
+        if (text == null) return null;
+        java.util.LinkedHashSet<String> out = new java.util.LinkedHashSet<>();
+        for (String ln : text.split("\n")) { ln = ln.trim(); if (!ln.isEmpty()) out.add(ln); }
+        return out;
+    }
+
+    /** Record pkg as an INFERRED orphan (see inferredOrphans). Idempotent; mirrors recordTurnedOff's shape. */
+    private void recordInferredOrphan(String pkg) {
+        try {
+            java.util.LinkedHashSet<String> s = inferredOrphansStrict();
+            if (s == null) {
+                // NWP-20261123-09: unknown is not empty -- a rewrite from an unread file would erase every other orphan.
+                android.util.Log.w("NowhereChooser", "nowhere-apporphan.list unreadable -- nothing written (NWP-20261123-09)");
+                return;
+            }
+            if (!s.add(pkg)) return;
+            StringBuilder sb = new StringBuilder();
+            for (String p : s) sb.append(p).append('\n');
+            StoreInstaller.writeAtomic(new java.io.File(getFilesDir(), "nowhere-apporphan.list"), sb.toString());
+        } catch (Throwable t) {
+            android.util.Log.w("NowhereChooser", "recordInferredOrphan", t);
+        }
+    }
+
+    /** DIA-20260804-04: write files/nowhere-appdrop.list -- the USER-INSTALLED apps this profile has switched
+     *  OFF -- so the logoff seal stops carrying their data (nowhere_roamd.sh exports it as NOWHERE_DROP_LIST;
+     *  the agent's walks skip those data dirs).
+     *
+     *  WHY: the keep-set previously gated only captureAppCode, i.e. the APK bytes that ride name#apps, while the
+     *  three data pushes took /data/user/N, /data/user_de/N and /data/media/N WHOLESALE. So an app switched Off
+     *  kept its data sealed, billed and roaming forever while the app itself was never reinstalled -- dead
+     *  weight the user paid for and could not see, and it made this screen's own copy ("Off means it's gone at
+     *  logoff, like always") untrue of the data.
+     *
+     *  CONSERVATIVE BY CONSTRUCTION -- this list causes data to be dropped, so every uncertainty resolves to
+     *  NOT dropping:
+     *   - Only apps the user can actually SEE and toggle are eligible: the same launcher enumeration + system
+     *     filters showYourApps uses. If it is not on that screen, it is never dropped.
+     *   - Bundled/system apps are excluded. Their data IS the profile (messages, browser, settings) and is not
+     *     represented in the keep-set at all, so treating "absent from keep-set" as "drop" would wipe it.
+     *   - Anything we cannot positively confirm as user-installed (PackageManager threw) is skipped.
+     *   - Our own package is never listed.
+     *   - An input that exists but cannot be read whole -- nowhere-appkeep or nowhere-apporphan.list -- is
+     *     UNKNOWN, never empty (NWP-20261123-09): the drop list is removed, so the seal carries every app, and
+     *     nowhere-appkeepcode.list and nowhere-apporphan.list are left exactly as they are.
+     *  An empty result DELETES the file rather than leaving a stale one: a list that outlived its session would
+     *  drop apps the user has since switched back on. */
+    private void captureAppDrops() {
+        java.io.File out = new java.io.File(getFilesDir(), "nowhere-appdrop.list");
+        try {
+            // NWP-20261123-09: both inputs read strictly. An unreadable keep-set or orphan record is UNKNOWN.
+            final java.util.LinkedHashMap<String,String> keptModes = readAppModesStrictIn(getFilesDir());
+            final java.util.LinkedHashSet<String> inferredRead = inferredOrphansStrict();
+            if (keptModes == null || inferredRead == null) {
+                android.util.Log.w("NowhereChooser", "captureAppDrops: "
+                        + (keptModes == null ? (inferredRead == null ? "nowhere-appkeep and nowhere-apporphan.list"
+                                                                     : "nowhere-appkeep")
+                                             : "nowhere-apporphan.list")
+                        + " unreadable -- drop list removed, the seal carries every app (NWP-20261123-09)");
+                out.delete();
+                return;
+            }
+            final java.util.LinkedHashSet<String> kept = new java.util.LinkedHashSet<>(keptModes.keySet());
+            final android.content.pm.PackageManager pm = getPackageManager();
+            final java.util.LinkedHashSet<String> seen = new java.util.LinkedHashSet<>();
+            // NWP-20260830-08: an EXPLICIT Off outranks an inference -- if the user actually switched it off,
+            // the code goes too, exactly as before. Only what is left is code-retained.
+            // DECIDED 2026-09-26 (docs/product-decisions.md): an Off app leaves the store at the next roam exactly
+            // as a never-kept install does, code and data alike -- this drop is that decision, and it replaces the
+            // 2026-09-06 table's "code retained". An Off is still not an uninstall: it must never mint a tombstone.
+            final java.util.LinkedHashSet<String> explicitOff = explicitlyTurnedOff();
+            final java.util.LinkedHashSet<String> inferred = new java.util.LinkedHashSet<>(inferredRead);
+            inferred.removeAll(explicitOff);
+            StringBuilder sb = new StringBuilder();
+            int n = 0;
+            Intent launch = new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER);
+            for (android.content.pm.ResolveInfo ri : pm.queryIntentActivities(launch, 0)) {
+                String p = ri.activityInfo.packageName;
+                if (p == null || p.isEmpty() || getPackageName().equals(p)) continue;
+                // ⚠ TESTED BEFORE seen.add, DELIBERATELY. Play Store IS launcher-visible, so this loop would
+                // otherwise claim it -- code and all -- before the code-retaining pass below ran; and marking
+                // it `seen` here would make that pass skip it as already-handled. Both halves matter.
+                if (inferred.contains(p)) continue;
+                if (!seen.add(p)) continue;
+                if (kept.contains(p)) continue;              // kept in either mode -> carried, never dropped
+                if (isBundledSystem(pm, p)) continue;        // part of the OS, not a user app
+                try {
+                    android.content.pm.ApplicationInfo ai = pm.getApplicationInfo(p, 0);
+                    if ((ai.flags & android.content.pm.ApplicationInfo.FLAG_SYSTEM) != 0) continue;
+                    if ((ai.flags & android.content.pm.ApplicationInfo.FLAG_UPDATED_SYSTEM_APP) != 0) continue;
+                    if (ai.sourceDir == null || ai.sourceDir.isEmpty()) continue;
+                } catch (Throwable t) {
+                    continue; // cannot confirm it is user-installed -> do not drop its data
+                }
+                sb.append(p).append('\n');
+                n++;
+            }
+            // Union the explicitly-turned-off set: an archived on-demand app satisfies NEITHER the launcher
+            // enumeration nor the sourceDir check above, so without this the one action this screen offers
+            // would silently do nothing for exactly the largest apps.
+            for (String p : explicitOff) {
+                if (p.isEmpty() || getPackageName().equals(p) || kept.contains(p) || !seen.add(p)) continue;
+                if (isBundledSystem(pm, p)) continue; // belt and braces: an OTA can bundle a formerly user app
+                sb.append(p).append('\n');
+                n++;
+            }
+            // NWP-20260830-08: inferred orphans drop their DATA on exactly the same terms -- they join THIS
+            // list, which roamd exports around the three data pushes -- but they ALSO go into
+            // nowhere-appkeepcode.list, which roamd SUBTRACTS from the drop list it passes to the #apps push.
+            // The #apps carry-forward then re-emits their APK bytes (agent main.go:3268-3285) and the stack
+            // stays rebuildable. Same filters as above: an inference must clear every bar an explicit Off does.
+            StringBuilder codeKeep = new StringBuilder();
+            int kc = 0;
+            for (String p : inferred) {
+                if (p.isEmpty() || getPackageName().equals(p) || kept.contains(p) || !seen.add(p)) continue;
+                if (isBundledSystem(pm, p)) continue;
+                sb.append(p).append('\n');
+                n++;
+                codeKeep.append(p).append('\n');
+                kc++;
+            }
+            // Written (or cleared) BEFORE the n == 0 return: a stale keepcode list outliving its session would
+            // retain code for packages nothing is dropping any more, which is the same class of bug as a stale
+            // drop list -- and the empty case must clear it, not leave the previous session's answer behind.
+            java.io.File codeOut = new java.io.File(getFilesDir(), "nowhere-appkeepcode.list");
+            try {
+                if (kc == 0) {
+                    codeOut.delete();
+                } else {
+                    StoreInstaller.writeAtomic(codeOut, codeKeep.toString());
+                }
+            } catch (Throwable ignore) { }
+            // NWP-20260830-08: and re-point nowhere-apporphan.list at the SAME set, so the record of "this is an
+            // inferred orphan" cannot outlive the retention it authorises. resolvableForKeep vouches for a
+            // package's sealed bytes on the strength of this file; a package that is back in the keep-set, or
+            // that the user has since explicitly switched Off, is no longer being retained, and a stale entry
+            // would keep vouching for bytes nothing is preserving. Both cases drop out here because codeKeep is
+            // built after the `kept` and `explicitOff` filters.
+            java.io.File orphanOut = new java.io.File(getFilesDir(), "nowhere-apporphan.list");
+            try {
+                if (kc == 0) {
+                    orphanOut.delete();
+                } else {
+                    StoreInstaller.writeAtomic(orphanOut, codeKeep.toString());
+                }
+            } catch (Throwable ignore) { }
+            if (n == 0) {
+                try { out.delete(); } catch (Throwable ignore) {}
+                return;
+            }
+            StoreInstaller.writeAtomic(out, sb.toString());
+            android.util.Log.i("NowhereChooser", "captureAppDrops: " + n + " switched-off app(s) will not be sealed"
+                    + (kc > 0 ? " (" + kc + " of them INFERRED orphans -- data dropped, code retained,"
+                                + " NWP-20260830-08)" : ""));
+        } catch (Throwable t) {
+            // Best-effort, and the safe direction is to carry everything: remove a partial list rather than let
+            // a half-written one decide what gets dropped.
+            android.util.Log.w("NowhereChooser", "captureAppDrops", t);
+            try { out.delete(); } catch (Throwable ignore) {}
+        }
+    }
+
+    private void captureAppCode() {
+        // NWP-20261119-10: AppInstallReceiver.recaptureCode rewrites ONE line of the same list (and the same
+        // nowhere-appmeta/<pkg>) in a session. Both hold AppCodeLine.LOCK, so this full rewrite and that one-line
+        // rewrite never interleave.
+        synchronized (AppCodeLine.LOCK) {
+            // Prune the keep-set BEFORE reading it below. ONE pass, ONE write, two reasons to drop a line:
+            //
+            //  (a) DIA-20260728 -- it turned into a BUNDLED system app. Sealing already skipped those (the
+            //      FLAG_SYSTEM guard below), but the stale mode line lived forever: it ghost-inflated the storage
+            //      count AND the ondemand carry-forward kept re-emitting its dead code line each logoff.
+            //  (b) NWP-20260821-15 -- the user UNINSTALLED it this session: present when the session settled,
+            //      absent now. Chester: "if i uninstall an app which is part of Your apps ... that app goes away
+            //      from Your apps. but a roam would bring it back."
+            //
+            // (b) IS THE SAME SHAPE AS (a), which is why they merged rather than sitting in two loops: both are
+            // "this keep line no longer describes anything real, and leaving it re-materialises the app". The
+            // resurrection machinery is literally the carry-forward at :5013 -- it walks readAppModes() and re-emits
+            // the OLD code line for any deferred package it could not capture live, which an uninstalled on-demand
+            // app is exactly. Pruning here, before that loop, also lets the meta-prune rmTree its now-orphaned
+            // nowhere-appmeta/<pkg>. For an INSTALLED-mode app the stakes are higher still: leaving the line keeps
+            // want_installed > 0 with nothing to stage, and appcode_seal then returns 4 ("staged 0 apk for N
+            // installed-mode app(s) -- keeping the previous head") on this and EVERY future logoff.
+            //
+            // (b) is gated on the session-presence receipt (StoreInstaller.snapshotAppSeen), NOT on a bare "is it
+            // installed" test. There is no point-in-time query that separates "the user removed it" from
+            // "on-demand, not materialised yet" -- both are absent -- so the discriminator has to be a TRANSITION
+            // observed within one session. A missing or foreign-stamped receipt reads as EMPTY, so the prune simply
+            // does not fire: today's behaviour, and the direction that loses a fix rather than a user's apps.
+            //
+            // gms/gsf are exempt BY NAME: they are launcher-less Play providers managed by reconcilePlayStack, never
+            // user-toggleable and deliberately not raised in sessions that do not use them -- absent without ever
+            // having been removed. Our own package is exempt for the obvious reason.
+            try {
+                android.content.pm.PackageManager pm = getPackageManager();
+                java.util.Set<String> seen = StoreInstaller.appSeenThisSession(this);
+                java.util.Set<String> gone = StoreInstaller.appGoneThisSession(this);
+                java.util.LinkedHashSet<String> drop = new java.util.LinkedHashSet<>();
+                // NWP-20260825-22: the SECOND route into the orphan trap. Both branches below remove a keep line,
+                // but only one of them means "this app is gone and its data should stop being carried":
+                //   - isBundledSystem  -> the app ships in the image. Its data IS the profile (messages, browser,
+                //                         settings) and must keep roaming. Recording a turn-off here would be a
+                //                         data-loss bug, so it is deliberately NOT recorded.
+                //   - seen && !pmKnows -> the user uninstalled a kept app outside "Your apps" (Settings, a launcher
+                //                         long-press). Before this, that removed the keep line and nothing else --
+                //                         exactly the shape that stranded 406 MB of tesla data, reached by a
+                //                         different door. captureAppDrops runs immediately after this, so recording
+                //                         it here lands in the same logoff.
+                java.util.LinkedHashSet<String> uninstalled = new java.util.LinkedHashSet<>();
+                for (String pkg : readAppKeep()) {
+                    if (pkg == null || pkg.isEmpty()) continue;
+                    if (isBundledSystem(pm, pkg)) { drop.add(pkg); continue; }
+                    if (GMS_PKG.equals(pkg) || GSF_PKG.equals(pkg) || getPackageName().equals(pkg)) continue;
+                    // NWP-20260904-06: OR the app was WATCHED LEAVING. seen-then-absent is an INFERENCE across two points
+                    // in time; gone is the transition itself, observed. It covers the two doors that never wrote a
+                    // sighting -- a Play/Aurora/sideload heal and the Your-apps mode toggle -- which is how a keep line
+                    // outlived its app forever (clean-room proven on lynx 2026-09-04). pmKnows is still required, so an
+                    // app removed and REINSTALLED in the same session keeps its line.
+                    if ((seen.contains(pkg) || gone.contains(pkg)) && !pmKnows(pm, pkg)) { drop.add(pkg); uninstalled.add(pkg); }
+                }
+                for (String pkg : uninstalled) recordTurnedOff(pkg);
+                StoreInstaller.recordUninstalled(this, uninstalled); // NWP-20261023-10: the uninstall record; never drop, which holds bundled-system apps
+                if (!drop.isEmpty()) {
+                    removeKeepLines(drop);
+                    // The uninstall ALREADY shrank the profile, so the seal that follows must be allowed to shrink
+                    // too. Without this the agent's shrink guard refuses the #apps push, keeps the old head, and
+                    // the app comes back at the next login -- the reported bug, returning by a second route.
+                    clearedStorageThisSession = true;
+                    android.util.Log.i("NowhereChooser", "keep-set prune: " + drop);
+                }
+            } catch (Throwable ignore) {}
+            try {
+                String prop = "";
+                try { prop = android.os.SystemProperties.get("persist.nowhere.appcode", ""); } catch (Throwable ignore) {}
+                prop = prop == null ? "" : prop.trim();
+                boolean all = prop.equalsIgnoreCase("all");
+                // NWP-20261123-12: ONE strict read of the keep-set decides the whole capture -- the opt-in set and the
+                // carry-forward below. NULL is a keep-set that exists but could not be read whole: unknown, not
+                // "nothing kept", so nothing here deletes, rewrites or prunes (the `all` override too).
+                java.util.Map<String,String> km = readAppModesStrictIn(getFilesDir());
+                if (km == null) {
+                    android.util.Log.w("NowhereChooser", "nowhere-appkeep unreadable -- code list left as restored (NWP-20261123-12)");
+                    return;
+                }
+                java.util.HashSet<String> allow = new java.util.HashSet<>();
+                if (!all) {
+                    allow.addAll(km.keySet()); // the per-profile opt-in set (roams)
+                    if (!prop.isEmpty()) for (String s : prop.split("[,\\s]+")) if (!s.isEmpty()) allow.add(s); // dev add-on
+                }
+                java.io.File out = new java.io.File(getFilesDir(), "nowhere-appcode.list");
+                if (!all && allow.isEmpty()) { // nothing opted in -> nothing persists; clear any stale list
+                    try { out.delete(); } catch (Throwable ignore) {}
+                    return;
+                }
+
+                android.content.pm.PackageManager pm = getPackageManager();
+                Intent launch = new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER);
+                java.util.LinkedHashSet<String> pkgs = new java.util.LinkedHashSet<>();
+                for (android.content.pm.ResolveInfo ri : pm.queryIntentActivities(launch, 0)) {
+                    String p = ri.activityInfo.packageName;
+                    if (!getPackageName().equals(p)) pkgs.add(p); // skip ourselves
+                }
+                // A kept app need not have a launcher activity. Sandboxed Play Services (com.google.android.gms) has
+                // none, so the CATEGORY_LAUNCHER enumeration above misses it -- a keep-set entry for it was still never
+                // sealed (logoff logged "2 opted-in, 1 captured") and it never came back on the roam, taking the signed-in
+                // Google account with it. Seed the opt-in set as capture candidates too; the FLAG_SYSTEM / sourceDir guards
+                // in the loop below still decide what actually seals. (DIA-20260801, sandboxed-Play roam.)
+                if (!all) for (String a : allow) if (!getPackageName().equals(a)) pkgs.add(a);
+                // On-demand tier: rebuilt per-app below. #DIA-20260726-08: read the OLD list (this login's restored copy)
+                // FIRST so a DORMANT on-demand app -- an APK-less archived placeholder we never TAPPED this session, so the
+                // sourceDir guard below skips it -- can carry its code line + archived meta forward instead of being
+                // dropped. Without this, a never-tapped on-demand app vanished from "Your apps" after one roam (no line, no
+                // meta -> no placeholder next login) and orphaned its held data. Mirrors the capturePerms carry-forward.
+                // The old blanket rmTree(nowhere-appmeta) is replaced by a targeted prune (after the loop) that keeps only
+                // meta we (re)captured or carried -- still dropping an app that flipped ondemand->installed/off.
+                // NWP-20261123-12: an unreadable old list or keep-set leaves the restored list and meta exactly as they are.
+                java.util.Map<String,String> oldCodeByPkg = AppCodeLine.oldLinesByPkg(SettingsText.read(out));
+                if (oldCodeByPkg == null) {
+                    android.util.Log.w("NowhereChooser", "nowhere-appcode.list unreadable -- left as restored, meta untouched (NWP-20261123-12)");
+                    return;
+                }
+                StringBuilder sb = new StringBuilder();
+                java.util.HashSet<String> fresh = new java.util.HashSet<>();    // captured live this session (any mode)
+                java.util.HashSet<String> metaKeep = new java.util.HashSet<>(); // pkgs whose nowhere-appmeta must survive the prune
+                int kept = 0;
+                for (String pkg : pkgs) {
+                    if (!all && !allow.contains(pkg)) continue;
+                    try {
+                        android.content.pm.ApplicationInfo ai = pm.getApplicationInfo(pkg, 0);
+                        // Only genuinely USER-installed apps: a (updated-)system app already ships in the image, so
+                        // install-existing brings it back for free -- sealing its bytes would just bloat the footprint.
+                        if ((ai.flags & android.content.pm.ApplicationInfo.FLAG_SYSTEM) != 0) continue;
+                        if ((ai.flags & android.content.pm.ApplicationInfo.FLAG_UPDATED_SYSTEM_APP) != 0) continue;
+                        if (ai.sourceDir == null || ai.sourceDir.isEmpty()) continue;
+                        long vc;
+                        try { vc = pm.getPackageInfo(pkg, 0).getLongVersionCode(); } catch (Throwable ignore) { vc = 0; }
+                        // The dev `persist.nowhere.appcode=all` override keeps everything as installed; a keep-set
+                        // app carries its chosen mode (default installed). Column 4 = mode (installed | ondemand).
+                        String mode = all ? MODE_INSTALLED : appMode(pkg);
+                        if (mode == null || mode.isEmpty()) mode = MODE_INSTALLED;
+                        // group-materialize: emit an optional TRAILING `group:<name>` token (explicit keep-set token or
+                        // the built-in DEFAULT_GROUPS bootstrap) AFTER all apk paths, so appcode_seal carries it into the
+                        // manifest without shifting col4=mode / col5=apk. The dormant carry-forward below re-emits the
+                        // whole prior line, preserving an already-written token for free. NWP-20261119-10: the line is
+                        // built by AppCodeLine.build, which AppInstallReceiver.recaptureCode also uses.
+                        sb.append(AppCodeLine.build(pkg, vc, isSideloaded(pm, pkg), mode, ai.sourceDir, ai.splitSourceDirs,
+                                groupFor(this, pkg))).append('\n');
+                        // On-demand apps also seal an ArchivedPackageInfo snapshot (signer + launcher activities +
+                        // icons) so restore can raise the archived placeholder WITHOUT the APK; the APK is fetched
+                        // from name#apps only on the unarchive tap.
+                        fresh.add(pkg);
+                        if (deferredMode(mode)) { captureArchivedMeta(this, pm, pkg, vc); metaKeep.add(pkg); } // #130: auto raises a placeholder too
+                        kept++;
+                    } catch (Throwable t) {
+                        android.util.Log.w("NowhereChooser", "appcode " + pkg, t);
+                    }
+                }
+                // #DIA-20260726-08 carry-forward: a keep-set deferred app (on-demand OR auto, #130) that's a dormant
+                // placeholder (not captured live above) re-emits its OLD code line and keeps its restored
+                // nowhere-appmeta, so it stays raisable next login.
+                for (java.util.Map.Entry<String, String> e : km.entrySet()) {
+                    if (!deferredMode(e.getValue())) continue;
+                    String pkg = e.getKey();
+                    if (getPackageName().equals(pkg) || fresh.contains(pkg)) continue;
+                    String oldLine = oldCodeByPkg.get(pkg);
+                    java.io.File meta = new java.io.File(new java.io.File(getFilesDir(), "nowhere-appmeta"), pkg);
+                    if (oldLine != null && meta.isDirectory()) { sb.append(oldLine).append('\n'); metaKeep.add(pkg); kept++; }
+                }
+                // Prune stale meta: keep only what we (re)captured or carried; this drops an app flipped
+                // ondemand->installed/off (the reason the up-front wipe existed) without nuking a dormant placeholder.
+                java.io.File[] metaSubs = new java.io.File(getFilesDir(), "nowhere-appmeta").listFiles();
+                if (metaSubs != null) for (java.io.File d : metaSubs)
+                    if (d.isDirectory() && !metaKeep.contains(d.getName())) rmTree(d);
+                StoreInstaller.writeAtomic(out, sb.toString());
+                android.util.Log.i("NowhereChooser", "captured app CODE for roaming: " + kept + " pkg(s) ("
+                        + (all ? "ALL override" : allow.size() + " opted-in") + ")");
+            } catch (Throwable t) {
+                android.util.Log.w("NowhereChooser", "captureAppCode", t);
+            }
+        }
+    }
+
+    /** On-demand tier: snapshot the ArchivedPackageInfo of an on-demand app into files/nowhere-appmeta/<pkg>/ so
+     *  restore can raise a native archived placeholder (icon + label + signer) WITHOUT the APK -- the APK is
+     *  fetched from name#apps only on the unarchive tap. Files:
+     *    meta    -- "vc\t<versionCode>", one "cert\t<base64 DER signer>" per apkContentsSigner, and one
+     *               "act\t<flatComponent>\t<label>" per launcher activity (1:1 with the icon files);
+     *               NWP-20261128-20: and "inst\t<installer package>" when AppCodeManifest.installerToRecord has one;
+     *    <i>.png -- the i-th launcher activity's icon. The dir seals into name#apps beside the APK.
+     *  Static since NWP-20261119-10, so AppInstallReceiver.recaptureCode re-captures it in a session.
+     *  NWP-20261125-18: the snapshot is built in files/.nowhere-appmeta-staging/<pkg> and AppMetaDir.publish swaps it
+     *  in only when it is complete (a vc line and a cert), or when there is no previous snapshot. The swap renames the
+     *  new meta over the old one and never deletes the published dir or its meta, so a throw, a failed swap or a failed
+     *  signer read keeps the previous snapshot: an app that had a raisable placeholder never loses it here. Old icons
+     *  that a failed swap could not put back stay in files/.nowhere-appmeta-old/<pkg>; AppMetaDir.recover puts them
+     *  back before the next capture, and the capture waits until it can. */
+    static void captureArchivedMeta(android.content.Context ctx, android.content.pm.PackageManager pm, String pkg, long vc) {
+        java.io.File dir = null;
+        try {
+            java.io.File files = ctx.getFilesDir();
+            java.io.File target = new java.io.File(new java.io.File(files, "nowhere-appmeta"), pkg);
+            java.io.File aside = AppMetaDir.asideFor(files, pkg);
+            dir = AppMetaDir.stagingFor(files, pkg);
+            if (!AppMetaDir.recover(target, aside)) { // aside holds old icons that are not back yet: never clear it
+                android.util.Log.w("NowhereChooser", "appmeta " + pkg
+                        + ": old icons of a failed swap are not back yet -- kept the previous snapshot (NWP-20261125-18)");
+                return;
+            }
+            AppMetaDir.clear(dir, aside);
+            if (!dir.mkdirs() && !dir.isDirectory()) return;
+            StringBuilder meta = new StringBuilder();
+            meta.append("vc\t").append(vc).append('\n');
+            // targetSdkVersion: the archived install FAILS (INSTALL_FAILED_DEPRECATED_SDK_VERSION "found 0") unless
+            // the ArchivedPackageInfo carries a target SDK >= 24, so capture it here for installArchivedPlaceholder.
+            try {
+                int tsdk = pm.getApplicationInfo(pkg, 0).targetSdkVersion;
+                if (tsdk > 0) meta.append("tsdk\t").append(tsdk).append('\n');
+            } catch (Throwable ignore) {}
+            try {
+                android.content.pm.SigningInfo si = pm.getPackageInfo(
+                        pkg, android.content.pm.PackageManager.GET_SIGNING_CERTIFICATES).signingInfo;
+                if (si != null) {
+                    // Capture the CURRENT apk-contents signer(s) ONLY -- NOT getSigningCertificateHistory(). A
+                    // key-ROTATED single-signer app (Play Store / gms ship a v3 signing lineage) has a history of
+                    // [oldCert, currentCert]; recording BOTH made installArchivedPlaceholder rebuild a MULTI-signer
+                    // SigningInfo {old,current}, which no longer matches the real APK's single-signer-plus-lineage
+                    // SigningDetails -> the materialize-on-tap real-APK install is rejected
+                    // INSTALL_FAILED_UPDATE_INCOMPATIBLE ("signatures do not match newer version"; group-materialize
+                    // BLOCKER 1). getApkContentsSigners() returns the current signer(s) in both the single- and
+                    // multi-signer cases, and they match the real APK directly via compareSignatures; the ephemeral
+                    // placeholder is replaced by the real APK on tap, so it needs no rotation lineage of its own.
+                    android.content.pm.Signature[] sigs = si.getApkContentsSigners();
+                    if (sigs != null) for (android.content.pm.Signature s : sigs)
+                        meta.append("cert\t").append(android.util.Base64.encodeToString(
+                                s.toByteArray(), android.util.Base64.NO_WRAP)).append('\n');
+                }
+            } catch (Throwable t) { android.util.Log.w("NowhereChooser", "appmeta signer " + pkg, t); }
+            Intent li = new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER).setPackage(pkg);
+            int i = 0;
+            for (android.content.pm.ResolveInfo ri : pm.queryIntentActivities(li, 0)) {
+                android.content.pm.ActivityInfo aci = ri.activityInfo;
+                if (aci == null || aci.name == null) continue;
+                android.content.ComponentName cn = new android.content.ComponentName(aci.packageName, aci.name);
+                CharSequence label = ri.loadLabel(pm);
+                meta.append("act\t").append(cn.flattenToShortString()).append('\t')
+                        .append(label == null ? "" : label.toString().replace('\t', ' ').replace('\n', ' ')).append('\n');
+                try {
+                    android.graphics.Bitmap bmp = drawableToBitmap(ri.loadIcon(pm));
+                    if (bmp != null) try (java.io.FileOutputStream fo =
+                            new java.io.FileOutputStream(new java.io.File(dir, i + ".png"))) {
+                        bmp.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, fo);
+                    }
+                } catch (Throwable t) { android.util.Log.w("NowhereChooser", "appmeta icon " + pkg, t); }
+                i++;
+            }
+            // NWP-20261128-20 (h50 #3): record the installer. The previous meta comes from the PUBLISHED dir: clear()
+            // emptied the staging dir. The chooser's own re-install keeps the previous installer.
+            String previous = null;
+            try {
+                java.io.File pf = new java.io.File(target, "meta");
+                if (pf.isFile()) previous = new String(java.nio.file.Files.readAllBytes(pf.toPath()),
+                        java.nio.charset.StandardCharsets.UTF_8);
+            } catch (Throwable ignore) {}
+            String current = null;
+            try {
+                if (android.os.Build.VERSION.SDK_INT >= 30)
+                    current = pm.getInstallSourceInfo(pkg).getInstallingPackageName();
+            } catch (Throwable ignore) {}
+            String inst = AppCodeManifest.installerToRecord(current, ctx.getPackageName(), previous);
+            if (inst != null) meta.append("inst\t").append(inst).append('\n');
+            StoreInstaller.writeAtomic(new java.io.File(dir, "meta"), meta.toString());
+            boolean whole = AppMetaDir.complete(dir);
+            if (!AppMetaDir.publish(target, dir, aside))
+                android.util.Log.w("NowhereChooser", whole
+                        ? "appmeta " + pkg + ": swap failed -- kept the previous snapshot, if any (NWP-20261125-18)"
+                        : "appmeta " + pkg + ": new snapshot incomplete -- kept the previous one (NWP-20261125-18)");
+        } catch (Throwable t) {
+            android.util.Log.w("NowhereChooser", "captureArchivedMeta " + pkg, t);
+            if (dir != null) AppMetaDir.clear(dir, null);
+        }
+    }
+
+    /** Rasterise a drawable (adaptive / vector / bitmap) to a bitmap for PNG capture. */
+    private static android.graphics.Bitmap drawableToBitmap(android.graphics.drawable.Drawable d) {
+        if (d == null) return null;
+        if (d instanceof android.graphics.drawable.BitmapDrawable) {
+            android.graphics.Bitmap b = ((android.graphics.drawable.BitmapDrawable) d).getBitmap();
+            if (b != null) return b;
+        }
+        int w = Math.max(1, d.getIntrinsicWidth());
+        int h = Math.max(1, d.getIntrinsicHeight());
+        android.graphics.Bitmap b = android.graphics.Bitmap.createBitmap(w, h, android.graphics.Bitmap.Config.ARGB_8888);
+        android.graphics.Canvas c = new android.graphics.Canvas(b);
+        d.setBounds(0, 0, w, h);
+        d.draw(c);
+        return b;
+    }
+
+    /** Recursively delete a file/dir tree (best-effort). */
+    static void rmTree(java.io.File f) {
+        if (f == null) return;
+        java.io.File[] kids = f.listFiles();
+        if (kids != null) for (java.io.File k : kids) rmTree(k);
+        try { f.delete(); } catch (Throwable ignore) {}
+    }
+
+    /** Whether pkg was sideloaded -- installer unknown / not a recognised app store. Recorded so P3 can show a
+     *  one-time "you sideloaded this" warning before keeping it (the T4 security sign-off). Best-effort: any
+     *  other failure (or a null installer) is treated as sideloaded, the conservative default for that warning.
+     *  NWP-20261127-08: a NameNotFoundException means this user does not have the package (an On-demand app
+     *  with no placeholder), so Your apps does not label it sideloaded. The pre-30 lookup throws
+     *  IllegalArgumentException instead and stays true; every shipped device is SDK 34 or later. */
+    static boolean isSideloaded(android.content.pm.PackageManager pm, String pkg) {
+        String installer = null;
+        boolean notFound = false;
+        try {
+            if (android.os.Build.VERSION.SDK_INT >= 30) installer = pm.getInstallSourceInfo(pkg).getInstallingPackageName();
+            else installer = pm.getInstallerPackageName(pkg);
+        } catch (android.content.pm.PackageManager.NameNotFoundException nf) {
+            notFound = true;
+        } catch (Throwable ignore) {}
+        return sideloadedVerdict(installer, notFound);
+    }
+
+    /** isSideloaded's decision, pure so test-placeholder-outcomes-java.sh runs it (NWP-20261127-08). */
+    static boolean sideloadedVerdict(String installer, boolean notFound) {
+        if (notFound) return false;
+        if (installer == null || installer.isEmpty()) return true;
+        // First-party stores that fetch signed, verifiable code -> not "sideloaded" for the warning's purpose.
+        // NWP-20260827-08: app.grapheneos.apps belongs here and was simply omitted. This is a TRUST test,
+        // not a config-bucket test -- the criterion is stated one line above, "first-party stores that fetch
+        // signed, verifiable code" -- and the GrapheneOS App Store is Endospore's own store, the one its OS
+        // documents for installing sandboxed Play. Badging its installs "sideloaded" told the user the single
+        // most trustworthy source on the device was the least. Reported by Chester on lynx 2026-08-27.
+        return !(installer.equals("org.fdroid.fdroid") || installer.equals("com.android.vending")
+                || installer.equals("com.aurora.store") || installer.equals("com.nowhere.chooser")
+                || installer.equals(GOS_STORE_PKG));
+    }
+
+    /** Snapshot this (roamed) user's effective timezone + locale into the chooser's own files dir, so they
+     *  ride in the sealed /data/user/N and the next login re-applies them (DIA-20260616-58). Mirrors
+     *  captureAppList: getFilesDir() here = /data/user/N/com.nowhere.chooser/files (we run as the roamed
+     *  user at logoff). The framework values are authoritative (the gate may have set tz via the device
+     *  owner / locale via LocalePicker on login). One small line-oriented file, surfaced by roamd as
+     *  prefs.out and applied by the user-0 gate on the next login. */
+    private void capturePrefs() {
+        try {
+            // `tz` is the user's OVERRIDE, NOT the live system zone -- timezone is auto-by-location unless the
+            // profile pins one (DIA-20260616-60; docs/timezone-model.md). PRESERVE any existing override (set by
+            // the timezone picker); capturing the live tz would pin the auto-detected zone and defeat auto on the
+            // next device. Locale DOES roam (identity-pinned), so capture the live locale.
+            String tzOverride = readPrefValue("tz");
+            // Route the logoff snapshot through setPref (read-modify-write) so it preserves EVERY roamed pref:
+            // it previously re-emitted only tz/locale/idle and silently DROPPED vpn/vpnlockdown (+ wipe), so a
+            // profile's always-on-VPN choice never survived the seal (#159). tz stays the override; locale is
+            // refreshed to the live (identity-pinned) value.
+            String loc = java.util.Locale.getDefault().toLanguageTag();
+            setPref("locale", loc);
+            android.util.Log.i("NowhereChooser",
+                    "captured prefs tzOverride=[" + tzOverride + "] locale=" + loc + " for roaming");
+        } catch (Throwable t) {
+            android.util.Log.w("NowhereChooser", "capture prefs", t);
+        }
+    }
+
+    /** Snapshot each roamed app's GRANTED runtime (dangerous) permissions into files/nowhere-perms, so they
+     *  ride in the sealed /data/user/N and roamd re-grants them on the next login (after install-existing) --
+     *  runtime grants live in misc_de, OUTSIDE the sealed trees, so without this every login re-prompts (OM
+     *  re-asks for location). Read here via PackageManager from the ROAMED user, which returns LIVE state --
+     *  the on-disk runtime-permissions.xml is written lazily, so a su:s0 read at logoff is stale (it missed a
+     *  just-granted location). One "pkg perm" per line for each dangerous + granted permission. (DIA-20260625-06)
+     *  ⚠ SUPERSEDED (NWP-20261012-05): this comment went on "(an explicit deny is a fresh user's default, so it's
+     *  preserved by simply not re-granting)". That premise was false. The platform re-prompts for a permission that
+     *  is not granted AND carries neither USER_SET nor USER_FIXED, and a fresh user's not-granted permission carries
+     *  neither -- so every declined permission (notifications above all) asked again after every roam. A dangerous
+     *  permission that is NOT granted and carries either flag now rides as "pkg flags:<user-set|user-fixed|
+     *  user-set,user-fixed>:<perm>", and roamd's grant_perms_for re-declines it (docs/product-decisions.md,
+     *  2026-10-12: a permission the user declined stays declined with the profile). Reading the flags needs
+     *  GET_RUNTIME_PERMISSIONS (AndroidManifest.xml).
+     *  NWP-20261112-07 (Q061): runs from any Context. The sign-out passes midSession=false and the keep-set read
+     *  after captureAppCode (behaviour unchanged); PermsCaptureReceiver passes true in the live session. Mid-session,
+     *  an on-demand or auto app whose restore has not landed keeps its carried lines verbatim (PermsCaptureRule). */
+    // #204: "special app access" permissions whose grant state lives in AppOps (not the pm runtime grant), so they
+    // never rode nowhere-perms and re-prompted on every roam (a file editor lost All-files access each login). Curated,
+    // user-facing allowlist ONLY. Captured as `pkg appop:<opstr>`; restored by grant_perms_for with `appops set`
+    // (which is allowlist-guarded again, defence in depth). Usage access (PACKAGE_USAGE_STATS ->
+    // android:get_usage_stats) roams here since Q024 (docs/product-decisions.md, decided 2026-10-20) as one more appop line,
+    // exactly as the user set it: only an op that reads MODE_ALLOWED is captured, so usage access nobody granted
+    // (MODE_DEFAULT) is never carried. Enabled accessibility services do NOT ride this list: they are a Secure setting,
+    // not an appop, with their own capture.
+    // REQUEST_INSTALL_PACKAGES (install-unknown-apps) IS roamed (DIA-20260727-01, Chester's call): without it F-Droid /
+    // Aurora Store re-ask to be an install source EVERY new session. Roaming it is acceptable because the real per-
+    // install gate stays -- PackageInstaller still shows its own CONFIRM_INSTALL ("Install <app>?") dialog for each
+    // individual APK regardless of this source-grant; this op only decides whether the app may be an install SOURCE.
+    private static final java.util.Set<String> SPECIAL_APPOP_PERMS = new java.util.HashSet<>(java.util.Arrays.asList(
+            android.Manifest.permission.MANAGE_EXTERNAL_STORAGE,
+            android.Manifest.permission.SYSTEM_ALERT_WINDOW,
+            android.Manifest.permission.WRITE_SETTINGS,
+            android.Manifest.permission.REQUEST_INSTALL_PACKAGES,
+            android.Manifest.permission.PACKAGE_USAGE_STATS));
+    // NWP-20261112-07: a relayed mid-session capture and the sign-out's never interleave their read-modify-write of
+    // files/nowhere-perms (both run in this process, in the session user).
+    private static final Object PERMS_CAPTURE_LOCK = new Object();
+    static void capturePerms(android.content.Context ctx, java.util.Map<String,String> keptModes, boolean midSession) {
+        synchronized (PERMS_CAPTURE_LOCK) {
+            if (keptModes == null) { // NWP-20261123-11: unknown is not empty -- the record stays as restored
+                android.util.Log.w("NowhereChooser", "capturePerms: keep-set unreadable -- permissions not captured"
+                        + " (NWP-20261123-11)");
+                return;
+            }
+            try {
+                android.content.pm.PackageManager pm = ctx.getPackageManager();
+                // #204: read the OLD perms (this login's restored copy) first, so we can CARRY FORWARD the grants of an
+                // on-demand app that is still an APK-less archived placeholder this session -- it has no manifest to
+                // enumerate below (requestedPermissions==null), so a never-tapped session would otherwise DROP its perms
+                // and the next materialise would come up with everything denied.
+                java.util.HashMap<String, java.util.ArrayList<String>> oldByPkg =
+                        PermsCaptureRule.oldLinesByPkg(SettingsText.read(new java.io.File(ctx.getFilesDir(), "nowhere-perms")));
+                if (oldByPkg == null) { // NWP-20261123-11: a part-read record would drop every placeholder's carried lines
+                    android.util.Log.w("NowhereChooser", "capturePerms: nowhere-perms unreadable -- nothing written"
+                            + " (NWP-20261123-11)");
+                    return;
+                }
+
+                Intent launch = new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER);
+                java.util.LinkedHashSet<String> pkgs = new java.util.LinkedHashSet<>();
+                for (android.content.pm.ResolveInfo ri : pm.queryIntentActivities(launch, 0)) {
+                    String p = ri.activityInfo.packageName;
+                    if (!ctx.getPackageName().equals(p)) pkgs.add(p); // skip ourselves
+                }
+                // NWP-20260903-23: the launcher query CANNOT SEE a launcher-less package, and the carry-forward below
+                // used to be gated to DEFERRED modes only -- so a keep-INSTALLED app with no launcher activity was in
+                // NEITHER, and the whole-file rewrite at the end dropped its restored grants PERMANENTLY, every logoff,
+                // with no error anywhere. Sandboxed Play Services and GSF are exactly this shape, and so is any app
+                // whose install failed or which crashed before it could be enumerated.
+                //
+                // Union the keep-set in rather than carrying it forward blindly, because that is what keeps the two
+                // cases apart:
+                //   - INSTALLED this session (launcher-less or not) -> getPackageInfo below SUCCEEDS, the package joins
+                //     `fresh`, and its LIVE grants are captured. An in-session REVOKE therefore still sticks; a blind
+                //     carry-forward would have silently resurrected it.
+                //   - NOT installed (archived placeholder, failed install) -> getPackageInfo throws, it never enters
+                //     `fresh`, and the carry-forward re-emits its restored lines exactly as it does for a placeholder.
+                //
+                // Safe against a package the user UNINSTALLED this session because captureAppCode() runs FIRST (see
+                // doLogoff) and prunes exactly those lines out of the keep-set before this reads it -- NWP-20260821-15.
+                // NWP-20261112-07: the keep-set is the caller's (keptModes), read after that prune at sign-out; a
+                // mid-session run (PermsCaptureReceiver) carries such a package forward until the sign-out prunes it.
+                for (String p : keptModes.keySet()) {
+                    if (!ctx.getPackageName().equals(p)) pkgs.add(p); // LinkedHashSet -> a launcher app already present is a no-op
+                }
+                StringBuilder sb = new StringBuilder();
+                java.util.HashSet<String> fresh = new java.util.HashSet<>();
+                java.util.HashSet<String> held = new java.util.HashSet<>(); // NWP-20261112-07: carried verbatim (PermsCaptureRule)
+                android.app.AppOpsManager ao = ctx.getSystemService(android.app.AppOpsManager.class);
+                // NWP-20261012-05: declined permissions captured, and flag reads that FAILED (with the first reason).
+                int declined = 0;
+                PermDeclines.Fails flagFails = new PermDeclines.Fails();
+                for (String pkg : pkgs) {
+                    // NWP-20261112-07: mid-session, a deferred app whose restore has not landed keeps its carried
+                    // lines -- odrestore's grant_perms_for reads them from this file (PermsCaptureRule).
+                    if (PermsCaptureRule.keepCarried(midSession, keptModes.get(pkg), UnarchiveService.odRestored(ctx, pkg))) {
+                        held.add(pkg);
+                        continue;
+                    }
+                    try {
+                        android.content.pm.PackageInfo pi =
+                                pm.getPackageInfo(pkg, android.content.pm.PackageManager.GET_PERMISSIONS);
+                        if (pi.requestedPermissions == null) continue;
+                        fresh.add(pkg); // a real installed app -- its LIVE grants are authoritative (honours a revoke too)
+                        int appUid = pi.applicationInfo != null ? pi.applicationInfo.uid : -1;
+                        for (int i = 0; i < pi.requestedPermissions.length; i++) {
+                            String perm = pi.requestedPermissions[i];
+                            // #204: a "special app access" (All files / draw-over / write-settings) isn't a dangerous runtime
+                            // grant and its state lives in AppOps, not the pm grant flag (REQUESTED_PERMISSION_GRANTED is
+                            // unreliable for it) -- read the appop mode directly (the chooser is platform-signed, so it can
+                            // check any pkg's op) and emit an `appop:<opstr>` line that grant_perms_for restores. Checked
+                            // BEFORE the granted-flag skip below, precisely because that flag doesn't track the appop.
+                            if (SPECIAL_APPOP_PERMS.contains(perm) && ao != null && appUid >= 0) {
+                                try {
+                                    String opstr = android.app.AppOpsManager.permissionToOp(perm);
+                                    if (opstr != null && ao.unsafeCheckOpNoThrow(opstr, appUid, pkg)
+                                            == android.app.AppOpsManager.MODE_ALLOWED)
+                                        sb.append(pkg).append(" appop:").append(opstr).append('\n');
+                                } catch (Throwable ignore) {}
+                                continue;
+                            }
+                            if ((pi.requestedPermissionsFlags[i]
+                                    & android.content.pm.PackageInfo.REQUESTED_PERMISSION_GRANTED) == 0) {
+                                // DIA-20260813-08 (#127): for INTERNET, capture the REVOKE explicitly. GrapheneOS
+                                // makes INTERNET a per-user runtime perm that install-time DEFAULTS to granted --
+                                // but the roam's install-existing/materialise paths don't apply install defaults,
+                                // so a package with NO captured line came back with NO NETWORK (Play Store,
+                                // 2026-08-13: Cronet ERR_INTERNET_DISCONNECTED on a fully-online device). With
+                                // revokes explicit (`deny:`), an ABSENT line unambiguously means "never captured"
+                                // and grant_perms_for can safely re-establish the platform default, while a user's
+                                // deliberate Network-off toggle still roams as the denial it is.
+                                if ("android.permission.INTERNET".equals(perm)) {
+                                    sb.append(pkg).append(" deny:").append(perm).append('\n');
+                                    continue;
+                                }
+                                // NWP-20261012-05: a DECLINED dangerous permission. Not granted is not enough -- a fresh
+                                // user's untouched permission is not granted either, and only USER_SET / USER_FIXED tell
+                                // the platform the user has answered (PermDeclines.declinedWord, which also leaves out a
+                                // permission hibernation AUTO_REVOKED). Record the flags so roamd puts them back. A read
+                                // that throws is counted in flagFails and logged below, never swallowed: without
+                                // GET_RUNTIME_PERMISSIONS every one throws and the declines would quietly stop roaming.
+                                int readFails = flagFails.n;
+                                String word = PermDeclines.declinedWord(pm, pkg, perm, android.os.Process.myUserHandle(), flagFails);
+                                // NWP-20261102-10 (Q059; the six SMS permissions since NWP-20261012-08): ANY permission with
+                                // no user flag, over a decline already on record, in any app. A role fill (SMS, dialer) grants
+                                // and clears the flags, and roamd leaves the SMS six to the role, so it reads as never
+                                // answered. Carry the recorded decline: a mid-session re-grant lasts the rest of that session
+                                // (accepted in writing) and the next sign-in declines it again; nothing is revoked here. If
+                                // declinedWord's read just failed (counted once, there), carry it without reading again.
+                                if (word == null)
+                                    word = flagFails.n > readFails ? PermDeclines.oldDeclineWord(oldByPkg.get(pkg), pkg, perm)
+                                            : PermDeclines.carriedDecline(pm, pkg, perm, android.os.Process.myUserHandle(),
+                                                    oldByPkg.get(pkg), flagFails);
+                                if (word != null) {
+                                    sb.append(pkg).append(" flags:").append(word).append(':').append(perm).append('\n');
+                                    declined++;
+                                }
+                                continue;
+                            }
+                            // NWP-20261102-10 (Q059; the six SMS permissions since NWP-20261012-08): ANY permission GRANTED
+                            // with no user flag, over a decline this profile recorded, in any app: a role grant (also a
+                            // mid-session fill of an empty dialer or SMS role) clears the user's flags, so that is the
+                            // role's grant, not the user's answer -- record the decline again, not a grant, so the next
+                            // sign-in declines it. The grant lasts the rest of the session (accepted in writing); nothing
+                            // revokes. A grant the user made sets USER_SET and is recorded as a grant.
+                            String keptDecline = PermDeclines.carriedDecline(pm, pkg, perm, android.os.Process.myUserHandle(),
+                                    oldByPkg.get(pkg), flagFails);
+                            if (keptDecline != null) {
+                                sb.append(pkg).append(" flags:").append(keptDecline).append(':').append(perm).append('\n');
+                                declined++;
+                                continue;
+                            }
+                            try { // only roam DANGEROUS (runtime) grants -- normal/signature perms aren't pm-grantable
+                                if (pm.getPermissionInfo(perm, 0).getProtection()
+                                        == android.content.pm.PermissionInfo.PROTECTION_DANGEROUS)
+                                    sb.append(pkg).append(' ').append(perm).append('\n');
+                            } catch (Throwable ignore) {}
+                        }
+                    } catch (Throwable ignore) {}
+                }
+                // #204: apps MATERIALISED this session (UnarchiveService wrote them here) -- their LIVE grants are
+                // authoritative (an in-session revoke must stick), so carry-forward must NOT re-emit their stale
+                // pre-session grants even if #206 re-archived them to a placeholder before logoff (their declines it
+                // does carry, NWP-20261012-05: see the loop below). Fail-safe: if such an
+                // app is a placeholder at logoff we simply drop its grants (re-granted on next use) rather than risk
+                // silently resurrecting a revoked permission. The marker file self-clears with the ephemeral user.
+                java.util.HashSet<String> materialised = new java.util.HashSet<>();
+                try (java.io.BufferedReader br = new java.io.BufferedReader(
+                        new java.io.FileReader(ctx.getFilesDir() + "/nowhere-od-materialised"))) {
+                    String ln;
+                    while ((ln = br.readLine()) != null) { ln = ln.trim(); if (!ln.isEmpty()) materialised.add(ln); }
+                } catch (Throwable ignore) {}
+                // #204 carry-forward: a deferred app (on-demand OR auto, #130) that is still an archived placeholder
+                // this session AND was never materialised is NOT in `fresh` -- re-emit its grants from the restored
+                // old file so they survive a dormant session. A materialised app either IS in `fresh` (still
+                // installed -> live enum wins) or is in `materialised` (re-archived this session -> skip, don't
+                // resurrect stale grants).
+                // NWP-20260903-23: NO LONGER gated on deferredMode. The gate assumed the only package that could be
+                // absent from `fresh` was an archived placeholder, but a keep-INSTALLED app that failed to install (or
+                // is simply not installed this session) is equally absent and equally in need of its grants. An
+                // INSTALLED app that IS present is now in `fresh` via the candidate-set union above, so it is skipped
+                // here and its live grants -- including a fresh revoke -- stay authoritative.
+                // NWP-20261012-05: a MATERIALISED app that is a placeholder again still carries its DECLINES forward (only its
+                // `flags:` lines). Dropping them lost the decline for good: the next login would let the app ask again.
+                // Withhold-only, so it is safe where re-emitting its stale GRANTS is not. But the line is stale -- the user
+                // may have granted that permission while the app was materialised -- and a user-fixed one would stop the
+                // app asking ever again, leaving Settings as the only way back. So it is SOFTENED to user-set
+                // (PermDeclines.softenedDecline): the platform does not prompt by itself, but the app can still ask.
+                for (java.util.Map.Entry<String,String> e : keptModes.entrySet()) {
+                    String pkg = e.getKey();
+                    if (ctx.getPackageName().equals(pkg) || fresh.contains(pkg)) continue;
+                    java.util.ArrayList<String> old = oldByPkg.get(pkg);
+                    if (old == null) continue;
+                    if (held.contains(pkg)) { // NWP-20261112-07: verbatim, never softened, until its restore lands
+                        for (String ln : old) sb.append(ln).append('\n');
+                        continue;
+                    }
+                    boolean declinesOnly = materialised.contains(pkg);
+                    for (String ln : old) {
+                        if (declinesOnly) {
+                            String soft = PermDeclines.softenedDecline(ln, pkg);
+                            if (soft != null) sb.append(soft).append('\n');
+                            continue;
+                        }
+                        sb.append(ln).append('\n');
+                    }
+                }
+                // temp + rename: on a failed write the file stays exactly as the login restored it, so this session's
+                // permission changes are not carried but nothing is lost -- an emptied file would re-grant INTERNET
+                // to every Network-off app at the next sign-in (roamd's #127 default). An unreadable record or keep-set
+                // writes nothing: the record stays as restored (NWP-20261123-11).
+                StoreInstaller.writeAtomic(new java.io.File(ctx.getFilesDir(), "nowhere-perms"), sb.toString());
+                if (flagFails.n > 0)
+                    android.util.Log.w("NowhereChooser", "capturePerms: " + flagFails.n + " permission-flag read(s) FAILED --"
+                            + " a declined permission whose read failed will NOT roam and will be asked again after the next"
+                            + " login, except one whose decline is already on record, which is"
+                            + " carried"
+                            + " (is GET_RUNTIME_PERMISSIONS granted to the chooser?) (NWP-20261012-05)", flagFails.first);
+                android.util.Log.i("NowhereChooser", "captured runtime perms for roaming (" + sb.length() + " bytes, "
+                        + declined + " declined kept, " + flagFails.n + " flag read(s) failed)");
+            } catch (Throwable t) {
+                android.util.Log.w("NowhereChooser", "capturePerms", t);
+            }
+        }
+    }
+
+    /** Read one `key=value` line from the roamed prefs file (`files/nowhere-prefs`), or "" if absent. */
+    private String readPrefValue(String key) {
+        return prefValueIn(readPrefsText(), key);
+    }
+
+    /** The roamed prefs file (PREFS_FILE, the name setPref writes) whole, or "" when it is absent or unreadable (every
+     *  key then reads as absent). */
+    private String readPrefsText() {
+        try {
+            return new String(java.nio.file.Files.readAllBytes(new java.io.File(getFilesDir(), PREFS_FILE).toPath()),
+                    java.nio.charset.StandardCharsets.UTF_8);
+        } catch (Exception ignore) {
+            return "";
+        }
+    }
+
+    /** The value of the FIRST line of text that starts with `key=`, trimmed, or "" when there is none. Lines end at
+     *  \n, \r or \r\n, as BufferedReader.readLine ends them -- this is the rule readPrefValue has always applied, made
+     *  pure for javac (NWP-20261016-45). */
+    static String prefValueIn(String text, String key) {
+        if (text == null || text.isEmpty()) return "";
+        String p = key + "=";
+        for (String line : text.split("\r\n|\r|\n", -1)) {
+            if (line.startsWith(p)) return line.substring(p.length()).trim();
+        }
+        return "";
+    }
+
+    // ---- #201 app-persistence opt-in: the per-profile "keep this app on my account" set. One package name per
+    // line in files/nowhere-appkeep, which seals + roams with the profile (like nowhere-apps.list / nowhere-perms).
+    // captureAppCode() reads it at logoff to decide which user-installed apps' APK bytes to persist; the "Your
+    // apps" screen writes it. Empty file / absent = nothing kept = nothing persists (the amnesia default). ----
+
+    // Keep MODES (on-demand app tier, DIA-20260725-02; auto tier #130, DIA-20260813-11). A kept app is
+    // MODE_INSTALLED (restored whole at sign-in), MODE_AUTO (parked as an archived placeholder for a fast
+    // sign-in, then background-materialised by the post-login sweep -- ready without a tap), or MODE_ONDEMAND
+    // (parked as a placeholder, APK fetched on first tap). Line format in nowhere-appkeep: bare `pkg` ==
+    // installed (back-compat with the #201 one-pkg-per-line file); `pkg\tondemand` / `pkg\tauto` carry the
+    // mode. All modes are SEALED identically (captureAppCode reads readAppKeep(), which is mode-agnostic);
+    // the mode only changes how -- and when -- the app comes back. AUTO shares ondemand's whole restore shape
+    // (deferred APK bytes, _meta, hold, placeholder); only the sweep distinguishes them. An OLD build reading
+    // an `auto` line falls back to installed (readAppModes), which is safe: slower login, correct data.
+    static final String MODE_INSTALLED = "installed";
+    static final String MODE_ONDEMAND  = "ondemand";
+    static final String MODE_AUTO      = "auto";
+
+    /** True for the modes that roam as a DEFERRED placeholder (APK bytes excluded from the login restore,
+     *  archived-placeholder raise, .nowhere-odhold data hold): on-demand and auto. */
+    static boolean deferredMode(String m) { return MODE_ONDEMAND.equals(m) || MODE_AUTO.equals(m); }
+
+    // ---- group-materialize (DIA-20260802, docs/ondemand-sandboxed-play-group.md): a set of kept packages that
+    // materialize TOGETHER. Tapping the group's launcher member (the entry point) brings the whole group back, so
+    // sandboxed Play (Play Store + the launcher-LESS Play Services/GSF) can roam ON-DEMAND yet return whole on one
+    // tap. Membership is data-driven: an optional 3rd `group:<name>` token on a nowhere-appkeep line, with a built-in
+    // DEFAULT bootstrap for the GMS set so no hand-authored token is required. The keep-set (which roams into the
+    // roamed user) is the source the tap flow reads -- the sealed manifest.tsv lives only in user 0. ----
+    static final java.util.Map<String,String> DEFAULT_GROUPS = new java.util.HashMap<>();
+    static {
+        DEFAULT_GROUPS.put("com.android.vending",    "sandboxed-play");
+        DEFAULT_GROUPS.put("com.google.android.gms", "sandboxed-play");
+        DEFAULT_GROUPS.put("com.google.android.gsf", "sandboxed-play");
+    }
+
+    // The sandboxed-Play STACK. Any app that uses Play Services depends on the WHOLE stack -- Google apps check for
+    // the Play Store APP itself, not just Services (DIA-20260803-01). gms/gsf are launcher-LESS (no icon, hidden from
+    // "Your apps", fully reconcile-managed); vending (Play Store) is launcher-bearing (icon stays visible + user-
+    // toggleable). All three are reconciled into the keep-set from whatever depends on them (DIA-20260802-13).
+    static final String GMS_PKG = "com.google.android.gms";
+    static final String GSF_PKG = "com.google.android.gsf";
+    static final String VENDING_PKG = "com.android.vending";
+
+    /** The built-in default group for a package, or null. Overridden by an explicit keep-set `group:` token. */
+    static String defaultGroupFor(String pkg) { return DEFAULT_GROUPS.get(pkg); }
+
+    /** Explicit `group:<name>` tokens from the keep-set (pkg -> group). Static so the roamed-user tap flow can read
+     *  it from a plain Context. Same 3rd-column format captureAppCode emits into the manifest.
+     *  Lenient: an unreadable keep-set reads as no groups; writeAppModes, which rewrites every token it is given,
+     *  uses readAppGroupsStrict (NWP-20261112-03). */
+    static java.util.Map<String,String> readAppGroups(android.content.Context ctx) {
+        java.util.Map<String,String> g = readAppGroupsStrict(ctx);
+        return g == null ? new java.util.HashMap<>() : g;
+    }
+
+    /** NWP-20261112-03: readAppGroups, strictly. Empty when nowhere-appkeep is absent; NULL when it exists but cannot
+     *  be opened or read whole -- unknown, never "no groups". Same rule as readPlayDepsStrict. */
+    static java.util.Map<String,String> readAppGroupsStrict(android.content.Context ctx) {
+        java.io.File f = new java.io.File(ctx.getFilesDir(), "nowhere-appkeep");
+        if (!f.exists()) return new java.util.HashMap<>();
+        try (java.io.BufferedReader br = new java.io.BufferedReader(new java.io.FileReader(f))) {
+            return parseAppGroups(br);
+        } catch (Exception e) { return null; }
+    }
+
+    /** readAppGroups' line rule over a reader. An IOException escapes: a part-read file is not a result. */
+    static java.util.Map<String,String> parseAppGroups(java.io.BufferedReader br) throws java.io.IOException {
+        java.util.HashMap<String,String> g = new java.util.HashMap<>();
+        String line;
+        while ((line = br.readLine()) != null) {
+            line = line.trim();
+            if (line.isEmpty()) continue;
+            String[] f = line.split("\t", -1);
+            if (f.length >= 3 && !f[0].trim().isEmpty() && f[2].trim().startsWith("group:")) {
+                g.put(f[0].trim(), f[2].trim().substring(6).trim());
+            }
+        }
+        return g;
+    }
+
+    /** pkg's group name -- an explicit keep-set token wins, else the built-in default, else null. */
+    static String groupFor(android.content.Context ctx, String pkg) {
+        return AppDeps.groupOf(pkg, readAppGroups(ctx), DEFAULT_GROUPS);
+    }
+
+    /** The OTHER on-demand members of entryPkg's group -- the launcher-less deps to materialise on an entry-point
+     *  tap. Restricted to sealed on-demand keep-set members so MATERIALIZE-APP never fetches an unsealed package.
+     *  Ordered, entryPkg excluded, deduped. Empty when entryPkg is in no group. */
+    static java.util.List<String> groupDeps(android.content.Context ctx, String entryPkg) {
+        // #130: an auto-mode dep is as fetchable as an on-demand one, so the candidates are the DEFERRED keep-set.
+        return AppDeps.groupDeps(entryPkg, readAppGroups(ctx), DEFAULT_GROUPS, deferredKeepSet(ctx));
+    }
+
+    /** The per-profile set of on-demand packages that DEPEND ON Play Services (gms) -- recorded at toggle time (when
+     *  the app is installed and its manifest is readable) so the tap flow can pull gms even though the app is an
+     *  APK-less archived placeholder by then. One bare package per line in files/nowhere-playdeps, which seals +
+     *  roams with the profile like nowhere-appkeep. Empty when none. (DIA-20260802-13.)
+     *  Lenient: an unreadable file reads as empty; a writer or a decision that must not treat unknown as empty
+     *  uses readPlayDepsStrict (NWP-20261111-06). */
+    static java.util.Set<String> readPlayDeps(android.content.Context ctx) {
+        java.util.Set<String> s = readPlayDepsStrict(ctx);
+        return s == null ? new java.util.LinkedHashSet<>() : s;
+    }
+
+    /** NWP-20261111-06: readPlayDeps, strictly. Empty when the file is absent; NULL when it exists but cannot be
+     *  opened or read whole -- unknown, never "no Play clients". Same rule as AppClaim.readClaimsFile. The writer
+     *  (setPlayDep) and the stack decisions (reconcilePlayStack, playStackOrphanKnown) read this. */
+    static java.util.Set<String> readPlayDepsStrict(android.content.Context ctx) {
+        java.io.File f = new java.io.File(ctx.getFilesDir(), "nowhere-playdeps");
+        java.util.LinkedHashSet<String> s = new java.util.LinkedHashSet<>();
+        if (!f.exists()) return s;
+        try (java.io.BufferedReader br = new java.io.BufferedReader(new java.io.FileReader(f))) {
+            String line;
+            while ((line = br.readLine()) != null) { line = line.trim(); if (!line.isEmpty()) s.add(line); }
+        } catch (Exception e) { return null; }
+        return s;
+    }
+
+    /** The on-demand deps to materialise BEFORE entryPkg on its tap. For a sandboxed-play stack member (Play Store)
+     *  this is groupDeps (its launcher-less siblings). For a Play-Services CLIENT outside the stack (e.g. YouTube) it
+     *  is the WHOLE stack -- Google apps check for the Play Store APP, not just Services (proven: YouTube "device not
+     *  compatible" when vending was absent) -- so pull every stack member that is a SEALED on-demand keep-set member
+     *  (an installed member is already present; never fetch an unsealed one). Ordered gms/gsf before vending so the
+     *  Store finds Services on first launch. entryPkg excluded, deduped. A superset of groupDeps. (DIA-20260803-01.) */
+    static java.util.List<String> appDeps(android.content.Context ctx, String entryPkg) {
+        // #130: auto deps too -- the stack members are fetched only from the DEFERRED keep-set.
+        return AppDeps.appDeps(entryPkg, readAppGroups(ctx), DEFAULT_GROUPS, deferredKeepSet(ctx), readPlayDeps(ctx),
+                GMS_PKG, GSF_PKG, VENDING_PKG);
+    }
+
+    /** True if pkg is a sandboxed-Play stack member (Play Store / Play Services / GSF) -- these materialise their
+     *  siblings via groupDeps; a Play-Services CLIENT outside the stack pulls the whole stack instead. */
+    static boolean isStackMember(android.content.Context ctx, String pkg) {
+        return AppDeps.isStackMember(pkg, readAppGroups(ctx), DEFAULT_GROUPS, GMS_PKG);
+    }
+
+    /** Read the per-profile keep-set as an order-preserving pkg -> mode map. A bare `pkg` line reads as installed
+     *  (back-compat); an unknown/blank mode also falls back to installed. Empty when nothing is kept. */
+    private java.util.LinkedHashMap<String,String> readAppModes() {
+        return readAppModesIn(getFilesDir());
+    }
+
+    /** readAppModes' parse, over an explicit files dir. NWP-20261112-07: static so PermsCaptureReceiver reads the
+     *  keep-set with no Activity. Lenient: an unreadable keep-set reads as empty; a writer, which rewrites the whole
+     *  file from what it read, uses readAppModesStrictIn (NWP-20261112-03). */
+    static java.util.LinkedHashMap<String,String> readAppModesIn(java.io.File filesDir) {
+        java.util.LinkedHashMap<String,String> m = readAppModesStrictIn(filesDir);
+        return m == null ? new java.util.LinkedHashMap<>() : m;
+    }
+
+    /** NWP-20261112-03: readAppModesIn, strictly. Empty when nowhere-appkeep is absent; NULL when it exists but cannot
+     *  be opened or read whole -- unknown, never "nothing kept" and never the lines read before the failure. Same rule
+     *  as readPlayDepsStrict. setAppModeLocked and writeAppModes read this. */
+    static java.util.LinkedHashMap<String,String> readAppModesStrictIn(java.io.File filesDir) {
+        java.io.File f = new java.io.File(filesDir, "nowhere-appkeep");
+        if (!f.exists()) return new java.util.LinkedHashMap<>();
+        try (java.io.BufferedReader br = new java.io.BufferedReader(new java.io.FileReader(f))) {
+            return parseAppModes(br);
+        } catch (Exception e) { return null; }
+    }
+
+    /** readAppModes' line rule over a reader. A bare `pkg` reads as installed, an unknown mode as installed. An
+     *  IOException escapes: a part-read file is not a result. */
+    static java.util.LinkedHashMap<String,String> parseAppModes(java.io.BufferedReader br) throws java.io.IOException {
+        java.util.LinkedHashMap<String,String> m = new java.util.LinkedHashMap<>();
+        String line;
+        while ((line = br.readLine()) != null) {
+            line = line.trim();
+            if (line.isEmpty()) continue;
+            // Split on ALL tabs: line is `pkg[\tmode[\tgroup:<name>]]`. A first-tab-only parse would read
+            // `pkg\tondemand\tgroup:x` mode as "ondemand\tgroup:x" and mis-fall-back to installed.
+            String[] f = line.split("\t", -1);
+            String pkg  = f[0].trim();
+            String mode = (f.length < 2 ? MODE_INSTALLED : f[1].trim());
+            if (pkg.isEmpty()) continue;
+            m.put(pkg, MODE_ONDEMAND.equals(mode) ? MODE_ONDEMAND
+                    : MODE_AUTO.equals(mode) ? MODE_AUTO : MODE_INSTALLED);
+        }
+        return m;
+    }
+
+    /** NWP-20261112-03: what setAppModeLocked and writeAppModes (and so setAppMode) return when they wrote NOTHING
+     *  because the keep-set could not be read. Compare by identity (==), never by contents. */
+    static final java.util.Set<String> KEEPSET_UNREADABLE = java.util.Collections.unmodifiableSet(new java.util.HashSet<>());
+
+    /** Persist the keep-set (pkg -> mode). Writes a bare `pkg` for installed (back-compat + diff-friendly),
+     *  `pkg\tondemand` for on-demand. An empty map writes an empty file (captureAppCode then persists nothing). */
+    /** True when the gateway says this profile's stored bytes ALREADY exceed its plan.
+     *
+     *  FAIL-OPEN on every error -- no gateway configured, offline, a daemon too old to answer -- exactly as
+     *  installHeadroom does. For an amnesiac phone being offline is a normal state, not an edge case, and
+     *  the gateway's own admission check is the real backstop; a transient hiccup must never block a user's
+     *  choice about their own apps.
+     *
+     *  NWP-20260925-03: it is never called under APPKEEP_LOCK (setAppMode asks it between two passes of the edit),
+     *  and it reports a fail-open that a timeout or a dead daemon caused, so an add let through by a stalled gate
+     *  is visible in the log rather than indistinguishable from "under plan". */
+    private boolean overPlan() {
+        try {
+            DaemonReply r = sendDaemonReply("GET-ENTITLEMENT\n");
+            if (r.failed()) {
+                android.util.Log.w("NowhereChooser", "plan check: " + r.reason()
+                        + " -- letting the add through (fail-open, NWP-20260925-03)");
+                return false;
+            }
+            String e = r.text;
+            if (!e.startsWith("OK")) return false;
+            long used = -1, covered = -1;
+            for (String tok : e.trim().split("\\s+")) {
+                int eq = tok.indexOf('=');
+                if (eq < 0) continue;
+                try {
+                    long v = Long.parseLong(tok.substring(eq + 1));
+                    if ("used".equals(tok.substring(0, eq))) used = v;
+                    else if ("covered".equals(tok.substring(0, eq))) covered = v;
+                } catch (NumberFormatException ignore) {}
+            }
+            return covered > 0 && used > covered;
+        } catch (Exception ignore) {
+            return false;
+        }
+    }
+
+    /** Q025 [BA] (decided 2026-10-20, NWP-20261104-07): turning on Keep counts the app's own size. Asks the daemon's
+     *  KEEP-HEADROOM (installHeadroom over the toggled app's installed APK set) and returns its verdict.
+     *
+     *  Called only from setAppMode, OFF APPKEEP_LOCK (NWP-20260925-03). Every branch without a verdict asks
+     *  overPlan() -- the toggle is not a keep add of pkg, pkg is already kept, its size cannot be measured, the
+     *  daemon failed or answered NONE / LOCAL / ERR-* / an older daemon's unknown-verb line -- so nothing that works
+     *  today regresses. Play-stack members a reconcile pulls in with the app are not sized: they keep the
+     *  already-over check. The log lines never carry the package or the size. */
+    private boolean overPlan(String pkg, String mode) {
+        if (mode == null || mode.isEmpty() || "off".equals(mode)) {
+            android.util.Log.w("NowhereChooser", "keep headroom: not a keep add -- the already-over check decides");
+            return overPlan();
+        }
+        if (appMode(pkg) != null) { // already kept: a mode change adds none of its own bytes
+            android.util.Log.w("NowhereChooser", "keep headroom: already kept -- the already-over check decides");
+            return overPlan();
+        }
+        String req = KeepHeadroom.request(pkg, keepApkBytes(pkg));
+        if (req == null) {
+            android.util.Log.w("NowhereChooser", "keep headroom: size not measured -- the already-over check decides");
+            return overPlan();
+        }
+        DaemonReply r = sendDaemonReply("KEEP-HEADROOM\n" + req + "\n");
+        if (r.failed()) {
+            android.util.Log.w("NowhereChooser", "keep headroom: " + r.reason() + " -- the already-over check decides");
+            return overPlan();
+        }
+        Boolean v = KeepHeadroom.verdict(r.text);
+        if (v == null) {
+            String w = r.text.isEmpty() ? "empty" : r.text.split("\\s+", 2)[0];
+            android.util.Log.w("NowhereChooser", "keep headroom: no verdict (" + w + ") -- the already-over check decides");
+            return overPlan();
+        }
+        return v;
+    }
+
+    /** The installed APK set's size (base + every split), or -1 when it cannot be measured. */
+    private long keepApkBytes(String pkg) {
+        try {
+            android.content.pm.ApplicationInfo ai = getPackageManager().getApplicationInfo(pkg, 0);
+            long n = new java.io.File(ai.sourceDir).length();
+            if (ai.splitSourceDirs != null) for (String s : ai.splitSourceDirs) n += new java.io.File(s).length();
+            return n > 0 ? n : -1;
+        } catch (Exception e) {
+            return -1;
+        }
+    }
+
+    /** Returns the packages whose ADD was refused by the plan gate (empty when everything landed). #136: the
+     *  refusal used to be surfaced from HERE via a runOnUiThread dialog -- posted from a background write,
+     *  it could miss the user entirely, and the store toast then claimed "added" over a dropped keep
+     *  (Chester, 2026-08-13: Notepad installed, row read Off, nothing explained why). The CALLER owns the
+     *  surfacing now, at the screen where the tap actually happened.
+     *
+     *  NWP-20260925-03: returns NULL -- before writing the keep-set -- when the edit adds a package and overPlanNow
+     *  is null. Only setAppModeLocked calls this, and setAppMode then asks the gate off the lock and runs again.
+     *
+     *  NWP-20261112-03: returns KEEPSET_UNREADABLE, having written nothing, when the keep-set or its group tokens
+     *  cannot be read -- this rewrites every line, so a rewrite from a failed read would drop what it missed. */
+    private java.util.Set<String> writeAppModes(java.util.Map<String,String> modes, Boolean overPlanNow) {
+      // NWP-20260819-03 review: every nowhere-appkeep read-modify-write serializes on the shared lock --
+      // StoreService's binder threads (StoreInstaller.keepAuto) made this file concurrently written for the
+      // first time, and two unsynchronized whole-file rewrites lose keep lines silently (an app that
+      // vanishes from the roam). Same-process lock; the write itself is temp+rename via StoreInstaller.
+      synchronized (StoreInstaller.APPKEEP_LOCK) {
+        // ADDS ARE GATED, REMOVALS NEVER ARE.
+        //
+        // Opting an app in writes its APK into name#apps -- real store footprint, and until now the only
+        // add path with NO plan check whatsoever: installHeadroom had exactly one caller, the store
+        // install. Being full has to block this the same way it blocks an install.
+        //
+        // Opting OUT stays unconditional, and that asymmetry is the point: removing a kept app is how a
+        // full profile gets back under its limit, so gating it would trap the user in the very state they
+        // are trying to leave. Same reason the seal is never blocked.
+        java.util.Set<String> dropped = new java.util.LinkedHashSet<>();
+        java.util.Set<String> landed = new java.util.LinkedHashSet<>(); // NWP-20260926-01: the adds this write keeps
+        try {
+            java.util.LinkedHashMap<String,String> keptOnDisk = readAppModesStrictIn(getFilesDir());
+            if (keptOnDisk == null) {
+                android.util.Log.w("NowhereChooser", "keep-set unreadable -- nothing written (NWP-20261112-03)");
+                return KEEPSET_UNREADABLE;
+            }
+            java.util.Set<String> before = keptOnDisk.keySet();
+            java.util.List<String> added = new java.util.ArrayList<>();
+            for (String p : modes.keySet()) if (!before.contains(p)) added.add(p);
+            // NWP-20260925-03: NEVER ask the gateway here, under APPKEEP_LOCK -- that round trip is what froze
+            // Profile on lynx 2026092603. An add with no verdict yet returns null BEFORE anything is written, and
+            // setAppMode asks the gate off the lock and runs the edit again with the answer.
+            if (!added.isEmpty() && overPlanNow == null) return null;
+            if (!added.isEmpty() && overPlanNow) {
+                java.util.LinkedHashMap<String,String> kept = new java.util.LinkedHashMap<>(modes);
+                for (String p : added) kept.remove(p); // every EXISTING choice survives; only the new ones drop
+                modes = kept;
+                dropped.addAll(added);
+            }
+            for (String p : added) if (!dropped.contains(p)) landed.add(p);
+        } catch (Exception ignore) {
+            // Fail-open, as above: a gate that throws must not cost the user their toggle.
+        }
+        // NWP-20260821-15: carry each package's explicit `group:<name>` token across the rewrite.
+        //
+        // This method re-SYNTHESIZES every line from (pkg, mode) alone, so any 3rd token on the old line was
+        // silently dropped by the next toggle -- readAppGroups (:5358) reads that token strictly as field 3.
+        // Nothing in-tree writes it into the keep-set today (group membership currently comes from the
+        // DEFAULT_GROUPS bootstrap, and captureAppCode :4998 emits it into the MANIFEST, a different file), so
+        // the loss is latent rather than live. It is fixed here anyway because it is one line and because the
+        // failure it would cause is invisible: a user-set group would survive until the next unrelated toggle
+        // and then quietly stop materialising its deps.
+        //
+        // An explicit mode string is required whenever the token is present -- the group is field 3, so field 2
+        // cannot be empty. MODE_INSTALLED is written explicitly in that case; readAppModes (:5437) resolves any
+        // non-ondemand/auto value to installed, so it round-trips. Bare `pkg` stays the installed form when
+        // there is no token, keeping the file back-compatible and diff-friendly.
+        java.util.Map<String,String> groups = readAppGroupsStrict(this);
+        if (groups == null) {
+            android.util.Log.w("NowhereChooser", "keep-set groups unreadable -- nothing written (NWP-20261112-03)");
+            return KEEPSET_UNREADABLE;
+        }
+        StringBuilder sb = new StringBuilder();
+        for (java.util.Map.Entry<String,String> e : modes.entrySet()) {
+            String grp = groups.get(e.getKey());
+            boolean hasGrp = grp != null && !grp.isEmpty();
+            sb.append(e.getKey());
+            if (MODE_ONDEMAND.equals(e.getValue())) sb.append('\t').append(MODE_ONDEMAND);
+            else if (MODE_AUTO.equals(e.getValue())) sb.append('\t').append(MODE_AUTO);
+            else if (hasGrp) sb.append('\t').append(MODE_INSTALLED); // field 2 must exist to reach field 3
+            if (hasGrp) sb.append('\t').append("group:").append(grp);
+            sb.append('\n');
+        }
+        // temp+rename so no reader (or crash mid-write) ever sees a truncated keep set -- a torn file here
+        // is a silently smaller roam.
+        try {
+            java.io.File f = new java.io.File(getFilesDir(), "nowhere-appkeep");
+            StoreInstaller.writeAtomic(f, sb.toString());
+        } catch (Exception e) {
+            android.util.Log.w("NowhereChooser", "writeAppModes", e);
+        }
+        // NWP-20260904-06: A KEEP LINE IS A CLAIM THAT THE APP EXISTS, SO RECORD THE SIGHTING HERE.
+        //
+        // The prune in captureAppCode fires only for `seen.contains(pkg) && !pmKnows(pkg)`, and until now the
+        // only writers of that receipt were an nApps install and a materialise that landed. Toggling a present
+        // app to Keep/On-demand wrote the claim and recorded nothing -- so a later uninstall could never be
+        // pruned, in that session or ANY future one (keepSetPresentNow only ever adds packages pmKnows can
+        // still see, and by then it cannot). The line then outlives the app forever and "Your data" reads
+        // "Not saved yet: <app>" on every visit.
+        //
+        // CLEAN-ROOM PROVEN on lynx 2026-09-04 (fresh profile odtest40, one Aurora app): after setting it to
+        // on-demand the keep-set held the line and the receipt was still "#stamp 338" with no package; after
+        // uninstall + roam the line survived with the package absent from PM entirely.
+        //
+        // Gated on pmKnows, the SAME predicate the prune uses -- so a sighting is recorded exactly when the
+        // claim is TRUE. A line written for a package PM cannot see is not a sighting and must not become
+        // one, or the prune would later read it as "was here, now gone" and delete a choice the user still
+        // holds. Best-effort: failing to record costs a future prune, never an app.
+        try {
+            android.content.pm.PackageManager pm = getPackageManager();
+            java.util.LinkedHashSet<String> sighted = new java.util.LinkedHashSet<>();
+            for (String p : modes.keySet()) if (pmKnows(pm, p)) sighted.add(p);
+            if (!sighted.isEmpty()) StoreInstaller.snapshotAppSeen(this, sighted);
+        } catch (Throwable ignore) {}
+        // NWP-20260926-01: a keep line is the newer choice, so it retires the Off record of an app switched back On.
+        // Only the adds this write actually kept (none reach here from pass one, which returned null above, and a
+        // refused add is in `dropped`), and clearTurnedOff re-checks the keep line on disk under the lock. Left in
+        // place, the old Off would still steer AppInstallReceiver and the logoff drop capture after the user undid it.
+        if (!landed.isEmpty()) StoreInstaller.clearTurnedOff(this, landed);
+        return dropped;
+      } // synchronized (StoreInstaller.APPKEEP_LOCK)
+    }
+
+    /** The kept package set (any mode). Order-preserving; empty when nothing is kept. captureAppCode reads this
+     *  to decide which apps to SEAL -- both modes are sealed; the mode only changes how they come back. */
+    private java.util.LinkedHashSet<String> readAppKeep() { return new java.util.LinkedHashSet<>(readAppModes().keySet()); }
+
+    /** pkg's keep mode -- MODE_INSTALLED, MODE_AUTO, MODE_ONDEMAND, or null if not kept (off). */
+    private String appMode(String pkg) { return readAppModes().get(pkg); }
+
+    // ---- #210 p2 "keep me signed in on this device": the per-profile set of kept apps whose Keystore keys roamd
+    // carries across a roam so the app stays authenticated. One BARE package per line in files/nowhere-keepkeys.list
+    // (roamd's keystore_register matches it with `grep -qx`, so no tab/mode -- bare names only), which seals + roams
+    // with the profile like nowhere-appkeep. Opt-in, DEFAULT OFF: empty/absent = carry no keys = the amnesia default.
+    // Only meaningful for a KEPT app (appMode != null) -- an off app has no persisted data for the keys to unlock. ----
+
+    // ---- NWP-20260826-11: WHICH apps "Keep me signed in" can actually do anything for. ----------------------
+    // The switch drives the per-app Keystore carry, so for an app that never touches Keystore it is inert: on
+    // and off behave identically and the control lies about what it does. Chester, 2026-08-25: "not have this
+    // option unless its something similar to Amazon as the current setting is misleading/invalid."
+    //
+    // The answer comes from a keystore2 census (GET-KEYSTORE-NS -> the RO-lane worker -> a file keystore2
+    // writes), because keystore2's AIDL surface is per-CALLER and cannot be asked about another app's
+    // namespace at all. The census speaks in UIDS; PackageManager turns those back into packages here.
+    //
+    // ⚠ AND IT IS REMEMBERED PER PROFILE, which is the half that makes it usable. The census is live state --
+    // an app appears in it only once it has actually made a key this boot -- so a screen driven by the census
+    // ALONE would show the switch appearing and disappearing under the user as apps run. nowhere-keystore.list
+    // records what this profile has ever been told, seals and roams with the profile like nowhere-keepkeys.list,
+    // and only ever grows within a profile. It holds this user's own package names and nothing about anyone
+    // else's, so it is not cross-session residue: it is the profile remembering its own apps.
+
+    /** Packages this profile has ever seen hold Keystore keys. Empty when nothing is known yet. */
+    private java.util.LinkedHashSet<String> readKeystoreApps() {
+        java.util.LinkedHashSet<String> s = new java.util.LinkedHashSet<>();
+        try (java.io.BufferedReader br = new java.io.BufferedReader(
+                new java.io.FileReader(new java.io.File(getFilesDir(), "nowhere-keystore.list")))) {
+            String line;
+            while ((line = br.readLine()) != null) { line = line.trim(); if (!line.isEmpty()) s.add(line); }
+        } catch (Exception ignore) {}
+        return s;
+    }
+
+    // NWP-20260830-03: refreshKeystoreApps() and the whole NWP-20260826-11 census client are REMOVED.
+    // The census answered one question -- "would carrying keys do anything for this app?" -- and existed
+    // solely to decide whether to SHOW the "Keep me signed in" switch. With the switch gone there is no
+    // longer a question to ask. roamd no longer serves the GET-KEYSTORE-NS op
+    // (NWP-20261015-32) and keystore2 still writes the file; retiring that half is tracked separately so this
+    // slice stays reviewable.
+
+    /** #206: the ON-DEMAND packages in this profile's keep-set, read statically from a plain Context (ReArchiveReceiver
+     *  has no ProfileActivity instance). Same parse as readAppModes: a `pkg\tondemand` line == on-demand; a bare
+     *  `pkg` line (installed) is skipped. Empty on any error / no keep-set. */
+    static java.util.Set<String> ondemandKeepSet(android.content.Context ctx) {
+        return keepSetByMode(ctx, MODE_ONDEMAND);
+    }
+
+    /** #130: the DEFERRED keep-set -- packages whose APK bytes ride the seal deferred (on-demand OR auto). This is
+     *  the set the DEPS/materialise machinery must consult: an auto-mode dep is exactly as fetchable as an
+     *  on-demand one. (ondemandKeepSet stays strictly on-demand for the #206 idle-reclaim sweep, which must NOT
+     *  re-archive an auto app -- auto promises "ready without a tap" for the whole session.) */
+    static java.util.Set<String> deferredKeepSet(android.content.Context ctx) {
+        java.util.Set<String> s = keepSetByMode(ctx, MODE_ONDEMAND);
+        s.addAll(keepSetByMode(ctx, MODE_AUTO));
+        return s;
+    }
+
+    /** #130: the AUTO keep-set -- what the post-login background-materialise sweep works through. */
+    static java.util.Set<String> autoKeepSet(android.content.Context ctx) {
+        return keepSetByMode(ctx, MODE_AUTO);
+    }
+
+    /** NWP-20261005-13's "Download first" (nowhere-appfirst) is retired by NWP-20261012-06: the keep-set's own line
+     *  order is the install order, dragged in Your apps. StoreInstaller.foldAppFirst moves the old marks to the top
+     *  of that order once and deletes the file. */
+
+    /** NWP-20260821-15: the keep-set packages PM knows about RIGHT NOW -- the raw material of the session-presence
+     *  receipt. Static so UnarchiveService (which has no ProfileActivity instance) can take the snapshot from its
+     *  own worker, the same way it reads autoKeepSet above.
+     *
+     *  "Knows about" is pmKnows, i.e. installed OR an archived placeholder OR uninstalled-but-known -- so this is
+     *  positively "the session had these", never "these are materialised". A package this misses is simply never
+     *  eligible for the prune, which is the direction that costs a fix rather than a user's apps. */
+    static java.util.Set<String> keepSetPresentNow(android.content.Context ctx) {
+        java.util.LinkedHashSet<String> out = new java.util.LinkedHashSet<>();
+        try {
+            android.content.pm.PackageManager pm = ctx.getPackageManager();
+            for (String pkg : keepSetAll(ctx)) if (pmKnows(pm, pkg)) out.add(pkg);
+        } catch (Throwable t) {
+            android.util.Log.w("NowhereChooser", "keepSetPresentNow", t);
+        }
+        return out;
+    }
+
+    /** NWP-20260904-07: LOGIN-TIME RECONCILE -- drop a keep line whose app is gone from PM AND has no code
+     *  in the #apps head. This is the half NWP-20260904-06 deliberately left open: that change records the
+     *  PACKAGE_REMOVED transition, but nothing can observe a departure that happened in a PAST session, so a
+     *  phantom line already fielded (odtest40, lynx, 2026-09-04) survived it and would have forever.
+     *
+     *  THE PREDICATE IS TWO INDEPENDENT ABSENCES, AND BOTH ARE REQUIRED:
+     *   - !pmKnows(pkg)     the app is not installed, not archived, not known to PM for any user.
+     *   - not in #apps      the store holds NO CODE for it -- so there is nothing a login could restore and
+     *                       nothing "Your data" could truthfully call unsaved.
+     *  An UN-MATERIALISED on-demand app is absent from PM until its placeholder is raised, but its code IS in
+     *  #apps -- that is what makes it restorable -- so the second absence is exactly the guard that keeps this
+     *  from deleting the on-demand opt-ins the keep-set exists to hold (the regression NWP-20260821-15 names).
+     *  The first absence is what keeps it from touching an app whose #apps seal merely REFUSED last logoff
+     *  while the app itself is still installed.
+     *
+     *  TIMING IS PART OF THE GUARD. This runs from the post-login sweep, after provisioning has raised this
+     *  login's archived placeholders (the same guarantee snapshotAppSeen relies on, in the same thread), so a
+     *  placeholder still being raised is not mistaken for gone. And the store answer must be MEASURED:
+     *  SEAL-DELTA's StoredApps is a single-flight cache that is cold right after login, so this polls a bounded
+     *  number of times and, if it never sees storedMeasured, prunes NOTHING. Every failure mode -- daemon down,
+     *  malformed reply, a throwaway session with no store -- resolves to "prune nothing". Since NWP-20261027-09 a
+     *  #apps head the store definitely lacks (every rung a definite not-found) is MEASURED and empty, so a kept
+     *  package PM does not know is pruned as a phantom then too: that is this predicate's own case (the store holds
+     *  no code for it), and a failed or unreadable read still prunes nothing. Losing a fix is
+     *  recoverable on the next login; losing a user's choice is not.
+     *
+     *  What it records: exactly what the logoff prune records for an app the user uninstalled -- the line goes,
+     *  and nowhere-appoff.list gains the package so its data stops being carried. No shrink intent is declared
+     *  because nothing is leaving #apps: by construction the code was never there. */
+    static void reconcilePhantomKeepLines(android.content.Context ctx) {
+        try {
+            android.content.pm.PackageManager pm = ctx.getPackageManager();
+            java.util.LinkedHashSet<String> absent = new java.util.LinkedHashSet<>();
+            for (String pkg : keepSetAll(ctx)) {
+                if (pkg == null || pkg.isEmpty()) continue;
+                if (GMS_PKG.equals(pkg) || GSF_PKG.equals(pkg) || ctx.getPackageName().equals(pkg)) continue;
+                if (isBundledSystem(pm, pkg)) continue; // the logoff prune owns those, for a different reason
+                if (!pmKnows(pm, pkg)) absent.add(pkg);
+            }
+            if (absent.isEmpty()) return; // the common case: nothing to ask the store about
+            java.util.Set<String> stored = null;
+            for (int i = 0; i < 6 && stored == null; i++) {
+                String[] lr = DaemonSocket.lenReply("SEAL-DELTA" + (char) 10, 15000);
+                if (lr[1] != null) {
+                    org.json.JSONObject o = new org.json.JSONObject(lr[1]);
+                    if ("local".equals(o.optString("session"))) return; // a throwaway has no store: nothing is phantom
+                    if (o.optBoolean("storedMeasured", false)) {
+                        stored = new java.util.HashSet<>();
+                        org.json.JSONObject sa = o.optJSONObject("storedApps");
+                        if (sa != null) for (java.util.Iterator<String> it = sa.keys(); it.hasNext(); ) stored.add(it.next());
+                    }
+                }
+                if (stored == null && i < 5) Thread.sleep(5000); // no sleep after the last poll
+            }
+            if (stored == null) {
+                android.util.Log.i("NowhereChooser", "phantom reconcile: #apps head not measured -- pruning nothing (NWP-20260904-07)");
+                return;
+            }
+            java.util.LinkedHashSet<String> drop = new java.util.LinkedHashSet<>();
+            // pmKnows is asked AGAIN here, not just when `absent` was built: the store poll above may have waited
+            // ~30 s, and an app the user reinstalled meanwhile is PM-known again -- its keep line was left alone by
+            // the install catch-up precisely because it already existed, so dropping it now would turn a fresh
+            // reinstall Off.
+            for (String pkg : absent) if (!stored.contains(pkg) && !pmKnows(pm, pkg)) drop.add(pkg);
+            if (drop.isEmpty()) return;
+            for (String pkg : drop) StoreInstaller.recordTurnedOff(ctx, pkg);
+            StoreInstaller.recordUninstalled(ctx, drop); // NWP-20261023-10: absent, non-bundled -- an uninstall
+            StoreInstaller.removeKeepLines(ctx, drop);
+            android.util.Log.i("NowhereChooser", "phantom keep-set reconcile: dropped " + drop
+                    + " -- absent from PM AND from the #apps head (NWP-20260904-07)");
+        } catch (Throwable t) {
+            android.util.Log.w("NowhereChooser", "reconcilePhantomKeepLines", t); // prune nothing
+        }
+    }
+
+    /** Every kept package, any mode -- the static twin of readAppKeep(), for callers holding only a Context.
+     *
+     *  Parses the lines itself rather than composing keepSetByMode three times: that helper skips any line with
+     *  no tab (`if (f.length < 2) continue` :5650), and a bare `pkg` line IS the ordinary installed-mode form.
+     *  Composing it would therefore return only the deferred apps while looking exhaustive -- and the
+     *  installed-mode app is exactly the case that matters most here, since losing it from the receipt leaves
+     *  appcode_seal's "staged 0 for N installed-mode app(s)" refusal wedged forever. Mode is irrelevant to this
+     *  question, so field 0 of every non-empty line is the whole answer. */
+    static java.util.Set<String> keepSetAll(android.content.Context ctx) {
+        java.util.LinkedHashSet<String> out = new java.util.LinkedHashSet<>();
+        try (java.io.BufferedReader br = new java.io.BufferedReader(
+                new java.io.FileReader(new java.io.File(ctx.getFilesDir(), "nowhere-appkeep")))) {
+            String line;
+            while ((line = br.readLine()) != null) {
+                line = line.trim();
+                if (line.isEmpty()) continue;
+                String pkg = line.split("\t", -1)[0].trim();
+                if (!pkg.isEmpty()) out.add(pkg);
+            }
+        } catch (Exception ignore) {}
+        return out;
+    }
+
+    private static java.util.Set<String> keepSetByMode(android.content.Context ctx, String want) {
+        java.util.LinkedHashSet<String> out = new java.util.LinkedHashSet<>();
+        try (java.io.BufferedReader br = new java.io.BufferedReader(
+                new java.io.FileReader(new java.io.File(ctx.getFilesDir(), "nowhere-appkeep")))) {
+            String line;
+            while ((line = br.readLine()) != null) {
+                line = line.trim();
+                if (line.isEmpty()) continue;
+                // Split on ALL tabs so a 3rd `group:<name>` token can't corrupt the mode read (a first-tab-only
+                // parse would make `pkg\tondemand\tgroup:x` mode = "ondemand\tgroup:x" and drop the on-demand app).
+                String[] f = line.split("\t", -1);
+                if (f.length < 2) continue; // bare pkg == installed, neither on-demand nor auto
+                String pkg = f[0].trim();
+                if (!pkg.isEmpty() && want.equals(f[1].trim())) out.add(pkg);
+            }
+        } catch (Exception ignore) {}
+        return out;
+    }
+
+    // ---- #206 idle-reclaim threshold: a per-profile "re-archive an on-demand app after it's been idle this long"
+    // setting, one line of milliseconds in files/nowhere-reclaim (0 == Never). It seals + roams with the profile
+    // like the keep-set. ReArchiveReceiver reads it via reclaimIdleMs(); the "Your apps" screen writes it. ----
+    static final long RECLAIM_NEVER = 0L;
+    static final long RECLAIM_1D = 24L * 60 * 60 * 1000;
+    static final long RECLAIM_3D = 3 * RECLAIM_1D;
+    static final long RECLAIM_1W = 7 * RECLAIM_1D;
+    static final long RECLAIM_DEFAULT_MS = RECLAIM_3D; // reclaim after 3 idle days unless the profile says otherwise
+
+    /** The per-profile idle-reclaim threshold in ms (0 = Never). Static so ReArchiveReceiver (no ProfileActivity
+     *  instance) can read it from a plain Context; unset/unreadable falls back to the 3-day default. */
+    static long reclaimIdleMs(android.content.Context ctx) {
+        try (java.io.BufferedReader br = new java.io.BufferedReader(
+                new java.io.FileReader(new java.io.File(ctx.getFilesDir(), "nowhere-reclaim")))) {
+            String s = br.readLine();
+            if (s != null) {
+                long v = Long.parseLong(s.trim());
+                if (v >= 0) return v; // 0 = Never is a valid stored value
+            }
+        } catch (Exception ignore) {}
+        return RECLAIM_DEFAULT_MS;
+    }
+
+    /** True only when nowhere-reclaim now holds ms (NWP-20261124-23). */
+    private boolean setReclaimIdleMs(long ms) {
+        try {
+            StoreInstaller.writeAtomic(new java.io.File(getFilesDir(), "nowhere-reclaim"), Long.toString(ms));
+            return true;
+        } catch (Exception e) {
+            android.util.Log.w("NowhereChooser", "setReclaimIdleMs", e);
+            return false;
+        }
+    }
+
+    private String reclaimLabel(long ms) {
+        if (ms == RECLAIM_1D) return "1 day";
+        if (ms == RECLAIM_3D) return "3 days";
+        if (ms == RECLAIM_1W) return "1 week";
+        return "Never"; // RECLAIM_NEVER or any unrecognised value
+    }
+
+    /** The reclaim chip: an accent outline for a real threshold, muted for Never. */
+    private void paintReclaimChip(TextView chip, long ms) {
+        chip.setText(reclaimLabel(ms));
+        boolean on = ms != RECLAIM_NEVER;
+        chip.setTextColor(on ? ACCENT : MUTED);
+        android.graphics.drawable.GradientDrawable g = new android.graphics.drawable.GradientDrawable();
+        g.setCornerRadius(dp(18));
+        g.setColor(android.graphics.Color.TRANSPARENT);
+        g.setStroke(dp(1), on ? ACCENT : OUTLINE);
+        chip.setBackground(g);
+    }
+
+    /** NWP-20261005-02 (Chester, 2026-10-05): "Install pending apps now". Shown only while Auto apps are still
+     *  placeholders -- after a cold lock cut a sweep short, or before the first sweep has reached them -- and starts
+     *  the SAME sweep a resume starts, so it materialises exactly the apps it counted (UnarchiveService.pendingAutoApps).
+     *  A second tap while one runs is harmless (the shared queue de-duplicates), but the chip goes inert anyway so the
+     *  screen does not invite it.
+     *  NWP-20261119-14 (Q042, h49 #1): with the "Download over mobile data" switch off and no Wi-Fi the grey line says
+     *  the apps wait for Wi-Fi (AutoPendingCopy), and a link under it opens Offline media, which holds the switch. */
+    private LinearLayout installPendingRow(int n, boolean allowMetered, boolean onWifi) {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(dp(4), dp(8), dp(4), dp(8));
+        row.setTag(AutoPendingCopy.waitingForWifi(allowMetered, onWifi)); // which words it says: rowAction reads it
+        LinearLayout col = new LinearLayout(this);
+        col.setOrientation(LinearLayout.VERTICAL);
+        TextView lab = new TextView(this);
+        lab.setText("Install pending apps now");
+        lab.setTextColor(INK);
+        lab.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
+        col.addView(lab);
+        TextView sub = new TextView(this);
+        sub.setText(AutoPendingCopy.subline(n, allowMetered, onWifi));
+        sub.setTextColor(MUTED);
+        sub.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        col.addView(sub);
+        final String link = AutoPendingCopy.link(allowMetered, onWifi);
+        if (link != null) { // NWP-20261119-14 (Q042): the way to the one switch, in Offline media
+            TextView to = new TextView(this);
+            to.setText(link);
+            to.setTextColor(ACCENT);
+            to.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+            to.setPadding(0, dp(4), 0, 0);
+            to.setOnClickListener(v -> showOfflineMedia());
+            col.addView(to);
+        }
+        row.addView(col, new LinearLayout.LayoutParams(0, WRAP, 1f));
+        final TextView chip = new TextView(this);
+        chip.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        chip.setPadding(dp(14), dp(7), dp(14), dp(7));
+        chip.setMinWidth(dp(96));
+        chip.setGravity(Gravity.CENTER);
+        chip.setText("Install");
+        chip.setTextColor(ACCENT);
+        android.graphics.drawable.GradientDrawable g = new android.graphics.drawable.GradientDrawable();
+        g.setCornerRadius(dp(18));
+        g.setColor(android.graphics.Color.TRANSPARENT);
+        g.setStroke(dp(1), ACCENT);
+        chip.setBackground(g);
+        chip.setOnClickListener(v -> {
+            try {
+                startService(new Intent(this, UnarchiveService.class).putExtra(UnarchiveService.EXTRA_SWEEP, true)
+                        .putExtra(UnarchiveService.EXTRA_BY_HAND, true)); // NWP-20261112-11 (Q042): any network
+                android.util.Log.i("NowhereChooser", "#130 sweep started by hand: " + n + " pending (NWP-20261005-02)");
+                chip.setText("Started");
+            } catch (Throwable t) {
+                android.util.Log.w("NowhereChooser", "install pending apps", t);
+                chip.setText("Try again");
+                return;
+            }
+            chip.setTextColor(MUTED);
+            g.setStroke(dp(1), OUTLINE);
+            chip.setOnClickListener(null);
+        });
+        LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(WRAP, WRAP);
+        clp.leftMargin = dp(8);
+        row.addView(chip, clp);
+        return row;
+    }
+
+    /** NWP-20261119-30: applyPendingRow for a count that does not come from a sweep's end. */
+    private void applyPendingRow(LinearLayout ll, View summary, View[] rowRef, int[] shown, int n) {
+        applyPendingRow(ll, summary, rowRef, shown, n, false);
+    }
+
+    /** NWP-20261027-12: puts the "Install pending apps now" row on screen, or updates or removes it, as
+     *  PendingRow.action decides from the count the row says now (shown[0], 0 = no row) and the fresh count n. The first
+     *  build and every refresh come through here, so they leave the same row at the same slot. UI thread only.
+     *  NWP-20261119-30: sweepEnded rebuilds a row whose count did not change, so a chip left at "Started" says "Install". */
+    private void applyPendingRow(LinearLayout ll, View summary, View[] rowRef, int[] shown, int n, boolean sweepEnded) {
+        int act = PendingRow.action(shown[0], n, sweepEnded);
+        boolean allowMetered = readPrefetchMetered();     // NWP-20261119-14: the "Download over mobile data" switch
+        boolean onWifi = ChooserActivity.onWifiCtx(this); // the sweep's own Wi-Fi test (AutoSweepNet.mayFetch)
+        // the same count can still need new words: Wi-Fi came or went since the row was drawn
+        act = AutoPendingCopy.rowAction(act, rowRef[0] == null ? null : rowRef[0].getTag(), allowMetered, onWifi);
+        if (act == PendingRow.NONE) return;
+        if (act != PendingRow.ADD && rowRef[0] != null) ll.removeView(rowRef[0]);
+        if (act == PendingRow.REMOVE) {
+            rowRef[0] = null;
+            shown[0] = 0;
+            return;
+        }
+        View v = installPendingRow(n, allowMetered, onWifi);
+        ll.addView(v, ll.indexOfChild(summary) + 1);
+        rowRef[0] = v;
+        shown[0] = n;
+    }
+
+    /** NWP-20261119-30: refreshPendingRow for a recount that does not come from a sweep's end. */
+    private void refreshPendingRow(LinearLayout ll, View summary, View[] rowRef, int[] shown,
+            java.util.concurrent.atomic.AtomicInteger pendingRowTicket) {
+        refreshPendingRow(ll, summary, rowRef, shown, pendingRowTicket, false);
+    }
+
+    /** NWP-20261027-12: re-counts the sweep's own list (UnarchiveService.pendingAutoApps, PackageManager work, so off
+     *  the UI thread) and redraws the row. The row was counted once per build, so an app newly set to Auto never
+     *  brought it up until the screen was rebuilt (lynx 0.5.48, 2026-10-19).
+     *  pendingRowTicket is the newest recount asked for BY THIS BUILD of the list, like rowRef and shown: two quick
+     *  batches start two recounts that can finish out of order and only the newest may draw. It must not be shared
+     *  across builds, or a late callback of a detached build would supersede the attached build's recount.
+     *  NWP-20261119-30: sweepEnded is true only from the sweepDone receiver; applyPendingRow says what it changes. */
+    private void refreshPendingRow(LinearLayout ll, View summary, View[] rowRef, int[] shown,
+            java.util.concurrent.atomic.AtomicInteger pendingRowTicket, boolean sweepEnded) {
+        final int ticket = pendingRowTicket.incrementAndGet();
+        new Thread(() -> {
+            final int n;
+            try {
+                n = UnarchiveService.pendingAutoApps(this, false).size();
+            } catch (Throwable t) {
+                android.util.Log.w("NowhereChooser", "install pending apps: recount", t);
+                return;                               // keep what is on screen; the next drained change asks again
+            }
+            runOnUiThread(() -> {
+                if (!ll.isAttachedToWindow()) return; // the user left Your apps: these views are gone
+                if (ticket != pendingRowTicket.get()) return; // a newer recount was asked for: its answer wins
+                applyPendingRow(ll, summary, rowRef, shown, n, sweepEnded);
+            });
+        }, "nowhere-pendingrow").start();
+    }
+
+    /** NWP-20261011-01: this profile's "Backups while apps set up" choice (SealHold), from getFilesDir()/nowhere-seal-hold.
+     *  Absent or unknown is the 30-minute default. */
+    private String readSealHold() {
+        try (java.io.BufferedReader r = new java.io.BufferedReader(new java.io.FileReader(new java.io.File(getFilesDir(), SealHold.FILE)))) {
+            return SealHold.normalize(r.readLine());
+        } catch (Throwable ignore) {}
+        return SealHold.DEFAULT;
+    }
+
+    /** NWP-20261011-01: one thread for every SET-SEAL-HOLD, so two quick choices reach the daemon in the order they
+     *  were made (each waits for its reply before the next is sent). */
+    private static final java.util.concurrent.ExecutorService SEAL_HOLD_IO =
+            java.util.concurrent.Executors.newSingleThreadExecutor();
+
+    /** Save the choice (the copy that ROAMS) and report whether it was saved. Then tell the daemon, so it applies to
+     *  this session's next backup decision, and say what happened in words that are true whatever the outcome
+     *  (SealHold.afterSave). The daemon answers this verb without waiting on a running setup (concurrentSafeCmd). */
+    private boolean writeSealHold(String v) {
+        final String val = SealHold.normalize(v);
+        try {
+            StoreInstaller.writeAtomic(new java.io.File(getFilesDir(), SealHold.FILE), val);
+        } catch (Throwable t) {
+            Log.w("NowhereChooser", "writeSealHold", t);
+            android.widget.Toast.makeText(this, SealHold.afterSave(false, null), android.widget.Toast.LENGTH_LONG).show();
+            return false;
+        }
+        SEAL_HOLD_IO.execute(() -> {
+            String reply = "";
+            // The user this chooser runs as: the daemon applies the choice only to that user's session, so a send
+            // that lands after this session ended cannot set the next profile's.
+            try { reply = sendDaemon("SET-SEAL-HOLD\n" + val + "\n" + android.os.UserHandle.myUserId() + "\n"); }
+            catch (Throwable ignore) {}
+            final String msg = SealHold.afterSave(true, reply);
+            if (msg != null) runOnUiThread(() -> android.widget.Toast.makeText(this, msg,
+                    android.widget.Toast.LENGTH_LONG).show());
+        });
+        return true;
+    }
+
+    private void paintSealHoldChip(TextView chip, String v) {
+        chip.setText(SealHold.label(v));
+        chip.setTextColor(ACCENT);
+        android.graphics.drawable.GradientDrawable g = new android.graphics.drawable.GradientDrawable();
+        g.setCornerRadius(dp(18));
+        g.setColor(android.graphics.Color.TRANSPARENT);
+        g.setStroke(dp(1), ACCENT);
+        chip.setBackground(g);
+    }
+
+    /** The picker: each choice with its trade-off in one line under it. */
+    private void showSealHoldDialog(final TextView chip, final TextView sub, final String[] cur) {
+        final CharSequence[] items = new CharSequence[SealHold.VALUES.length];
+        int checked = 0;
+        for (int i = 0; i < SealHold.VALUES.length; i++) {
+            items[i] = SealHold.item(SealHold.VALUES[i]);
+            if (SealHold.VALUES[i].equals(cur[0])) checked = i;
+        }
+        new android.app.AlertDialog.Builder(this)
+                .setTitle("Backups while apps set up")
+                .setSingleChoiceItems(items, checked, (dlg, which) -> {
+                    dlg.dismiss();
+                    if (!writeSealHold(SealHold.VALUES[which])) return; // not saved: the row keeps the old choice
+                    cur[0] = SealHold.VALUES[which];
+                    paintSealHoldChip(chip, cur[0]);
+                    sub.setText(SealHold.tradeoff(cur[0]));
+                })
+                .setNegativeButton("Cancel", null)
+                .show();
+    }
+
+    /** The reclaim picker: Never / 1 day / 3 days / 1 week. Writes the per-profile setting + repaints the chip. */
+    private void showReclaimDialog(final TextView chip, final long[] cur) {
+        final long[] opts = { RECLAIM_NEVER, RECLAIM_1D, RECLAIM_3D, RECLAIM_1W };
+        final CharSequence[] items = { "Never", "1 day", "3 days", "1 week" };
+        int checked = 0;
+        for (int i = 0; i < opts.length; i++) if (opts[i] == cur[0]) { checked = i; break; }
+        new android.app.AlertDialog.Builder(this)
+                .setTitle("Re-archive idle apps")
+                .setSingleChoiceItems(items, checked, (d, which) -> {
+                    d.dismiss();
+                    // NWP-20261122-02: through the preset guard; its Cancel leaves the chip as it was.
+                    presetGuard(PresetPicker.change("reclaim", Long.toString(opts[which])), () -> {
+                        // NWP-20261124-23: not saved -- the chip keeps the choice the file still holds
+                        if (!setReclaimIdleMs(opts[which])) {
+                            android.widget.Toast.makeText(this, SettingsSaveCopy.NOT_SAVED,
+                                    android.widget.Toast.LENGTH_LONG).show();
+                            return;
+                        }
+                        cur[0] = opts[which];
+                        paintReclaimChip(chip, cur[0]);
+                    }, null);
+                })
+                .setNegativeButton("Cancel", null)
+                .show();
+    }
+
+    /** Set pkg's keep mode. mode = null / "" / "off" drops it from the keep-set; otherwise installed / ondemand.
+     *  After the edit: record whether pkg is a kept Play-Services client (so reconcile counts it + its tap can pull
+     *  gms), then reconcile the launcher-less Play providers (gms / gsf) into the keep-set to match demand -- so the
+     *  user only ever toggles the apps they can actually see (DIA-20260802-13). */
+    private java.util.Set<String> setAppMode(String pkg, String mode) {
+      // NWP-20260925-03: THE PLAN GATE IS ASKED OFF THE LOCK, BETWEEN TWO PASSES OF THE EDIT. On lynx 2026092603 the
+      // gate's GET-ENTITLEMENT round trip ran under APPKEEP_LOCK (inside writeAppModes) and hung behind a network
+      // that could not reach the gateway; "Your apps" then blocked on the same lock on the UI thread and Profile
+      // froze (ANR: main thread in StoreInstaller.appGoneThisSession, waiting on the nowhere-appmode thread in
+      // overPlan). Pass one runs the whole edit under the lock and, if it would ADD a package -- the toggled one or
+      // a Play-stack member reconcile pulls in, whichever way the toggle went -- returns null before writing the
+      // keep-set. The gate is then asked here, holding nothing, and pass two re-runs the edit with the answer and
+      // always completes. An edit that adds nothing asks nothing, exactly as before. Re-running is safe because
+      // every side file pass one touches before the keep-set write is idempotent: recordTurnedOff and
+      // recordInferredOrphan are set inserts, setPlayDep an insert or removal that is a no-op when unchanged,
+      // notePlaySeen (reached through playDependent and playStackOrphanKnown, and directly from the Off branch since
+      // NWP-20260926-01) an upsert that returns early when unchanged, and reconcilePlayStack otherwise only edits
+      // the local map.
+      Boolean overPlanNow = null;
+      for (;;) {
+        java.util.Set<String> dropped = setAppModeLocked(pkg, mode, overPlanNow);
+        if (dropped != null) return dropped;
+        overPlanNow = overPlan(pkg, mode);
+      }
+    }
+
+    /** setAppMode's edit, under APPKEEP_LOCK. Returns null -- having written no keep-set line; only the idempotent
+     *  side files above -- when the edit would add a package and overPlanNow is still null; setAppMode then asks the
+     *  gate off the lock and calls this again. Returns KEEPSET_UNREADABLE, having written nothing at all, when the
+     *  keep-set cannot be read (NWP-20261112-03). */
+    private java.util.Set<String> setAppModeLocked(String pkg, String mode, Boolean overPlanNow) {
+      // NWP-20260904-13: THE WHOLE READ-MODIFY-WRITE HOLDS THE KEEP-SET LOCK, not just the write.
+      //
+      // writeAppModes re-emits EVERY line from the map read here, so a line that another thread removed
+      // between this read and that write came straight back -- a lost update on the one file that says what
+      // the user chose to roam. Three removers genuinely run concurrently with a toggle: the logoff prune in
+      // captureAppCode (which since NWP-20260904-06 also drops what the PACKAGE_REMOVED receiver watched
+      // leave), the login-time phantom reconcile thread (NWP-20260904-07 -- ~15-45 s after every login, so
+      // the window is live in ordinary use, not just at logoff), and a second setAppMode on another thread
+      // (the MODE_QUEUE worker, the store-add thread, the Storage chip). A concurrent keepAutoImpl ADD is lost
+      // the same way. Holding the lock across the span makes each of them land before or after this edit, never
+      // inside it.
+      //
+      // Deadlock: none. The span is file I/O in our own dir, PackageManager binder reads and PLAYDEP_LOCK -- a
+      // documented leaf that nothing takes APPKEEP_LOCK under, so the order here (APPKEEP -> PLAYDEP) is the
+      // only order in the process and cannot invert. It holds NO daemon socket since NWP-20260925-03 (the plan
+      // check is asked by setAppMode, off the lock). Nothing in it waits on the reconcile or receiver threads.
+      // writeAppModes' own synchronized nests (Java monitors are reentrant).
+      //
+      // ⚠ ANR: the HOLDER is always off the UI thread (the MODE_QUEUE worker, the store-add thread, the Storage
+      // chip's thread). ~~But WAITERS on this lock run on the main thread -- confirmDropAndSignOut's "Drop X and
+      // sign out" click, AppInstallReceiver.onReceive (registered with no Handler) and "Your apps"
+      // (showYourApps -> applyDefaultsToUndecided).~~ superseded by NWP-20261029-19 (row "Three UI-thread paths
+      // still wait on `APPKEEP_LOCK`"): none of the three waits on main any more -- the receiver runs on one
+      // serial worker under goAsync, Your apps reconciles on its build thread, and Drop-and-sign-out records
+      // on a worker and logs off on the UI thread after the last record. The lock is a leaf held for
+      // milliseconds and these paths must not wait on it from the main thread. It USED to hold overPlan's
+      // GET-ENTITLEMENT round trip (a 90 s socket timeout, queued on the daemon's sessionMu or on the network),
+      // and on lynx 2026092603 that froze Profile: NWP-20260925-03 moved the ask out of the lock (into
+      // setAppMode, between two passes of this method), so the span is now milliseconds of binder reads and small
+      // file rewrites. ~~Moving the main-thread takers off main is still worth doing and is not done here.~~ (Done,
+      // above.) Do not "fix" either by shrinking THIS block back to the write, which reopens the lost update.
+      synchronized (StoreInstaller.APPKEEP_LOCK) {
+        java.util.LinkedHashMap<String,String> m = readAppModesStrictIn(getFilesDir());
+        if (m == null) { // NWP-20261112-03: unknown is not empty -- a rewrite from a failed read drops every kept app
+            android.util.Log.w("NowhereChooser", "keep-set unreadable -- nothing written (NWP-20261112-03)");
+            return KEEPSET_UNREADABLE;
+        }
+        // Snapshot keep-set membership BEFORE the edit: a stack member the user just toggled OFF is gone from `m` by
+        // reconcile time, but if it was kept a moment ago its APK bytes are sealed/available, so reconcile can still
+        // re-add it when a client still demands it (else toggling the auto-pulled Play Store off would strand YouTube).
+        java.util.Set<String> preKept = new java.util.HashSet<>(m.keySet());
+        putAppMode(m, pkg, mode);
+        // Record pkg in the roamed Play-Services-client list (nowhere-playdeps) whenever it is KEPT (installed OR
+        // on-demand) and uses Play Services -- reconcile reads this ARCHIVE-SAFE record instead of a live manifest
+        // read (which throws once a client is archived). Detect HERE via a live read, which is safe because the app
+        // being toggled is installed (you can only keep an installed app). Drop it only when pkg leaves the keep-set
+        // (off). If pkg is kept but the live read fails now (re-toggling an already-archived on-demand placeholder),
+        // LEAVE any existing record intact rather than clobbering a valid one. (Recording an INSTALLED client is
+        // harmless to appDeps: an installed app never enters the tap flow, and appDeps only adds gms when gms is a
+        // sealed ON-DEMAND member -- which it won't be once an installed client has forced gms to INSTALLED.)
+        // Play Store (vending) self-demands the whole stack whenever the user keeps it, WITHOUT relying on it
+        // declaring the gms.version marker (it does, but don't hinge "keep Play Store alone" on an unasserted manifest
+        // fact -- absent the marker, reconcile would compute need==null and drop the whole stack). gms/gsf are never
+        // recorded (hidden providers). Any other app records iff it actually uses Play Services (live read, safe:
+        // the app being toggled is installed). Drop on un-keep; leave an existing record if the live read fails
+        // (re-toggling an already-archived placeholder).
+        // NWP-20260825-22: leaving the keep-set must RECORD the turn-off, not merely delete the keep line.
+        //
+        // ⚠ THE BUG THIS FIXES COST CHESTER 406 MB OF PLAN, INDEFINITELY. captureAppDrops builds the drop list
+        // from (launcher-enumerable AND not kept) ∪ nowhere-appoff.list. An ON-DEMAND app is an APK-less
+        // ARCHIVED PLACEHOLDER -- no launcher activity, no sourceDir -- so it satisfies neither half of the
+        // enumeration and can ONLY arrive via appoff.list. recordTurnedOff, the sole writer of that file, was
+        // called from exactly two places: the Storage-screen chip and sign-out-without-X. NOT from "Your apps",
+        // which reaches here via applyKeepModeOffThread -> setAppMode(pkg, null) and wrote only the keep-set.
+        // So turning an on-demand app Off removed its keep line and nothing else: the seal kept referencing its
+        // parked .nowhere-odhold data and its deferred #apps APK, addCDCChunks kept leasing BOTH (deferred
+        // chunks are leased exactly like essential ones), and the user kept paying for an app that was gone.
+        //
+        // ⚠ It is also a ONE-WAY TRAP: renderStorageList's `actionable` needs a live keep mode, so the instant
+        // the keep line went the only chip went with it -- a row, a number, and no way to act. Chester saw the
+        // end state as "broken com.teslamotors.tesla" using 406 MB.
+        //
+        // HERE, not in applyKeepModeOffThread, because setAppMode is the single funnel EVERY keep-mode edit
+        // passes through (Your apps, the store add, the Storage chip). Fixing one caller would leave exactly
+        // the drift that produced this -- and which the comment above confirmDropAndSignOut already documents
+        // WRONGLY, asserting the Your-apps toggle uses recordTurnedOff. It never did.
+        //
+        // `preKept` makes the predicate exact -- WAS kept, now is not -- so a no-op write, a never-kept package
+        // or a mere mode change cannot record a turn-off. It sits BEFORE reconcilePlayStack deliberately: only
+        // the package the user actually touched is recorded, never the cascaded vending/gms/gsf removals, which
+        // reconcile can re-add and whose data (gms especially) is a separate decision.
+        //
+        // clearedStorageThisSession is load-bearing, not bookkeeping: it makes logoff re-declare EXPECT-SHRINK
+        // immediately before the seal that shrinks. Without it a sudden multi-hundred-MB drop can meet the
+        // shrink guard with no walk-side explanation and be REFUSED -- the user would get "report this" instead
+        // of a saved session, which is a worse failure than the leak.
+        if (preKept.contains(pkg) && m.get(pkg) == null) {
+            recordTurnedOff(pkg);
+            // NWP-20260826-08 also cleared the keep-me-signed-in opt-in here, because setAppMode is the one
+            // funnel every keep-mode edit passes through and a stale opt-in kept an app's device-bound sign-in
+            // roaming after the user turned it off. NWP-20260830-03 removed the opt-in entirely -- keys now
+            // carry unconditionally -- so there is nothing left to clear and only the turn-off record remains.
+            clearedStorageThisSession = true;
+        }
+        // NWP-20260926-01: an Off erases the only record that pkg needs Play (setPlayDep below), and once pkg is an
+        // archived placeholder playDependent can answer only from nowhere-playseen -- so an Off -> On of an archived
+        // Play client with no playseen record came back without its Play stack. Keep the fact where playDependent
+        // reads it. Idempotent (notePlaySeen returns early when unchanged), and on the edit's second pass pkg is no
+        // longer in playdeps, so it does nothing; the stack members are reconcile's, never a client.
+        if (m.get(pkg) == null && !GMS_PKG.equals(pkg) && !GSF_PKG.equals(pkg) && !VENDING_PKG.equals(pkg)
+                && readPlayDeps(this).contains(pkg) && readPlaySeen(this).get(pkg) == null) notePlaySeen(this, pkg, true);
+        if (m.get(pkg) == null) setPlayDep(pkg, false); // removed from the keep-set -> no longer a client
+        else if (!GMS_PKG.equals(pkg) && !GSF_PKG.equals(pkg)
+                && (VENDING_PKG.equals(pkg) || playDependent(pkg))) setPlayDep(pkg, true);
+        // Reconcile the whole sandboxed-Play stack (Play Store + Services + GSF) from demand (runs AFTER the playdeps
+        // write, so it sees the current client set). Makes "YouTube on-demand" pull the whole stack -- Google apps
+        // need the Play Store app present, not just Services -- from the single visible toggle, refcount-correct.
+        reconcilePlayStack(m, preKept);
+        // NWP-20260826-13: and stop CARRYING the stack once it is proven orphaned.
+        //
+        // Chester: "turning off play store should remove gms". It already stops being INSTALLED -- reconcile
+        // drops gms/gsf/vending from the keep-set the moment it sees no demand -- but only recordTurnedOff
+        // reaches the drop list, so their data kept being sealed, leased and billed. gms is routinely the
+        // largest data dir on the phone, which made this the biggest instance of the NWP-20260825-22 leak,
+        // sitting in the one place the Storage screen refuses to offer a chip.
+        //
+        // ⚠ GATED ON playStackOrphanKnown, NOT on reconcile having removed them. That distinction is the
+        // whole slice: reconcile removing the stack means it SAW no demand, which is not the same as there
+        // being none, and acting on the weaker statement is what got the two previous attempts rejected.
+        //
+        // A later re-add is safe: captureAppDrops skips anything in the live keep-set and the agent
+        // intersects the drop list with it again, so installing a Play app tomorrow re-keeps the stack and
+        // these entries stop having any effect.
+        //
+        // ⚠ THE ACCOUNT DOES NOT GO WITH IT. Google account rows live in accounts_ce.db / accounts_de.db
+        // under /data/system_ce|de/<uid> and seal as #sys, which the drop list cannot reach by construction:
+        // dropPkgForRel matches four shapes and every one is an app-data dir. This is the "Clear data on Play
+        // Services" outcome, not a sign-out.
+        //
+        // ⚠ clearedStorageThisSession makes logoff re-declare EXPECT-SHRINK before the seal, so a deliberate
+        // multi-hundred-MB drop is not mistaken for corruption by pushProfile's chunk-ratio guard
+        // (DIA-20260804-03/-05, shrink_intent.go). NB that guard, NOT #743, which is the separate #sys
+        // accounts row check.
+        // NWP-20260830-07/-08: evaluated once PER PASS -- ONCE until NWP-20260925-03, which runs this edit twice for
+        // a verdict-less add (setAppMode). playStackOrphanKnown is not a pure predicate (notePlaySeen backfills a
+        // determination as it goes), so no evaluation is free: the second pass repeats the readsPlayServices /
+        // versionCodeOf binder reads and the "NOT declaring orphaned" log line, and only notePlaySeen's write
+        // returns early, finding its backfill already recorded.
+        //
+        // ⚠ -07 ALSO GATED THIS ON A `playStoreWanted` FLAG. That was WRONG and is reverted: it keyed on
+        // vending being in the keep-set, which is true when the stack was AUTO-PULLED as well as when the user
+        // chose it, so it suppressed legitimate drops -- and it suppressed the wrong half anyway, leaving the
+        // data retained while the code still left the seal. Device-proven on lynx 2026-08-30 (odtest35, build
+        // 2026083002): the guard fired on a drop that was entirely correct. The real split is data-vs-code,
+        // below, not drop-vs-no-drop.
+        final boolean stackOrphaned = playStackOrphanKnown(m);
+        if (stackOrphaned) {
+            for (String sp : new String[] { VENDING_PKG, GMS_PKG, GSF_PKG }) {
+                if (!preKept.contains(sp) || m.get(sp) != null) continue;
+                recordInferredOrphan(sp);
+                // gms/gsf cannot be switched Off by the user (filtered out of Your apps); vending CAN, when no kept
+                // app needs it, and lands here too -- so a user's Off of Play Store keeps its code, as DECIDED
+                // (Chester, 2026-09-26, "keep play store"). Idempotent when absent.
+                // NWP-20260903-13: this used to set clearedStorageThisSession, borrowing the USER's
+                // shrink authority for an inference -- the provenance collapse the backlog row names.
+                // The inferred set gets its own scoped declaration at logoff instead.
+                inferredOrphanedThisSession.add(sp);
+                android.util.Log.i("NowhereChooser", "play stack orphaned: " + sp
+                        + " -- its DATA stops being carried, its CODE is retained so the stack can come back"
+                        + " (NWP-20260826-13, split by NWP-20260830-08)");
+            }
+        }
+        return writeAppModes(m, overPlanNow); // #136: the caller surfaces any plan-gate drop where the tap happened; null = ask the gate
+      } // synchronized (StoreInstaller.APPKEEP_LOCK)
+    }
+
+    /** Apply one pkg->mode edit to a keep-set map (off / null / "" removes; else installed / auto / ondemand). */
+    private void putAppMode(java.util.Map<String,String> m, String pkg, String mode) {
+        if (mode == null || mode.isEmpty() || "off".equals(mode)) m.remove(pkg);
+        else m.put(pkg, MODE_ONDEMAND.equals(mode) ? MODE_ONDEMAND
+                : MODE_AUTO.equals(mode) ? MODE_AUTO : MODE_INSTALLED);
+    }
+
+    /** Reconcile the whole sandboxed-Play STACK (Play Store `vending` + Play Services `gms` + `gsf`) in a keep-set map
+     *  to match demand. A Play-Services CLIENT (YouTube, a game, ...) depends on the WHOLE stack -- Google apps check
+     *  for the Play Store APP itself, not just Services (proven: YouTube "device not compatible" when vending was
+     *  absent). Demand = the strongest mode across kept Play-Services clients, ARCHIVE-SAFE: an on-demand client from
+     *  the recorded nowhere-playdeps set (its manifest is unreadable once archived), an installed client from a live
+     *  read (installed => not archived). Play Store (vending) counts as demand ONLY when the USER kept it (in
+     *  playdeps), never when auto-pulled -> no self-perpetuation. INSTALLED DOMINATES on-demand.
+     *
+     *  Two ROLES, deliberately different, to avoid the vending duality traps an earlier cut fell into:
+     *   - gms / gsf (launcher-less, hidden, never user-toggled): reconcile OWNS their mode -- write it at `need`, drop
+     *     when nothing depends on them.
+     *   - vending (launcher-bearing, a visible user-toggleable row): split by whether the user chose its mode. A
+     *     USER-kept vending (in playdeps) keeps the user's mode -- reconcile NEVER overwrites it, because vending's
+     *     own mode is what feeds `need`, so overwriting it would self-latch (a transient installed client would pin it
+     *     installed forever). An AUTO-pulled vending (not in playdeps, so NOT a demand source) has its mode OWNED by
+     *     reconcile at `need`, exactly like gms/gsf -- keeping the stack internally consistent (eager Store for eager
+     *     Services) with no latch risk. `preKept` = keep-set membership BEFORE this edit, so a just-toggled-off but
+     *     still-demanded vending is re-addable from its sealed bytes. */
+    private void reconcilePlayStack(java.util.Map<String,String> m, java.util.Set<String> preKept) {
+        // NWP-20261111-06: an unreadable nowhere-playdeps is not "no Play clients". Read as empty, an archived
+        // on-demand client stops demanding the stack and gms, gsf and Play Store leave the keep-set -- the
+        // 2026-08-27 loss, reached by a read error. Unknown changes nothing: the stack stays exactly as kept.
+        if (readPlayDepsStrict(this) == null) {
+            android.util.Log.w("NowhereChooser", "play stack: nowhere-playdeps unreadable -- the stack is left as kept"
+                    + " (NWP-20261111-06)");
+            return;
+        }
+        java.util.Set<String> playClients = readPlayDeps(this);
+        // NWP-20261122-06 (h50 #7 B1 (i)): with Google Play turned off in Profile › Apps, Play Store is never put back,
+        // by either re-add below. Absent and on leave this method as it was; gms/gsf are unchanged. playState() reads a
+        // roamed flag as absent where the GrapheneOS App Store is not installed (Diaspore), so it changes nothing there.
+        final boolean playOff = PlayChoice.blocksVendingReadd(playState());
+        String need = null;
+        for (java.util.Map.Entry<String,String> e : m.entrySet()) {
+            String p = e.getKey();
+            if (GMS_PKG.equals(p) || GSF_PKG.equals(p)) continue; // providers are never demand sources
+            String cmode = e.getValue();
+            boolean present = MODE_INSTALLED.equals(cmode) || MODE_AUTO.equals(cmode); // #130: an auto client is
+            // installed for most of the session (the sweep materialises it), so its manifest is live-readable
+            // exactly like an installed one -- both count for the usesPlayServices probe.
+            // A client if it's in playdeps (archive-safe) or present+usesPlayServices (live read). Play Store
+            // demands only when USER-kept (in playdeps), never when auto-pulled.
+            boolean demands = VENDING_PKG.equals(p)
+                    ? playClients.contains(p)
+                    : playClients.contains(p) || (present && usesPlayServices(p));
+            if (!demands) continue;
+            need = stronger(need, cmode);
+        }
+        // gms/gsf: reconcile OWNS the mode.
+        applyStackMember(m, GMS_PKG, need, preKept);
+        applyStackMember(m, GSF_PKG, need, preKept);
+        // vending: split by whether the user chose its mode.
+        if (need == null) {
+            m.remove(VENDING_PKG);                                 // nothing demands the stack -> drop Play Store too
+        } else if (playClients.contains(VENDING_PKG)) {
+            // USER-kept Play Store: honour the user's chosen mode -- NEVER overwrite it, because vending's own mode is
+            // exactly what feeds `need`, so overwriting it would self-latch (a transient installed client would pin it
+            // installed forever). Only re-add (at on-demand) if it somehow left the keep-set while still demanded.
+            if (!playOff && !m.containsKey(VENDING_PKG) && (preKept.contains(VENDING_PKG) || isInstalledPkg(VENDING_PKG)))
+                m.put(VENDING_PKG, MODE_ONDEMAND);
+        } else if (!playOff) {
+            // AUTO-pulled Play Store (the user never chose its mode, so it is NOT a demand source): reconcile OWNS its
+            // mode at `need`, exactly like gms/gsf -- so an installed client gets an eager Store consistent with eager
+            // Services (no lazy-Store/eager-Services divergence), and a toggled-off-but-still-demanded vending is
+            // re-added from its sealed bytes (applyStackMember's preKept term). No self-latch: an auto-pulled vending
+            // is never in playdeps, so its reconcile-written mode can never feed back as demand.
+            applyStackMember(m, VENDING_PKG, need, preKept);
+        }
+        // NWP-20260830-07: THE STACK IS KEPT OR DROPPED AS A UNIT. Every branch above is individually correct
+        // and they can still leave Play Store kept with a provider missing -- not in one pass (`need == null`
+        // removes all three together) but across two, because vending has a re-add path that gms/gsf do not:
+        // the `playClients.contains` branch restores it from `preKept || isInstalledPkg`, while a provider comes
+        // back only through resolvableForKeep, which is false once its bytes have left #apps.
+        //
+        // That half-state is the 2026-08-30 failure, and it is the worst of the three possible outcomes: the
+        // Google account row roams on in #sys (the drop list cannot reach accounts_ce.db by construction), so
+        // Settings shows an account that renders as nothing and Play cannot sign in, with no error anywhere.
+        // Prefer either working Play or visibly absent Play over Play Store that cannot function.
+        if (m.get(VENDING_PKG) != null) {
+            String vmode = m.get(VENDING_PKG);
+            for (String prov : new String[] { GMS_PKG, GSF_PKG }) {
+                if (m.get(prov) != null) continue;              // present -- nothing to repair
+                // ⚠⚠ NOT EVERY EDITION HAS EVERY MEMBER, and the first cut of this invariant did not know it.
+                // GrapheneOS's sandboxed Play is Play Store + Play services + GrapheneOS's OWN GmsCompatConfig;
+                // there is NO com.google.android.gsf on an Endospore device. Device-checked on lynx 2026-08-30,
+                // build 2026083004: `pm list packages -a | grep -c com.google.android.gsf` = 0 DEVICE-WIDE.
+                // ⚠ THE SECOND HALF OF THIS EVIDENCE WAS WRONG AND IS CORRECTED (NWP-20260912-04): it used to
+                // say "the GrapheneOS App Store lists exactly two dependencies for Play Store, neither of them
+                // GSF" -- true, and irrelevant, because GSF is a dependency of PLAY SERVICES, not of Play
+                // Store. Read off the Apps repo metadata on husky 2026-09-12, com.google.android.gms declares
+                // `"deps":["com.google.android.gsf","com.android.vending"]`. THE CONCLUSION SURVIVES ANYWAY,
+                // for the real reason: GrapheneOS removed GSF as a dependency for Android 15+ on 2024-10-16
+                // (release 2024101600, "add stubs to fully remove the need for the Google Services Framework"),
+                // and its catalog entry is gated `"android < 35"` with the gms dep marked `SkipIfMissing`. So
+                // GSF is absent on every modern GrapheneOS device, ours included, and that is correct.
+                // So the original `m.get(GSF_PKG) == null` term was ALWAYS true here, which made this repair
+                // fire on EVERY keep-set edit and remove Play Store outright -- turning a guard against a
+                // half-stack into a guarantee of one. Caught before it bit only because Chester said "have a
+                // look at the screen" and the dependency list was right there.
+                //
+                // A member this device has never had is not a missing member. Require evidence it belongs to
+                // THIS stack: either the profile was carrying it (preKept) or its bytes are reachable.
+                if (!preKept.contains(prov) && !resolvableForKeep(prov)) continue;
+                applyStackMember(m, prov, vmode, preKept);      // repair upward: a complete stack is the better
+                if (m.get(prov) != null) continue;              // end whenever the bytes are still reachable
+                android.util.Log.w("NowhereChooser", "play stack INCOMPLETE: Play Store kept at " + vmode
+                        + " but " + prov + " belongs to this stack and cannot be resolved -- dropping Play Store"
+                        + " too, rather than keeping a Store that cannot work and an account that cannot render"
+                        + " (NWP-20260830-07, scoped by NWP-20260830-08)");
+                m.remove(VENDING_PKG);
+                break;
+            }
+        }
+    }
+
+    /** Fold one dependent's mode into a running provider need. #130 three-level strength: INSTALLED (restored
+     *  in-login) > AUTO (background-materialised right after) > ON-DEMAND (tap) -- a provider must be at least
+     *  as eager as its most eager client, or the client comes up before its stack does. */
+    private String stronger(String cur, String depMode) {
+        return modeRank(depMode) > modeRank(cur) ? normalMode(depMode) : cur;
+    }
+
+    private int modeRank(String m) {
+        return MODE_INSTALLED.equals(m) ? 3 : MODE_AUTO.equals(m) ? 2 : m != null ? 1 : 0;
+    }
+
+    private String normalMode(String m) {
+        return MODE_INSTALLED.equals(m) ? MODE_INSTALLED : MODE_AUTO.equals(m) ? MODE_AUTO : MODE_ONDEMAND;
+    }
+
+    /** Reconcile one sandboxed-Play stack member's keep-set entry to `need`: DROP when null (reaping even a
+     *  not-yet-materialised deferred dep that's now orphaned), else write at `need` when its bytes are AVAILABLE to
+     *  (re)seal -- already a keep-set member (roamed, APK sealed in name#apps) OR currently installed. The keep-set
+     *  mode is a next-login PREFERENCE, not a claim the APK is present now (on the roamed user a launcher-less member
+     *  is an un-materialised deferred dep whose getApplicationInfo throws), so gating the write on live-install alone
+     *  would silently drop a correct INSTALLED need. `preKept` (keep-set membership before this edit) additionally
+     *  keeps a member whose sealed bytes exist but was just toggled out of `m`. Used for gms/gsf (never user-toggled,
+     *  so preKept is belt-and-suspenders here); vending's presence is handled directly in reconcilePlayStack. */
+    private void applyStackMember(java.util.Map<String,String> m, String pkg, String need, java.util.Set<String> preKept) {
+        if (need == null) { m.remove(pkg); return; }
+        // ⚠ NWP-20260827-09: isInstalledPkg is flags=0 and is FALSE for an archived placeholder, which is the
+        // steady state of an on-demand stack member. So a member that left the keep-set could never be re-added:
+        // m.containsKey is false (it was removed), preKept is false (it left on the PREVIOUS edit), and the
+        // install test is false because it is archived. Chester, 2026-08-27 -- YouTube off then on again, and
+        // Play Store stayed Off with no way back, then vanished from Your apps entirely.
+        // resolvableForKeep accepts the archived case, which is correct here: the question this asks is "are
+        // this member's bytes available to (re)seal", and an archived app's APK is sealed in name#apps.
+        if (m.containsKey(pkg) || preKept.contains(pkg) || resolvableForKeep(pkg)) { m.put(pkg, need); return; }
+        // NWP-20260830-07: SAY SO. This skip was silent, and its silence is what made the 2026-08-30 loss
+        // undiagnosable from the device: a demanded provider that cannot be re-added leaves a Play Store that
+        // cannot work and a Google account that renders as nothing, with not one line explaining why. gms and
+        // gsf are filtered out of "Your apps", so there is no manual route back either -- the user sees only
+        // the symptom. Warn, and name the reason, so the next occurrence is readable in a bug report.
+        //
+        // NWP-20260831-04: ONCE PER SCREEN SESSION, not per keep-set edit. Reaching here means the member has
+        // no trace anywhere -- which is EITHER a genuinely damaged pre--08 profile (signal, keep it) OR a
+        // member this edition has never had at all (GSF on Endospore, where reconcile's provider probe demands
+        // it unconditionally -- device-observed firing on every edit, pure noise). Profile state cannot tell
+        // the two apart, so the honest middle is to say it once and stop repeating it.
+        if (!stackUnresolvableWarned.add(pkg)) return;
+        android.util.Log.w("NowhereChooser", "play stack member " + pkg + " is DEMANDED (" + need
+                + ") but NOT resolvable -- its bytes are gone from #apps and PM holds no record of it, so it"
+                + " cannot be re-added and has no UI to add it by hand (NWP-20260830-07)");
+    }
+
+    /** NWP-20260831-04: play-stack members already warned about this screen session -- see applyStackMember. */
+    private final java.util.HashSet<String> stackUnresolvableWarned = new java.util.HashSet<>();
+
+    /** Does pkg need Play Services? Live manifest read when it can be had, the NWP-20260827-06 record when it
+     *  cannot, and false only when neither can answer.
+     *
+     *  ⚠ WHY NOT usesPlayServices DIRECTLY. That one collapses "cannot tell" to false, and for an ON-DEMAND
+     *  app "cannot tell" is the NORMAL case -- it is an archived placeholder with no APK, so the read throws.
+     *  Chester, 2026-08-27: turn an on-demand Play client Off and back On, and it never returns to
+     *  nowhere-playdeps, because the Off happened while it was readable and the On happened after it was
+     *  archived. Demand then computes as zero, the whole Play stack is dropped, and (applyStackMember below)
+     *  it cannot be re-added either. Two archived-blind lookups compounding, the same shape as the #keys
+     *  chain earlier the same day.
+     *
+     *  A recorded YES is trusted regardless of version: an app that needed Play at some version is assumed to
+     *  still need it, which fails toward KEEPING the stack. The version key exists to stop a recorded NO going
+     *  stale (see nowhere-playseen), and that direction is the dangerous one. */
+    private boolean playDependent(String pkg) {
+        Boolean live = readsPlayServices(this, pkg);
+        if (live != null) {
+            notePlaySeen(this, pkg, live);   // readable now -> record it, so the next Off/On does not need it
+            return live;
+        }
+        String[] rec = readPlaySeen(this).get(pkg);
+        return rec != null && "y".equals(rec[1]);
+    }
+
+    /** True if pkg's bytes are available to (re)seal -- installed OR an archived placeholder whose APK is in
+     *  the sealed name#apps scope. Deliberately WIDER than isInstalledPkg, which asks a different question
+     *  (can roamd re-resolve a live code dir) and answers false for every archived app. */
+    private boolean resolvableForKeep(String pkg) {
+        if (isInstalledPkg(pkg)) return true;
+        try {
+            getPackageManager().getApplicationInfo(pkg,
+                    android.content.pm.PackageManager.ApplicationInfoFlags.of(
+                            android.content.pm.PackageManager.MATCH_ARCHIVED_PACKAGES
+                                    | android.content.pm.PackageManager.MATCH_UNINSTALLED_PACKAGES));
+            return true;
+        } catch (Throwable notThere) { /* fall through to the seal-backed answer below */ }
+        // NWP-20260830-08: THE SEAL-BACKED ANSWER, and the half without which the rest of this slice is inert.
+        //
+        // Every branch above asks PACKAGE MANAGER, and PM's answer is scoped to THIS user. Every login mints a
+        // fresh one, and only keep-set members get installed into it -- so a package that left the keep-set has
+        // no record here AT ALL, archived or otherwise, and both tests above are false no matter what is in the
+        // store. Retaining its APK bytes (the roamd half of -08) therefore bought nothing on its own: the bytes
+        // were preserved and nothing could see them.
+        //
+        // An INFERRED orphan is exactly the case where we KNOW the bytes are there, because -08 is what kept
+        // them: captureAppDrops writes nowhere-appkeepcode.list from this same set, and roamd subtracts that
+        // list from the drop list it passes to the #apps push, so the carry-forward re-emits them. The list
+        // that causes the retention is therefore the list entitled to authorise the re-add.
+        //
+        // ⚠ FAILURE DIRECTION, deliberately chosen. If retention somehow did NOT happen, this answers true for
+        // a package whose bytes are absent, and the on-demand install then fails -- visible, retryable, and
+        // fixed by turning the app off and on. The alternative is what shipped: answering false forever for a
+        // package whose bytes ARE there, which is silent and permanent. A recoverable wrong answer beats an
+        // unrecoverable one.
+        boolean sealed = inferredOrphans().contains(pkg);
+        if (sealed) {
+            // Deliberately LOGGED, and not only for diagnosis: this branch adds no string of its own to the
+            // dex, so without it there is no way to prove from an IMAGE that the seal-backed answer shipped,
+            // and no way to see it fire on a device. A path that silently decides whether an app can ever
+            // come back should not be invisible -- that invisibility is most of what made #1024's parent bug
+            // cost a profile.
+            android.util.Log.i("NowhereChooser", "resolvableForKeep(" + pkg + "): no PM record in this user,"
+                    + " but it is a RETAINED inferred orphan -- its code is in #apps, so it can be re-added"
+                    + " (NWP-20260830-08)");
+        }
+        return sealed;
+    }
+
+    /** True if pkg is currently installed for this (roamed) user. */
+    private boolean isInstalledPkg(String pkg) {
+        try { getPackageManager().getApplicationInfo(pkg, 0); return true; } catch (Throwable notInstalled) { return false; }
+    }
+
+    /** True if pkg declares the com.google.android.gms.version manifest meta-data -- the standard marker every app
+     *  that uses Google Play Services carries. Live PackageManager read (the app is installed when it's toggled). */
+    private boolean usesPlayServices(String pkg) { return usesPlayServices(this, pkg); }
+
+    /** Does pkg's manifest declare a Play-Services dependency? Reads com.google.android.gms.version, the
+     *  metadata the Play SDK bakes into every client's manifest.
+     *
+     *  ⚠ ONLY ANSWERABLE WHILE THE APK IS ON DISK. An on-demand app is an ARCHIVED PLACEHOLDER most of the
+     *  time -- no APK, so getApplicationInfo throws and this returns false, meaning "cannot tell", NOT "no".
+     *  That is exactly why nowhere-playdeps exists: it is this answer, recorded at a moment when it COULD be
+     *  read. Never treat a false from here as evidence that an app does not need Play Services.
+     *
+     *  Static form (NWP-20260826-12) so the store install path can record the answer at install time, which
+     *  is the one moment every client's APK is guaranteed present. */
+    static boolean usesPlayServices(android.content.Context ctx, String pkg) {
+        try {
+            android.content.pm.ApplicationInfo ai = ctx.getPackageManager().getApplicationInfo(
+                    pkg, android.content.pm.PackageManager.GET_META_DATA);
+            return ai.metaData != null && ai.metaData.containsKey("com.google.android.gms.version");
+        } catch (Throwable ignore) { return false; }
+    }
+
+
+    /** Add or remove one package from the Play-Services-dependent set (files/nowhere-playdeps). No-op when unchanged. */
+    private void setPlayDep(String pkg, boolean on) { setPlayDep(this, pkg, on); }
+
+    /** NWP-20260826-12: record pkg's Play-Services dependency AT INSTALL TIME.
+     *
+     *  ⚠ WHY THIS HAS TO EXIST, and why its absence was a live bug rather than a missing nicety.
+     *  reconcilePlayStack decides whether anything still needs the Play stack. For an ON-DEMAND client it
+     *  cannot read the manifest -- the app is an archived placeholder -- so it consults nowhere-playdeps and
+     *  nothing else. But that file had exactly two writers, both inside setAppMode, and NO store install path
+     *  reaches setAppMode: StoreService -> keepAuto and AppInstallReceiver -> keepInMode both land in
+     *  StoreInstaller.keepAutoImpl, which writes a keep line and returns.
+     *
+     *  So an app installed from Play, Aurora, F-Droid or nApps at on-demand was INVISIBLE to reconcile
+     *  however plainly its manifest declared the dependency. Turning off any unrelated app then recomputed
+     *  demand as "nobody needs Play Services" and dropped the whole stack from the keep-set -- which is why a
+     *  Play-dependent app could come back after a login with Play Services missing.
+     *
+     *  Install time is the right moment BY CONSTRUCTION: keepAutoImpl runs after the install is confirmed
+     *  (StoreService gates it on the OK verdict) or from PACKAGE_ADDED, so the APK is on disk and the
+     *  manifest is readable -- the one instant that is true for an app whose steady state is archived.
+     *
+     *  Best-effort and silent: a failure here costs a stack drop, never the user's install. */
+    static void recordPlayDepAtInstall(android.content.Context ctx, String pkg) {
+        // ⚠ NWP-20260827-10: NEVER FOR THE STACK MEMBERS THEMSELVES, and this is a design rule, not tidiness.
+        // vending in nowhere-playdeps means "the USER kept Play Store" and is read by reconcilePlayStack as a
+        // DEMAND SOURCE -- its own comment warns that writing it mechanically would self-latch ("a transient
+        // installed client would pin it installed forever").
+        //
+        // ⚠ THE PATH THAT MAKES THIS FILTER MANDATORY IS THIS SLICE'S OWN materialise call site, not the older
+        // install paths -- the adversarial review of this diff established the attribution precisely. A group
+        // materialise runs installApks for EVERY dep of a Play client, vending included, so without the filter
+        // an ORDINARY TAP on any Play client would record vending and latch the stack on. The store-install
+        // path is conditional by contrast: a default-config Off bucket exits AppInstallReceiver.decide before
+        // keepInMode, so it only fires at all under a user-reconfigured non-Off bucket. (If vending's manifest
+        // does not declare gms.version this filter is a harmless no-op for it -- unverified either way, since
+        // no copy of vending was on the test device to inspect; the filter does not depend on the answer.)
+        // gms/gsf are skipped by reconcile's own demand loop, but recording them would still be a lie -- their
+        // fate is OWNED by reconcile, and only setAppMode (a user choice) may put vending here.
+        if (GMS_PKG.equals(pkg) || GSF_PKG.equals(pkg) || VENDING_PKG.equals(pkg)) return;
+        try {
+            // NWP-20260826-13: one sound path for both answers. readsPlayServices returns null when the
+            // manifest could not actually be read, and an unread package must produce NO record at all --
+            // a determination we did not make is exactly the false NO that deletes gms later.
+            Boolean yes = readsPlayServices(ctx, pkg);
+            if (yes == null) return;
+            if (yes) setPlayDep(ctx, pkg, true);   // reconcilePlayStack's own input, unchanged
+            // And record the ANSWER, keyed to the version it was determined for. This is what the orphan
+            // guard reads; it never infers an answer from a missing playdeps line.
+            notePlaySeen(ctx, pkg, yes);
+        } catch (Throwable t) {
+            android.util.Log.w("NowhereChooser", "recordPlayDepAtInstall " + pkg, t);
+        }
+    }
+
+    // ---- NWP-20260826-13: is the Play stack REALLY orphaned? -------------------------------------------
+    // The question the cascade below turns on, and the one two earlier attempts got wrong in the same way:
+    // both inferred "nothing needs the Play stack" from an ABSENCE of evidence and then deleted gms's data
+    // permanently. v1 inferred it from "reconcilePlayStack removed the stack" -- false, because reconcile
+    // cannot see an on-demand client that is not in nowhere-playdeps. v2 inferred it from "the APK resolves"
+    // -- also false, because `present = INSTALLED || AUTO` short-circuits reconcile's manifest read for
+    // ON-DEMAND, so a materialised on-demand app read as "known" while reconcile had read nothing.
+    //
+    // ⚠ THE RULE THAT MAKES THE THIRD ATTEMPT DIFFERENT: NEVER CACHE A NEGATIVE WITHOUT A VERSION.
+    // A stale YES is safe -- it only makes us abstain. A stale NO deletes the largest data dir on the phone
+    // while an app still depends on it. An app UPDATE can add or remove the Play SDK, so a bare "we checked
+    // this package once" is exactly the dangerous kind of record. Every determination is therefore keyed to
+    // the versionCode it was made for, and stops counting the moment the app updates.
+
+    /** pkg's current versionCode, resolving ARCHIVED placeholders too, or -1 when it cannot be resolved. */
+    static long versionCodeOf(android.content.Context ctx, String pkg) {
+        try {
+            android.content.pm.PackageInfo pi = ctx.getPackageManager().getPackageInfo(pkg,
+                    android.content.pm.PackageManager.PackageInfoFlags.of(
+                            // Deliberately NOT MATCH_ANY_USER, unlike keptFlags elsewhere on this screen.
+                            // That one wants the widest match so a row can still be labelled; this wants THIS
+                            // user's view, because a package resolvable only in another user is not one this
+                            // profile keeps and must not contribute a version to a determination here.
+                            android.content.pm.PackageManager.MATCH_ARCHIVED_PACKAGES
+                                    | android.content.pm.PackageManager.MATCH_UNINSTALLED_PACKAGES));
+            return pi == null ? -1L : pi.getLongVersionCode();
+        } catch (Throwable ignore) { return -1L; }
+    }
+
+    /** Determinations made so far: package -> {versionCode, "y"|"n"}. files/nowhere-playseen, one
+     *  `pkg<TAB>versionCode<TAB>y|n` per line. Seals and roams with the profile.
+     *
+     *  ⚠ THE ANSWER IS IN THIS FILE, not inferred from the absence of a nowhere-playdeps line. An earlier cut
+     *  recorded only THAT the question was asked and left the yes in playdeps, which made "determined NO" a
+     *  CONJUNCTION across two files -- and the safe-side half was the fragile one: setPlayDep is an
+     *  unsynchronised whole-file rewrite whose failure is swallowed, it is pruned whenever an app leaves the
+     *  keep-set, and a concurrent read-modify-write from the install thread and the keep-mode queue can lose
+     *  an update outright. Any of those turned a Play client into a determined NO and deleted gms. One file,
+     *  one record, one answer: there is nothing left to drift against.
+     *  Lenient: an unreadable file reads as empty; a writer or a decision that must not treat unknown as empty
+     *  uses readPlaySeenStrict (NWP-20261111-06). */
+    static java.util.Map<String,String[]> readPlaySeen(android.content.Context ctx) {
+        java.util.Map<String,String[]> m = readPlaySeenStrict(ctx);
+        return m == null ? new java.util.HashMap<>() : m;
+    }
+
+    /** NWP-20261111-06: readPlaySeen, strictly. Empty when the file is absent; NULL when it exists but cannot be
+     *  opened or read whole -- unknown, never "no determinations". The writer (notePlaySeen) and
+     *  playStackOrphanKnown read this. */
+    static java.util.Map<String,String[]> readPlaySeenStrict(android.content.Context ctx) {
+        java.io.File file = new java.io.File(ctx.getFilesDir(), "nowhere-playseen");
+        java.util.Map<String,String[]> out = new java.util.HashMap<>();
+        if (!file.exists()) return out;
+        try (java.io.BufferedReader br = new java.io.BufferedReader(new java.io.FileReader(file))) {
+            String ln;
+            while ((ln = br.readLine()) != null) {
+                String[] f = ln.split("\t");
+                if (f.length != 3) continue;                       // malformed / an older 2-field line: no record
+                String ans = f[2].trim();
+                if (!"y".equals(ans) && !"n".equals(ans)) continue;
+                out.put(f[0].trim(), new String[] { f[1].trim(), ans });
+            }
+        } catch (Exception e) { return null; }
+        return out;
+    }
+
+    /** Record pkg's Play dependency AND the version it was determined for. No-op if the version cannot be
+     *  resolved -- a determination we cannot key to a version is one we must not keep. */
+    static void notePlaySeen(android.content.Context ctx, String pkg, boolean needsPlay) {
+        long vc = versionCodeOf(ctx, pkg);   // a binder read: BEFORE the lock, per PLAYDEP_LOCK's rule (NWP-20261011-62)
+        if (vc < 0) return;
+        synchronized (PLAYDEP_LOCK) {
+            String ans = needsPlay ? "y" : "n";
+            java.util.Map<String,String[]> m = readPlaySeenStrict(ctx);
+            if (m == null) {   // unknown is not empty: rewriting it from empty would drop every other answer
+                android.util.Log.w("NowhereChooser", "nowhere-playseen unreadable -- nothing written (NWP-20261111-06)");
+                return;
+            }
+            String[] had = m.get(pkg);
+            if (had != null && had[0].equals(Long.toString(vc)) && had[1].equals(ans)) return;   // unchanged
+            m.put(pkg, new String[] { Long.toString(vc), ans });
+            StringBuilder sb = new StringBuilder();
+            for (java.util.Map.Entry<String,String[]> e : m.entrySet())
+                sb.append(e.getKey()).append('\t').append(e.getValue()[0]).append('\t').append(e.getValue()[1]).append('\n');
+            try {
+                StoreInstaller.writeAtomic(new java.io.File(ctx.getFilesDir(), "nowhere-playseen"), sb.toString());
+            } catch (Exception e) { android.util.Log.w("NowhereChooser", "notePlaySeen", e); }
+        }
+    }
+
+    /** Can the Play stack be declared orphaned -- i.e. is it PROVEN that no app the profile still keeps needs
+     *  Play Services?
+     *
+     *  Answers the question directly rather than trusting reconcilePlayStack's narrower view, and backfills a
+     *  determination for every package it can read on the way past. Returns false on the first package that
+     *  demands the stack OR whose dependency is undetermined; only an all-clear walk returns true.
+     *
+     *  ⚠ ABSENCE IS NEVER EVIDENCE. An app that cannot be read and has no determination at its current
+     *  version is UNKNOWN, and unknown abstains. Abstaining costs the pre-existing leak -- the stack's data
+     *  keeps roaming -- while being wrong costs gms's data with a client still depending on it, and those are
+     *  not comparable. captureAppDrops states the same rule for the same list: "every uncertainty resolves to
+     *  NOT dropping". */
+    private boolean playStackOrphanKnown(java.util.Map<String,String> m) {
+        java.util.Set<String> deps = readPlayDepsStrict(this);
+        java.util.Map<String,String[]> seen = readPlaySeenStrict(this);
+        if (deps == null || seen == null) {   // an unreadable record is unknown, and unknown abstains
+            android.util.Log.i("NowhereChooser", "play stack: NOT declaring orphaned -- a Play record is unreadable"
+                    + " (NWP-20261111-06)");
+            return false;
+        }
+        for (String p : m.keySet()) {
+            if (GMS_PKG.equals(p) || GSF_PKG.equals(p) || VENDING_PKG.equals(p)) continue; // the stack itself
+            if (getPackageName().equals(p)) continue;
+            if (deps.contains(p)) { logNotOrphaned(p, "is a recorded Play client"); return false; }
+            Boolean live = readsPlayServices(this, p);
+            if (live != null) {                       // manifest readable RIGHT NOW -> a real answer
+                notePlaySeen(this, p, live);          // backfill it, either way, keyed to this version
+                if (live) { logNotOrphaned(p, "declares a Play dependency"); return false; }
+                continue;
+            }
+            String[] rec = seen.get(p);
+            long now = versionCodeOf(this, p);
+            if (rec != null && now >= 0 && rec[0].equals(Long.toString(now))) {
+                // A determination at the CURRENT version. Trust the recorded ANSWER, never the absence of one.
+                if ("y".equals(rec[1])) { logNotOrphaned(p, "was determined to be a Play client"); return false; }
+                continue;
+            }
+            logNotOrphaned(p, rec == null ? "has never been checked" : "has updated since it was checked");
+            return false;
+        }
+        return true;
+    }
+
+    private void logNotOrphaned(String pkg, String why) {
+        android.util.Log.i("NowhereChooser", "play stack: NOT declaring orphaned -- " + pkg + " " + why
+                + " (NWP-20260826-13)");
+    }
+
+    /** TRUE / FALSE when pkg's manifest can be read right now, null when it cannot -- the distinction
+     *  usesPlayServices deliberately collapses to false, and the one this guard cannot afford to lose. */
+    static Boolean readsPlayServices(android.content.Context ctx, String pkg) {
+        try {
+            android.content.pm.ApplicationInfo ai = ctx.getPackageManager().getApplicationInfo(
+                    pkg, android.content.pm.PackageManager.GET_META_DATA);
+            // ⚠ A SUCCESSFUL LOOKUP IS NOT PROOF THE APK IS THERE, and treating it as one is precisely the
+            // false NO that deletes gms. An ARCHIVED placeholder can come back as an ApplicationInfo with a
+            // null/empty sourceDir -- no APK, so no manifest was read -- and its metaData is then null, which
+            // reads as "declares no Play dependency" unless we check. This tree already guards on exactly
+            // this signal in two places: UnarchiveService.hasInstalledCode ("sourceDir != null && !isEmpty")
+            // and the Your-apps enumeration, which skips a package with no sourceDir.
+            if (ai == null || ai.sourceDir == null || ai.sourceDir.isEmpty()) return null;
+            return ai.metaData != null && ai.metaData.containsKey("com.google.android.gms.version");
+        } catch (Throwable ignore) { return null; }   // not installed here at all: no answer
+    }
+
+    /** NWP-20260827-10: every read-modify-write of nowhere-playdeps and nowhere-playseen holds this. FOUR
+     *  writer threads genuinely race -- the Profile UI (setAppMode via its MODE_QUEUE worker), StoreService's
+     *  binder threads (keepAutoImpl), UnarchiveService's FGS (the materialise record), and ~~the MAIN LOOPER:
+     *  AppInstallReceiver is registered with no Handler, so its decide() -> keepInMode path runs on main~~
+     *  superseded by NWP-20261029-19: that fourth writer is now the receiver's one serial worker
+     *  (nowhere-appinstall), under goAsync. (The review of this slice caught that fourth one after the first cut
+     *  claimed three.) Both files are
+     *  whole-file read-modify-writes, so an unserialised pair of writers loses an update and silently drops a
+     *  dependency record: exactly the state the -09 arc spent a day recovering from. Each write is temp + rename
+     *  (StoreInstaller.writeAtomic, NWP-20261022-04), so a failed write leaves the file whole.
+     *
+     *  ⚠ ~~A main-thread writer means the ANR question must be answered~~ (that was the state before
+     *  NWP-20261029-19: no writer is on main now, row "Three UI-thread paths still wait on `APPKEEP_LOCK`").
+     *  The rule below STANDS, and is what keeps any future main-thread taker safe (NWP-20260826-10 is the
+     *  precedent): the lock is safe on main because NO BINDER CALL is ever made while holding it -- the
+     *  readsPlayServices/versionCodeOf binder reads happen in the callers BEFORE the lock -- and the guarded
+     *  work is a read-modify-write of two files of a few hundred bytes in the app's own dir. The hold time is
+     *  bounded local I/O, not a wait on a busy system_server. Keep it that way: never add a binder call or a
+     *  cross-lock acquisition inside. Same pattern as StoreInstaller.APPKEEP_LOCK; a LEAF lock -- nothing
+     *  else is ever taken while holding it -- so it cannot deadlock. */
+    static final Object PLAYDEP_LOCK = new Object();
+
+    /** Static form of setPlayDep, for the store install path (NWP-20260826-12). */
+    static void setPlayDep(android.content.Context ctx, String pkg, boolean on) {
+        synchronized (PLAYDEP_LOCK) {
+            java.util.Set<String> onDisk = readPlayDepsStrict(ctx);
+            if (onDisk == null) {   // unknown is not empty: rewriting it from empty would drop every other client
+                android.util.Log.w("NowhereChooser", "nowhere-playdeps unreadable -- nothing written (NWP-20261111-06)");
+                return;
+            }
+            java.util.LinkedHashSet<String> s = new java.util.LinkedHashSet<>(onDisk);
+            if (on) { if (!s.add(pkg)) return; } else { if (!s.remove(pkg)) return; }
+            StringBuilder sb = new StringBuilder();
+            for (String p : s) sb.append(p).append('\n');
+            try {
+                StoreInstaller.writeAtomic(new java.io.File(ctx.getFilesDir(), "nowhere-playdeps"), sb.toString());
+            } catch (Exception e) { android.util.Log.w("NowhereChooser", "setPlayDep", e); }
+        }
+    }
+
+    /** On-device size of a package's APK set (base + splits) -- the local, pre-dedup estimate of what keeping it
+     *  adds to the account footprint. Best-effort (a stat failure just contributes 0). */
+    private long apkSize(android.content.pm.ApplicationInfo ai) {
+        long t = 0;
+        try { if (ai.sourceDir != null) t += new java.io.File(ai.sourceDir).length(); } catch (Throwable ignore) {}
+        try {
+            if (ai.splitSourceDirs != null)
+                for (String s : ai.splitSourceDirs) if (s != null) t += new java.io.File(s).length();
+        } catch (Throwable ignore) {}
+        return t;
+    }
+
+    // One-time (per account) acknowledgement that keeping a SIDELOADED app persists unvetted code that auto-
+    // installs on every device the profile touches (the T4 sign-off). The marker roams in the sealed files dir,
+    // so the user acks once, not once per device.
+    private boolean sideloadAcked() { return new java.io.File(getFilesDir(), ".appkeep-sideload-ack").exists(); }
+    private void ackSideload() { try { new java.io.File(getFilesDir(), ".appkeep-sideload-ack").createNewFile(); } catch (Throwable ignore) {} }
+
+    /** #201 "Your apps": pick which USER-INSTALLED apps to keep on the account. Keeping one seals its APK bytes
+     *  (the name#apps scope) so it reinstalls when you sign in on any nowhere phone; nothing is kept by default
+     *  (amnesia). The keep-set is a roamed file (nowhere-appkeep) that captureAppCode() reads at logoff. Built on
+     *  a background thread (icon/label + APK-size stat is I/O), mirroring showOfflineMedia. */
+    private void showYourApps() {
+        // NWP-20261016-48: the title and the search are a head pinned above the scroll (finishMenuScreen's third
+        // argument); everything below them scrolls in `ll`, as on every other menu screen.
+        final LinearLayout head = menuScreen("Your apps", "keep an app and it comes back on any nowhere phone");
+        head.setPadding(dp(22), dp(44), dp(22), dp(4));
+        final LinearLayout ll = new LinearLayout(this);
+        ll.setOrientation(LinearLayout.VERTICAL);
+        ll.setBackgroundColor(BG);
+        ll.setPadding(dp(22), 0, dp(22), dp(30));
+        playRow(ll); // NWP-20261122-06: Google Play on or off, Endospore stored sessions only
+        TextView note = new TextView(this);
+        note.setText("Choose how each app comes back on any nowhere phone. Keep installed puts it back ready to use; "
+                + "On-demand parks just its icon and downloads the app the first time you tap it; Off means it's gone "
+                + "at logoff, like always.");
+        note.setTextColor(MUTED);
+        note.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        LinearLayout.LayoutParams nlp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        nlp.topMargin = dp(10); nlp.bottomMargin = dp(4);
+        ll.addView(note, nlp);
+        // #44 (Q081, 2026-10-22): where an app's sign-in lives. SignInCopy says why it never says "stay signed in".
+        TextView signIn = new TextView(this);
+        signIn.setText(SignInCopy.YOUR_APPS_LINE);
+        signIn.setTextColor(MUTED);
+        signIn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        LinearLayout.LayoutParams silp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        silp.bottomMargin = dp(4);
+        ll.addView(signIn, silp);
+
+        // #206: per-profile idle-reclaim threshold (Never / 1 day / 3 days / 1 week). Roams in nowhere-reclaim.
+        final long[] reclaim = { reclaimIdleMs(this) };
+        LinearLayout rcRow = new LinearLayout(this);
+        rcRow.setOrientation(LinearLayout.HORIZONTAL);
+        rcRow.setGravity(Gravity.CENTER_VERTICAL);
+        rcRow.setPadding(dp(4), dp(8), dp(4), dp(8));
+        LinearLayout rcCol = new LinearLayout(this);
+        rcCol.setOrientation(LinearLayout.VERTICAL);
+        TextView rcLab = new TextView(this);
+        rcLab.setText("Re-archive idle apps");
+        rcLab.setTextColor(INK);
+        rcLab.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
+        rcCol.addView(rcLab);
+        TextView rcSub = new TextView(this);
+        rcSub.setText("Re-archive an on-demand app you haven't opened, to save storage. It comes back when you tap it.");
+        rcSub.setTextColor(MUTED);
+        rcSub.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        rcCol.addView(rcSub);
+        rcRow.addView(rcCol, new LinearLayout.LayoutParams(0, WRAP, 1f));
+        final TextView rcVal = new TextView(this);
+        rcVal.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        rcVal.setPadding(dp(14), dp(7), dp(14), dp(7));
+        rcVal.setMinWidth(dp(96));
+        rcVal.setGravity(Gravity.CENTER);
+        paintReclaimChip(rcVal, reclaim[0]);
+        rcVal.setOnClickListener(v -> showReclaimDialog(rcVal, reclaim));
+        LinearLayout.LayoutParams rcvlp = new LinearLayout.LayoutParams(WRAP, WRAP);
+        rcvlp.leftMargin = dp(8);
+        rcRow.addView(rcVal, rcvlp);
+        ll.addView(rcRow, new LinearLayout.LayoutParams(MATCH, WRAP));
+
+        // NWP-20261011-01: how long backups may wait while an app downloads and installs (SealHold). Roams in
+        // nowhere-seal-hold; the daemon gets it at sign-in from roamd and at once from SET-SEAL-HOLD.
+        final String[] hold = { readSealHold() };
+        LinearLayout shRow = new LinearLayout(this);
+        shRow.setOrientation(LinearLayout.HORIZONTAL);
+        shRow.setGravity(Gravity.CENTER_VERTICAL);
+        shRow.setPadding(dp(4), dp(8), dp(4), dp(8));
+        LinearLayout shCol = new LinearLayout(this);
+        shCol.setOrientation(LinearLayout.VERTICAL);
+        TextView shLab = new TextView(this);
+        shLab.setText("Backups while apps set up");
+        shLab.setTextColor(INK);
+        shLab.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
+        shCol.addView(shLab);
+        final TextView shSub = new TextView(this);
+        shSub.setText(SealHold.tradeoff(hold[0]));
+        shSub.setTextColor(MUTED);
+        shSub.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        shCol.addView(shSub);
+        shRow.addView(shCol, new LinearLayout.LayoutParams(0, WRAP, 1f));
+        final TextView shVal = new TextView(this);
+        shVal.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        shVal.setPadding(dp(14), dp(7), dp(14), dp(7));
+        shVal.setMinWidth(dp(96));
+        shVal.setGravity(Gravity.CENTER);
+        paintSealHoldChip(shVal, hold[0]);
+        shVal.setOnClickListener(v -> showSealHoldDialog(shVal, shSub, hold));
+        LinearLayout.LayoutParams shvlp = new LinearLayout.LayoutParams(WRAP, WRAP);
+        shvlp.leftMargin = dp(8);
+        shRow.addView(shVal, shvlp);
+        ll.addView(shRow, new LinearLayout.LayoutParams(MATCH, WRAP));
+
+        final TextView summary = new TextView(this);
+        summary.setTextColor(MUTED);
+        summary.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        LinearLayout.LayoutParams smlp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        smlp.bottomMargin = dp(8);
+        ll.addView(summary, smlp);
+
+        final LinearLayout list = new LinearLayout(this);
+        list.setOrientation(LinearLayout.VERTICAL);
+        ll.addView(list, new LinearLayout.LayoutParams(MATCH, WRAP));
+
+        // NWP-20261016-48 (Chester, 2026-10-16: "your apps - can we add a filter on top? I've about 50 apps and getting
+        // harder to find the app I am looking for"): a search pinned in the head. It filters the list as you type, by
+        // label and package (AppFilter), and filters nothing else: the two settings rows and the summary stay. Each
+        // visit builds a new, empty field, so the search clears when you leave. The query is never logged and never
+        // written down -- it says which apps the profile has, and the files dir seals and roams.
+        // textField, never a bare EditText: that dies on a long-press in the roamed user (SafeEdit).
+        final EditText search = textField("Search your apps");
+        search.setInputType(android.text.InputType.TYPE_CLASS_TEXT | android.text.InputType.TYPE_TEXT_VARIATION_FILTER
+                | android.text.InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
+        search.setImeOptions(android.view.inputmethod.EditorInfo.IME_ACTION_SEARCH
+                | android.view.inputmethod.EditorInfo.IME_FLAG_NO_FULLSCREEN
+                | android.view.inputmethod.EditorInfo.IME_FLAG_NO_EXTRACT_UI
+                | android.view.inputmethod.EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING);
+        // The list filters live, so the keyboard's search key only puts the keyboard away.
+        search.setOnEditorActionListener((v, action, ev) -> {
+            if (action != android.view.inputmethod.EditorInfo.IME_ACTION_SEARCH) return false;
+            hideKeyboard(true);
+            return true;
+        });
+        search.addOnAttachStateChangeListener(new View.OnAttachStateChangeListener() {
+            @Override public void onViewAttachedToWindow(View v) {}
+            // Leaving the screen takes the field away; the keyboard goes with it. No clearFocus while it comes down.
+            @Override public void onViewDetachedFromWindow(View v) { hideKeyboard(false); }
+        });
+        // The list's row drag must never land here. The field sits just above the list's edge-scroll zone, and an
+        // editable TextView takes a drag on its own: it takes focus as the drag enters, and a release types the drag's
+        // text -- the row's package name -- in, filtering the list to that one app. A listener that returns true takes
+        // every drag event, so TextView.onDragEvent never runs; one that returns false falls through to it. The list
+        // still gets DRAG_ENDED and writes the order.
+        search.setOnDragListener((v, e) -> true);
+        // SafeEdit cannot select all, so without this a query is backspaced away one letter at a time.
+        final TextView clear = new TextView(this);
+        clear.setText("Clear");
+        clear.setTextColor(ACCENT);
+        clear.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        clear.setPadding(dp(14), dp(12), dp(4), dp(12));
+        clear.setContentDescription("Clear search");
+        clear.setVisibility(View.GONE);
+        clear.setOnClickListener(v -> search.setText(""));
+        final LinearLayout searchRow = new LinearLayout(this);
+        searchRow.setOrientation(LinearLayout.HORIZONTAL);
+        searchRow.setGravity(Gravity.CENTER_VERTICAL);
+        searchRow.addView(search, new LinearLayout.LayoutParams(0, WRAP, 1f));
+        searchRow.addView(clear, new LinearLayout.LayoutParams(WRAP, WRAP));
+        LinearLayout.LayoutParams srlp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        srlp.topMargin = dp(14);
+        head.addView(searchRow, srlp);
+        // "3 of 52 apps", or that nothing matches; hidden with no search. Announced as it changes.
+        final TextView count = new TextView(this);
+        count.setTextColor(MUTED);
+        count.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        count.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
+        count.setVisibility(View.GONE);
+        LinearLayout.LayoutParams cnlp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        cnlp.topMargin = dp(6);
+        head.addView(count, cnlp);
+        search.addTextChangedListener(new android.text.TextWatcher() {
+            @Override public void afterTextChanged(android.text.Editable s) {
+                clear.setVisibility(s.length() > 0 ? View.VISIBLE : View.GONE);
+                if (!applyYourAppsFilter(list, s, count)) return;
+                // Searching: bring the list's top under the head, so the matches fill the space above the keyboard
+                // rather than the note and the settings rows.
+                if (ll.getParent() instanceof android.widget.ScrollView) {
+                    final android.widget.ScrollView sv = (android.widget.ScrollView) ll.getParent();
+                    sv.post(() -> sv.scrollTo(0, list.getTop()));
+                }
+            }
+            @Override public void beforeTextChanged(CharSequence s, int a, int b, int c) {}
+            @Override public void onTextChanged(CharSequence s, int a, int b, int c) {}
+        });
+
+        final android.widget.ProgressBar spin = new android.widget.ProgressBar(this);
+        spin.setIndeterminateTintList(android.content.res.ColorStateList.valueOf(ACCENT)); // NWP-20261007-13
+        LinearLayout.LayoutParams splp = new LinearLayout.LayoutParams(WRAP, WRAP);
+        splp.gravity = Gravity.CENTER; splp.topMargin = dp(20);
+        ll.addView(spin, splp);
+
+        // #74a: entered from Preferences (showPreferences :1087/:1090), not the Profile hub.
+        finishMenuScreen(ll, this::showPreferences, head); // present now; fill the list off-thread
+
+        new Thread(() -> {
+            // NWP-20260825-19: reconcile before painting. If the chooser process was dead when an app was
+            // installed, its runtime receiver missed the broadcast -- this is the screen where that would show up
+            // as a wrong row, so catch up here rather than let the user read a stale answer. Idempotent, and it
+            // cannot touch an app the user has already decided about in either direction.
+            // NWP-20261029-19 (row "Three UI-thread paths still wait on `APPKEEP_LOCK`"): it reaches decide(),
+            // which takes APPKEEP_LOCK -- a leaf held for milliseconds, but this path must not wait on it from
+            // the main thread. So it runs HERE, first on the build thread, before the rows read the keep-set;
+            // the rows are painted only from this thread's result, so the reconcile still precedes the paint.
+            AppInstallReceiver.applyDefaultsToUndecided(this);
+            final android.content.pm.PackageManager pm = getPackageManager();
+            final java.util.List<String> pkgs = new java.util.ArrayList<>();
+            final java.util.Map<String, Long> sizes = new java.util.HashMap<>();
+            final java.util.Map<String, Boolean> side = new java.util.HashMap<>();
+            final java.util.Set<String> noIcon = new java.util.HashSet<>(); // NWP-20261111-13: the rows with no launcher icon
+            StoreInstaller.foldAppFirst(this); // NWP-20261012-06: old "Download first" marks lead the order, once
+            // NWP-20261005-02: what an "Install pending apps now" tap would install -- the sweep's OWN list.
+            final java.util.List<String> pendingAuto = UnarchiveService.pendingAutoApps(this, false);
+            try {
+                Intent launch = new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER);
+                java.util.LinkedHashSet<String> seen = new java.util.LinkedHashSet<>();
+                for (android.content.pm.ResolveInfo ri : pm.queryIntentActivities(launch, 0)) {
+                    String p = ri.activityInfo.packageName;
+                    if (getPackageName().equals(p) || !seen.add(p)) continue;
+                    try {
+                        android.content.pm.ApplicationInfo ai = pm.getApplicationInfo(p, 0);
+                        if ((ai.flags & android.content.pm.ApplicationInfo.FLAG_SYSTEM) != 0) continue;
+                        if ((ai.flags & android.content.pm.ApplicationInfo.FLAG_UPDATED_SYSTEM_APP) != 0) continue;
+                        if (ai.sourceDir == null || ai.sourceDir.isEmpty()) continue;
+                        pkgs.add(p); sizes.put(p, apkSize(ai)); side.put(p, isSideloaded(pm, p));
+                    } catch (Throwable ignore) {}
+                }
+                // NWP-20261111-13 (Q140, DECIDED 2026-10-20): an installed app with no launcher activity -- a keyboard,
+                // an icon pack, a plugin, a widget-only app -- was in none of the passes unless its store default kept
+                // it, so it had no row, could not be kept, and was gone at the next sign-in. This user's installed apps
+                // through the launcher pass's own filters (self, system, updated system, no APK) plus gms and gsf,
+                // which reconcilePlayStack owns, as a pure rule; each is added as the launcher pass adds a row, through
+                // the same seen. Not kept, it lands in the A-to-Z part below the kept block and the search finds it;
+                // its picker offers Off and Keep installed only (showKeepModeDialog reads yourAppsNoIcon).
+                final java.util.List<String[]> installed = new java.util.ArrayList<>();
+                try {
+                    for (android.content.pm.ApplicationInfo ai : pm.getInstalledApplications(0)) {
+                        if (ai == null || ai.packageName == null) continue;
+                        installed.add(new String[] { ai.packageName,
+                                (ai.flags & android.content.pm.ApplicationInfo.FLAG_SYSTEM) != 0 ? "1" : "0",
+                                (ai.flags & android.content.pm.ApplicationInfo.FLAG_UPDATED_SYSTEM_APP) != 0 ? "1" : "0",
+                                ai.sourceDir == null || ai.sourceDir.isEmpty() ? "0" : "1" });
+                    }
+                } catch (Throwable ignore) {}
+                for (String p : AppFilter.launcherless(installed, seen, getPackageName(), GMS_PKG, GSF_PKG)) {
+                    if (!seen.add(p)) continue;
+                    try {
+                        android.content.pm.ApplicationInfo ai = pm.getApplicationInfo(p, 0);
+                        pkgs.add(p); sizes.put(p, apkSize(ai)); side.put(p, isSideloaded(pm, p));
+                        noIcon.add(p);
+                    } catch (Throwable ignore) {}
+                }
+                // NWP-20260926-01: read the keep-set and the Off record TOGETHER, under the lock. An On writes the keep
+                // line and retires the Off record in one hold of APPKEEP_LOCK (writeAppModes), and an Off records the
+                // Off and removes the line in one hold (setAppModeLocked); two separate reads could straddle either and
+                // see the app in neither, dropping its row for this visit -- the symptom this slice fixes. The holders
+                // do file I/O and binder reads only (NWP-20260925-03) and this is the list thread, so the wait is
+                // milliseconds; every PackageManager lookup below stays outside the lock.
+                final java.util.LinkedHashSet<String> keptNow;
+                final java.util.LinkedHashSet<String> offNow;
+                synchronized (StoreInstaller.APPKEEP_LOCK) {
+                    keptNow = readAppKeep();
+                    offNow = explicitlyTurnedOff();
+                }
+                // #204/#206: a KEPT app is often NOT returned by queryIntentActivities(...,0) -- an on-demand app is
+                // an ARCHIVED placeholder most of the time (right after login and after an idle reclaim), and a
+                // failed/partial placeholder install can leave it not-installed-for-this-user. Any of these dropped
+                // it from this screen so the user could no longer change its mode or turn it off ("calculator is
+                // missing"). Add every keep-set package the query missed, resolving it with the WIDEST match so its
+                // label/icon come back whatever the not-installed sub-state: archived, uninstalled-but-known, or
+                // present for another user. Its APK bytes live in the store, so on-device size is 0. Best-effort per
+                // field so a size/sideload hiccup never drops it.
+                final long keptFlags = android.content.pm.PackageManager.MATCH_ARCHIVED_PACKAGES
+                        | android.content.pm.PackageManager.MATCH_UNINSTALLED_PACKAGES
+                        | android.content.pm.PackageManager.MATCH_ANY_USER;
+                for (String p : keptNow) {
+                    if (getPackageName().equals(p) || !seen.add(p)) continue;
+                    // The launcher-less Play providers (gms / gsf) are managed AUTOMATICALLY by reconcilePlayStack from
+                    // whatever depends on them -- they are NOT user-toggleable (no icon, invariant above). Never
+                    // surface them as a "Your apps" row: a ghost row inflates the kept-count, and toggling the gms row
+                    // Off would strand every Play-Services client. (Play Store `vending` is NOT filtered -- it has a
+                    // launcher, so it stays a visible, user-toggleable row.)
+                    if (GMS_PKG.equals(p) || GSF_PKG.equals(p)) continue;
+                    if (isBundledSystem(pm, p)) continue; // explicit (was only hidden by seen-ordering luck): bundled apps aren't "your apps"
+                    try {
+                        android.content.pm.ApplicationInfo ai = pm.getApplicationInfo(p,
+                                android.content.pm.PackageManager.ApplicationInfoFlags.of(keptFlags)); // throws if truly gone
+                        pkgs.add(p);
+                        long sz = 0L; try { sz = apkSize(ai); } catch (Throwable ignore) {}
+                        sizes.put(p, sz);
+                        boolean sl = false; try { sl = isSideloaded(pm, p); } catch (Throwable ignore) {}
+                        side.put(p, sl);
+                    } catch (Throwable ignore) {}
+                }
+                // NWP-20260926-01: an app switched OFF this session stays a row until logoff. Off removes the keep
+                // line, so an app that is an ARCHIVED placeholder -- an on-demand app not yet downloaded -- was in
+                // neither pass above and vanished at the next visit, although the picker says "Off — removed at
+                // logoff": on lynx 2026092609 Chester switched myQ and Home Depot Off and could not switch them
+                // back ("we are disabling people from changing their mind"). Until logoff an Off is only a
+                // choice; the store drops the app at the next roam (DECIDED 2026-09-26). The source is the Off
+                // record (nowhere-appoff.list) plus Play Store by name -- explicitlyTurnedOff filters the stack out
+                // of that record, but reconcile can drop an auto-pulled vending, and its row must stay switchable
+                // too. Resolved for THIS user only (no MATCH_ANY_USER, as versionCodeOf), so it becomes a row only if
+                // this login provisioned it: an Off from an earlier session is normally not provisioned and never
+                // resolves, and when it is (the #apps head still carried it -- a session that ended without a clean
+                // logoff, or the NWP-20260926-01 "last kept app" row) its code is in the store and On restores it. An
+                // app uninstalled after its Off does not resolve. The row itself needs nothing new: appKeepRow paints
+                // a mode-less app "Off" with its picker live.
+                final long offFlags = android.content.pm.PackageManager.MATCH_ARCHIVED_PACKAGES
+                        | android.content.pm.PackageManager.MATCH_UNINSTALLED_PACKAGES;
+                offNow.add(VENDING_PKG);
+                for (String p : offNow) {
+                    if (getPackageName().equals(p) || !seen.add(p)) continue;
+                    if (GMS_PKG.equals(p) || GSF_PKG.equals(p)) continue;
+                    if (isBundledSystem(pm, p)) continue;
+                    try {
+                        android.content.pm.ApplicationInfo ai = pm.getApplicationInfo(p,
+                                android.content.pm.PackageManager.ApplicationInfoFlags.of(offFlags)); // throws unless this user has a record of it
+                        // MATCH_UNINSTALLED_PACKAGES also resolves a SYSTEM package this user never got, which
+                        // isBundledSystem (flags 0) cannot see -- e.g. an app an OTA bundled after it was switched Off.
+                        // Not "your app" either way; the launcher pass skips the same two flags.
+                        if ((ai.flags & (android.content.pm.ApplicationInfo.FLAG_SYSTEM
+                                | android.content.pm.ApplicationInfo.FLAG_UPDATED_SYSTEM_APP)) != 0) continue;
+                        pkgs.add(p);
+                        long sz = 0L; try { sz = apkSize(ai); } catch (Throwable ignore) {}
+                        sizes.put(p, sz);
+                        boolean sl = false; try { sl = isSideloaded(pm, p); } catch (Throwable ignore) {}
+                        side.put(p, sl);
+                    } catch (Throwable ignore) {}
+                }
+                // NWP-20261012-06: the kept apps first, in keep-set order -- the order the automatic install works
+                // through, and the order the user drags. keptFirst leaves every other row in the order the passes found
+                // it; the block below re-sorts those A to Z (NWP-20261016-48).
+                java.util.List<String> sorted = KeepOrder.keptFirst(pkgs, keptNow);
+                pkgs.clear();
+                pkgs.addAll(sorted);
+                // NWP-20261016-48: the rows after the kept block, A to Z by the label each row shows (the kept block keeps
+                // its dragged order, the install order). keptLabel is PackageManager work, so it runs here, on the list
+                // thread, as the Storage screen's label prefetch does.
+                final java.util.Map<String, String> otherLabels = new java.util.HashMap<>();
+                for (String p : pkgs) if (!keptNow.contains(p)) otherLabels.put(p, String.valueOf(keptLabel(p)));
+                java.util.List<String> listed = AppFilter.otherRowsAtoZ(pkgs, keptNow, otherLabels);
+                pkgs.clear();
+                pkgs.addAll(listed);
+                // NWP-20261012-06: each kept row's "Wake for notifications" state, here and not per row on the UI
+                // thread -- the messaging rule is PackageManager work. A row kept later this visit asks on its own.
+                keepRowWake.clear(); // the map outlives the visit: a stale entry would paint an old default
+                for (String p : pkgs) if (keptNow.contains(p)) keepRowWake.put(p, UnarchiveService.wakeOnRestore(this, p));
+            } catch (Throwable ignore) {}
+            // NWP-20260826-11: resolve the Keystore census HERE, on the background thread and once for the
+            // whole screen. It is a socket round-trip to the daemon plus a worker hop, so doing it per row --
+            // or on the main thread -- would be the same mistake as the gate ANR in NWP-20260826-10, on a
+            // screen that already takes a visible moment to build.
+            runOnUiThread(() -> {
+                ll.removeView(spin);
+                if (pkgs.isEmpty()) {
+                    TextView empty = new TextView(this);
+                    empty.setText("No apps to keep yet — apps you install will show up here.");
+                    empty.setTextColor(MUTED);
+                    empty.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+                    empty.setPadding(dp(4), dp(20), dp(4), dp(4));
+                    list.addView(empty);
+                    if (search.hasFocus()) hideKeyboard(true); // NWP-20261016-48: nothing to search
+                    searchRow.setVisibility(View.GONE);
+                    count.setVisibility(View.GONE);
+                    return;
+                }
+                yourAppsNoIcon = noIcon; // NWP-20261111-13: before any row is painted; read by showKeepModeDialog
+                final Runnable updateSummary = () -> {
+                    java.util.Map<String,String> modes = readAppModes();
+                    long tot = 0; int n = 0, od = 0, au = 0;
+                    for (String p : pkgs) {
+                        String md = modes.get(p);
+                        if (md == null) continue;
+                        n++;
+                        if (MODE_ONDEMAND.equals(md)) od++;
+                        else if (MODE_AUTO.equals(md)) au++;
+                        Long s = sizes.get(p); if (s != null) tot += s;
+                    }
+                    // DIA-20260727-01: `tot` sums ON-DEVICE apk size (sizes.get), which is 0 for an archived on-demand
+                    // placeholder -- so an all-on-demand keep-set totalled ~0 yet the label claimed "on your account",
+                    // and the same app's number jumped when it was materialised. Label it honestly as on-device storage
+                    // (an archived on-demand app correctly reads ~0 here -- it isn't sitting on the phone). The true
+                    // account/billed footprint (sealed #apps size, incl. archived apps) is task #212, not this stat.
+                    String detail = od > 0 && au > 0 ? " (" + au + " auto, " + od + " on-demand)"
+                            : au > 0 ? " (" + au + " auto)" : od > 0 ? " (" + od + " on-demand)" : "";
+                    // DIA-20260818-21: while mode changes are queued, the summary reports the BATCH instead of a
+                    // storage total that is about to change anyway. Without this a bulk change looked frozen:
+                    // every row repainted at its own pace and nothing said work was outstanding.
+                    int q = MODE_PENDING.get();
+                    // NWP-20261007-01: the batch line is drawn so it is seen -- accent, bold, a size up -- and goes back
+                    // to the quiet stat style when the batch drains. Chester on lynx 2026100606: "the text \"Updating
+                    // 1 app\" is not eye catching, easy to miss" -- and it is the line that says to keep the screen open.
+                    summary.setTextColor(q > 0 ? ACCENT : MUTED);
+                    summary.setTextSize(TypedValue.COMPLEX_UNIT_SP, q > 0 ? 14 : 12);
+                    summary.setTypeface(q > 0 ? android.graphics.Typeface.DEFAULT_BOLD : android.graphics.Typeface.DEFAULT);
+                    if (q > 0) {
+                        summary.setText("Updating " + q + (q == 1 ? " app" : " apps") + "… keep this screen open");
+                        return;
+                    }
+                    summary.setText(n == 0 ? "Nothing kept — these apps won't roam."
+                            : n + (n == 1 ? " app" : " apps") + " kept" + detail
+                                    + " · ~" + humanBytes(tot) + " on this device");
+                };
+                updateSummary.run();
+                // NWP-20261027-12: the visible row and its count, local to this build; the first row and every refresh
+                // go through applyPendingRow.
+                final View[] pendingRowView = {null};
+                final int[] pendingShown = {0};
+                final java.util.concurrent.atomic.AtomicInteger pendingTicket = new java.util.concurrent.atomic.AtomicInteger();
+                applyPendingRow(ll, summary, pendingRowView, pendingShown, pendingAuto.size());
+                // NWP-20261016-48: a mode change refreshes the summary and re-applies the search, so the count line and
+                // the reorder pause follow a row switched On or Off under a search. NWP-20261027-12: and, once the
+                // batch has drained, re-counts the pending Auto apps and redraws the install row.
+                final Runnable onRowChange = () -> {
+                    updateSummary.run();
+                    // Only when drained: the enqueue call runs before setAppMode has written the keep-set.
+                    if (MODE_PENDING.get() == 0) refreshPendingRow(ll, summary, pendingRowView, pendingShown, pendingTicket);
+                    applyYourAppsFilter(list, search.getText(), count);
+                };
+                keepRowPaints.clear(); // NWP-20260821-11: drop the previous build's runnables with its views
+                keepRowSizePaints.clear(); // NWP-20261119-30: and their size repaints
+                list.setOnDragListener(keepOrderDrag(list));
+                for (String p : pkgs)
+                    list.addView(appKeepRow(p, sizes.get(p), Boolean.TRUE.equals(side.get(p)), onRowChange),
+                            new LinearLayout.LayoutParams(MATCH, WRAP));
+                applyYourAppsFilter(list, search.getText(), count); // NWP-20261016-48: a query typed while the list loaded
+                // NWP-20261117-40: the end of a sweep re-measures the sizes, redraws the summary line and recounts the
+                // install row. Before, only a drained mode change did, so after "Install pending apps now" the open
+                // screen kept the waiting row, "Started" and "~0 B on this device" (lynx 2026102901).
+                if (ll.isAttachedToWindow()) {
+                    final android.content.BroadcastReceiver sweepDone = new android.content.BroadcastReceiver() {
+                        @Override public void onReceive(android.content.Context c, Intent i) {
+                            if (!ll.isAttachedToWindow()) return;
+                            new Thread(() -> {
+                                final java.util.Map<String, Long> fresh = new java.util.HashMap<>();
+                                for (String p : pkgs) {
+                                    try { fresh.put(p, apkSize(pm.getApplicationInfo(p, 0))); }
+                                    catch (Throwable ignore) {} // archived or gone: it keeps its old size
+                                }
+                                runOnUiThread(() -> {
+                                    if (!ll.isAttachedToWindow()) return; // sweep done: the user left Your apps
+                                    sizes.putAll(fresh); // UI thread only, as updateSummary reads it
+                                    updateSummary.run();
+                                    // NWP-20261119-30: each row redraws its own size line, and the install row is
+                                    // rebuilt even at an unchanged count, so a sweep that leaves apps pending offers
+                                    // "Install" again instead of a dead "Started".
+                                    for (java.util.function.Consumer<java.util.Map<String, Long>> r : new java.util.ArrayList<>(keepRowSizePaints)) {
+                                        try { r.accept(sizes); } catch (Throwable ignore) {}
+                                    }
+                                    if (MODE_PENDING.get() == 0) refreshPendingRow(ll, summary, pendingRowView, pendingShown, pendingTicket, true);
+                                });
+                            }, "nowhere-sweepdone").start();
+                        }
+                    };
+                    registerReceiver(sweepDone, new android.content.IntentFilter(UnarchiveService.ACTION_SWEEP_DONE),
+                            android.content.Context.RECEIVER_NOT_EXPORTED);
+                    ll.addOnAttachStateChangeListener(new View.OnAttachStateChangeListener() {
+                        @Override public void onViewAttachedToWindow(View v) {}
+                        @Override public void onViewDetachedFromWindow(View v) {
+                            try { unregisterReceiver(sweepDone); } catch (Throwable ignore) {}
+                        }
+                    });
+                }
+            });
+        }).start();
+    }
+
+    /** NWP-20261122-06: the Play choice as nowhere-config holds it (PlayChoice.CFG_KEY, absent when never chosen), read
+     *  as absent where the GrapheneOS App Store is not installed: Diaspore has no row, so a flag roamed from an Endospore
+     *  phone must not act there. */
+    private PlayChoice.State playState() {
+        return PlayChoice.effective(PlayChoice.parse(readConfig().get(PlayChoice.CFG_KEY)), gosStorePresent(this));
+    }
+
+    /** NWP-20261122-06: is the GrapheneOS App Store installed (Endospore)? The same flags-0 test the Configuration row
+     *  uses, static so AppInstallReceiver.decide asks the same question. */
+    static boolean gosStorePresent(android.content.Context ctx) {
+        try { ctx.getPackageManager().getApplicationInfo(GOS_STORE_PKG, 0); return true; } catch (Throwable notInstalled) { return false; }
+    }
+
+    /** NWP-20261122-06: is pkg on this phone for this user, installed OR an archived On-demand placeholder? Play Store
+     *  kept On-demand is archived on every sign-in after the first, and flags 0 (isInstalledPkg) reads that as absent;
+     *  the row must not offer to install a Play Store whose icon is already in the drawer. MATCH_ARCHIVED_PACKAGES is a
+     *  LONG, so it only reaches PM through ApplicationInfoFlags.of(). */
+    private boolean isOnDevicePkg(String pkg) {
+        if (isInstalledPkg(pkg)) return true;
+        try {
+            getPackageManager().getApplicationInfo(pkg, android.content.pm.PackageManager.ApplicationInfoFlags.of(
+                    android.content.pm.PackageManager.MATCH_ARCHIVED_PACKAGES));
+            return true;
+        } catch (Throwable notThere) {
+            return false;
+        }
+    }
+
+    /** NWP-20261122-06 (h50 #7): the "Google Play" row at the top of Your apps. Drawn only where the GrapheneOS App
+     *  Store is installed (Endospore) and the session is a stored profile that is online. paintPlayRow reads the row
+     *  again when it is drawn, when it is tapped and each time this window gets the focus back: Play Store installed
+     *  from the App Store must turn "not installed yet" into "On", and the next tap must offer Off. */
+    private void playRow(LinearLayout ll) {
+        if (!PlayChoice.offered(isInstalledPkg(GOS_STORE_PKG), sessionType, offlineSession)) return;
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(dp(4), dp(8), dp(4), dp(8));
+        LinearLayout col = new LinearLayout(this);
+        col.setOrientation(LinearLayout.VERTICAL);
+        TextView lab = new TextView(this);
+        lab.setText(PlayChoice.TITLE);
+        lab.setTextColor(INK);
+        lab.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
+        col.addView(lab);
+        final TextView sub = new TextView(this);
+        sub.setTextColor(MUTED);
+        sub.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        col.addView(sub);
+        paintPlayRow(sub);
+        row.addView(col, new LinearLayout.LayoutParams(0, WRAP, 1f));
+        row.setOnClickListener(v -> {
+            switch (paintPlayRow(sub)) {
+                case TURN_ON: turnPlayOn(); break;
+                case OPEN_STORE: openGosStore(); break;
+                case CONFIRM_OFF: confirmPlayOff(); break;
+            }
+        });
+        // Back or Recents from the App Store gives this window the focus again; the listener lives while the row does.
+        final android.view.ViewTreeObserver.OnWindowFocusChangeListener onFocus = has -> { if (has) paintPlayRow(sub); };
+        row.addOnAttachStateChangeListener(new View.OnAttachStateChangeListener() {
+            @Override public void onViewAttachedToWindow(View v) { v.getViewTreeObserver().addOnWindowFocusChangeListener(onFocus); }
+            @Override public void onViewDetachedFromWindow(View v) { v.getViewTreeObserver().removeOnWindowFocusChangeListener(onFocus); }
+        });
+        LinearLayout.LayoutParams rlp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        rlp.topMargin = dp(10);
+        ll.addView(row, rlp);
+    }
+
+    /** One reading of the flag, of Play Store's keep line and of whether Play Store is on this phone (installed or an
+     *  archived On-demand placeholder): the subtitle shows it, and the tap it returns comes from the same reading. */
+    private PlayChoice.Tap paintPlayRow(TextView sub) {
+        final PlayChoice.State st = playState();
+        final boolean kept = readAppModes().containsKey(VENDING_PKG);
+        final boolean installed = isOnDevicePkg(VENDING_PKG);
+        sub.setText(PlayChoice.rowText(st, kept, installed));
+        return PlayChoice.tap(st, kept, installed);
+    }
+
+    /** Off -> on: write "1", mark each of Play Store, Play services and GSF that is on this phone On-demand (A1), and
+     *  open the GrapheneOS App Store. Play Store goes first, as the user's own keep, so it demands the services that
+     *  reconcilePlayStack owns. One not installed yet is kept On-demand by AppInstallReceiver.decide when it lands. */
+    private void turnPlayOn() {
+        cfgPut(PlayChoice.CFG_KEY, PlayChoice.raw(PlayChoice.State.ON));
+        if (playState() != PlayChoice.State.ON) {
+            android.widget.Toast.makeText(this, "Couldn't save that change — try again.", android.widget.Toast.LENGTH_SHORT).show();
+            return;
+        }
+        for (String p : PlayChoice.onMarks(this::isOnDevicePkg)) applyKeepModeOffThread(p, MODE_ONDEMAND, null, null);
+        showYourApps();
+        openGosStore();
+    }
+
+    /** The GrapheneOS App Store, by its launch intent. No package-detail link of its own is known to exist (its
+     *  manifest is not in reach of this repo), so the user picks sandboxed Play from its list. */
+    private void openGosStore() {
+        android.content.Intent i = getPackageManager().getLaunchIntentForPackage(GOS_STORE_PKG);
+        if (i == null) {
+            android.widget.Toast.makeText(this, "Couldn't open the GrapheneOS App Store.", android.widget.Toast.LENGTH_SHORT).show();
+            return;
+        }
+        i.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK);
+        try {
+            startActivity(i);
+        } catch (Throwable t) {
+            android.widget.Toast.makeText(this, "Couldn't open the GrapheneOS App Store.", android.widget.Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    /** On -> off asks first: Off removes Play Store and signs the Google account out. */
+    private void confirmPlayOff() {
+        new android.app.AlertDialog.Builder(this)
+                .setTitle(PlayChoice.OFF_TITLE)
+                .setMessage(PlayChoice.OFF_MESSAGE)
+                .setNegativeButton(PlayChoice.OFF_CANCEL, null)
+                .setPositiveButton(PlayChoice.OFF_CONFIRM, (d, w) -> turnPlayOff())
+                .show();
+    }
+
+    /** Write "0" first, so the reconcile the drop runs already sees Off and does not put Play Store back. Then drop
+     *  what Off drops (Play Store alone, B1 (i)) through the keep-mode funnel, and sign each Google account out through
+     *  "Sign out of Google" (signOutGoogle: the mark first, the removal only once the mark is recorded). A flag that
+     *  did not land stops here: without it, reconcile would re-add Play Store. */
+    private void turnPlayOff() {
+        cfgPut(PlayChoice.CFG_KEY, PlayChoice.raw(PlayChoice.State.OFF));
+        if (playState() != PlayChoice.State.OFF) {
+            android.widget.Toast.makeText(this, "Couldn't save that change — try again.", android.widget.Toast.LENGTH_SHORT).show();
+            return;
+        }
+        for (String p : PlayChoice.offDrops()) applyKeepModeOffThread(p, null, null, null);
+        if (GoogleSignOut.offered(sessionType, offlineSession)) {
+            for (final android.accounts.Account a : android.accounts.AccountManager.get(this).getAccountsByType(GoogleSignOut.ACCOUNT_TYPE)) {
+                final String hash = GoogleSignOut.markHash(a.name);
+                // one sign-out per account at a time, as confirmGoogleSignOut
+                if (GoogleSignOut.claim(hash)) {
+                    new Thread(() -> signOutGoogle(a, hash), "nowhere-google-signout").start();
+                }
+            }
+        }
+        showYourApps();
+    }
+
+    /** One "keep this app" row: icon + label + (size · sideloaded) + a Switch bound to the keep-set. */
+    /** #204: the "Your apps" display label. An INSTALLED app has a normal PM label; an ARCHIVED on-demand app has
+     *  no on-device APK, so PM.getApplicationLabel throws / falls back to the bare package name. The captured
+     *  launcher-activity title lives in the ArchivedPackageInfo -- getArchivedPackage() is the read-side inverse of
+     *  installArchivedPlaceholder(). (LauncherApps.getActivityList does NOT surface archived apps to a non-launcher
+     *  caller like the chooser -- only the HOME-role launcher sees them -- so it can't be used here.) */
+    /** NWP-20260826-15: the kept apps that FORCE the Play stack to stay, i.e. the reason Play Store cannot be
+     *  turned off. Empty when nothing depends on it and the row is genuinely actionable.
+     *
+     *  ⚠ WHY THIS EXISTS. Tapping Play Store Off appeared to do nothing: the tap DID register (vending left
+     *  nowhere-playdeps) and then reconcilePlayStack immediately re-added it at `need`, because a Play client
+     *  needs the whole stack -- Google apps check for the Play Store APP, not just Services. Correct
+     *  behaviour, silently rendered as a control that ignores you. Chester, 2026-08-26: "i dont see any
+     *  error/warning but its not turning off (stays as ondemand)".
+     *
+     *  The Storage screen already knew: it lists vending as NON-ACTIONABLE precisely because
+     *  "reconcilePlayStack re-adds a stack member that still has a kept client, so the drop would be silently
+     *  reverted while the toast reported success". Your apps did not, so one screen refused a lie the other
+     *  was still telling. This closes that gap by SAYING WHY rather than removing the control outright --
+     *  turning the stack off is legitimate once nothing needs it, and a chip that silently vanishes teaches
+     *  the user nothing. */
+    private java.util.List<String> playStackHolders() {
+        java.util.List<String> out = new java.util.ArrayList<>();
+        java.util.Map<String,String> modes = readAppModes();
+        for (String p : readPlayDeps(this)) {
+            if (VENDING_PKG.equals(p) || GMS_PKG.equals(p) || GSF_PKG.equals(p)) continue;
+            if (modes.get(p) != null) out.add(p);   // still kept -> still demands the stack
+        }
+        return out;
+    }
+
+    /** NWP-20260902-07: remember an app's LABEL so it can still be named when the app is not on this phone.
+     *
+     *  keptLabel resolves a name from the DEVICE -- an installed package, or an archived placeholder. An app
+     *  that is in your STORE but has no local presence at all matches neither, so it fell through to the raw
+     *  package string and "Your data" listed `com.costco.app` instead of Costco. That list is built from the
+     *  KEEP SET, so it is exactly the set most likely to contain apps this phone has never materialised
+     *  (Chester: "maybe its doing for the apps still in store not on phone materialized" -- correct).
+     *
+     *  So: whenever a label IS resolved, record it; consult the record only as the last step before giving up.
+     *  The file lives beside nowhere-appkeep in the chooser's files dir, which SEALS and ROAMS, so a name
+     *  learned once on any device is available on every later one -- including a phone where the app has never
+     *  been installed. It is the profile's own app labels, in the profile's own sealed data, wiped with it.
+     *
+     *  ⚠ A CACHED LABEL NEVER OUTRANKS A LIVE ONE. It is consulted AFTER PackageManager, after the archived
+     *  placeholder, and after the three fixed Play names -- so a stale entry (an app renamed since) or a
+     *  planted one can never shadow what the device itself reports. Bounded at 200 entries and 80 chars.
+     *
+     *  NWP-20261016-48: keptLabel runs on the UI thread and on list threads (Your apps' A to Z, the Storage screen's
+     *  prefetch), so the map and its file are touched only under the activity's monitor. */
+    private static final String LABEL_CACHE = "nowhere-applabels";
+    private java.util.HashMap<String,String> labelCacheMap;
+
+    private synchronized java.util.HashMap<String,String> labelCache() {
+        if (labelCacheMap != null) return labelCacheMap;
+        java.util.HashMap<String,String> m = new java.util.HashMap<>();
+        try (java.io.BufferedReader br = new java.io.BufferedReader(
+                new java.io.FileReader(new java.io.File(getFilesDir(), LABEL_CACHE)))) {
+            String line;
+            while ((line = br.readLine()) != null) {
+                int t = line.indexOf((char) 9);
+                if (t <= 0 || t == line.length() - 1) continue;
+                m.put(line.substring(0, t), line.substring(t + 1));
+            }
+        } catch (Throwable ignore) {}
+        labelCacheMap = m;
+        return m;
+    }
+
+    /** Record a resolved label. No-op when it adds nothing (empty, over-long, or just the package again). */
+    private synchronized void rememberLabel(String pkg, CharSequence label) {
+        if (label == null) return;
+        String l = label.toString().replace((char) 9, ' ').replace((char) 10, ' ').trim();
+        if (l.isEmpty() || l.length() > 80 || l.equals(pkg)) return;
+        java.util.HashMap<String,String> m = labelCache();
+        if (l.equals(m.get(pkg))) return;   // unchanged -> no write at all
+        m.put(pkg, l);
+        try {
+            StringBuilder sb = new StringBuilder();
+            int i = 0;
+            for (java.util.Map.Entry<String,String> e : m.entrySet()) {
+                if (++i > 200) break;
+                sb.append(e.getKey()).append((char) 9).append(e.getValue()).append((char) 10);
+            }
+            java.io.File tmp = new java.io.File(getFilesDir(), LABEL_CACHE + ".tmp");
+            try (java.io.FileWriter w = new java.io.FileWriter(tmp)) { w.write(sb.toString()); }
+            if (!tmp.renameTo(new java.io.File(getFilesDir(), LABEL_CACHE))) tmp.delete();
+        } catch (Throwable ignore) {}
+    }
+
+    private CharSequence keptLabel(String pkg) {
+        try { // installed
+            android.content.pm.ApplicationInfo ai = getPackageManager().getApplicationInfo(pkg, 0);
+            CharSequence l = getPackageManager().getApplicationLabel(ai);
+            if (l != null && l.length() > 0 && !pkg.contentEquals(l)) { rememberLabel(pkg, l); return l; }
+        } catch (Throwable ignore) {}
+        try { // archived on-demand placeholder
+            android.content.pm.ArchivedPackageInfo api = getPackageManager().getArchivedPackage(pkg);
+            if (api != null) {
+                java.util.List<android.content.pm.ArchivedActivityInfo> acts = api.getLauncherActivities();
+                if (acts != null && !acts.isEmpty()) {
+                    CharSequence l = acts.get(0).getLabel();
+                    if (l != null && l.length() > 0 && !pkg.contentEquals(l)) { rememberLabel(pkg, l); return l; }
+                }
+            }
+        } catch (Throwable ignore) {}
+        // DIA-20260804-09: the launcher-less Play providers resolve to NEITHER a PM label nor an archived
+        // launcher-activity title, so they fell through as a raw package name. gms is routinely the largest
+        // data dir on the phone, so "com.google.android.gms" was the FIRST row on "What's using space" -- the
+        // one line guaranteed to be read. These three are the only packages we bundle-manage by identity, so
+        // naming them is a fixed lookup, not a heuristic that could mislabel someone else's app.
+        if (GMS_PKG.equals(pkg))     return "Google Play services";
+        if (VENDING_PKG.equals(pkg)) return "Play Store";
+        if (GSF_PKG.equals(pkg))     return "Google Services Framework";
+        // NWP-20260902-07: nothing on THIS phone can name it -- so fall back to what a previous session
+        // learned. Deliberately last, so the device always wins over the record.
+        String cached;
+        synchronized (this) { cached = labelCache().get(pkg); }
+        if (cached != null) return cached;
+        return pkg; // last resort (nothing, anywhere, resolved)
+    }
+
+    /** #204: the "Your apps" icon. Same story as keptLabel -- an installed app has a PM icon; an archived
+     *  placeholder's captured icon comes from the ArchivedPackageInfo (getArchivedPackage), not from PackageManager
+     *  (no on-device resources) and not from LauncherApps (archived apps aren't surfaced to a non-launcher caller). */
+    private android.graphics.drawable.Drawable keptIcon(String pkg) {
+        try { return getPackageManager().getApplicationIcon(pkg); } catch (Throwable ignore) {} // installed
+        try { // archived on-demand placeholder
+            android.content.pm.ArchivedPackageInfo api = getPackageManager().getArchivedPackage(pkg);
+            if (api != null) {
+                java.util.List<android.content.pm.ArchivedActivityInfo> acts = api.getLauncherActivities();
+                if (acts != null && !acts.isEmpty()) {
+                    android.graphics.drawable.Drawable d = acts.get(0).getIcon();
+                    if (d != null) return d;
+                }
+            }
+        } catch (Throwable ignore) {}
+        try { return getPackageManager().getDefaultActivityIcon(); } catch (Throwable ignore) {}
+        return null;
+    }
+
+    private LinearLayout appKeepRow(final String pkg, Long sizeBytes, final boolean sideloaded, final Runnable onChange) {
+        final LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(dp(4), dp(12), dp(4), dp(6));
+        final KeepRowTag tag = new KeepRowTag(pkg);
+        row.setTag(tag); // NWP-20261012-06: keepOrderDrag reads the package and whether the row is kept
+        final CharSequence rowLabel = keptLabel(pkg);
+        tag.key = AppFilter.key(rowLabel, pkg); // NWP-20261016-48: what the search matches, the label this row shows
+
+        // NWP-20261012-06: the drag handle. Kept rows only (paint shows it; an Off row keeps the space, so the icons
+        // stay in one column): touch it and drag, and the keep order -- the automatic install's order -- follows.
+        final TextView handle = new TextView(this);
+        handle.setText("≡");
+        handle.setTextColor(MUTED);
+        handle.setTextSize(TypedValue.COMPLEX_UNIT_SP, 22);
+        handle.setPadding(dp(2), dp(4), dp(10), dp(4));
+        handle.setContentDescription("Reorder " + rowLabel); // NWP-20261012-06: names its app, row by row
+        handle.setOnTouchListener((v, ev) -> {
+            if (ev.getActionMasked() != android.view.MotionEvent.ACTION_DOWN || !tag.kept) return false;
+            row.startDragAndDrop(android.content.ClipData.newPlainText("pkg", pkg),
+                    new View.DragShadowBuilder(row), row, 0);
+            return true;
+        });
+        // NWP-20261012-06: the same reorder without a drag -- "Move up" / "Move down" for TalkBack and switch access,
+        // on a kept row's handle, inside the kept block only, written exactly as a drag is (writeKeepOrder).
+        handle.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_YES);
+        handle.setAccessibilityDelegate(new View.AccessibilityDelegate() {
+            @Override
+            public void onInitializeAccessibilityNodeInfo(View host, android.view.accessibility.AccessibilityNodeInfo info) {
+                super.onInitializeAccessibilityNodeInfo(host, info);
+                String pos = keepRowPosition(row);
+                if (pos != null) info.setStateDescription(pos); // read live, so it is never stale after a move
+                if (keepRowCanMove(row, -1)) info.addAction(
+                        new android.view.accessibility.AccessibilityNodeInfo.AccessibilityAction(A11Y_MOVE_UP, "Move up"));
+                if (keepRowCanMove(row, 1)) info.addAction(
+                        new android.view.accessibility.AccessibilityNodeInfo.AccessibilityAction(A11Y_MOVE_DOWN, "Move down"));
+            }
+            @Override
+            public boolean performAccessibilityAction(View host, int action, Bundle args) {
+                if (action == A11Y_MOVE_UP) return moveKeepRow(row, host, -1);
+                if (action == A11Y_MOVE_DOWN) return moveKeepRow(row, host, 1);
+                return super.performAccessibilityAction(host, action, args);
+            }
+        });
+        row.addView(handle, new LinearLayout.LayoutParams(WRAP, WRAP));
+        tag.handle = handle; // NWP-20261016-48: applyYourAppsFilter hides it while a search is active
+
+        android.widget.ImageView icon = new android.widget.ImageView(this);
+        try { icon.setImageDrawable(keptIcon(pkg)); } catch (Throwable ignore) {}
+        LinearLayout.LayoutParams ilp = new LinearLayout.LayoutParams(dp(38), dp(38));
+        ilp.rightMargin = dp(12);
+        row.addView(icon, ilp);
+
+        LinearLayout col = new LinearLayout(this);
+        col.setOrientation(LinearLayout.VERTICAL);
+        TextView lab = new TextView(this);
+        lab.setText(rowLabel);
+        lab.setTextColor(INK);
+        lab.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
+        col.addView(lab);
+        // NWP-20261119-30: the size line is always made and is GONE while it has nothing to say, so the end of a sweep
+        // can fill in a row built archived (size 0) and redraw a size that changed. keepRowSizePaints holds its repaint.
+        final TextView sub = new TextView(this);
+        sub.setTextColor(MUTED);
+        sub.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        final java.util.function.Consumer<Long> paintSize = s -> {
+            StringBuilder sb = new StringBuilder();
+            if (s != null && s > 0) sb.append("~").append(humanBytes(s));
+            if (sideloaded) { if (sb.length() > 0) sb.append(" · "); sb.append("sideloaded"); }
+            sub.setText(sb.toString());
+            sub.setVisibility(sb.length() > 0 ? View.VISIBLE : View.GONE);
+        };
+        paintSize.accept(sizeBytes);
+        col.addView(sub);
+        keepRowSizePaints.add(sizes -> { if (sub.isAttachedToWindow()) paintSize.accept(sizes.get(pkg)); });
+        // #210 p2 "keep me signed in on this device": a secondary opt-in that only makes sense once the app is kept.
+        // Sits UNDER the label (so it never crowds the mode chip) and is shown only while appMode(pkg) != null. On =>
+        // the package is written into nowhere-keepkeys.list, which roamd reads to carry the app's Keystore keys across
+        // a roam. Default off; hidden + cleared the moment the app goes back to Off.
+        // DIA-20260818-19 (#756): for a Google-account-backed app this switch is INERT in both directions, so
+        // it is replaced by a line saying where the sign-in actually comes from. "Keep me signed in" drives the
+        // PER-APP keystore carry (nowhere-keepkeys.list -> #keys), but Play Store / YouTube / Maps get their
+        // sign-in from the Google ACCOUNT -- one account-level object roaming in the #sys scope. A per-app
+        // switch has no lever on it: OFF still comes back signed in (the amnesia leak in #72), ON adds nothing.
+        // Observed on lynx 2026-08-18: YouTube and Play Store both OFF, the Google account present, both signed
+        // in; and YouTube registering for the carry across three days despite its switch being off.
+        //
+        // DIA-20260818-20: the FIRST cut of this used readPlayDeps and was wrong on device within minutes --
+        // Chester: "now i see all with signed in with google account (including amazon)". nowhere-playdeps means
+        // "DEPENDS ON Play Services", not "signs in via the Google account", and the file on lynx proves it:
+        //     com.android.vending / maps / youtube / com.amazon.mShop.android.shopping
+        // Amazon uses Play Services for push and maps while keeping its OWN login, and so does most of the app
+        // store -- so that rule swallows nearly everything and hides the switch exactly where it works.
+        //
+        // The property we actually need is "this app's sign-in IS the Google account", which is true of Google's
+        // own apps. Namespace, not a list: com.google.* covers YouTube/Maps/Photos/Drive and every future one
+        // without a table to maintain, and isStackMember still covers com.android.vending, whose name predates
+        // the convention. Amazon (com.amazon.*) is correctly excluded and keeps a switch that does something.
+        //
+        // A namespace test IS a heuristic, and worth being honest about: it assumes Google apps authenticate via
+        // the account (they do) and that nothing else squats that namespace. It fails SAFE either way -- a wrong
+        // exclusion shows a switch that does nothing (today's status quo), never hides a working one.
+        final boolean acctBacked = isStackMember(this, pkg) || pkg.startsWith("com.google.");
+        // NWP-20260830-03: acctBacked now governs only the "Signed in with your Google account" note below.
+        // It used to also suppress the "Keep me signed in" switch, alongside a census check (NWP-20260826-11)
+        // that hid the switch for apps holding no Keystore keys -- both gone with the switch itself.
+        final TextView acctNote = new TextView(this);
+        acctNote.setText("Signed in with your Google account");
+        acctNote.setTextColor(MUTED);
+        acctNote.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        acctNote.setVisibility(android.view.View.GONE);
+
+        // The reason line -- "Needed by YouTube". Shown INSTEAD of a chip the user can tap, because the tap
+        // provably does nothing: reconcilePlayStack re-adds vending at `need` on the very next breath.
+        // Naming the holders is the point: "you cannot" teaches nothing, "YouTube needs it" tells the user
+        // what to do about it.
+        //
+        // Declared bare here and FILLED IN BY paintHeld below -- see the note there for why it cannot be
+        // computed at row-build time.
+        final TextView heldNote = new TextView(this);
+        heldNote.setTextColor(MUTED);
+        heldNote.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        heldNote.setVisibility(android.view.View.GONE);
+
+        // NWP-20260830-03: the "Keep me signed in" switch is GONE. It named an outcome it could not
+        // deliver -- a session may live in Keystore, in app data, or both, and this only ever governed
+        // the first, so OFF left apps signed in anyway (proven on AliExpress, NWP-20260829-22). Keys now
+        // roam unconditionally, on the same rule as app data. The layout params it used are kept, because
+        // acctNote and heldNote below still lay out in that same slot.
+        LinearLayout.LayoutParams kswp = new LinearLayout.LayoutParams(WRAP, WRAP);
+        kswp.topMargin = dp(2);
+        col.addView(acctNote, kswp);   // #756: shown in the switch's place for account-backed apps
+        col.addView(heldNote, kswp);   // NWP-20260826-15: why Play Store cannot be turned off
+
+        // NWP-20261012-06: "Wake for notifications" (DECIDED 2026-10-12). Auto and Keep-installed rows only -- the
+        // two modes that restore an app without a tap, so the two that leave it in Android's stopped state, where no
+        // push reaches it. Checked = after a confirmed restore the app is taken out of the stopped state
+        // (UnarchiveService.wakeOnRestore). The default is the messaging rule; a tap is the user's choice and is kept
+        // with the profile (nowhere-appwake). Checking it on an app that is installed and stopped wakes it at once.
+        // Wake only: no battery exemption.
+        final android.widget.CheckBox wake = new android.widget.CheckBox(this);
+        wake.setText("Wake for notifications");
+        wake.setTextColor(MUTED);
+        wake.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        wake.setButtonTintList(android.content.res.ColorStateList.valueOf(ACCENT));
+        wake.setVisibility(View.GONE);
+        final boolean[] wakeRead = { false };
+        // NWP-20261125-26: a failed write puts the check back to wakeHeld and wakes nothing. wakeHeld is the last choice
+        // known to be on file: the default the row was painted with, then each saved tap. It is never read anew for a
+        // revert: the read can fail too, and wakeOnRestore then gives the messaging rule, not a stored "off". It is set
+        // before the listener is attached, then only on KEEP_ROW_WRITES. wakeReverting stops the revert's setChecked
+        // from running onWake again (a lambda cannot name itself to detach); wakeTaps lets only the latest tap move it.
+        final boolean[] wakeHeld = { false };
+        final boolean[] wakeReverting = { false };
+        final int[] wakeTaps = { 0 };
+        final android.widget.CompoundButton.OnCheckedChangeListener onWake = (b, on) -> {
+            if (wakeReverting[0]) return;
+            final int tap = ++wakeTaps[0];
+            final android.content.Context app = getApplicationContext();
+            // KEEP_ROW_WRITES, never a thread per tap: the writes land in tap order, so a quick check-then-uncheck
+            // stores "off" (two threads racing for an unfair lock could store the first tap last).
+            KEEP_ROW_WRITES.execute(() -> {
+                final boolean saved = StoreInstaller.setWakeOverride(app, pkg, on);
+                if (!saved) {
+                    final boolean held = wakeHeld[0];
+                    runOnUiThread(() -> {
+                        if (isFinishing() || isDestroyed()) return;
+                        android.widget.Toast.makeText(this, KeepOrder.WAKE_NOT_SAVED, android.widget.Toast.LENGTH_SHORT).show();
+                        if (wakeTaps[0] != tap) return; // a later tap is queued: its own outcome sets the check
+                        wakeReverting[0] = true;
+                        wake.setChecked(held);
+                        wakeReverting[0] = false;
+                    });
+                    return;
+                }
+                wakeHeld[0] = on;
+                if (!on || !UnarchiveService.hasInstalledCode(app, pkg)) return;
+                // Only over restored data, the sweep's own guard (woken over an empty data dir an app could register
+                // itself anew). Auto: its sweep or tap RESTORE-ODDATA came back OK (nowhere-od-restored). Keep-installed:
+                // the gate's login RESTORE-ODDATA answered OK, recorded by UnarchiveService.wakeRestored when the sweep
+                // kick ran (nowhere-installed-restored) -- a failed restore, or a tap before that kick, wakes nothing.
+                String md = appMode(pkg);
+                boolean restored = MODE_AUTO.equals(md) ? UnarchiveService.odRestored(app, pkg)
+                        : MODE_INSTALLED.equals(md) && UnarchiveService.installedRestored(app, pkg);
+                if (!restored) return;
+                try {
+                    if ((app.getPackageManager().getApplicationInfo(pkg, 0).flags
+                            & android.content.pm.ApplicationInfo.FLAG_STOPPED) != 0) UnarchiveService.unstop(app, pkg);
+                } catch (Throwable t) { Log.w("NowhereChooser", "wake " + pkg, t); }
+            });
+        };
+        col.addView(wake, kswp);
+
+        row.addView(col, new LinearLayout.LayoutParams(0, WRAP, 1f));
+
+        // #205 tri-state: a tappable mode chip (Off / On-demand / Installed) instead of a binary switch. Tapping it
+        // opens the mode picker; paint() re-renders the chip. (It also used to re-render the keep-signed-in
+        // switch, which NWP-20260830-03 removed.)
+        final TextView chip = new TextView(this);
+        chip.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        chip.setPadding(dp(14), dp(7), dp(14), dp(7));
+        chip.setMinWidth(dp(96));
+        chip.setGravity(Gravity.CENTER);
+        // DIA-20260812-02: preview paints a mode the user has CHOSEN but that is not stored yet, so the row reflects
+        // the tap immediately. It deliberately does NOT touch the keep-set or the keep-signed-in opt-in -- it only
+        // moves what the eye sees. `paint` below stays the authority and runs when the work lands.
+        // NWP-20261012-06: the order handle and the wake check follow the mode, in the preview and in paint.
+        final ModePreview orderWake = m -> {
+            tag.kept = m != null;
+            handle.setVisibility(AppFilter.reorderable(m != null, tag.searching) ? View.VISIBLE : View.INVISIBLE);
+            boolean wakeable = MODE_AUTO.equals(m) || MODE_INSTALLED.equals(m);
+            if (wakeable && !wakeRead[0]) {
+                wakeRead[0] = true;
+                Boolean w = keepRowWake.get(pkg);
+                if (w != null) {
+                    wakeHeld[0] = w;
+                    wake.setChecked(w);
+                    wake.setOnCheckedChangeListener(onWake);
+                } else {
+                    // A row kept during this visit has no precomputed state. The rule reads a file and asks
+                    // PackageManager, so it runs on the writer, never here; the check stays disabled until it lands.
+                    wake.setEnabled(false);
+                    final android.content.Context app = getApplicationContext();
+                    KEEP_ROW_WRITES.execute(() -> {
+                        final boolean d = UnarchiveService.wakeOnRestore(app, pkg);
+                        wakeHeld[0] = d;
+                        runOnUiThread(() -> {
+                            wake.setChecked(d);
+                            wake.setOnCheckedChangeListener(onWake);
+                            wake.setEnabled(true);
+                        });
+                    });
+                }
+            }
+            wake.setVisibility(wakeable ? View.VISIBLE : View.GONE);
+        };
+        final ModePreview preview = m -> {
+            paintModeChip(chip, m);
+            orderWake.show(m);
+            acctNote.setVisibility(m != null && acctBacked ? android.view.View.VISIBLE : android.view.View.GONE);
+        };
+        final Runnable paint = () -> {
+            String m = appMode(pkg);
+            paintModeChip(chip, m);
+            orderWake.show(m);
+            if (m == null) {                              // app no longer kept -> drop the opt-in + hide the switch
+                acctNote.setVisibility(android.view.View.GONE);   // #756: app not kept -> neither is shown
+            } else {                                      // re-sync from the file with the listener detached (no write-back)
+                acctNote.setVisibility(acctBacked ? android.view.View.VISIBLE : android.view.View.GONE);
+            }
+        };
+        // ⚠ NWP-20260827-08: THE HOLDERS ARE RECOMPUTED HERE, NOT AT ROW-BUILD TIME. The first cut of -15
+        // resolved them once while building the row, which is wrong for the case the feature exists for:
+        // the Play stack becomes held BY ANOTHER ROW'S EDIT. Chester, 2026-08-27 -- "installed youtube,
+        // changed it to on demand and play store became on-demand on its own, but it doesnt say youtube
+        // depends on it". Exactly right: reconcilePlayStack had pulled vending in and nowhere-playdeps
+        // recorded YouTube, so the DATA was correct; the Play Store row simply still held the empty holder
+        // list it was built with. keepRowPaints exists precisely so a cross-row reconcile can refresh a row
+        // (NWP-20260821-11) -- this just has to be inside the thing it refreshes.
+        final Runnable paintHeld = () -> {
+            java.util.List<String> holders =
+                    VENDING_PKG.equals(pkg) ? playStackHolders() : java.util.Collections.<String>emptyList();
+            if (holders.isEmpty()) {
+                heldNote.setVisibility(android.view.View.GONE);
+                chip.setAlpha(1f);
+                chip.setOnClickListener(v -> showKeepModeDialog(pkg, sideloaded, paint, preview, onChange));
+                return;
+            }
+            StringBuilder hb = new StringBuilder();
+            int shown = 0;
+            for (String h : holders) {
+                if (shown == 3) { hb.append(" +").append(holders.size() - 3).append(" more"); break; }
+                if (shown > 0) hb.append(", ");
+                hb.append(keptLabel(h));
+                shown++;
+            }
+            heldNote.setText("Needed by " + hb);
+            heldNote.setVisibility(android.view.View.VISIBLE);
+            // A chip that cannot act does not get a listener. Before -15, tapping Play Store Off silently
+            // reverted: the tap registered, reconcilePlayStack re-added vending, and the row repainted
+            // unchanged with no error.
+            chip.setAlpha(0.45f);
+            chip.setOnClickListener(null);
+            chip.setClickable(false);
+        };
+        final Runnable paintAll = () -> { paint.run(); paintHeld.run(); };
+        paintAll.run();
+        keepRowPaints.add(paintAll); // NWP-20260821-11: so a cross-row reconcile can refresh this row too
+        LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(WRAP, WRAP);
+        clp.leftMargin = dp(8);
+        row.addView(chip, clp);
+        return row;
+    }
+
+    /** NWP-20261012-06: what keepOrderDrag needs from a Your apps row -- its package, and whether it is kept now
+     *  (paint keeps it current, so a row switched On or Off this visit drags, or stops dragging, at once). */
+    private static final class KeepRowTag {
+        final String pkg;
+        volatile boolean kept;
+        // NWP-20261016-48, UI thread only: what the search matches (AppFilter.key), the row's drag handle, and whether
+        // a search is active on its list -- per row, not per screen, so a late fill from an earlier visit cannot
+        // pause this visit's handles.
+        String key;
+        View handle;
+        boolean searching;
+        KeepRowTag(String pkg) { this.pkg = pkg; }
+    }
+
+    /** NWP-20261016-48: show only the Your apps rows that match the search, and pause reordering while one is active.
+     *  Returns whether a search is active. A row that does not match is hidden (GONE), never removed: it keeps its
+     *  place, its order and its keepRowPaints entry, so a mode change reconciled onto a hidden row (Play Store) is
+     *  already painted when the search is cleared, and the summary still counts every app. Runs on every keystroke,
+     *  once more when the rows land (a query typed while the list loaded), and from onChange after a mode change
+     *  (applyKeepModeOffThread runs that twice per change: once when the change is queued, once when it lands). */
+    private boolean applyYourAppsFilter(LinearLayout list, CharSequence q, TextView count) {
+        String[] terms = AppFilter.terms(q);
+        boolean searching = terms.length > 0;
+        int shown = 0, total = 0;
+        boolean keptShown = false;
+        for (int i = 0; i < list.getChildCount(); i++) {
+            View row = list.getChildAt(i);
+            if (!(row.getTag() instanceof KeepRowTag)) continue;
+            KeepRowTag t = (KeepRowTag) row.getTag();
+            total++;
+            t.searching = searching;
+            boolean hit = AppFilter.matches(terms, t.key);
+            row.setVisibility(hit ? View.VISIBLE : View.GONE);
+            if (hit) { shown++; if (t.kept) keptShown = true; }
+            if (t.handle != null)
+                t.handle.setVisibility(AppFilter.reorderable(t.kept, searching) ? View.VISIBLE : View.INVISIBLE);
+        }
+        String line = AppFilter.countLine(q, shown, total, keptShown);
+        count.setText(line == null ? "" : line);
+        count.setVisibility(line == null ? View.GONE : View.VISIBLE);
+        return searching;
+    }
+
+    /** NWP-20261016-48: put the soft keyboard away, as ChooserActivity.hideKeyboard does at the gate. clear = also drop
+     *  the field's focus, which is not done while the screen is coming down. */
+    private void hideKeyboard(boolean clear) {
+        try {
+            android.view.inputmethod.InputMethodManager imm =
+                    (android.view.inputmethod.InputMethodManager) getSystemService(INPUT_METHOD_SERVICE);
+            View f = getCurrentFocus();
+            android.os.IBinder tok = (f != null) ? f.getWindowToken()
+                    : getWindow().getDecorView().getWindowToken();
+            if (imm != null && tok != null) imm.hideSoftInputFromWindow(tok, 0);
+            if (clear && f != null) f.clearFocus();
+        } catch (Throwable ignore) {
+        }
+    }
+
+    /** NWP-20261012-06: the ONE writer for Your apps' order and wake writes. A thread per drag or tap let two writes
+     *  race for APPKEEP_LOCK / WAKE_LOCK, which are not fair, so drag A-over-B then B-over-A (or check then uncheck)
+     *  could land in the wrong order and the FIRST choice stick. One thread runs them in the order they were made. */
+    private static final java.util.concurrent.ExecutorService KEEP_ROW_WRITES =
+            java.util.concurrent.Executors.newSingleThreadExecutor(r -> {
+                Thread t = new Thread(r, "nowhere-yourapps-write");
+                t.setDaemon(true);
+                return t;
+            });
+
+    /** NWP-20261125-26: UI thread only. Bumped by each writeKeepOrder, so a failed write redraws only when no later
+     *  one is queued. */
+    private int keepOrderWrites;
+
+    /** NWP-20261012-06: the list's rows, top to bottom, written as the keep order (on KEEP_ROW_WRITES). Rows that are
+     *  not kept are passed too and simply match no line. The snapshot is taken here, on the UI thread.
+     *  NWP-20261125-26: a failed write says so and redraws Your apps from nowhere-appkeep, so the rows never keep an
+     *  order the file does not hold. */
+    private void writeKeepOrder(android.view.ViewGroup list) {
+        final java.util.List<String> order = new java.util.ArrayList<>();
+        for (int i = 0; i < list.getChildCount(); i++) {
+            Object t = list.getChildAt(i).getTag();
+            if (t instanceof KeepRowTag) order.add(((KeepRowTag) t).pkg);
+        }
+        final int write = ++keepOrderWrites;
+        final android.content.Context app = getApplicationContext();
+        KEEP_ROW_WRITES.execute(() -> {
+            if (StoreInstaller.reorderKeepLines(app, order)) return;
+            runOnUiThread(() -> {
+                if (isFinishing() || isDestroyed()) return;
+                android.widget.Toast.makeText(this, KeepOrder.ORDER_NOT_SAVED, android.widget.Toast.LENGTH_SHORT).show();
+                // a later drag or move is queued (its own outcome rules), or the owner left Your apps (it reads the file anew)
+                if (write != keepOrderWrites || !list.isAttachedToWindow()) return;
+                showYourApps();
+            });
+        });
+    }
+
+    /** NWP-20261012-06: the accessibility actions' ids. Custom actions, outside the framework's standard action
+     *  bits and android.R.id range; nothing else in the chooser defines accessibility actions. */
+    private static final int A11Y_MOVE_UP = 0x7e0b0001;
+    private static final int A11Y_MOVE_DOWN = 0x7e0b0002;
+
+    /** Whether a kept row can move one place (d = -1 up, 1 down) and stay inside the kept block. */
+    private static boolean keepRowCanMove(View row, int d) {
+        if (!(row.getParent() instanceof android.view.ViewGroup)) return false;
+        if (!(row.getTag() instanceof KeepRowTag) || !((KeepRowTag) row.getTag()).kept) return false;
+        android.view.ViewGroup list = (android.view.ViewGroup) row.getParent();
+        int to = list.indexOfChild(row) + d;
+        if (to < 0 || to >= list.getChildCount()) return false;
+        Object t = list.getChildAt(to).getTag();
+        return t instanceof KeepRowTag && ((KeepRowTag) t).kept;
+    }
+
+    /** "Position n of m" among the kept rows, or null for a row that is not kept. The handle's state description,
+     *  computed each time TalkBack reads the node, so a move is heard as the new position when focus returns. */
+    private static String keepRowPosition(View row) {
+        if (!(row.getParent() instanceof android.view.ViewGroup)) return null;
+        if (!(row.getTag() instanceof KeepRowTag) || !((KeepRowTag) row.getTag()).kept) return null;
+        android.view.ViewGroup list = (android.view.ViewGroup) row.getParent();
+        int n = 0, m = 0;
+        for (int i = 0; i < list.getChildCount(); i++) {
+            Object t = list.getChildAt(i).getTag();
+            if (!(t instanceof KeepRowTag) || !((KeepRowTag) t).kept) continue;
+            m++;
+            if (list.getChildAt(i) == row) n = m;
+        }
+        return "Position " + n + " of " + m;
+    }
+
+    /** Move a kept row one place and write the order, as a drag does. removeView drops TalkBack's focus, so it is put
+     *  back on the handle once the row is re-attached; the handle's state description then reads the new position.
+     *  (No announceForAccessibility: it is deprecated here, and the position already says what happened.) */
+    private boolean moveKeepRow(View row, View handle, int d) {
+        if (!keepRowCanMove(row, d)) return false;
+        android.view.ViewGroup list = (android.view.ViewGroup) row.getParent();
+        int to = list.indexOfChild(row) + d;
+        list.removeView(row);
+        list.addView(row, to);
+        writeKeepOrder(list);
+        handle.post(() -> handle.performAccessibilityAction(
+                android.view.accessibility.AccessibilityNodeInfo.ACTION_ACCESSIBILITY_FOCUS, null));
+        return true;
+    }
+
+    /** NWP-20261012-06: each kept row's "Wake for notifications" state, read once per visit off the UI thread. */
+    private final java.util.Map<String, Boolean> keepRowWake = new java.util.concurrent.ConcurrentHashMap<>();
+    /** NWP-20261111-13: the Your apps rows with no launcher icon, from the last list build. UI thread only: assigned in
+     *  the build's runOnUiThread block before any row is painted, read by showKeepModeDialog. */
+    private java.util.Set<String> yourAppsNoIcon = java.util.Collections.emptySet();
+
+    /** NWP-20261012-06: drag-to-reorder for the Your apps list (framework drag and drop; the chooser has no
+     *  androidx). The dragged row moves live under the finger; a kept row never sinks below the last other kept row,
+     *  so the kept apps stay one block above the Off ones. Near the top or bottom of the screen the page scrolls.
+     *  When the drag ends, the kept rows' order is written to the keep-set off the UI thread
+     *  (StoreInstaller.reorderKeepLines): that is the order the automatic install works through, kept with the
+     *  profile. Rows that are not kept are passed too and simply match no line. */
+    private View.OnDragListener keepOrderDrag(final LinearLayout list) {
+        return (v, e) -> {
+            Object ls = e.getLocalState();
+            if (!(ls instanceof View) || ((View) ls).getParent() != list) return false;
+            final View dragged = (View) ls;
+            switch (e.getAction()) {
+                case android.view.DragEvent.ACTION_DRAG_STARTED:
+                    dragged.setAlpha(0.4f);
+                    return true;
+                case android.view.DragEvent.ACTION_DRAG_LOCATION: {
+                    float y = e.getY();
+                    int to = 0, others = 0, lastKept = -1;
+                    for (int i = 0; i < list.getChildCount(); i++) {
+                        View c = list.getChildAt(i);
+                        if (c == dragged) continue;
+                        if (y > (c.getTop() + c.getBottom()) / 2f) to++;
+                        if (c.getTag() instanceof KeepRowTag && ((KeepRowTag) c.getTag()).kept) lastKept = others;
+                        others++;
+                    }
+                    to = Math.min(to, lastKept + 1); // indices among the other rows: never below the kept block
+                    if (to != list.indexOfChild(dragged)) {
+                        list.removeView(dragged);
+                        list.addView(dragged, to);
+                    }
+                    android.view.ViewParent p = list.getParent();
+                    while (p != null && !(p instanceof android.widget.ScrollView)) p = p.getParent();
+                    if (p != null) {
+                        android.widget.ScrollView sv = (android.widget.ScrollView) p;
+                        int[] a = new int[2], b = new int[2];
+                        list.getLocationOnScreen(a);
+                        sv.getLocationOnScreen(b);
+                        float sy = a[1] + y - b[1];
+                        if (sy < dp(64)) sv.smoothScrollBy(0, -dp(24));
+                        else if (sy > sv.getHeight() - dp(64)) sv.smoothScrollBy(0, dp(24));
+                    }
+                    return true;
+                }
+                case android.view.DragEvent.ACTION_DRAG_ENDED:
+                    dragged.setAlpha(1f);
+                    writeKeepOrder(list);
+                    return true;
+                default:
+                    return true;
+            }
+        };
+    }
+
+    /** DIA-20260812-02: paints a row for a mode the user has just CHOSEN, before it is stored. Needed because the
+     *  row's own `paint` re-reads appMode(pkg) from the keep-set, so it can only ever render what is already
+     *  written -- which is precisely why the row sat on the old value while the write was in flight. Not a
+     *  Runnable because the mode is the argument, and null is a REAL mode here (Off), so it cannot be a sentinel. */
+    private interface ModePreview {
+        void show(String mode);
+    }
+
+    /** Render a keep-mode chip as an intensity ramp: Off (muted outline) < On-demand (accent outline) < Auto
+     *  (accent outline + tint, #130) < Installed (solid accent). One glance tells you how much of the app is
+     *  ready -- and how eagerly it comes back. */
+    private void paintModeChip(TextView chip, String mode) {
+        String label; int fg, fill, stroke;
+        if (MODE_ONDEMAND.equals(mode)) {
+            label = "On-demand"; fg = ACCENT; fill = android.graphics.Color.TRANSPARENT; stroke = ACCENT;
+        } else if (MODE_AUTO.equals(mode)) {
+            label = "Auto"; fg = ACCENT; fill = GatePalette.withAlpha(ACCENT, 0x22); stroke = ACCENT;
+        } else if (MODE_INSTALLED.equals(mode)) {
+            label = "Installed"; fg = BG; fill = ACCENT; stroke = ACCENT;
+        } else {
+            label = "Off"; fg = MUTED; fill = android.graphics.Color.TRANSPARENT; stroke = OUTLINE;
+        }
+        chip.setText(label);
+        chip.setTextColor(fg);
+        android.graphics.drawable.GradientDrawable g = new android.graphics.drawable.GradientDrawable();
+        g.setCornerRadius(dp(18));
+        g.setColor(fill);
+        g.setStroke(dp(1), stroke);
+        chip.setBackground(g);
+    }
+
+    /** #205 the keep-mode picker: Off / On-demand / Auto / Keep installed, or Off / Keep installed for an app with no
+     *  launcher icon (NWP-20261111-13), with a one-line explanation of each. A
+     *  SIDELOADED app going to a keep mode still hits the one-time T4 sideload warning; Off never does. onChange
+     *  refreshes the summary, paint refreshes just this row's chip. */
+    private void showKeepModeDialog(final String pkg, final boolean sideloaded, final Runnable paint,
+                                    final ModePreview preview, final Runnable onChange) {
+        final String cur = appMode(pkg); // null=off, installed, auto, ondemand
+        // NWP-20261111-13 (Q140): an app with no launcher icon (yourAppsNoIcon, from the list build) is offered Off and
+        // Keep installed only -- On-demand and Auto rely on an icon placeholder it cannot show. At On-demand or Auto
+        // (a store default) no item is checked; picking one replaces it.
+        final boolean hasIcon = !yourAppsNoIcon.contains(pkg);
+        final java.util.List<String[]> modes = AppFilter.keepModes(hasIcon);
+        final CharSequence[] items = new CharSequence[modes.size()];
+        int checked = -1;
+        for (int i = 0; i < modes.size(); i++) {
+            items[i] = modes.get(i)[0];
+            if (java.util.Objects.equals(modes.get(i)[1], cur)) checked = i;
+        }
+        if (checked < 0 && hasIcon) checked = 0; // as before: a mode word it does not know reads as Off
+        // NWP-20261012-06: no "Download first" button -- the install order is the order of the rows, dragged.
+        new android.app.AlertDialog.Builder(this)
+                // DIA-20260727-01: keptLabel (archived-aware) not appLabel (getApplicationInfo flags=0, which throws
+                // for an APK-less archived on-demand placeholder and falls back to the bare pkg name) -- else the row
+                // says "Calculator" while its own mode dialog is titled "com.example.calculator". Matches the row label.
+                .setTitle(keptLabel(pkg))
+                .setSingleChoiceItems(items, checked, (d, which) -> {
+                    d.dismiss();
+                    applyKeepMode(pkg, modes.get(which)[1], sideloaded, paint, preview, onChange);
+                })
+                .setNegativeButton("Cancel", null)
+                .show();
+    }
+
+    /** Apply a chosen keep mode. A keep mode (not Off) on a SIDELOADED app is gated behind the one-time sideload
+     *  ack; Off drops it immediately. Repaints the chip + refreshes the summary only after the change lands. */
+    private void applyKeepMode(final String pkg, final String mode, final boolean sideloaded, final Runnable paint,
+                               final ModePreview preview, final Runnable onChange) {
+        // DIA-20260812-02: preview fires exactly where the work COMMITS, never at the tap. The sideload warning is
+        // a real branch point -- dismiss it and nothing is applied -- so previewing before it would leave the row
+        // showing a mode the user declined.
+        if (mode != null && sideloaded && !sideloadAcked()) {
+            showSideloadWarning(() -> {
+                ackSideload();
+                if (preview != null) preview.show(mode);
+                applyKeepModeOffThread(pkg, mode, paint, onChange);
+            });
+            return;
+        }
+        if (preview != null) preview.show(mode);
+        applyKeepModeOffThread(pkg, mode, paint, onChange);
+    }
+
+    /** setAppMode calls overPlan -> GET-ENTITLEMENT whenever an edit adds a package -- off the keep-set lock, between
+     *  two passes of the edit, since NWP-20260925-03; it used to be inside writeAppModes, under the lock -- and that
+     *  BLOCKS on a socket read. Running that from the keep-mode dialog's onClick put it on the UI thread and ANR'd the Profile app:
+     *  "Waited 5003ms for FocusEvent" with the main thread parked in LocalSocketImpl.readba_native
+     *  (lynx 2026081100, setting YouTube to on-demand). The same call is why switching apps in Your Apps felt
+     *  slow -- one blocking call, two symptoms, separated only by how long the daemon happened to take.
+     *
+     *  No socket timeout can save this: Android ANRs at 5s, and the daemon calls wait 90s. The only fix is not
+     *  being on the UI thread.
+     *
+     *  writeAppModes was ALREADY written for this -- it wrapped its over-plan dialog in runOnUiThread -- so the
+     *  bug was purely the call site. paint/onChange touch views, so they go back to the UI thread here. (#136 later
+     *  moved the dialog out of writeAppModes: it returns the refused set, and the caller -- this method, or
+     *  getAppInMode -- shows showOverPlanDialog.)
+     *
+     *  DIA-20260812-02: moving the work off the UI thread stopped the ANR but introduced a second-order lie --
+     *  the row kept rendering the PREVIOUS mode for the whole duration, because `paint` only runs after
+     *  setAppMode returns. On a profile with the Play stack that is many seconds (reconcilePlayStack cascades the
+     *  toggle across vending+gms+gsf and archives them, and overPlan waits on a single-threaded daemon), so the
+     *  user taps, sees nothing change, and taps again -- queueing more work behind an already-slow daemon.
+     *  The caller now previews the chosen mode immediately; the `paint` below stays authoritative and CORRECTS
+     *  the row from storage when the work lands. That is what reverts the chip when writeAppModes refuses an add
+     *  under the plan gate: it drops the package, this method shows showOverPlanDialog, paint re-reads, the chip goes back.
+     *  Note the asymmetry that remains: rows CASCADED by reconcilePlayStack (vending/gms/gsf) are not the tapped
+     *  row and still update only when onChange re-renders, i.e. at the end. */
+    /** DIA-20260818-21: ONE worker for every mode change, and a visible count of what is still queued.
+     *
+     *  Before this, each tap started its OWN unbounded thread. They then all serialised anyway -- on the
+     *  single-threaded daemon and on roamd's workerMu -- so N taps did not go faster, they just went invisibly:
+     *  reconcilePlayStack cascades vending+gms+gsf and overPlan blocks on GET-ENTITLEMENT, seconds per app, with
+     *  nothing on screen saying a queue existed. Chester: changing several apps "doesnt work for it takes for
+     *  ever and no way to know whats going on".
+     *
+     *  A single-thread executor makes the ordering explicit instead of accidental, and MODE_PENDING lets the
+     *  summary line say how many are left -- which is the difference between "stuck" and "working through 4".
+     *  Distinct from #104, which fixed the per-ROW repaint lie; this is the batch. */
+    private static final java.util.concurrent.ExecutorService MODE_QUEUE =
+            java.util.concurrent.Executors.newSingleThreadExecutor(r -> {
+                Thread t = new Thread(r, "nowhere-appmode");
+                t.setDaemon(true);
+                return t;
+            });
+    static final java.util.concurrent.atomic.AtomicInteger MODE_PENDING =
+            new java.util.concurrent.atomic.AtomicInteger(0);
+
+    /** NWP-20260821-11: every VISIBLE keep-row's repaint, so a mode change can refresh the rows it did not
+     *  touch directly. `paint` in appKeepRow is a per-row closure over that row's own chip and pkg, so
+     *  repainting only the tapped row leaves any OTHER row that setAppMode changed showing a stale chip --
+     *  which is exactly what happens with the sandboxed-Play stack: setting YouTube to on-demand reconciles
+     *  Play Store to on-demand too (setAppMode -> reconcilePlayStack), and the Play Store row kept its old
+     *  chip until the screen was rebuilt. Reported on device: "if i go to your apps and made youtube on
+     *  demand the screen will not change play store ondemand. if i go out of that screen and come back, then
+     *  i will see it as ondemand."
+     *
+     *  Rebuilt (cleared + refilled) every time the list is built, so a runnable can never outlive its views.
+     *  Each entry re-reads the file itself, so running them all is a plain re-sync of what is on screen. */
+    /** NWP-20260826-11: the packages this profile knows hold Keystore keys, resolved ONCE per Your Apps build
+     *  on the background thread. null = the daemon could not say, in which case every switch is shown (the
+     *  pre-census behaviour) rather than every switch being hidden. */
+
+    private final java.util.List<Runnable> keepRowPaints = new java.util.ArrayList<>();
+    /** NWP-20261119-30: every keep-row's size-line repaint, rebuilt with keepRowPaints. The sweepDone receiver hands each
+     *  the map it has just re-measured; a repaint whose row is no longer attached draws nothing. UI thread only. */
+    private final java.util.List<java.util.function.Consumer<java.util.Map<String, Long>>> keepRowSizePaints =
+            new java.util.ArrayList<>();
+
+    private void applyKeepModeOffThread(final String pkg, final String mode, final Runnable paint, final Runnable onChange) {
+        MODE_PENDING.incrementAndGet();
+        if (onChange != null) runOnUiThread(onChange);   // show the queue immediately, before the work starts
+        MODE_QUEUE.submit(() -> {
+            java.util.Set<String> dropped = java.util.Collections.emptySet();
+            try {
+                dropped = setAppMode(pkg, mode);
+            } catch (Throwable t) {
+                android.util.Log.w("NowhereChooser", "setAppMode " + pkg, t);
+            }
+            final boolean unsaved = dropped == KEEPSET_UNREADABLE; // NWP-20261112-03: nothing was written
+            final boolean refused = !unsaved && dropped.contains(pkg); // #136: the plan gate dropped THIS add
+            MODE_PENDING.decrementAndGet();                // decrement BEFORE the repaint, so the count is right
+            runOnUiThread(() -> {
+                if (unsaved) android.widget.Toast.makeText(this, "Couldn't save that change — try again.",
+                        android.widget.Toast.LENGTH_SHORT).show();
+                else if (refused) showOverPlanDialog(pkg, null); // surfaced HERE, on the screen the user tapped
+                if (paint != null) paint.run();             // re-reads storage -> reverts the previewed chip
+                // NWP-20260821-11: setAppMode also reconciles the sandboxed-Play stack, so it can change the
+                // mode of packages the user did not tap. Repaint every registered row, not just this one.
+                // Each is a no-op re-read when nothing changed, and the list is small (visible rows only).
+                // Kept AFTER the tapped row's own paint so the row the user touched settles first.
+                for (Runnable r : new java.util.ArrayList<>(keepRowPaints)) {
+                    if (r != paint) {
+                        try { r.run(); } catch (Throwable ignore) {}
+                    }
+                }
+                if (onChange != null) onChange.run();
+            });
+        });
+    }
+
+    /** One-time warning before keeping a SIDELOADED app (the T4 security sign-off): unvetted code that will
+     *  auto-install on every device the profile touches. onConfirm runs only on "Keep it". */
+    private void showSideloadWarning(final Runnable onConfirm) {
+        new android.app.AlertDialog.Builder(this)
+                .setTitle("Keep a sideloaded app?")
+                .setMessage("This app didn't come from an app store, so no one has vetted it. Keeping it saves its "
+                        + "code to your account and reinstalls it automatically on every nowhere phone you sign in "
+                        + "on. Only keep apps you trust.")
+                .setPositiveButton("Keep it", (d, w) -> { if (onConfirm != null) onConfirm.run(); })
+                .setNegativeButton("Cancel", null)
+                .show();
+    }
+
+    // ===== Daemon length-prefixed replies (the storefront itself is com.nowhere.napps) =====
+
+    // Read a length-prefixed daemon reply ("OK <nbytes>\n<json>" | else null). Used by GET-STORAGE-BREAKDOWN
+    // (the catalog calls moved with the storefront to com.nowhere.napps). Returns {header line, body or null}.
+    private String[] daemonLenReply(String cmd, int readCapMs) {
+        LocalSocket s = DaemonSocket.connect(); // NWP-20261005-19: bounded connect
+        try {
+            if (s == null) throw new java.io.IOException("daemon connect timed out");
+            s.setSoTimeout(readCapMs);
+            s.getOutputStream().write(cmd.getBytes("UTF-8"));
+            s.getOutputStream().flush();
+            java.io.InputStream in = s.getInputStream();
+            StringBuilder head = new StringBuilder();
+            int c;
+            while ((c = in.read()) != -1 && c != '\n') head.append((char) c);
+            String hl = head.toString().trim();
+            String[] h = hl.split(" ");
+            if (h.length < 2 || !"OK".equals(h[0])) return new String[]{hl, null};
+            int n;
+            try { n = Integer.parseInt(h[1]); } catch (NumberFormatException nfe) { return new String[]{hl, null}; }
+            if (n < 0 || n > (8 << 20)) return new String[]{hl, null}; // sanity cap
+            byte[] buf = new byte[n];
+            int off = 0, rd;
+            while (off < n && (rd = in.read(buf, off, n - off)) >= 0) off += rd;
+            // A TRUNCATED body is null, not a short string. The old code returned the partial bytes, which the
+            // JSON parse then rejected -- rendering an EMPTY catalog (or a ZERO storage total) instead of an
+            // honest "couldn't load". Silently-plausible beats obviously-broken only until someone acts on it.
+            if (off < n) return new String[]{hl, null};
+            return new String[]{hl, new String(buf, 0, n, "UTF-8")};
+        } catch (Exception e) {
+            Log.w("NowhereChooser", "daemonLenReply", e);
+            return new String[]{"", null};
+        } finally {
+            if (s != null) try { s.close(); } catch (Exception ignore) {}
+        }
+    }
+
+    /** GET-STORAGE-BREAKDOWN read cap. The daemon allows its worker 120s for the walk, so the old hardcoded 30s
+     *  would give up on exactly the phones this screen exists for -- the full ones. Sitting above the daemon's
+     *  own ceiling costs nothing: a dead daemon closes the socket and the read returns at once. */
+    private static final int STORAGE_CAP_MS = 150000;
+
+    /** Row bounds. The daemon returns one row per data DIRECTORY with no cap and no keep-set filter, and
+     *  hold_ondemand leaves a 0-byte skeleton per kept app, so a real phone yields well over a hundred rows
+     *  of which most are noise. Sorted largest-first, so a floor + cap keeps every row that could matter. */
+    private static final long STORAGE_ROW_MIN_BYTES = 1L << 20; // 1 MB
+    private static final int  MAX_STORAGE_ROWS = 40;
+
+    private String[] getStorageBreakdown() { return daemonLenReply("GET-STORAGE-BREAKDOWN\n", STORAGE_CAP_MS); }
+
+    // ===== NWP-20261120-09: the kept storage count (h48 #6, core/agent/storage_count.go) =====
+
+    /** GET-STORAGE-BREAKDOWN-CACHED read cap. The daemon answers it from RAM and never walks, so it is short. */
+    private static final int STORAGE_CACHED_CAP_MS = 10000;
+    /** How often the screen asks for the kept count while a fresh count runs. */
+    private static final long STORAGE_POLL_MS = 3000;
+
+    private String[] getStorageBreakdownCached() {
+        return daemonLenReply("GET-STORAGE-BREAKDOWN-CACHED\n", STORAGE_CACHED_CAP_MS);
+    }
+
+    /** The views showStorageBreakdown's breakdown worker fills. age is made on first use, on the UI thread only. */
+    private static final class StorageScreen {
+        final android.view.View root;
+        final LinearLayout ll;
+        final android.widget.ProgressBar spin;
+        final android.os.Handler slow;
+        final TextView local, localSub, blindLine;
+        final LinearLayout list;
+        final TextView device;
+        TextView age;
+
+        StorageScreen(android.view.View root, LinearLayout ll, android.widget.ProgressBar spin, android.os.Handler slow,
+                      TextView local, TextView localSub, TextView blindLine, LinearLayout list, TextView device) {
+            this.root = root; this.ll = ll; this.spin = spin; this.slow = slow;
+            this.local = local; this.localSub = localSub; this.blindLine = blindLine;
+            this.list = list; this.device = device;
+        }
+    }
+
+    /** Render one breakdown reply (replyHead = its header line, si = its parsed body, null when it failed). Called on
+     *  the worker thread: the PackageManager prefetch runs here, the views are set on the UI thread. Both the kept
+     *  count and today's GET-STORAGE-BREAKDOWN walk render through it, and the kept-count path can call it twice per
+     *  open (the kept count, then the fresh one). */
+    private void renderStorageReply(final StorageScreen v, final String replyHead, final StorageInfo si) {
+        // Resolve labels + PackageManager eligibility HERE, not per row on the main thread: keptLabel
+        // alone can cost several binder round-trips per package (an archived app falls through to
+        // getArchivedPackage), and a full phone has a lot of packages.
+        final java.util.Map<String,CharSequence> labels = new java.util.HashMap<>();
+        final java.util.Map<String,Boolean> droppable = new java.util.HashMap<>();
+        // DIA-20260806-13: the fate line needs two more PackageManager facts per row, and they belong
+        // here for the same reason the labels do -- getApplicationInfo is a binder call and the render
+        // loop runs on the main thread.
+        final java.util.Map<String,Boolean> bundled   = new java.util.HashMap<>();
+        final java.util.Map<String,Boolean> installed = new java.util.HashMap<>();
+        if (si != null) {
+            // Prefetch for anything the render loop could show. That loop now ranks by plan bytes and
+            // never hides a kept app, so a local-bytes floor here would starve exactly the rows the
+            // change was made to surface; cover both axes plus the keep-set, capped the same way.
+            final java.util.Map<String,String> keptNow = readAppModes();
+            int pre = 0;
+            for (StorageRow r : si.apps) {
+                boolean couldShow = keptNow.containsKey(r.pkg)
+                        || r.bytes >= STORAGE_ROW_MIN_BYTES || r.store >= STORAGE_ROW_MIN_BYTES;
+                if (!couldShow) continue;
+                labels.put(r.pkg, keptLabel(r.pkg));
+                droppable.put(r.pkg, pmDroppable(r.pkg));
+                bundled.put(r.pkg, isBundledSystem(getPackageManager(), r.pkg));
+                installed.put(r.pkg, pmInstalledNow(r.pkg));
+                if (++pre >= MAX_STORAGE_ROWS + 8) break; // a little headroom over the render cap
+            }
+        }
+        runOnUiThread(() -> {
+            if (isFinishing() || isDestroyed() || v.root.getParent() == null) return;
+            v.slow.removeCallbacksAndMessages(null);
+            v.ll.removeView(v.spin);
+            if (si == null) {
+                v.localSub.setText("");
+                v.local.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
+                v.local.setTextColor(MUTED);
+                String head = replyHead == null ? "" : replyHead;
+                if (head.startsWith("NONE")) {
+                    v.local.setText("No active session.");
+                } else {
+                    // NWP-20260826-04: the daemon now DISTINGUISHES "busy" from "failed". The generic
+                    // line below already guessed "may be busy" -- ERR-WORKER-BUSY means it does not have
+                    // to guess: the read gave up waiting for the worker rather than failing, so nothing
+                    // is wrong and retrying shortly will work. Saying that is the difference between a
+                    // screen that looks broken and one that is momentarily unavailable.
+                    StatusLine.error(v.local, head.startsWith("ERR-WORKER-BUSY")
+                            ? "The phone is busy saving or downloading right now, so this couldn't be "
+                                    + "measured. Nothing is wrong — try again in a moment."
+                            : head.startsWith("ERR")
+                            ? "Couldn't work out what's using space — try again."
+                            : "Couldn't measure what's using space right now — this phone may be busy "
+                                    + "saving or downloading an app.");
+                    v.list.addView(secondaryButton("Try again", () -> showStorageBreakdown()), btnLp(dp(10)));
+                }
+                return;
+            }
+            v.local.setText((si.blind > 0 ? "At least " : "") + humanBytes(si.totalBytes) + " on this phone");
+            v.localSub.setText("what's actually on this device right now");
+            if (si.blind > 0) {
+                android.util.Log.i("NowhereChooser", "storage breakdown: " + si.blind + " unreadable path(s)");
+                v.blindLine.setText("Part of this phone couldn't be read, so the real total is higher than "
+                        + "this. What's listed is still accurate — there's just more that isn't.");
+                v.blindLine.setVisibility(android.view.View.VISIBLE);
+            } else {
+                // NWP-20261120-09: this branch now runs again when the fresh count lands; a count with no
+                // unreadable path must not keep the kept count's warning.
+                v.blindLine.setVisibility(android.view.View.GONE);
+            }
+            renderStorageList(v.list, si, v.device, labels, droppable, bundled, installed);
+        });
+    }
+
+    /** Show (or refresh) the age line under localSub. Posts to the UI thread; the TextView is made there on first use. */
+    private void showStorageAge(final StorageScreen v, final long countedAtSec, final boolean running) {
+        runOnUiThread(() -> {
+            if (isFinishing() || isDestroyed() || v.root.getParent() == null) return;
+            if (v.age == null) {
+                v.age = new TextView(this);
+                v.age.setTextColor(MUTED);
+                v.age.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+                v.ll.addView(v.age, v.ll.indexOfChild(v.localSub) + 1, new LinearLayout.LayoutParams(MATCH, WRAP));
+            }
+            v.age.setText(StorageCountView.ageLine(System.currentTimeMillis() / 1000, countedAtSec, running));
+        });
+    }
+
+    /** The kept-count poll: render the session's kept count with its age, then poll every STORAGE_POLL_MS while the
+     *  screen is shown and the fresh count runs, and render the fresh count when it lands. It never starts a count
+     *  and never walks. Returns false only when the daemon does not keep a count (an older daemon, a failed read, or
+     *  no count ran and none runs) and nothing was rendered: the caller then runs today's GET-STORAGE-BREAKDOWN. */
+    private boolean showKeptStorageCount(final StorageScreen v) {
+        long shown = 0; // the countedAt on screen; 0 = nothing rendered yet
+        while (v.root.getParent() != null) {
+            final String[] r = getStorageBreakdownCached();
+            final StorageCountView.Cached c = StorageCountView.parse(r[0]);
+            int step = StorageCountView.next(c, shown);
+            if (step == StorageCountView.RENDER) {
+                final StorageInfo si = parseStorageBreakdown(r[1]);
+                if (si == null) {
+                    step = StorageCountView.LEGACY; // a body that did not parse
+                } else {
+                    renderStorageReply(v, r[0], si);
+                    shown = c.countedAtSec;
+                    step = StorageCountView.next(c, shown); // WAIT or DONE, without another read
+                }
+            }
+            if (step == StorageCountView.WAIT) {
+                if (shown > 0) showStorageAge(v, shown, true);
+                try { Thread.sleep(STORAGE_POLL_MS); } catch (InterruptedException e) { return true; }
+                continue;
+            }
+            // Anything else ends the poll. Once a count is on screen it stays: a failed fresh count, a session end
+            // or a cold lock keeps the shown figure, with the age line and no "counting again".
+            if (shown > 0) { showStorageAge(v, shown, false); return true; }
+            if (step == StorageCountView.LEGACY) return false;
+            if (step == StorageCountView.NO_SESSION) renderStorageReply(v, "NONE", null);
+            else if (step == StorageCountView.FAILED) renderStorageReply(v, c.lastErr, null);
+            return true;
+        }
+        return true;
+    }
+
+    /** One row of the GET-STORAGE-BREAKDOWN reply. mode is "installed" | "ondemand" | "" (not in the keep-set). */
+    private static final class StorageRow {
+        final String pkg; final long bytes; final String mode;
+        /** DIA-20260805-13: sealed bytes -- what this app costs the PLAN. Zero while
+         *  StorageInfo.storeMeasured is false means NOT MEASURED YET, which the row says in words instead of
+         *  printing "0 B" and inviting someone to conclude the app is free. */
+        final long store;
+        /** DIA-20260806-06: does this app have sealed CODE (bytes in #apps)? The keep-set says what the user
+         *  WANTS kept; only #apps says what CAN come back. Without this the row promised "comes back
+         *  installed on your next phone" for an app whose code the roam-in reap had already removed --
+         *  device-proven on lynx, where Play Services showed 161 MB of plan, no sealed code, and that
+         *  promise. A cost we charge for is bad; a restore we promise and cannot perform is worse. */
+        final boolean code;
+        StorageRow(String p, long b, String m, long st, boolean c) { pkg = p; bytes = b; mode = m; store = st; code = c; }
+    }
+
+    /** NWP-20261125-09: one entry of the reply's folders. name "" = the files outside every top-level folder; bytes
+     *  is what it holds on this phone; store is what it costs the plan, real only when StorageInfo.foldersMeasured. */
+    private static final class StorageFolder {
+        final String name; final long bytes, store;
+        StorageFolder(String n, long b, long st) { name = n; bytes = b; store = st; }
+    }
+
+    private static final class StorageInfo {
+        final java.util.List<StorageRow> apps = new java.util.ArrayList<>();
+        long mediaBytes, cacheBytes, totalBytes;
+        int blind;
+        /** The plan side (DIA-20260805-12). storeOther is everything the plan holds that no row owns --
+         *  chunks shared between apps, recent backups, the profile's own data -- so the rows PLUS that line
+         *  reconcile with storeTotal instead of leaving a silent gap the user reads as slack. */
+        long storeTotal, storeOther;
+        boolean storeMeasured;
+        /** DIA-20260806-13: did the #apps scope itself resolve? storeMeasured goes true as soon as ANY scope
+         *  carries an index, so it cannot tell "this app has no sealed code" from "we never read the scope
+         *  that would say". Gating the missing-code line on storeMeasured accused every kept app on a profile
+         *  whose first code seal had simply not happened yet. Absent from an older daemon -> false -> the
+         *  screen makes no claim at all, which is the safe direction. */
+        boolean appsMeasured;
+        /** NWP-20261125-09: the top-level folders in the daemon's order; their bytes sum to mediaBytes. Absent from
+         *  an older daemon -> empty -> the screen draws the one "Your photos, videos and files" row as before.
+         *  foldersMeasured says the store figures are real; false -> each folder row says what it said before. */
+        final java.util.List<StorageFolder> folders = new java.util.ArrayList<>();
+        boolean foldersMeasured;
+    }
+
+    /** Parse the breakdown JSON. Returns NULL when it cannot be parsed -- never an all-zero object: telling a
+     *  user who is over their plan that nothing is using space is worse than telling them we couldn't measure.
+     *  opt* with explicit defaults throughout, so a field the daemon omits degrades instead of throwing
+     *  mid-render and leaving a half-built list. The daemon already sorts largest-first with a name tiebreak,
+     *  so DO NOT re-sort here -- a refresh would reshuffle the many 0-byte rows that hold_ondemand leaves. */
+    private StorageInfo parseStorageBreakdown(String json) {
+        if (json == null) return null;
+        org.json.JSONObject o = null;
+        try { o = new org.json.JSONObject(json); } catch (Throwable ignore) {}
+        if (o == null) return null;
+        StorageInfo si = new StorageInfo();
+        si.mediaBytes = o.optLong("media_bytes", 0);
+        si.cacheBytes = o.optLong("cache_bytes", 0);
+        si.totalBytes = o.optLong("total_bytes", 0);
+        si.blind      = o.optInt("blind", 0);
+        // DIA-20260805-13: the plan side. All optional -- an older daemon omits them and the screen falls back
+        // to exactly the local-only view it had before.
+        si.storeTotal    = o.optLong("store_total", 0);
+        si.storeOther    = o.optLong("store_other", 0);
+        si.storeMeasured = o.optBoolean("store_measured", false);
+        si.appsMeasured  = o.optBoolean("apps_measured", false);
+        org.json.JSONArray as = o.optJSONArray("apps");
+        if (as == null) as = new org.json.JSONArray(); // a missing array renders an empty list, never a crash
+        for (int i = 0; i < as.length(); i++) {
+            org.json.JSONObject e = as.optJSONObject(i);
+            if (e == null) continue;
+            String pkg = e.optString("pkg", "");
+            if (pkg.isEmpty()) continue;
+            si.apps.add(new StorageRow(pkg, e.optLong("bytes", 0), e.optString("mode", ""), e.optLong("store", 0), e.optBoolean("code", false)));
+        }
+        // NWP-20261125-09: the folder rows. A missing or non-array field is no folders; a non-object entry is
+        // skipped; the daemon's order is kept (it sorts largest-first with a name tiebreak).
+        si.foldersMeasured = o.optBoolean("folders_measured", false);
+        org.json.JSONArray fs = o.optJSONArray("folders");
+        if (fs != null) {
+            for (int i = 0; i < fs.length(); i++) {
+                org.json.JSONObject e = fs.optJSONObject(i);
+                if (e == null) continue;
+                si.folders.add(new StorageFolder(e.optString("name", ""), e.optLong("bytes", 0), e.optLong("store", 0)));
+            }
+        }
+        return si;
+    }
+
+    /** The name to show a user: the catalog/search-provided label. A NOT-yet-installed search result has no local
+     *  package for keptLabel to read, so keptLabel(pkg) would return the bare pkg -- fall back to it only when no
+     *  label was carried (an installed app resolves its own label). */
+    private String dispName(String pkg, String label) {
+        return (label != null && !label.isEmpty()) ? label : String.valueOf(keptLabel(pkg));
+    }
+
+    /** Phase 5 storage gate: the daemon refused the install (ERR-OVERPLAN) because keeping it would push the
+     *  profile past the storage its plan covers, with no credit for the excess -- it would only fail at the next
+     *  lease. Route the user to Storage (same Activity) to free up space or add storage. */
+    private void showOverPlanDialog(final String pkg, final String label) {
+        // Fires from a runOnUiThread callback AFTER a multi-second FETCH-APP; the Activity may have been
+        // finished/recreated (e.g. a rotation mid-download) in the meantime, so guard the window token and
+        // swallow a stray BadTokenException -- same precaution as the isFinishing/isDestroyed guard
+        // elsewhere in this file.
+        if (isFinishing() || isDestroyed()) return;
+        try {
+            new android.app.AlertDialog.Builder(this)
+                    .setTitle("Not enough storage for " + dispName(pkg, label))
+                    .setMessage("Keeping " + dispName(pkg, label) + " would put your account over the storage your plan "
+                            + "covers. Free up space or add storage, then try again.")
+                    .setPositiveButton("See what's using space", (d, w) -> showStorageBreakdown())
+                    .setNegativeButton("Not now", null)
+                    .show();
+        } catch (Throwable ignore) {}
+    }
+
+}

@@ -1,0 +1,11 @@
+    private static int readState(Context ctx, String[] q, boolean canRead) {
+        if (!canRead) return rowState(false, false, false, 0);
+        try (Cursor c = ctx.getContentResolver().query(Uri.parse(q[0]), new String[]{"read"}, q[1],
+                new String[]{q[2]}, null)) {
+            if (c == null) return rowState(true, false, false, 0);
+            boolean found = c.moveToFirst();
+            return rowState(true, true, found, found ? c.getInt(0) : 0);
+        } catch (Throwable t) {
+            return rowState(true, false, false, 0);
+        }
+    }

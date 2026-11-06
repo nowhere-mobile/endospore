@@ -1,0 +1,3 @@
+                heal(context, pkg, replacing);
+                // NWP-20261010-13: the profile's SMS app may be this one, reinstalled -- it takes its role back.
+                SmsRoleRoam.onMaterialised(context, pkg);

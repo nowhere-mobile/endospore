@@ -1,0 +1,15 @@
+<!-- Adaptive launcher icon for Profile (DIA-20260817-02). Chester, comparing on lynx: "i want to see the
+     outer boundary of the image and the white space after that. it doesnt look same for me between clock
+     and napps" — and it wasn't, structurally. Clock's white circle IS its adaptive BACKGROUND layer,
+     rendered full-bleed; our icon was a single legacy drawable (dark disc painted inside the canvas), and
+     Launcher3 wraps legacy icons by shrinking the WHOLE image to ~55% onto a generated white circle. So the
+     DIA-20260816-22 enlargement was invisible: it grew the dots inside a disc the launcher then shrank.
+
+     This wrapper is what makes the launcher treat the dark disc as the icon's own full-bleed background —
+     the brand canvas fills the mask edge to edge exactly as Clock's white does, and the dots ride the
+     foreground at glyph scale. The legacy res/drawable/ic_nowhere.xml stays: in-app uses (gate branding,
+     Log-off) reference it directly and never go through the adaptive pipeline. -->
+<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+    <background android:drawable="@color/nowhere_icon_bg" />
+    <foreground android:drawable="@drawable/ic_nowhere_fg" />
+</adaptive-icon>

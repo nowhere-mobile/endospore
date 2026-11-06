@@ -1,0 +1,236 @@
+{
+  "schema": 1,
+  "ring": "stable",
+  "generated": 1785538594,
+  "entries": [
+    {
+      "pkg": "org.videolan.vlc",
+      "versionCode": 13070106,
+      "versionName": "3.7.1",
+      "label": "VLC",
+      "category": "Cast",
+      "description": "The best video and music player. Fast and \u201cjust works\u201d, plays any file",
+      "sizeBytes": 47990842,
+      "source": "fdroid",
+      "signingCert": "80535be61eedb9a03b0476a6f493d496c3498770404339ea7a8000f5e61d22c0",
+      "iconRef": "https://f-droid.org/repo/org.videolan.vlc/en-US/icon_yAfSvPRJukZzMMfUzvbYqwaD1XmHXNtiPBtuPVHW-6s=.png",
+      "apks": [
+        {
+          "name": "base.apk",
+          "url": "https://f-droid.org/repo/org.videolan.vlc_13070106.apk",
+          "sha256": "355ff246a0348c094a256926ea31cbec92701a2faca3d41d49170798c550ee3b",
+          "size": 47990842
+        }
+      ]
+    },
+    {
+      "pkg": "com.fsck.k9",
+      "versionCode": 39041,
+      "versionName": "21.0",
+      "label": "K-9 Mail",
+      "category": "Email",
+      "description": "Full-featured email client",
+      "sizeBytes": 10682170,
+      "source": "fdroid",
+      "signingCert": "c430665e3662253b2078dcda350c2c6ce44d915a3d8a147b63ced619bb9e8576",
+      "iconRef": "https://f-droid.org/repo/com.fsck.k9/en-US/icon_-2bZW0ZnkKqPVher2SxQK8hXGGSjgaBHoa8x6vW0v8w=.png",
+      "apks": [
+        {
+          "name": "base.apk",
+          "url": "https://f-droid.org/repo/com.fsck.k9_39041.apk",
+          "sha256": "f7d99242fe134d58ea63b759e49c874d549077bda0fb9b2d53c3b56468fe5372",
+          "size": 10682170
+        }
+      ]
+    },
+    {
+      "pkg": "org.fdroid.fdroid",
+      "versionCode": 1023052,
+      "versionName": "1.23.2",
+      "label": "F-Droid",
+      "category": "App Store & Updater",
+      "description": "The app store that respects freedom and privacy",
+      "sizeBytes": 12426276,
+      "source": "fdroid",
+      "signingCert": "43238d512c1e5eb2d6569f4a3afbf5523418b82e0a3ed1552770abb9a9c9ccab",
+      "iconRef": "https://f-droid.org/repo/org.fdroid.fdroid/en-US/icon_0slNR8J9edqDZDoyWABFZrqQONU9EyiNVwM6B3Jui_Q=.png",
+      "apks": [
+        {
+          "name": "base.apk",
+          "url": "https://f-droid.org/repo/org.fdroid.fdroid_1023052.apk",
+          "sha256": "985f5181d48bb6bafd54083a048b391271e0ab28385881cc41294fb01a222762",
+          "size": 12426276
+        }
+      ]
+    },
+    {
+      "pkg": "eu.siacs.conversations",
+      "versionCode": 4217804,
+      "versionName": "2.20.1+free",
+      "label": "Conversations",
+      "category": "Internet",
+      "description": "Encrypted, easy-to-use XMPP instant messenger for your mobile device",
+      "sizeBytes": 31714960,
+      "source": "fdroid",
+      "signingCert": "c75abe78593643ae7cac527327cd2193482db067404a88b8c13f7a0701946187",
+      "iconRef": "https://f-droid.org/repo/eu.siacs.conversations/en-US/icon_hjL1SjuLrU9_UUIRtKM8JJocd8SF0plDL70VFGPUbGc=.png",
+      "apks": [
+        {
+          "name": "base.apk",
+          "url": "https://f-droid.org/repo/eu.siacs.conversations_4217804.apk",
+          "sha256": "dac24c81ba4ca0bbb73dfa11c42eaa90c34fd8375941a0874b37159e2ac07e4d",
+          "size": 31714960
+        }
+      ]
+    },
+    {
+      "pkg": "org.breezyweather",
+      "versionCode": 60201,
+      "versionName": "6.2.1_freenet",
+      "label": "Breezy Weather",
+      "category": "Internet",
+      "description": "A feature-rich weather app with good visualizations and many sources.",
+      "sizeBytes": 20599441,
+      "source": "fdroid",
+      "signingCert": "29d435f70aa9aec3c1faff7f7ffa6e15785088d87f06ecfcab9c3cc62dc269d8",
+      "iconRef": "https://f-droid.org/repo/org.breezyweather/en-US/icon_e18rWq0tKc__3173BVXmiiasM_F7yrUbs6kh7lQffto=.png",
+      "apks": [
+        {
+          "name": "base.apk",
+          "url": "https://f-droid.org/repo/org.breezyweather_60201.apk",
+          "sha256": "ac2715f6165b42fb34a6bfd2bfe4fb5812e74fbf23397fd872710f362082741e",
+          "size": 20599441
+        }
+      ]
+    },
+    {
+      "pkg": "org.schabi.newpipe",
+      "versionCode": 1013,
+      "versionName": "0.28.8",
+      "label": "NewPipe",
+      "category": "Internet",
+      "description": "Lightweight YouTube frontend",
+      "sizeBytes": 10901946,
+      "source": "fdroid",
+      "signingCert": "964dfa418e66390110b0c061a0497cbbd7395b8b2526bee4dece95597eb5e9d4",
+      "iconRef": "https://f-droid.org/repo/org.schabi.newpipe/en-US/icon_OHy4y1W-fJCNhHHOBCM9V_cxZNJJgbcNkB-x7UDTY9Q=.png",
+      "apks": [
+        {
+          "name": "base.apk",
+          "url": "https://f-droid.org/repo/org.schabi.newpipe_1013.apk",
+          "sha256": "88a1c99ca48394af431b24379783165860aaab3f7f45cce9ca6b8a7d2139a4d6",
+          "size": 10901946
+        }
+      ]
+    },
+    {
+      "pkg": "com.beemdevelopment.aegis",
+      "versionCode": 81,
+      "versionName": "3.4.2",
+      "label": "Aegis Authenticator",
+      "category": "Password & 2FA",
+      "description": "Free, secure and open source 2FA app to manage tokens for your online services",
+      "sizeBytes": 6604352,
+      "source": "fdroid",
+      "signingCert": "09cfde62e2a81c8050d3be4c20e3f8d8ddd01531be1b47cb3b0eec213f641f89",
+      "iconRef": "https://f-droid.org/repo/com.beemdevelopment.aegis/en-US/icon_C951ZFTL5UuK5VK6KaIOnVy5NNb0Wqe8asl4v1fSXLI=.png",
+      "apks": [
+        {
+          "name": "base.apk",
+          "url": "https://f-droid.org/repo/com.beemdevelopment.aegis_81.apk",
+          "sha256": "ab633d31cc0fa49e3ae29a3b816a7fcbe04033a3227f42bd30cf86fcd3be4159",
+          "size": 6604352
+        }
+      ]
+    },
+    {
+      "pkg": "de.danoeh.antennapod",
+      "versionCode": 3110495,
+      "versionName": "3.11.4",
+      "label": "AntennaPod - Podcast Player",
+      "category": "Multimedia",
+      "description": "Easy-to-use, flexible and open-source podcast manager and player",
+      "sizeBytes": 12295036,
+      "source": "fdroid",
+      "signingCert": "179430565a4a04bfe7827483243099bd10870410800cd7c4c7b48d8d3226df55",
+      "iconRef": "https://f-droid.org/repo/de.danoeh.antennapod/en-US/icon_w44b41PyuNt3pI7Gh8zYHJrWgu__3HT7YSWZtttfenk=.png",
+      "apks": [
+        {
+          "name": "base.apk",
+          "url": "https://f-droid.org/repo/de.danoeh.antennapod_3110495.apk",
+          "sha256": "8faee459f952e62e5c12be18620911b01c15b5fa0ee67768dcf8ae1e1a68b09c",
+          "size": 12295036
+        }
+      ]
+    },
+    {
+      "pkg": "me.hackerchick.catima",
+      "versionCode": 166,
+      "versionName": "2.42.1",
+      "label": "Catima \u2014 Loyalty Card Wallet",
+      "category": "Pass Wallet",
+      "description": "For your barcodes, memberships, loyalty programs, coupons and tickets.",
+      "sizeBytes": 4948926,
+      "source": "fdroid",
+      "signingCert": "62864db787cc31928dc2c114673cdbb017beabb13ba6df6ae5256e738bb953ae",
+      "iconRef": "https://f-droid.org/repo/me.hackerchick.catima/en-US/icon_VCZNh2txtHoqGn3oaxFP6g8LJ0-CdYJdYhrrtS5X9B8=.png",
+      "apks": [
+        {
+          "name": "base.apk",
+          "url": "https://f-droid.org/repo/me.hackerchick.catima_166.apk",
+          "sha256": "4105e0f1f8e53893d6294729c39f974ee9248f3a8caede5b6e1192d475888a17",
+          "size": 4948926
+        }
+      ]
+    },
+    {
+      "pkg": "com.omgodse.notally",
+      "versionCode": 57,
+      "versionName": "6.2",
+      "label": "Notally | Minimalist Notes",
+      "category": "Note",
+      "description": "A simple and elegant open source notes app",
+      "sizeBytes": 1883907,
+      "source": "fdroid",
+      "signingCert": "f3d1c4fdf1c32823aa54633141df0d429a809ec0798c0cd191cc97c218600c5b",
+      "iconRef": "https://f-droid.org/repo/com.omgodse.notally/en-US/icon_IFXaz8dy-Vo9RHOuCuPSvslGZGerMdK6vLai6gC3GqA=.png",
+      "apks": [
+        {
+          "name": "base.apk",
+          "url": "https://f-droid.org/repo/com.omgodse.notally_57.apk",
+          "sha256": "545050cd6da0d5ab2b6a3c7c73e8ca26b4de8225db948fa6eb630512ffb0eb56",
+          "size": 1883907
+        }
+      ]
+    },
+    {
+      "pkg": "net.thunderbird.android",
+      "versionCode": 27,
+      "versionName": "20.1",
+      "label": "Thunderbird: Free Your Inbox",
+      "category": "Connectivity",
+      "description": "Thunderbird is a 100% open source, privacy focused email app.",
+      "sizeBytes": 10671224,
+      "source": "fdroid",
+      "signingCert": "b6524779b3dbbc5ac17a5ac271ddb29dcfbf723578c238e03c3c217811356dd1",
+      "iconRef": "https://f-droid.org/repo/net.thunderbird.android/en-US/icon_llBuXRxsJFITCCuDze-ENOPa1J_HFZLudN5K3gU-xiU=.png",
+      "apks": [
+        {
+          "name": "base.apk",
+          "url": "https://f-droid.org/repo/net.thunderbird.android_27.apk",
+          "sha256": "f98236bc59f261c839a5928831b75ef134838b1cf9d87d71547ce0b289c68c0a",
+          "size": 10671224
+        }
+      ]
+    },
+    {
+      "pkg": "org.thoughtcrime.securesms",
+      "label": "Signal",
+      "category": "Messaging",
+      "description": "Private messenger with end-to-end encrypted calls and texts",
+      "iconRef": "data:image/png;base64,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",
+      "source": "play",
+      "apks": []
+    }
+  ]
+}

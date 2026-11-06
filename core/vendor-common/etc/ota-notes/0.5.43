@@ -1,0 +1,8 @@
+version 0.5.43
+previous 0.5.42
+- Software update now shows what's new in each update.
+- Texts and calls that arrive while you're signing in or out now reach your profile, and only once.
+- You can tie a profile to this phone from its settings, and untie it later. New profiles are no longer tied automatically.
+- An app you tap downloads next, and Auto apps can be marked "Download first".
+- Messaging apps restored in the background start up again, so their notifications arrive.
+- A profile tied to another phone opens here as a blank session, and its saved data is left untouched.

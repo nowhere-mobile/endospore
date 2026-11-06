@@ -1,0 +1,15 @@
+private void disableRoamedDialerComponents(int uid) {
+        if (uid <= 0) return;
+        try {
+            final android.content.pm.PackageManager pm =
+                    createContextAsUser(android.os.UserHandle.of(uid), 0).getPackageManager();
+            for (String c : roamedDialerComponents()) {
+                try {
+                    pm.setComponentEnabledSetting(
+                            new android.content.ComponentName(getPackageName(), getPackageName() + c),
+                            android.content.pm.PackageManager.COMPONENT_ENABLED_STATE_DISABLED,
+                            android.content.pm.PackageManager.DONT_KILL_APP);
+                } catch (Throwable t) { android.util.Log.w("NowhereChooser", "disable chooser dialer component " + c, t); }
+            }
+        } catch (Throwable t) { android.util.Log.w("NowhereChooser", "disableRoamedDialerComponents", t); }
+    }

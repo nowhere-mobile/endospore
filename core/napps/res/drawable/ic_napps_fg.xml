@@ -1,0 +1,23 @@
+<!-- nApps adaptive-icon FOREGROUND (DIA-20260817-02): the four-dot brand mark alone - the dark disc moved
+     to the background layer (see mipmap-anydpi-v26/ic_napps.xml), which is what lets the launcher render it
+     full-bleed instead of shrinking the whole canvas to 52% (measured on lynx, vs Clock's glyph at 63%).
+
+     Geometry: the same nav brand mark (viewBox 0 0 20 20: 10,14.6 r3 | 5.4,8.4 r2 | 14.3,7.6 r2.2 |
+     10,4 r1.4), scaled so the cluster's bounding box is 46 units of this 108-unit canvas, centred at 54.
+     The launcher displays roughly the central 72 of an adaptive foreground's 108, so 46/72 = 64% of the
+     visible circle - matching Clock's measured 63%. Furthest dot edge is 23.0 units from centre, well
+     inside the 33-unit safe zone, so no mask shape can clip it. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path android:fillColor="#4FD6AC"
+        android:pathData="M54.15,67.8 m-9.2,0 a9.2,9.2 0 1,0 18.4,0 a9.2,9.2 0 1,0 -18.4,0 Z" />
+    <path android:fillColor="#4FD6AC"
+        android:pathData="M40.05,48.79 m-6.13,0 a6.13,6.13 0 1,0 12.26,0 a6.13,6.13 0 1,0 -12.26,0 Z" />
+    <path android:fillColor="#4FD6AC"
+        android:pathData="M67.34,46.33 m-6.75,0 a6.75,6.75 0 1,0 13.5,0 a6.75,6.75 0 1,0 -13.5,0 Z" />
+    <path android:fillColor="#4FD6AC"
+        android:pathData="M54.15,35.29 m-4.29,0 a4.29,4.29 0 1,0 8.58,0 a4.29,4.29 0 1,0 -8.58,0 Z" />
+</vector>

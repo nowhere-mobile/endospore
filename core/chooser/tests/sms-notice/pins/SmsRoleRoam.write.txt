@@ -1,0 +1,11 @@
+    private static boolean write(Context ctx, String name, String text) {
+        java.io.File dir = ctx.getFilesDir(), tmp = new java.io.File(dir, name + ".tmp");
+        try {
+            java.nio.file.Files.write(tmp.toPath(), text.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            if (tmp.renameTo(new java.io.File(dir, name))) return true;
+        } catch (Throwable t) {
+            android.util.Log.w("NowhereChooser", "NWP-20261010-13 write " + name, t);
+        }
+        tmp.delete();
+        return false;
+    }

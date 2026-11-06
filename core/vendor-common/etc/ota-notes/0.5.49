@@ -1,0 +1,8 @@
+version 0.5.49
+previous 0.5.48
+- The gate's owner settings add Appearance › Light mode, which the call and alarm screens follow, and the gate's Settings add Airplane mode beside Wi-Fi.
+- Your apps lists keyboards and other apps without an icon, so you can keep them; opening an On-demand app installs its newer version if the App store has one.
+- An On-demand app that needs Google Play services first shows the download size and asks, and Auto apps wait for Wi-Fi unless Download over mobile data is on.
+- Your autofill service comes back when you sign in, and apps that start with the phone, such as car keys and VPNs, now start after sign-in without being opened.
+- Signing out during an app download stops it and saves instead of restarting the phone, and Your data and Back up now say what a save left out and why.
+- The Wi-Fi hotspot now starts and its passphrase has a show/hide eye, and at the gate the volume keys set the volume of a call you have answered.

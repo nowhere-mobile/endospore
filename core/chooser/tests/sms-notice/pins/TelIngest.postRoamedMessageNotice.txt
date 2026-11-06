@@ -1,0 +1,45 @@
+    private static void postRoamedMessageNotice(Context ctx, String tag, String from, String subject, String preview,
+                                                String mediaLabel, long when) {
+        try {
+            android.app.NotificationManager nm = ctx.getSystemService(android.app.NotificationManager.class);
+            if (nm == null) return;
+            SmsDeliverReceiver.ensureTelChannel(nm); // HIGH + explicit sound + vibrate -> the roamed session alerts
+            String title = from == null || from.isEmpty() ? "New message" : from;
+            String body = preview == null ? "" : preview.trim();
+            if (body.isEmpty() && subject != null) body = subject.trim();
+            if (mediaLabel != null) body = body.isEmpty() ? mediaLabel : (body + "  " + mediaLabel);
+            if (body.isEmpty()) body = "New message";
+            android.app.PendingIntent pi = android.app.PendingIntent.getActivity(ctx, (int) when,
+                    messageTapIntent(ctx, from),
+                    android.app.PendingIntent.FLAG_IMMUTABLE | android.app.PendingIntent.FLAG_UPDATE_CURRENT);
+            android.os.Bundle named = new android.os.Bundle();
+            named.putString(SmsDeliverReceiver.EXTRA_SUBST_APP_NAME, SmsDeliverReceiver.substituteAppName(tag.startsWith("mms:") ? "mms" : "sms"));
+            android.app.Notification locked = new android.app.Notification.Builder(ctx, TEL_CHANNEL) // the public version
+                    .setSmallIcon(R.drawable.ic_notif_message)
+                    .addExtras(named)
+                    .setContentTitle("New message")
+                    .setCategory(android.app.Notification.CATEGORY_MESSAGE)
+                    .setWhen(when)
+                    .setShowWhen(true)
+                    .build();
+            android.app.Notification.Builder b = new android.app.Notification.Builder(ctx, TEL_CHANNEL)
+                    .setSmallIcon(R.drawable.ic_notif_message)
+                    .setContentTitle(title)
+                    .setContentText(body)
+                    .setCategory(android.app.Notification.CATEGORY_MESSAGE)
+                    .setGroup(MessageGroup.KEY)
+                    .setVisibility(android.app.Notification.VISIBILITY_PRIVATE)
+                    .setPublicVersion(locked)
+                    .addExtras(named)
+                    .setWhen(when)
+                    .setShowWhen(true)
+                    .setAutoCancel(true)
+                    .setContentIntent(pi);
+            // id keyed on the arrival-ms so a re-verify pass or re-login updates rather than stacks duplicates,
+            // while two different MMS still get distinct notifications.
+            nm.notify(tag, (int) (when ^ (when >>> 32)), b.build());
+            syncMessageSummary(ctx); // NWP-20261118-16: the group's own summary, so Android never posts its own
+        } catch (Throwable t) {
+            android.util.Log.w("NowhereChooser", "roamed message notice", t);
+        }
+    }

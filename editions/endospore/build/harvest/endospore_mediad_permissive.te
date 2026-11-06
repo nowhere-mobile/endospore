@@ -1,0 +1,27 @@
+# HARVEST-ONLY. NEVER SHIPPED. NEVER REFERENCED FROM THE STAGED SEPOLICY DIR.
+#
+# This file lives OUTSIDE editions/endospore/vendor/ on purpose, so the rsync that stages the sepolicy cannot
+# pick it up. stage-vendor.sh copies it into the staged sepolicy dir only when NOWHERE_SEPOLICY_HARVEST=1, and
+# DELETES any stale copy on every other build -- so a harvest build followed by a normal build cannot leave a
+# permissive domain behind. Making that structural rather than a convention is the point: endospore.te records
+# two occasions (lines 19-36 and 178-190) where a suppression that was true on a dev device and false
+# everywhere else shipped, and each one cost a release image and a day of diagnosis.
+#
+# WHAT IT IS FOR. endospore_mediad is a brand-new domain, so it starts with no rules at all and a first
+# enforcing boot would deny its way through every step of a path that is already known to fail quietly. One
+# permissive run on lynx collects the whole denial set instead, and round 2 folds it in and drops this file.
+#
+# WHAT IT CANNOT TELL YOU. Permissive silently waives MLS/MCS category constraints and some binder callbacks
+# WITHOUT LOGGING ANYTHING. A harvest taken under it looks complete and is not. Anything in that class --
+# mlstrustedsubject above all -- must be reasoned about and written into endospore_mediad.te directly, which
+# is why it already carries the typeattribute rather than waiting for this run to suggest it.
+#
+# HOW TO USE IT:
+#   NOWHERE_SEPOLICY_HARVEST=1 <the usual build>    then flash lynx and exercise EVERY mediad path --
+#   login with deferred media, open a deferred file in the owning app, write one back, the #129 external
+#   /data/media scope, cold-lock park/resume, and the logoff teardown + sweep.
+#   Collect with: dmesg | grep endospore_mediad
+# Then write the rules, rebuild WITHOUT the flag, and verify the OUTCOME (a nonzero fuse.nowheremedia count in
+# /proc/mounts and an app actually reading through the overlay) -- not merely the absence of denials.
+
+permissive endospore_mediad;

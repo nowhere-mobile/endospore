@@ -1,0 +1,18 @@
+<?xml version='1.0' encoding='utf-8' standalone='yes' ?>
+<!--
+  Nowhere (#136 A3.b): pre-grant READ_PHONE_STATE to the chooser so owner mode can read active SIMs
+  (SubscriptionManager.getActiveSubscriptionInfoList) to bind each SIM to its owning profile(s).
+
+  READ_PHONE_STATE is DANGEROUS (runtime) since API 33 and the chooser targets SDK 34, so privapp-permissions
+  (signature|privileged only) does NOT grant it, so without this exception the SIM list comes up empty and the
+  binding UI has to fall back to manual ICCID entry. Same mechanism as the POST_NOTIFICATIONS + geotz grants.
+  fixed="false" leaves it user-revocable.
+
+  NOTE: the ICCID (the stable binding key) additionally needs READ_PRIVILEGED_PHONE_STATE, which is
+  signature|privileged and is granted via the chooser's privapp-permissions (not here).
+  -->
+<exceptions>
+    <exception package="com.nowhere.chooser">
+        <permission name="android.permission.READ_PHONE_STATE" fixed="false"/>
+    </exception>
+</exceptions>

@@ -1,0 +1,76 @@
+# patch-markers.tsv -- the machine-checked form of docs/framework-patches.md's Verify column (NWP-20261020-04).
+#
+# build-device.sh runs check-patch-markers.py against this table AFTER `m` and the build-number assert, BEFORE
+# signing, on the artifact that assert read (the target-files zip, or the product tree of a dev image build). A row
+# whose literal is missing from the built artifact fails the build: an upstream sync can leave an anchor that still
+# matches while the patch's own edit lands nowhere, the script exits 0, and nothing else notices.
+# CI runs `check-patch-markers.py --self-check .`, which holds this table to the patch scripts (below).
+#
+# FORMAT. Tab-separated, four columns, '#' starts a comment line. NO leading or trailing space in any text: a
+# column ends at the next tab.
+#   <patch basename>  <artifact basename>  <kind>  <text>
+# <patch basename> resolves to the script build-device.sh APPLIES, never to a same-named script elsewhere: a name in
+#   its GOS_MANDATED_PATCHES list -> editions/diaspore/build/patches/<n>; otherwise editions/endospore/build/patches/<n>
+#   (so telephony-per-user.sh is the Endospore copy); otherwise editions/endospore/devices/*/patches/<n>, where a
+#   need/absent text must appear in EVERY device's copy.
+# <artifact basename> is found by basename in the target-files zip, or under system/ system_ext/ product/ vendor/ of
+#   a product tree; exactly one match is required. An .apk/.jar is read as a zip and every classes*.dex in it is
+#   searched; any other artifact is searched as raw bytes. `-` for exempt.
+# <kind>:
+#   need     the text MUST be present: a literal the patch writes into the source.
+#   control  a STOCK literal that must be present: it proves the right bytes were read, so a missing `need` means
+#            the patch is absent and not that the wrong file was opened.
+#   absent   the text must NOT be present: the original text the patch replaces.
+#   exempt   the patch has no artifact literal that meets the two rules below; <text> is the reason.
+#
+# MARKER RULES. (a) A `need` text is a literal the patch writes as ONE contiguous string constant (a Java string
+# literal, one piece of a Rust format string between placeholders, a sepolicy token), copied from the SCRIPT, not
+# from the register; where they disagree the script wins. (b) It is SPECIFIC to ONE patch: it contains a
+# Nowhere-only token (nowhere, Nowhere, a NWP-/DIA- work id) and appears in no other applied script. services.jar
+# carries the literals of about eight patches and `com.nowhere.chooser` is inserted by two of them, so a shared or
+# generic text would let one patch's literal stand in for another's absence.
+# A patch that inserts no such literal is exempt, with the reason. Every applied patch needs a row; a NEW patch is not
+# done until it has one (docs/framework-patches.md, THE ONE RULE).
+#
+# patch	artifact	kind	text
+ssaid-userkey-seed.sh	SettingsProvider.apk	need	nowhere-ssaid-seed
+ssaid-userkey-seed.sh	SettingsProvider.apk	need	nowhere: seeded ssaid userkey for user
+keystore-roam.sh	keystore2	need	KeystoreDB::nowhere_dump_user_keys
+keystore-roam.sh	keystore2	need	KeystoreDB::nowhere_import_keys
+keystore-roam.sh	keystore2	need	/data/misc/keystore/nowhere-export
+endospore-accountsdb-close-ce.sh	services.jar	need	nowhere: closed the CE accounts db with the DE one (NWP-20261004-01)
+endospore-ams-stopped-user-snapshot.sh	services.jar	need	starting -- stopped-user snapshot dropped (NWP-20261005-22)
+endospore-settings-locglobals-root.sh	SettingsProvider.apk	need	nowhere: allowed root to write protected setting
+endospore-settings-locglobals-root.sh	SettingsProvider.apk	control	allowed shell to access protected setting
+endospore-ams-account-reload.sh	-	exempt	every literal it inserts is a Log tag message or a shell verb with no Nowhere-only token (roam #732 is not a work id), so none meets marker rule (b); its tell is the logcat line in the register
+keyguard-roaming-noocclude.sh	services.jar	need	nowhere: in-call lock exemption on (NWP-20261013-08)
+keyguard-roaming-noocclude.sh	services.jar	control	Duplicate startWrite call?
+systemui-no-restart-doze.sh	SystemUI.apk	need	Nowhere: NOT restarting sleep state (NWP-20260825-03)
+systemui-no-restart-doze.sh	SystemUI.apk	absent	Restarting sleep state
+sms-raw-no-sim-filter.sh	TelephonyProvider.apk	need	Nowhere: raw query not filtered by SIM links (NWP-20260929-02)
+sms-raw-no-sim-filter.sh	TelephonyProvider.apk	need	Nowhere: raw query not filtered for the gate app (h49 #6)
+sms-raw-no-sim-filter.sh	TelephonyProvider.apk	control	raw/permanentDelete
+system-userdir-guard.sh	framework.jar	need	nowhere: refused to re-create the missing system dir of user
+system-userdir-guard.sh	framework.jar	control	Failed to create directory for
+system-userdir-guard.sh	services.jar	need	nowhere: refused to re-create the missing system dir of user
+system-userdir-guard.sh	services.jar	need	stale entries discarded (NWP-20261003-01)
+system-userdir-guard.sh	services.jar	need	orphan system dir(s) of removed users at boot (NWP-20261003-01): user ids
+system-userdir-guard.sh	services.jar	control	Duplicate startWrite call?
+vpn-lockdown-on-first-connect.sh	services.jar	need	Nowhere: VPN block armed at the first connection for user
+sepolicy-app-media-manage.sh	plat_sepolicy.cil	need	nowhere_media_file
+sepolicy-app-media-manage.sh	system_ext_sepolicy.cil	need	nowhere_media_file
+settings-fallbackhome-resume.sh	-	exempt	its only inserted words, Resuming and Finishing booting, are generic and carry no Nowhere-only token (marker rule (b)), and the script writes them as …-escaped Java text
+gos-chooser-grant.sh	-	exempt	the one literal it inserts, com.nowhere.chooser, is also inserted by endospore-gmscompat-chooser-exempt.sh, so it could not prove this patch (marker rule (b)); its tell is the chooser's gos apply log line
+endospore-gmscompat-chooser-exempt.sh	-	exempt	the one literal it inserts, com.nowhere.chooser, is also inserted by gos-chooser-grant.sh (marker rule (b)); its tell is behavioural, Play packages reinstall at roam-in
+endospore-gmscompat-incremental-hide.sh	-	exempt	inserts no Nowhere-only literal; its tell is behavioural, a first-tap big-game install after a roam
+subscription-user-filter.sh	-	exempt	inserts no Nowhere-only literal; its tell is behavioural, the eSIM missing from the roamed SMS picker
+libselinux-pkgdir-uid-aliasing.sh	-	exempt	its only Nowhere-only token is a C local variable, which a stripped libselinux does not carry; the register records that it has no tell
+telephony-per-user.sh	-	exempt	the edit deletes android:singleUser attributes from AndroidManifest.xml, which the build compiles to binary XML with no searchable literal; the script itself refuses a missed or over-reaching edit (exit 2, NWP-20261021-05) and prints the surviving count
+launcher3-no-autoadd-home.sh	-	exempt	flips a Kotlin boolean constant and an XML default; the script asserts its own end state and exits 1 or 2 on drift
+recovery-rebrand.sh	-	exempt	edits two recovery title strings; the script asserts both and exits 2 on drift (NWP-20261011-15)
+endospore-brand-strings.sh	-	exempt	edits resources only; the script asserts its own end state and exits 2 on drift (NWP-20261013-29)
+endospore-attest-strings.sh	-	exempt	edits resources only; the script asserts its own end state and exits 2 on drift (NWP-20261013-29)
+launcher3-grid.sh	-	exempt	edits XML attributes only; the script asserts its own end state and exits 2 on drift (NWP-20261011-15)
+launcher3-qsb-firstscreen.sh	-	exempt	flips a boolean constant the compiler inlines; the script asserts its own end state and exits 2 on drift (NWP-20261011-15)
+launcher3-media-progress-ring.sh	Launcher3QuickStep.apk	need	app.nowhere.MEDIA_PROGRESS
+launcher3-media-ring-smooth.sh	-	exempt	adds a field and arithmetic, and inserts no string literal; the script exits 3 when the ring is missing and 2 when its anchors drift

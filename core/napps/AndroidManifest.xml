@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- nApps (DIA-20260818-08, closes #747): the storefront as its OWN package, so it appears in
+     Settings > Apps as its own app. It previously had a launcher icon but lived inside
+     com.nowhere.chooser, and Settings enumerates PACKAGES — so it could never show up there
+     however it was labelled.
+
+     This APK holds NO authority. No INTERNET permission, no login-socket access, no install
+     permission: it binds com.nowhere.chooser/.StoreService and asks. The daemon still pins exactly
+     one package on its socket (audit #2, DIA-20260618-08) and the install still happens where the
+     privileged permission already lives. The split buys a Settings entry without buying a second
+     trusted peer. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.nowhere.napps"
+    android:versionCode="5"
+    android:versionName="1.0">
+  <uses-sdk android:minSdkVersion="24" android:targetSdkVersion="34"/>
+
+  <!-- Signature-level, declared by the chooser. Both APKs carry the platform cert, so this binds and
+       nothing else on the device can. -->
+  <uses-permission android:name="com.nowhere.chooser.permission.STORE"/>
+
+  <!-- QUERY_ALL_PACKAGES: the rows read "Get" / "Update" / "Added" from what is actually installed, so
+       the list must see beyond this app's own package visibility. Signature|privileged. -->
+  <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES"/>
+
+  <application
+      android:label="nApps"
+      android:icon="@mipmap/ic_napps"
+      android:allowBackup="false"
+      android:supportsRtl="true">
+    <activity android:name=".StoreActivity"
+              android:exported="true"
+              android:label="nApps"
+              android:theme="@android:style/Theme.Material.NoActionBar"
+              android:excludeFromRecents="false">
+      <intent-filter>
+        <action android:name="android.intent.action.MAIN"/>
+        <category android:name="android.intent.category.LAUNCHER"/>
+      </intent-filter>
+    </activity>
+  </application>
+</manifest>

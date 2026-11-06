@@ -1,0 +1,34 @@
+    private static android.content.Intent messageTapIntent(Context ctx, String from) {
+        android.content.pm.PackageManager pm = ctx.getPackageManager();
+        String holder = null;
+        try { holder = android.provider.Telephony.Sms.getDefaultSmsPackage(ctx); } catch (Throwable ignore) {}
+        boolean messaging = false;
+        try { pm.getPackageInfo(MESSAGING, 0); messaging = true; } catch (Throwable ignore) {}
+        String pkg = messageTapPackage(holder, ctx.getPackageName(), messaging ? MESSAGING : null);
+        boolean hasFrom = from != null && !from.isEmpty();
+        android.content.Intent view = hasFrom
+                ? new android.content.Intent(android.content.Intent.ACTION_VIEW, Uri.fromParts("sms", from, null)) : null;
+        boolean viewResolves = false;
+        if (view != null && pkg != null) {
+            view.setPackage(pkg);
+            try { viewResolves = view.resolveActivity(pm) != null; } catch (Throwable ignore) {}
+        }
+        android.content.Intent open;
+        switch (messageTapAction(hasFrom, pkg != null, viewResolves)) {
+            case "view":
+                open = view;
+                break;
+            case "sendto":
+                open = new android.content.Intent(android.content.Intent.ACTION_SENDTO, Uri.fromParts("smsto", from, null))
+                        .setPackage(pkg);
+                break;
+            default: // "launch": no sender to open a thread for -- the app's own entry, else any messaging app
+                open = pkg == null ? null : pm.getLaunchIntentForPackage(pkg);
+                if (open == null) {
+                    open = new android.content.Intent(android.content.Intent.ACTION_MAIN)
+                            .addCategory(android.content.Intent.CATEGORY_APP_MESSAGING);
+                }
+        }
+        open.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK);
+        return open;
+    }

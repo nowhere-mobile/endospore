@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The adaptive launcher icons' background layer (DIA-20260817-02): the brand canvas #0B0F14, same color
+     the legacy drawables paint as their disc. As an adaptive BACKGROUND it fills the launcher's mask edge
+     to edge - measured on lynx: a legacy icon's whole canvas is shrunk to 52% of the mask and set on a
+     generated white circle, while an adaptive background IS the full 130px circle (Clock renders its white
+     at 100% the same way). -->
+<resources>
+    <color name="nowhere_icon_bg">#0B0F14</color>
+</resources>
