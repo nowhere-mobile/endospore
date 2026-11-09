@@ -174,6 +174,12 @@ func oneTarEntry(frag []byte) (*tar.Header, []byte, error) {
 // (media_sync_test.go's empty_root_is_never_looked_up pins that such a write lands); both production callers
 // pass the scope root.
 func writeMaterialized(target, root string, hdr *tar.Header, data []byte) error {
+	return writeMaterializedVia(target, root, hdr, data, os.Rename)
+}
+
+// writeMaterializedVia is writeMaterialized with its last step passed in: finalize moves the finished temp to target.
+// The lander passes renameNoReplace (media_lander.go). A finalize error leaves no temp, through the deferred Remove.
+func writeMaterializedVia(target, root string, hdr *tar.Header, data []byte, finalize func(tmp, target string) error) error {
 	dir := filepath.Dir(target)
 	if root != "" {
 		if err := noLinkBelow(root, dir); err != nil {
@@ -244,7 +250,7 @@ func writeMaterialized(target, root string, hdr *tar.Header, data []byte) error 
 	if !hdr.ModTime.IsZero() {
 		_ = os.Chtimes(tmpName, hdr.ModTime, hdr.ModTime)
 	}
-	return os.Rename(tmpName, target)
+	return finalize(tmpName, target)
 }
 
 // errLinkOnPath and errNotDirOnPath: noLinkBelow's refusals. Their text names no path (a rel under Android/data

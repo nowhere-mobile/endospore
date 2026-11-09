@@ -528,7 +528,22 @@ func dropNamedSpent(plain []Token, blind []BlindToken, spent []string) (keepPlai
 
 // settlePayment returns the tokens the gateway did NOT charge (a delta lease may spend fewer than were
 // presented) to the wallet. The gateway collects nonces plain-first, then blind, so the first `spent` of
-// (plain ++ blind) are gone; the rest go back. Mutates the wallet in place.
+// (plain ++ blind) are gone; the rest go back, in order. `spent` is clamped to [0, len(plain)+len(blind)].
+// Mutates the wallet in place.
+//
+// ⚠ THIS MIRRORS THE GATEWAY'S ORDER, AND THE TWO MUST MOVE TOGETHER: nowhere-cloud
+// internal/gateway/gateway.go, handleLease's legacy loop (req.Tokens, then req.BlindTokens) and
+// collectTokens, both plain then blind. choosePayment TAKES blind first from the wallet, but the gateway
+// CHARGES plain first, so a mixed presentation gets its blind tail back. If either side changes the order
+// alone, this returns spent nonces and burns unspent tokens: bearer credit nobody can re-issue.
+//
+// The one known limit: the gateway SKIPS a token that fails Verify (a wrong denom, a repeated nonce, an
+// expired blind token). With such a token among the presented ones, the charged set is not a prefix, and
+// this positional rule can hand back a spent nonce. On the profile arms the next lease's 409 names it and
+// dropNamedSpent retires it (leaseRefsLocked's and capFlush's 409 arms, NWP-20261020-03). The profile-less
+// legacy arm (throwaways) retires nothing on a 409.
+//
+// Pinned by identity in settle_payment_test.go and test-settle-payment.sh (NWP-20261128-27).
 func (w *Wallet) settlePayment(plain []Token, blind []BlindToken, spent int) {
 	if spent < 0 {
 		spent = 0
@@ -1019,6 +1034,17 @@ func (g *gatewayClient) issueBatch(pub *rsa.PublicKey, denom, claim string, n in
 // with the same plan, and an identical repeat purchase is already re-bought by planPurchase because the balance still
 // covers the price.
 //
+// THE HOLD (Wallet.ActivateAfter, Q134). A purchase that REPLACES the plan starts a fresh hold once the stored one has
+// ended (NWP-20261129-05): planPurchase holds only while ActivateAfter is later than now, so a value at or before now
+// is a finished wait. Testing for zero is not enough: capFlush never clears ActivateAfter when a purchase lands and
+// walletForPublish keeps the later copy, so after a profile's first purchase it is never 0 again, and every later
+// purchase recorded no wait. A hold still running is kept, so a second top-up cannot keep pushing activation away --
+// the delay is a fixed privacy budget, not a penalty that compounds. A purchase that QUEUES never moves the hold of the
+// purchase it waits behind, even one that has passed; it starts a hold only when none was ever set.
+//
+// ⚠ RESIDUAL: a hold left in the FUTURE by an over-free activation (planPurchase ignores the hold when overFree) still
+// applies to a purchase redeemed before it ends, which then starts on that hold's batch day.
+//
 // mode is the customer's answer at redemption: "keep", "convert" (h51 #5, NWP-20261125-12) or "" when the question
 // was not asked. Any other mode records no answer.
 func applyPlanMode(w *Wallet, periods int64, gb int, mode string) {
@@ -1031,15 +1057,15 @@ func applyPlanMode(w *Wallet, periods int64, gb int, mode string) {
 		if last.GB != gb || last.Periods != periods || last.Keep != keep || last.Convert != convert {
 			w.PlanQueue = append(w.PlanQueue, PlanSpec{GB: gb, Periods: periods, Keep: keep, Convert: convert})
 		}
+		if w.ActivateAfter == 0 {
+			w.ActivateAfter = activationHold()
+		}
 	} else {
 		w.PlanGB, w.PlanPeriods, w.PlanKeep = gb, periods, keep
 		w.PlanConvert = convert
-	}
-	// Start the jitter window (see Wallet.ActivateAfter). Set only when it is not already running, so a
-	// second top-up cannot keep pushing activation away -- the delay is a fixed privacy budget, not a
-	// penalty that compounds.
-	if w.ActivateAfter == 0 {
-		w.ActivateAfter = activationHold()
+		if w.ActivateAfter <= nowEpoch() {
+			w.ActivateAfter = activationHold()
+		}
 	}
 }
 
@@ -3042,7 +3068,8 @@ func sealWalletValueDurable(base, name, pass string, dk []byte, walletPath strin
 // monotonic in MEANING -- a term never shortens, a deadline never nears, a plan size never falls except
 // through the gateway (which is why AccountPlanGB is NOT here; it is the gateway's own answer and must
 // be free to go down when a plan genuinely lapses). Taking the max is therefore not a guess about which
-// write came last; it is the true value in both.
+// write came last; it is the true value in both. The plan pair has two exceptions, each a waiting purchase: this
+// phone's (NWP-20261031-07, below) and the stored copy's, when the tokens carried fund it (NWP-20261129-10, below).
 //
 // ⚠ THE TOKENS ARE MERGED BY THE DECIDED RULE (NWP-20261031-01; decided 2026-10-20, Q107 -- "two signed-in handsets
 // merge their wallets"). Until then they were published unchanged, and a second handset's seal replaced the stored
@@ -3059,6 +3086,19 @@ func sealWalletValueDurable(base, name, pass string, dk []byte, walletPath strin
 // The pending claim codes (Wallet.PendingClaims, NWP-20261125-05) follow the token rule and its seen semantics. The
 // cost is the same shape: a code the OTHER phone cleared but this one still holds is published again, and lasts until
 // this phone's next drain, where the gateway's 402 proves it empty and clears it (one /issue round trip).
+//
+// ⚠ AN IDLE PHONE PUBLISHES THE OTHER PHONE'S PURCHASE WHOLE (NWP-20261129-10; decided 2026-10-20, "a bigger plan
+// starts at once ...": a smaller purchase "is never stranded: the wallet activates each purchase at its own size and
+// term"; and Q107: a publish carries the other phone's new credit). A phone that publishes the other phone's credit
+// must publish the purchase that credit pays for, at its own size, term, answer and queue. planPurchase prices at
+// PlanGB x PlanPeriods, so a max of two purchases prices a plan no balance funds: a 10 x 3 keep top-up redeemed on one
+// phone under the 50 x 12 plan the other holds was published as 50 x 12 beside 30 tokens, paid for and unspendable.
+// So when this phone has nothing waiting, the stored copy has, stored tokens were carried, and the published balance
+// funds the stored purchase, that purchase's plan fields, answer and queue are published; otherwise the max stands.
+// The carried count is what keeps this phone's own history out: a stored copy whose tokens this session has already
+// held or spent pays for nothing new, even when this phone's own tokens would fund the price. NOT COVERED: both phones
+// holding a DIFFERENT waiting purchase. This phone's is kept and the other's tokens ride without their plan, which is
+// raised to the maintainer. A wallet already stored in the maxed shape is not repaired.
 //
 // seen == nil means no union: today's publish of the local set alone. That is what a set that cannot be read, is
 // absent or belongs to another generation gives (walletSeen), and what mergeLateRestore passes because its own union
@@ -3078,7 +3118,8 @@ func walletForPublish(stored, local *Wallet, seen map[string]bool) *Wallet {
 	// ⚠ A WAITING PURCHASE (OR A QUEUE) IS NOT MAXED (NWP-20261031-07): planPurchase prices at PlanGB x PlanPeriods, so
 	// a stored 50 GB raised over this phone's waiting 10 GB top-up would demand 50 x periods signatures and strand the
 	// money. The plan fields and the queue are this phone's, verbatim. With nothing waiting the max stands (a stale
-	// handset must not lower the account's plan).
+	// handset must not lower the account's plan), unless the union below carries the stored purchase's funding
+	// (NWP-20261129-10).
 	if !local.planPending() && len(local.PlanQueue) == 0 {
 		if stored.PlanGB > out.PlanGB {
 			out.PlanGB = stored.PlanGB
@@ -3110,16 +3151,19 @@ func walletForPublish(stored, local *Wallet, seen map[string]bool) *Wallet {
 		for _, k := range walletSeenKeys(local) {
 			have[k] = true
 		}
+		carried := 0
 		for _, t := range stored.Tokens {
 			if k := plainSeenKey(t); !have[k] && !seen[k] {
 				have[k] = true
 				out.Tokens = append(out.Tokens, t)
+				carried++
 			}
 		}
 		for _, t := range stored.BlindTokens {
 			if k := blindSeenKey(t); !have[k] && !seen[k] {
 				have[k] = true
 				out.BlindTokens = append(out.BlindTokens, t)
+				carried++
 			}
 		}
 		// The pending claim codes (NWP-20261125-05) by the same rule: this phone's, plus each stored code neither held
@@ -3130,6 +3174,14 @@ func walletForPublish(stored, local *Wallet, seen map[string]bool) *Wallet {
 				have[k] = true
 				out.PendingClaims = append(out.PendingClaims, c)
 			}
+		}
+		// The other phone's waiting purchase, whole (NWP-20261129-10, above). Read after the union: out.balance() is the
+		// published balance.
+		if carried > 0 && !local.planPending() && len(local.PlanQueue) == 0 && (stored.planPending() || len(stored.PlanQueue) > 0) &&
+			stored.PlanGB > 0 && stored.PlanPeriods > 0 && out.balance() >= stored.PlanGB*int(stored.PlanPeriods) {
+			out.PlanGB, out.PlanPeriods = stored.PlanGB, stored.PlanPeriods
+			out.PlanKeep, out.PlanConvert = stored.PlanKeep, stored.PlanConvert
+			out.PlanQueue = append([]PlanSpec(nil), stored.PlanQueue...)
 		}
 	}
 	return &out
@@ -3229,6 +3281,17 @@ func noWalletRenewalDue(meterKey string, nowEpoch int64) bool {
 	return sim.RenewedEpoch < nowEpoch && renewalDue(sim, nowEpoch)
 }
 
+// periodicRenewalDue is the periodic and manual seals' due test: renewalDue, and not twice in the epoch the footprint
+// was last renewed (docs/product-decisions.md, "seventeen answers to harvest 59 ...", #9). The renewal that already
+// ran this epoch either bought (PaidThrough moved on, planPending false) or could buy nothing, because the wallet's
+// tokens are short of the plan's price or its purchase is inside its ActivateAfter hold; a second one inside the epoch
+// extends no deadline (they are epoch-granular) and buys nothing. A purchase claimed after it activates at the next
+// epoch, which is the decided cost. A renewal that fell short (Q090 batches) stamps no RenewedEpoch, so it is still
+// retried this epoch. noWalletRenewalDue is the same rule for a profile with no wallet file.
+func periodicRenewalDue(w *Wallet, nowEpoch int64) bool {
+	return w.RenewedEpoch < nowEpoch && renewalDue(w, nowEpoch)
+}
+
 // signOutRenewalDue is the sign-out's due test (NWP-20261112-14, Q088's device half): renew unless the footprint
 // was already renewed in this epoch. It is an inference from Q088's day granularity -- the ledger stamps each row
 // with the DAY it was last presented, so a second full-footprint renewal inside the epoch the footprint was last
@@ -3264,7 +3327,7 @@ func dueBy(rule renewRule, w *Wallet, nowEpoch int64) bool {
 	if rule == renewSignOut {
 		return signOutRenewalDue(w, nowEpoch)
 	}
-	return renewalDue(w, nowEpoch)
+	return periodicRenewalDue(w, nowEpoch)
 }
 
 // noWalletDueBy is rule's due test with no wallet file.

@@ -97,8 +97,12 @@ def main():
     pin('p2 freeNow archives only under an "ok" verdict',
         fn != "",
         "FreeOnPhone.verdict(" in fn and fn.count("readJobs(") == 1 and "ReArchiveGate.holdsJob(" in fn
+        and fn.count("readPlayNeeded(") == 1
+        and 0 <= fn.find("readJobs(") < fn.find("readPlayNeeded(") < fn.find("FreeOnPhone.verdict(")
+        and ", roles, needed)" in fn
         and "archive(ctx, pkg" in ok_block and "archive(ctx, pkg" not in rest,
-        'freeNow must read the jobs once, decide through FreeOnPhone.verdict and ReArchiveGate.holdsJob, and call '
+        'freeNow must read the jobs and then the needed Play stack once, decide through FreeOnPhone.verdict and '
+        'ReArchiveGate.holdsJob with that set, and call '
         'archive(ctx, pkg, ...) only inside if ("ok".equals(v)) { ... }')
 
     tap = block(row, "free.setOnClickListener(")

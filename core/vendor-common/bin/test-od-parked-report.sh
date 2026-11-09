@@ -117,6 +117,7 @@ date() { echo DATE; }
 timeout() {
   printf '%s\n' "$*" >> "$C/timeout.calls"
   if [ -f "$C/to_rc" ]; then return "$(cat "$C/to_rc")"; fi
+  while [ "${1:-}" = -k ]; do shift 2; done
   shift
   "$@"
 }

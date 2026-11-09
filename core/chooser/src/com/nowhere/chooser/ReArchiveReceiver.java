@@ -13,6 +13,7 @@ import android.content.pm.PackageInstaller;
 import android.content.pm.PackageManager;
 import android.os.Process;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -33,9 +34,10 @@ import java.util.concurrent.atomic.AtomicLong;
  * armed through {@link #keepArmed} (NWP-20261120-12). An offline session gets no claims kick; its next tap re-arms.
  * A re-arm never moves a pending sweep later ({@link ReArchiveGate#armAt}), so frequent taps cannot postpone it.
  * The sweep keeps an app that holds a job ({@link ReArchiveGate#holdsJob}: the current keyboard, the always-on VPN,
- * an enabled accessibility service or notification listener, a role holder), and archives nothing in a sweep that
- * cannot read one of those sources (h51 #6, NWP-20261122-10). {@link #freeNow} is "Free on this phone": the user
- * frees one app now, under the same job guards and with no idle threshold (h51 #4 B2, NWP-20261125-11).
+ * an enabled accessibility service or notification listener, a role holder, a Play stack member an app with code on
+ * the phone needs), and archives nothing in a sweep that cannot read one of those sources (h51 #6, NWP-20261122-10;
+ * the stack and its nowhere-playdeps source: h59 #8, NWP-20261129-14). {@link #freeNow} is "Free on this phone": the
+ * user frees one app now, under the same job guards and with no idle threshold (h51 #4 B2, NWP-20261125-11).
  */
 public class ReArchiveReceiver extends BroadcastReceiver {
     static final String ACTION = "com.nowhere.chooser.REARCHIVE_SWEEP";
@@ -92,7 +94,9 @@ public class ReArchiveReceiver extends BroadcastReceiver {
         // nothing (onReceive re-arms the next one).
         String[] jobs = new String[JOB_KEYS.length];
         Set<String> roles = new HashSet<>();
+        Set<String> needed = new HashSet<>();
         String failed = readJobs(ctx, jobs, roles);
+        if (failed == null) failed = readPlayNeeded(ctx, needed);
         if (failed != null) {
             android.util.Log.w("NowhereChooser", "rearchive: job source " + failed
                     + " unreadable -- archiving nothing this sweep");
@@ -120,7 +124,7 @@ public class ReArchiveReceiver extends BroadcastReceiver {
                 // ReArchiveGate.archive's.
                 long lastUpdate = 0L;
                 try { lastUpdate = pm.getPackageInfo(pkg, 0).lastUpdateTime; } catch (Throwable ignore) {}
-                boolean job = ReArchiveGate.holdsJob(pkg, jobs[0], jobs[1], jobs[2], jobs[3], roles);
+                boolean job = ReArchiveGate.holdsJob(pkg, jobs[0], jobs[1], jobs[2], jobs[3], roles, needed);
                 if (job) android.util.Log.i("NowhereChooser", "rearchive keep " + pkg + ": holds a job");
                 if (!ReArchiveGate.archive(now, idle, lastUsed, lastVisible, lastFgs, lastUpdate, job)) {
                     continue; // holds a job, or used/materialised recently -> keep
@@ -170,6 +174,35 @@ public class ReArchiveReceiver extends BroadcastReceiver {
         return null;
     }
 
+    /** The Play stack members an app with code on this phone needs (h59 #8, NWP-20261129-14), read once per sweep and
+     *  per free into out: for every kept package this user can answer for, its deps as ProfileActivity.appDeps computes
+     *  them, with each input read once here (appDeps re-reads them per call). An archived placeholder or an absent app
+     *  has no code and names nothing. Null when the read held; else the name of what failed ("nowhere-playdeps", whose
+     *  unknown is not empty: appDeps' lenient read would then keep nothing, or "packages"), never a package. */
+    private static String readPlayNeeded(Context ctx, Set<String> out) {
+        Set<String> playDeps = ProfileActivity.readPlayDepsStrict(ctx);
+        if (playDeps == null) return "nowhere-playdeps";
+        Map<String, String> groups = ProfileActivity.readAppGroups(ctx);
+        Set<String> deferred = ProfileActivity.deferredKeepSet(ctx);
+        PackageManager pm = ctx.getPackageManager();
+        Map<String, List<String>> deps = new HashMap<>();
+        for (String pkg : ProfileActivity.keepSetAll(ctx)) {
+            try {
+                pm.getApplicationInfo(pkg, 0);
+            } catch (PackageManager.NameNotFoundException e) {
+                continue; // an archived placeholder or an absent app has no code on this phone
+            } catch (Throwable t) {
+                // The class name only: a framework message can carry the package name.
+                android.util.Log.w("NowhereChooser", "rearchive: read packages: " + t.getClass().getSimpleName());
+                return "packages";
+            }
+            deps.put(pkg, AppDeps.appDeps(pkg, groups, ProfileActivity.DEFAULT_GROUPS, deferred, playDeps,
+                    ProfileActivity.GMS_PKG, ProfileActivity.GSF_PKG, ProfileActivity.VENDING_PKG));
+        }
+        out.addAll(ReArchiveGate.playNeeded(deps));
+        return null;
+    }
+
     /** Re-archive pkg: the framework drops its APK, keeps the archived placeholder (icon + launcher metadata), and
      *  a later tap re-runs the on-demand unarchive. We are the installer of record, so this is permitted. */
     private static boolean archive(Context ctx, String pkg) {
@@ -193,16 +226,18 @@ public class ReArchiveReceiver extends BroadcastReceiver {
     }
 
     /** "Free on this phone" (h51 #4 B2, NWP-20261125-11): archive pkg NOW, under the sweep's own guards. It reads
-     *  the job sources once, and archives only when every source was read and pkg holds no job. No usage-time
-     *  check: the user asked now. Runs on the caller's worker thread and never throws. Returns the verdict: "ok"
-     *  (requested), "job", "unread", or "failed" (requestArchive threw). */
+     *  the job sources and the needed Play stack once, and archives only when every source was read and pkg holds
+     *  no job. No usage-time check: the user asked now. Runs on the caller's worker thread and never throws. Returns
+     *  the verdict: "ok" (requested), "job", "unread", or "failed" (requestArchive threw). */
     static String freeNow(Context ctx, String pkg) {
         try {
             String[] jobs = new String[JOB_KEYS.length];
             Set<String> roles = new HashSet<>();
+            Set<String> needed = new HashSet<>();
             String failed = readJobs(ctx, jobs, roles);
+            if (failed == null) failed = readPlayNeeded(ctx, needed);
             String v = FreeOnPhone.verdict(failed, failed == null
-                    && ReArchiveGate.holdsJob(pkg, jobs[0], jobs[1], jobs[2], jobs[3], roles));
+                    && ReArchiveGate.holdsJob(pkg, jobs[0], jobs[1], jobs[2], jobs[3], roles, needed));
             if ("ok".equals(v)) {
                 if (!archive(ctx, pkg, "free on this phone")) v = "failed";
             }

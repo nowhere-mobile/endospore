@@ -14,8 +14,9 @@ package main
 // groupUnit makes a held package (com.nowhere.chooser/.nowhere-odhold/<pkg>) its own unit, so held packages, the
 // set the carry exists for, get spans too.
 //
-// Nothing reads the index yet. The fetch slice carries an unfetched package by these spans; a package the reader
-// refuses is fetched at sign-in as today.
+// ~~Nothing reads the index yet. The fetch slice carries an unfetched package by these spans;~~ (Superseded by
+// NWP-20261129-03: the seal's carryUnfetched reads it, unfetched_carry.go.) A package the reader refuses is fetched at
+// sign-in as today.
 
 import (
 	"sort"
@@ -168,8 +169,8 @@ func buildPkgSpans(a *pkgAcct, essIdx []int, nChunks int) map[string][][2]int {
 //   - no m.Deferred rel files under pkg: a deferred file's bytes are not in Chunks, so the span would not hold all
 //     of the package.
 //
-// No caller yet: the fetch slice carries an unfetched package by these spans. A package the reader refuses is
-// fetched at sign-in as today.
+// ~~No caller yet: the fetch slice carries an unfetched package by these spans.~~ (Superseded by NWP-20261129-03:
+// carryUnfetched is the caller.) A package the reader refuses is fetched at sign-in as today.
 func pkgSpanChunks(m chunkManifest, pkg string) (chunks []string, sizes []int64, ok bool) {
 	rs := m.PkgSpan[pkg]
 	if len(rs) == 0 {

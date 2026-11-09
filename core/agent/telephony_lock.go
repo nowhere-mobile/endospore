@@ -462,7 +462,8 @@ func serveRestageTelIngest(w io.Writer, puid int, row string) {
 	}
 	// NWP-20260924-07: a call row carries its SIM tag, so it goes back to that SIM's mailbox -- or is dropped (reply
 	// OK: the chooser must not retry it) when that SIM was unassigned while the chooser held it. NWP-20261005-15: an
-	// SMS or MMS row (the chooser re-stages those too now) gets the same treatment from the SIM it was claimed from.
+	// SMS or MMS row (the chooser re-stages those too now) gets the same treatment, from its own slot since
+	// NWP-20261130-01, else from the SIM it was claimed from.
 	if _, err := restageTelIngest(strconv.Itoa(puid/100000), row); err != nil {
 		fmt.Fprint(w, "ERR\n")
 		return

@@ -3,6 +3,7 @@
 # NWP-20261116-12: compile the REAL GateAlarmAuto (unchanged), run GateAlarmAutoCases, then pin the chooser call sites
 # on comment-stripped text. $JAVAC / $JAVA come from core/chooser/test-gate-alarm-auto-java.sh. No pin waits for the
 # 10-minute timer: it is pinned by value (the cases) and by position (onCreate, stopRinging, unattended).
+# NWP-20261128-34: dispatchKeyEvent's volume branch silences the ring, then releases the screen-on hold.
 # Exit codes: 1 = a case or a pin failed; 3 = no compile, or the JVM died with anything but 0/1.
 set -euo pipefail
 U="usage: run.sh GateAlarmAuto.java ChooserActivity.java GateAlarmActivity.java GateAlarmReceiver.java gate_log.go"
@@ -119,4 +120,17 @@ pin gateAlarmPi "$gp" 'FLAG_UPDATE_CURRENT'
 pin gateAlarmPi-1 "$(method "$ACT" 'private static android.app.PendingIntent gateAlarmPi(android.content.Context ctx) {')" \
   'return gateAlarmPi(ctx, 0);'
 pin cancelGateAlarm "$(method "$ACT" 'static void cancelGateAlarm(')" 'gateAlarmPi(ctx)'
+# NWP-20261128-34: onCreate still lights the screen; a volume press silences the ring, THEN releases the screen-on hold.
+pin onCreate-keep-screen-on "$oc" 'getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);'
+dk=$(method "$GAT" 'public boolean dispatchKeyEvent(')
+VOL='kc == KeyEvent.KEYCODE_VOLUME_MUTE) {'
+DOWN='if (event.getAction() == KeyEvent.ACTION_DOWN) {'
+case "$dk" in *"$VOL"*) vb=${dk#*"$VOL"}; vb=${vb%%'return super.dispatchKeyEvent'*} ;; *) vb="" ;; esac
+case "$vb" in *"$DOWN"*) kb=${vb#*"$DOWN"}; kb=${kb%%'return true;'*} ;; *) kb="" ;; esac
+if [ -z "$kb" ]; then
+  echo "--- FAIL: pin: dispatchKeyEvent-down: no braced ACTION_DOWN branch in the volume branch"; rc=1
+else
+  before dispatchKeyEvent-down "$kb" 'stopRinging();' 'getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)'
+fi
+pin dispatchKeyEvent-volume "$vb" 'return true;'
 exit "$rc"

@@ -9,7 +9,8 @@
 # brought back. This suite runs the REAL helper (extracted by anchor, the binary re-rooted to a stub) and the REAL
 # CE and #de tails of the `in` arm under every shell found, and pins the order: both calls run before remap_per_pkg
 # and restorecon, which re-own and relabel any -wal/-shm the rewrite creates as root. What the binary does to the
-# database is test-nowhere-db-fix.sh's job.
+# database is test-nowhere-db-fix.sh's job. NWP-20261129-01: the binary prints `<remapped> <dropped> <reowned>
+# <generation>`, the last `-` when it took no generation; the OK line carries all four (C1, C2, C9).
 #
 #   bash test-media-remap-call.sh              # the cases
 #   bash test-media-remap-call.sh --mutate     # ... plus mutants of roamd that must each CONVICT under every shell
@@ -90,7 +91,7 @@ suite() {  # suite <roamd.sh> <quiet|""> -> 0 all ok, 1 a check failed, 2 the ha
       cat > "$root/bin/nowhere_db_fix" <<STUB
 #!/bin/sh
 echo "\$*" >> "$root/calls"
-printf '%s\n' "${4:-2 1}"
+printf '%s\n' "${4:-2 1 3 42}"
 echo "stub-stderr-word" >&2
 exit $3
 STUB
@@ -115,6 +116,7 @@ pw() { printf '%s\n' x; }
 agent_sim() { echo "agent" >> "\$ROOT/calls"; return "\$SIM_RC"; }
 _ms() { echo 0; }
 _tlog() { :; }
+_ssum() { :; }
 relabel_launcher() { echo "relabel_launcher" >> "\$ROOT/calls"; }
 remap_media_db() { echo "remap_media_db \$1 \${2#\$ROOT/}" >> "\$ROOT/calls"; }
 remap_per_pkg() { echo "remap_per_pkg \${1#\$ROOT/}" >> "\$ROOT/calls"; }
@@ -133,15 +135,15 @@ CASE
     chk "C1 [$sh] the com.android call" [ "$(printf '%s\n' "$out" | sed -n '/^media-remap /{p;q;}')" = "media-remap ROOT/data/user/11/$A_PK 11" ]
     chk "C1 [$sh] the com.google call" [ "$(printf '%s\n' "$out" | grep '^media-remap ' | sed -n 2p)" = "media-remap ROOT/data/user/11/$G_PK 11" ]
     chk "C1 [$sh] two 'repointed' lines with the stub's counts" \
-      [ "$(printf '%s\n' "$out" | grep -cxF '[roamd] media-remap user 11: 2 row(s) repointed, 1 stale duplicate(s) dropped (NWP-20261124-01)')" = 2 ]
+      [ "$(printf '%s\n' "$out" | grep -cxF '[roamd] media-remap user 11: 2 row(s) repointed, 1 stale duplicate(s) dropped, 3 row(s) given user 11, generation 42 (NWP-20261129-01)')" = 2 ]
     chk "C1 [$sh] returns 0" [ "$(printf '%s\n' "$out" | grep -c '^ret=0$')" = 1 ]
     chk "C1 [$sh] the helper's variables are local (the caller's db and out survive)" \
       [ "$(printf '%s\n' "$out" | grep -c '^caller db=keep out=keep$')" = 1 ]
-    out=$(helper "$sh" g 0 "7 0")
+    out=$(helper "$sh" g 0 "7 0 3 42")
     chk "C2 [$sh] only com.google: one call, on its path" \
       [ "$(printf '%s\n' "$out" | grep '^media-remap ' | tr '\n' '|')" = "media-remap ROOT/data/user/11/$G_PK 11|" ]
     chk "C2 [$sh] its line carries the binary's counts" \
-      [ "$(printf '%s\n' "$out" | grep -cxF '[roamd] media-remap user 11: 7 row(s) repointed, 0 stale duplicate(s) dropped (NWP-20261124-01)')" = 1 ]
+      [ "$(printf '%s\n' "$out" | grep -cxF '[roamd] media-remap user 11: 7 row(s) repointed, 0 stale duplicate(s) dropped, 3 row(s) given user 11, generation 42 (NWP-20261129-01)')" = 1 ]
     out=$(helper "$sh" a 0)
     chk "C2 [$sh] only com.android: one call, on its path" \
       [ "$(printf '%s\n' "$out" | grep '^media-remap ' | tr '\n' '|')" = "media-remap ROOT/data/user/11/$A_PK 11|" ]
@@ -160,6 +162,9 @@ CASE
     out=$(helper "$sh" a 0 "PLANTED-STDOUT")
     chk "C6 [$sh] the binary's stderr goes to the log" [ "$(printf '%s\n' "$out" | grep -cx 'stub-stderr-word')" = 1 ]
     chk "C6 [$sh] the binary's stdout is parsed, not logged as its own line" [ "$(printf '%s\n' "$out" | grep -cx 'PLANTED-STDOUT')" = 0 ]
+    out=$(helper "$sh" a 0 "2 1 3 -")
+    chk "C9 [$sh] a binary that took no generation: 'generation unchanged'" \
+      [ "$(printf '%s\n' "$out" | grep -cxF '[roamd] media-remap user 11: 2 row(s) repointed, 1 stale duplicate(s) dropped, 3 row(s) given user 11, generation unchanged (NWP-20261129-01)')" = 1 ]
     out=$(tailrun "$sh" ce 0)
     chk "C7 [$sh] CE tail: relabel_launcher, remap_media_db on the CE dir, remap_per_pkg, restorecon (got '$out')" \
       [ "$out" = "relabel_launcher|remap_media_db 11 user/11|remap_per_pkg user/11|restorecon|" ]
@@ -176,7 +181,7 @@ CASE
   chk "P3 the CE call sits directly after relabel_launcher and directly before remap_per_pkg \"\$USERDIR\"" \
     [ "$(before "$CODE" "$F_CE" "$F_PCE" "$L_RL")" = 1 ]
   chk "P4 the DE call sits directly before remap_per_pkg \"\$DEDIR\"" [ "$(before "$CODE" "$F_DE" "$F_PDE")" = 1 ]
-  n=$(printf '%s\n' "$FN" | grep -cE '^  local db out rc nrem ndrop$')
+  n=$(printf '%s\n' "$FN" | grep -cE '^  local db out rc nrem ndrop mrest nown ngen$')
   chk "P5 the helper declares every variable local" [ "$n" = 1 ]
   n=$(printf '%s\n' "$FN" | grep -cF -e "\"\$2/$A_PK\"" -e "\"\$2/$G_PK\"")
   chk "P6 the helper names both MediaProvider packages" [ "$n" = 2 ]
@@ -206,7 +211,8 @@ R = {
   'N3': (' \\\n            "$2/com.google.android.providers.media.module/databases/external.db"; do', '; do'),
   'N4': ('FAILED rc=$rc -- left as restored (NWP-20261124-01)" >> "$LOG"',
          'FAILED rc=$rc -- left as restored (NWP-20261124-01)" >> "$LOG"; return 1'),
-  'N5': ('  local db out rc nrem ndrop\n', '  :\n'),
+  'N5': ('  local db out rc nrem ndrop mrest nown ngen\n', '  :\n'),
+  'N6': ('if [ "$ngen" = "-" ]; then', 'if false; then'),
 }
 a, b = R[m]
 if s.count(a) != 1:
@@ -217,13 +223,14 @@ PY
 
 run_mutants() {
   local m c sh rc bad=0 desc
-  for m in N1 N2 N3 N4 N5; do
+  for m in N1 N2 N3 N4 N5 N6; do
     case "$m" in
       N1) desc="the CE call moved after remap_per_pkg" ;;
       N2) desc="the DE call moved after remap_per_pkg" ;;
       N3) desc="the com.google path dropped" ;;
       N4) desc="a failure returns 1" ;;
       N5) desc="the helper's variables are not local" ;;
+      N6) desc="'-' is not read as unchanged" ;;
     esac
     c=$(mktemp -p "$W")
     if ! mutate_to "$m" "$c" || cmp -s "$c" "$SUT"; then echo "  FAIL  $m did not apply: $desc"; bad=1; rm -f "$c"; continue; fi

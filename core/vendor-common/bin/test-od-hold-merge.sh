@@ -102,6 +102,8 @@ hold_runner(){                     # hold_runner <file> <root> <uid> [failcp]
     printf 'set -u\n'
     printf "ROOT='%s'; LOG=\"\$ROOT/roam.log\"\n" "$2"
     printf 'restorecon(){ :; }\n'                # not on a dev host; the function only uses it to relabel
+    printf 'pm(){ case "$*" in "list packages -s -u") echo package:android ;; esac; return 0; }\n'
+    printf 'timeout(){ while [ "${1:-}" = -k ]; do shift 2; done; shift; "$@"; }\n'
     [ "${4:-}" = failcp ] && printf 'cp(){ return 1; }\n'
     printf '%s\n' "$ODHOLD_LINE" "$PKGOK" "$FN_ROOTED"
     printf "hold_ondemand '%s'\n" "$3"

@@ -155,6 +155,7 @@ func unfNoNames(t *testing.T, out string) {
 
 func unfRefusesADroppedHold(t *testing.T, scope string) {
 	base := unfFirstSeal(t, scope)
+	ucPlantHead(t, base, scope, func(m *chunkManifest) { m.PkgSpan = nil }) // a head sealed before NWP-20261127-01: the carry cannot take it
 	before := unfHeadBytes(t, base, scope)
 	t.Setenv("NOWHERE_UNFETCHED_LIST", unfList(t, unfHeld))
 	refused, why, out := unfSeal(t, base, scope, unfTree(t, false))

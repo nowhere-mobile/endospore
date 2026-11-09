@@ -19,8 +19,8 @@ package main
 //     blocks"); it is safe here because the phone always keeps the baked /system index, which rides verified boot, so
 //     a refused /data refresh costs freshness only.
 //
-// Nothing calls it yet: the call in index.go, the call beside the build-warning refresh and the operator's put command
-// are later slices. No goroutine.
+// NWP-20261129-18 built the calls: refreshOtaCache calls fetchIndexKey beside the build-warning refresh, and index.go
+// calls currentIndexKey. The operator's put command is a later slice. No goroutine.
 
 import (
 	"crypto/sha256"
@@ -195,10 +195,9 @@ func acceptIndexKey(seqPath, heldPath string, env []byte, now int64) (*indexKeyO
 // agree (same hash) and the held object re-verifies at floor-1 with the floor's seq; else "" with one log line (one
 // file without the other, a hash mismatch, a damaged or unreadable floor, a held object that no longer verifies).
 //
-// "" means "no /data refresh is accepted", NEVER "unsigned": the baked /system copy still serves. The call in index.go
-// is the next slice. There the selected key replaces indexPubKey ONLY for loadIndexBytes's /data branch and
-// refreshIndex's checks; the `indexPubKey == ""` branches trust the baked copy unsigned, so an "" from here must never
-// reach them.
+// "" means "no /data refresh is accepted", NEVER "unsigned": the baked /system copy still serves. In index.go the
+// selected key replaces indexPubKey ONLY for loadIndexBytesWith's /data branch and refreshIndex's checks; the
+// `indexPubKey == ""` branches trust the baked copy unsigned, so an "" from here must never reach them.
 func currentIndexKey(now int64) string {
 	seq, stored, err := readIndexKeyFloor(indexKeySeqPath)
 	if err != nil {
@@ -235,7 +234,7 @@ func currentIndexKey(now int64) string {
 }
 
 // fetchIndexKey fetches the published object and holds it to the device's floor. (nil, nil) when nothing is
-// published. The fetch error is returned as it is, never wrapped. Nothing calls it yet.
+// published. The fetch error is returned as it is, never wrapped. refreshOtaCache calls it after each completed check.
 func fetchIndexKey(base string, now int64) (*indexKeyObject, error) {
 	env, err := fetchIndexKeyEnvelope(base)
 	if err != nil {

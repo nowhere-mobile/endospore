@@ -21,6 +21,9 @@
 # accepts only TRUE. rowStep and readBack are lifted and RUN under javac, so this suite needs a JDK and FAILS (exit 2) without one -- a suite that
 # skips would read green on a runner that never ran it. javac/java come from PATH, then the build VM's prebuilt JDK 21.
 #
+# NWP-20261129-02: run() reads each inserted row back after the last pass, as evidence only. Those two calls hand their
+# Boolean to TelSeen.readBack and never unbox it, behind `canRead ?` (test-tel-seen-java.sh pins them).
+#
 #   bash test-tel-dedup.sh            # the invariants
 #   bash test-tel-dedup.sh --mutate   # ... plus mutations that must each CONVICT the suite
 #
@@ -148,7 +151,7 @@ fi
 # false without inserting (NWP-20261112-21), and only then the insert.
 DB=$(body "$TI" 'private static boolean deliver(')
 SSHORT=$(bline "$DB" '            if (!isCall && insertedThisRun.contains(when)) return true; // SMS dedup')
-SCHK=$(bline "$DB" '            int step = rowStep(exists(ctx, uri, when));')
+SCHK=$(bline "$DB" '            int step = rowStep(isCall ? found : TelSub.lookup(canReadMessages(ctx), found));')
 SDONE=$(bline "$DB" '            if (step == DONE) return true; // present: fresh dedup, or confirmed-persisted on a re-verify pass')
 SUNK=$(bline "$DB" '            if (step != INSERT) { unknown[0]++; return false; } // NWP-20261112-21: unknown -- insert nothing, ask again later')
 SINS=$(bline "$DB" '            Uri ins = ctx.getContentResolver().insert(uri, v);')
@@ -161,7 +164,7 @@ else
 fi
 # deliverMms(): the same, through mmsExists.
 MB=$(body "$TI" 'private static boolean deliverMms(')
-MCHK=$(bline "$MB" '            int step = rowStep(mmsExists(ctx, when));')
+MCHK=$(bline "$MB" '            int step = rowStep(TelSub.lookup(canReadMessages(ctx), mmsExists(ctx, when)));')
 MDONE=$(bline "$MB" '            if (step == DONE) return true;')
 MUNK=$(bline "$MB" '            if (step != INSERT) { unknown[0]++; return false; } // NWP-20261112-21: unknown -- insert nothing, ask again later')
 MINS=$(bline "$MB" '            Uri mmsUri = ctx.getContentResolver().insert(Uri.parse("content://mms"), pdu);')
@@ -198,7 +201,7 @@ LOG1='        if (unknown[0] > 0) android.util.Log.w("NowhereChooser", "telinges
 LOG2='                + " row lookup(s) did not complete -- not inserted or acknowledged on that answer, asked again later");'
 LN1=$(line "$TI" "$LOG1"); LN2=$(line "$TI" "$LOG2")
 inorder "one log line per run counts the unknown lookups, after the final acknowledgement" \
-  "$(line "$TI" '        ackLanded(ctx, reply, everOk, acked, true, unknown);')" "$LN1" "$LN2" \
+  "$(line "$TI" '        ackLanded(ctx, reply, everOk, readOk, acked, true, unknown);')" "$LN1" "$LN2" \
   "$(line "$TI" '        DaemonSocket.roundTrip("ACK-TELINGEST\n", 5_000);')"
 LEAK=$(printf '%s\n%s\n' "$LOG1" "$LOG2" | grep -cE 'when|from|f\[|body')
 if [ "$LN1" -gt 0 ] && [ "$LN2" = $((LN1 + 1)) ] && [ "$LEAK" = 0 ]; then
@@ -218,13 +221,13 @@ cnt(){ printf '%s\n' "$CODE" | grep -oE -- "$1" | grep -c .; }
 BAD=$(cnt 'if \(!?(exists|mmsExists)\(')
 if [ "$BAD" = 0 ]; then ok "no 'if (exists(', 'if (!exists(' or 'if (mmsExists(' form"
 else no "$BAD condition(s) unbox exists()/mmsExists() directly -- a failed lookup reads as absent, or throws on null"; fi
-E_ALL=$(cnt '\bexists\(ctx'); E_OK=$(cnt 'rowStep\(exists\(ctx|readBack\(exists\(ctx|Boolean present = exists\(ctx')
-if [ "$E_ALL" = 4 ] && [ "$E_OK" = 4 ]; then ok "every exists(ctx, ...) call (4) goes through rowStep, readBack or a Boolean local"
-else no "exists(ctx, ...) calls: $E_ALL, of them in an allowed form: $E_OK (want 4 and 4)"; fi
-M_ALL=$(cnt '\bmmsExists\(ctx'); M_OK=$(cnt 'rowStep\(mmsExists\(ctx')
-if [ "$M_ALL" = 1 ] && [ "$M_OK" = 1 ]; then ok "the one mmsExists(ctx, ...) call goes through rowStep"
-else no "mmsExists(ctx, ...) calls: $M_ALL, through rowStep: $M_OK (want 1 and 1)"; fi
-P_ALL=$(cnt '\bpresent\b'); P_OK=$(cnt 'Boolean present\b|\bpresent == null|Boolean\.(TRUE|FALSE)\.equals\(present\)')
+E_ALL=$(cnt '\bexists\(ctx'); E_OK=$(cnt 'rowStep\(exists\(ctx|readBack\(exists\(ctx|Boolean (present|found) = exists\(ctx|canRead \? exists\(ctx|: exists\(ctx')
+if [ "$E_ALL" = 6 ] && [ "$E_OK" = 6 ]; then ok "every exists(ctx, ...) call (6) goes through rowStep, readBack, a Boolean local, the canRead read-back or the read-back's lookup"
+else no "exists(ctx, ...) calls: $E_ALL, of them in an allowed form: $E_OK (want 6 and 6)"; fi
+M_ALL=$(cnt '\bmmsExists\(ctx'); M_OK=$(cnt 'TelSub\.lookup\((canReadMessages\(ctx\)|canRead), (mms \? )?mmsExists\(ctx|canRead \? mmsExists\(ctx')
+if [ "$M_ALL" = 3 ] && [ "$M_OK" = 3 ]; then ok "all three mmsExists(ctx, ...) calls go through TelSub.lookup or the canRead read-back"
+else no "mmsExists(ctx, ...) calls: $M_ALL, through TelSub.lookup or the canRead read-back: $M_OK (want 3 and 3)"; fi
+P_ALL=$(cnt '\bpresent\b'); P_OK=$(cnt 'Boolean present\b|\bpresent == null|Boolean\.(TRUE|FALSE)\.equals\(present\)|readBack\(present, unknown\)')
 if [ "$P_ALL" -gt 0 ] && [ "$P_ALL" = "$P_OK" ]; then ok "every use of a lookup's Boolean ($P_ALL) is a null test or Boolean.TRUE/FALSE.equals -- never unboxed"
 else no "a lookup's Boolean is used outside a null test or Boolean.TRUE/FALSE.equals ($P_OK of $P_ALL uses allowed)"; fi
 
@@ -286,9 +289,9 @@ if [ "$MUTATE" = yes ]; then
   mutate "the read app-op left ignored" \
          's/OPSTR_READ_SMS),/OPSTR_WRITE_SMS),/'
   mutate "the SMS existence check dropped" \
-         '/^            int step = rowStep(exists(ctx, uri, when));$/d'
+         '/^            int step = rowStep(isCall ? found : TelSub.lookup(canReadMessages(ctx), found));$/d'
   mutate "the MMS existence check dropped" \
-         '/^            int step = rowStep(mmsExists(ctx, when));$/d'
+         '/^            int step = rowStep(TelSub.lookup(canReadMessages(ctx), mmsExists(ctx, when)));$/d'
   mutate "the MMS message id no longer stamped" \
          '/^            pdu.put("m_id", mmsKey(when));/d'
   mutate "the MMS lookup by date instead of its id" \
@@ -317,7 +320,7 @@ if [ "$MUTATE" = yes ]; then
   mutate "M12 the post-insert fallback bypasses readBack (an unknown answer uncounted)" \
          's/boolean ok = ins != null || readBack(exists(ctx, uri, when), unknown);/boolean ok = ins != null || Boolean.TRUE.equals(exists(ctx, uri, when));/'
   mutate "M10 a call's existence unboxed in a condition" \
-         's/int step = rowStep(exists(ctx, uri, when));/int step = rowStep(exists(ctx, uri, when)); if (exists(ctx, uri, when)) return true;/'
+         's/Boolean found = exists(ctx, uri, when);/Boolean found = exists(ctx, uri, when); if (exists(ctx, uri, when)) return true;/'
 fi
 
 echo

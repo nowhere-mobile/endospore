@@ -121,6 +121,9 @@ cur_agent_lines() {
 # and must survive whole; a user-named interface stays quoted and must still be redacted.
 KEEP=('[restore] skip "net.thunderbird.android/databases/global.db": denied'
   '[roamd] #apps staged 3 pkg(s), 120 KiB, in 40ms (copy 30ms, 0 mtime kept-failed) (NWP-20261005-04, NWP-20261123-02)'
+  '[roamd] #apps staged 3 pkg(s), 120 KiB, in 90ms (copy 30ms, 0 mtime kept-failed, 2 reused) (NWP-20261005-04, NWP-20261123-02, NWP-20261128-09) (lookups 20ms/8, carry 10ms, lists 10ms, other 20ms)'
+  '[roamd] #apps pm snapshot: 8 package(s) in 12ms (NWP-20261130-16)'
+  '[roamd] #apps pm snapshot: none, empty dump -- per-package lookups, 12ms (NWP-20261130-16)'
   '[roamd] GRANT checkin kicked for user 11 (android_id bootstrap, installed path)'
   '[roamd] GRANT -> 12 perms + 3 INTERNET default(s) (user 11)'
   '[roamd] GRANT (com.example.app) -> 2 perms + 1 INTERNET default(s) (user 11)'
@@ -140,6 +143,7 @@ KEEP=('[restore] skip "net.thunderbird.android/databases/global.db": denied'
   '[resolver] egress iface=wlan0 resolvers=[<net4>:53 1.1.1.1:53] src=discovered dot=off'
   '[resolver] egress iface="wg-home" resolvers=[<net4>:53] src=discovered dot=off')
 MUST=('net.thunderbird.android/databases/global.db' '#apps staged 3 pkg(s)' '(copy 30ms, 0 mtime kept-failed)' 'kicked for user 11'
+  '(lookups 20ms/8, carry 10ms, lists 10ms, other 20ms)' '#apps pm snapshot: 8 package(s) in 12ms' 'none, empty dump -- per-package lookups, 12ms'
   '12 perms + 3 INTERNET default(s)' '2 perms + 1 INTERNET default(s)' '-- PARTIAL: apps=refused'
   '#keys sealed (3 pkg, 1 fresh, 0 dropped)' 'ce=NO de=yes -> user 11' '+ reloaded -> user 11'
   'placed a ROW-EMPTY accounts db -- NOT marking' 'sealed 2048 bytes (7-day expiry applied)' ': Put "<name>": EOF'

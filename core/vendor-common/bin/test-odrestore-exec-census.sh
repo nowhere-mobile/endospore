@@ -117,7 +117,7 @@ reroot() { printf '%s\n' "$1" | sed -E 's#([" |])/data/#\1$ROOT/data/#g'; }
 nleft() { printf '%s\n' "$1" | sed -E 's/(^|[[:space:]])#.*$//' | sed 's#\$ROOT/data/##g' | grep -cE '(^|[^[:alnum:]_])/data/'; }
 
 suite() {  # suite <roamd.sh> <sh> [quiet] -> 0 all ok, 1 a case failed, 2 the harness could not run
-  local f="$1" sh="$2" quiet="${3:-}" p=0 x=0 ARM GPF KSR RA RG RK ODH n R d k
+  local f="$1" sh="$2" quiet="${3:-}" p=0 x=0 ARM GPF KSR RA RG RK ODH PKGOK n R d k
   say() { [ -n "$quiet" ] || printf '%s\n' "$1"; }
   chk() {
     local l="$1"; shift
@@ -133,6 +133,7 @@ suite() {  # suite <roamd.sh> <sh> [quiet] -> 0 all ok, 1 a case failed, 2 the h
   ARM=$(arm_of "$f" odrestore)
   GPF=$(fn_of "$f" grant_perms_for)
   KSR=$(fn_of "$f" keystore_register)
+  PKGOK=$(fn_of "$f" pkgname_ok)
   ODH=$(grep -m1 -E '^ODHOLD=' "$f")
   EXP=$(grep -m1 -F 'export NOWHERE_SEAL_KIND="$skind"' "$f")
   [ -n "$EXP" ] || { echo "EXTRACTION FAILED: the line-6 NOWHERE_SEAL_KIND export in $f" >&2; return 2; }
@@ -141,6 +142,7 @@ suite() {  # suite <roamd.sh> <sh> [quiet] -> 0 all ok, 1 a case failed, 2 the h
     [ -n "$k" ] && [ "$(printf '%s\n' "$k" | sed -n '$p')" = "}" ] || { echo "EXTRACTION FAILED: grant_perms_for or keystore_register in $f" >&2; return 2; }
   done
   [ -n "$ODH" ] || { echo "EXTRACTION FAILED: ODHOLD= not found in $f" >&2; return 2; }
+  case "$PKGOK" in *'return 1'*'return 0'*) ;; *) echo "EXTRACTION FAILED: pkgname_ok in $f" >&2; return 2 ;; esac
   RA=$(reroot "$ARM"); RG=$(reroot "$GPF"); RK=$(reroot "$KSR")
   for k in "$RA" "$RG" "$RK"; do
     n=$(nleft "$k")
@@ -155,7 +157,7 @@ suite() {  # suite <roamd.sh> <sh> [quiet] -> 0 all ok, 1 a case failed, 2 the h
         LOG "$1/roam.log" RES "$1/res" \
         ACCT_AUTH_PKG com.example.authenticator STATE "$1/state" C "$1/sim/calls" CENSUS "$1/sim/census" \
         SIM "$1/sim" KS_MAP "$1/ks/map" KS_IMPORT "$1/ks/import" KS_IN "$1/ks/in" PATH "$BIN:$PATH"
-      printf '%s\n' 'export CENSUS SIM PATH' "$EXP" 'USERDIR="$ROOT/data/user/$uid"' "$ODH"
+      printf '%s\n' 'export CENSUS SIM PATH' "$EXP" 'USERDIR="$ROOT/data/user/$uid"' "$ODH" "$PKGOK"
       for t in a11y_apply autofill_apply pkg_live_pids reown_restored od_relabel cutoff_prog reown_ext_appdata \
                wait_acct_authenticator acct_reload sync_apply keystore_unit; do
         printf '%s() { echo "%s $*" >> "$C"; }\n' "$t" "$t"

@@ -18,14 +18,19 @@
 #     refuses and an absent keep-set, while a parked package in the same manifest IS reaped. An empty or non-numeric
 #     uid makes no pm call at all. $STATE/od-unparked.<uid> lists exactly the skipped names, mode 600, and each call
 #     rewrites it (empty when nothing is skipped, also with no manifest).
+#   - NWP-20261129-13: the same list is also written beside the manifest as <manifest dir>/od-unparked, the copy the gate's
+#     chooser reads: exactly the skipped names, mode 600, chowned to the dir's owner and restorecon'd before the rename,
+#     no temp left. A manifest whose dir is absent writes no copy. A failed write logs one WARN naming no package and
+#     changes nothing else; a failed restorecon alone keeps the copy.
 # It deliberately does not pin the exact `pm uninstall <pkg>` argv beyond "uninstall <pkg>": the open row about the
 # USER_ALL reap removing a cold-locked user's apps (docs/backlog.md, "A fresh sign-in over a cold-locked session
 # uninstalls apps ...") will change that argv, and its fix must not have to fight this suite.
 #
 # reap_stale_ondemand, hold_ondemand, pkgname_ok and the ODHOLD= line are extracted from nowhere_roamd.sh BY ANCHOR,
 # never copied, so a stale copy cannot keep passing after the real code moves. Every `"/data/` path in the extracted
-# text is re-rooted to the case dir with sed. pm, timeout and restorecon are stubbed; cut, cp, mv, date and the file
-# reads are real.
+# text is re-rooted to the case dir with sed. pm, timeout, restorecon, chown and `stat -c %u` are stubbed (a non-root
+# runner cannot chown, and its own file already carries its uid, so "owned by the dir's owner" is the recorded chown);
+# cut, cp, mv, chmod, date, the other stat formats and the file reads are real.
 #
 # ⚠ NO `cmd | grep -q` ANYWHERE IN THIS FILE: under pipefail an early-exiting grep -q makes the writer die of SIGPIPE
 # and the pipeline FAIL although grep matched. Match against a here-string or a file instead.
@@ -49,15 +54,26 @@ done
 
 # pm records its argv, one call per line; it fails (rc 1) for a package listed in $T/pmfail.
 # timeout records its own argv, strips `-k <grace>` and the duration, then runs the rest.
+# restorecon and chown record their argv; each fails when its marker is in the case dir. `stat -c %u` answers the fixture
+# owner 10057, or fails on $T/statfail.
+# hold_ondemand's two listings name none of this suite's packages and stay out of both records (NWP-20261129-27).
 STUBS=$(cat <<'EOS'
-restorecon(){ :; }
+restorecon(){ printf '%s\n' "$*" >> "$T/restorecon"; [ ! -e "$T/rconfail" ]; }
+chown(){ printf '%s\n' "$*" >> "$T/chown"; [ ! -e "$T/chownfail" ]; }
+stat(){
+  if [ "${1:-}" = -c ] && [ "${2:-}" = %u ]; then
+    [ -e "$T/statfail" ] && return 1
+    echo 10057
+  else command stat "$@"; fi
+}
 pm(){
+  case "$*" in "list packages -s -u") echo package:android; return 0 ;; "list packages -3 -u") return 0 ;; esac
   printf '%s\n' "$*" >> "$T/pm"
   [ "${2:-}" ] && grep -qxF -- "$2" "$T/pmfail" 2>/dev/null && return 1
   return 0
 }
 timeout(){
-  printf '%s\n' "$*" >> "$T/timeout"
+  case "$*" in *"pm list packages "*) ;; *) printf '%s\n' "$*" >> "$T/timeout" ;; esac
   while [ "${1:-}" = -k ]; do shift 2; done
   shift
   "$@"
@@ -93,10 +109,10 @@ suite() {
   newcase() {
     T=$(mktemp -d -p "$W")
     mkdir -p "$T/state"
-    : > "$T/pm"; : > "$T/timeout"; : > "$T/log"
+    : > "$T/pm"; : > "$T/timeout"; : > "$T/log"; : > "$T/chown"; : > "$T/restorecon"
   }
   # reap_in <shell> [hold] -- the extracted pieces + stubs in a fresh shell over the case dir; with `hold`, hold_ondemand 10
-  # runs first, as the `in` op runs it. The reap gets $T/man and the uid ${UIDARG-10} (UIDARG= passes an empty uid).
+  # runs first, as the `in` op runs it. The reap gets ${MANARG:-$T/man} and the uid ${UIDARG-10} (UIDARG= passes an empty uid).
   # STATEDIR overrides $STATE. Leaves rc in $RC, the pm argv lines in $T/pm, the timeout argv lines in $T/timeout and
   # the log in $T/log.
   reap_in() {
@@ -106,7 +122,7 @@ suite() {
     "$1" -c "T='$T'; ROOT='$T'; LOG='$T/log'; STATE='${STATEDIR:-$T/state}'; $FN
 $STUBS
 $h
-reap_stale_ondemand '$T/man' '${UIDARG-10}'; echo \$? > '$T/rc'" >"$T/stdout" 2>&1
+reap_stale_ondemand '${MANARG:-$T/man}' '${UIDARG-10}'; echo \$? > '$T/rc'" >"$T/stdout" 2>&1
     RC=$(cat "$T/rc" 2>/dev/null)
   }
   # run <shell> [<manifest text>|-] -- newcase, the manifest ("-" = no manifest file), then reap_in with no hold.
@@ -129,6 +145,12 @@ reap_stale_ondemand '$T/man' '${UIDARG-10}'; echo \$? > '$T/rc'" >"$T/stdout" 2>
     [ -f "$T/state/od-unparked.10" ] && cmp -s "$T/want" "$T/state/od-unparked.10"
   }
   showlist() { { tr '\n' ';' < "$T/state/od-unparked.10"; } 2>/dev/null || echo '(no list)'; }
+  copy_is() {  # copy_is <want text> -- $T/od-unparked, the copy beside the manifest $T/man, is exactly that text
+    printf '%b' "$1" > "$T/want"
+    [ -f "$T/od-unparked" ] && cmp -s "$T/want" "$T/od-unparked"
+  }
+  showcopy() { { tr '\n' ';' < "$T/od-unparked"; } 2>/dev/null || echo '(no copy)'; }
+  warned() { grep -cF 'beside the manifest' "$T/log"; }
   # unparked <tag> <what> <pkg> <vol> -- the pkg made no pm call and logged its skip; com.parked (the control) WAS reaped
   unparked() {
     if [ "$RC" = 0 ] && ! pm_has "$3" && skipped "$3" "$4"; then ok "$1 $2: $3 makes no pm call and logs SKIPPED ($4)"
@@ -220,6 +242,16 @@ reap_stale_ondemand '$T/man' '${UIDARG-10}'; echo \$? > '$T/rc'" >"$T/stdout" 2>
     else no "$tg (g) od-unparked.10 mode is $(stat -c %a "$T/state/od-unparked.10" 2>/dev/null || echo '(no list)'), want 600"; fi
     if [ ! -e "$T/state/od-unparked.10.tmp" ]; then ok "$tg (g) no temp file is left in \$STATE"
     else no "$tg (g) od-unparked.10.tmp left in \$STATE"; fi
+    if copy_is 'com.mg\n'; then ok "$tg (g) the copy beside the manifest lists exactly the skipped package"
+    else no "$tg (g) the copy is not exactly com.mg: $(showcopy)"; fi
+    if [ "$(stat -c %a "$T/od-unparked" 2>/dev/null)" = 600 ]; then ok "$tg (g) the copy is mode 600"
+    else no "$tg (g) the copy's mode is $(stat -c %a "$T/od-unparked" 2>/dev/null || echo '(no copy)'), want 600"; fi
+    if grep -qxF "10057:10057 $T/od-unparked.tmp" "$T/chown"; then ok "$tg (g) the copy is chowned to the owner of its dir before the rename"
+    else no "$tg (g) no chown of the copy to 10057:10057: $(tr '\n' ';' < "$T/chown")"; fi
+    if grep -qxF -- "-D $T/od-unparked.tmp" "$T/restorecon"; then ok "$tg (g) the copy is restorecon'd before the rename"
+    else no "$tg (g) no restorecon of the copy: $(tr '\n' ';' < "$T/restorecon")"; fi
+    if [ ! -e "$T/od-unparked.tmp" ]; then ok "$tg (g) no temp file is left beside the manifest"
+    else no "$tg (g) od-unparked.tmp left beside the manifest"; fi
     rm -rf "$T"
 
     # (b) a failed mv, CE only: the chooser's CE .nowhere-odhold is a regular file, so mkdir and mv fail
@@ -275,6 +307,8 @@ reap_stale_ondemand '$T/man' '${UIDARG-10}'; echo \$? > '$T/rc'" >"$T/stdout" 2>
       else no "$tg (f) uid '$u': rc=$RC, $(pm_calls) pm calls, log: $(tr '\n' ';' < "$T/log")"; fi
       if [ -z "$(ls -A "$T/state")" ]; then ok "$tg (f) uid '$u' writes no list"
       else no "$tg (f) uid '$u' wrote into \$STATE: $(ls -A "$T/state" | tr '\n' ' ')"; fi
+      if [ ! -e "$T/od-unparked" ]; then ok "$tg (f) uid '$u' writes no copy"
+      else no "$tg (f) uid '$u' wrote a copy: $(showcopy)"; fi
       rm -rf "$T"
     done
 
@@ -285,21 +319,30 @@ reap_stale_ondemand '$T/man' '${UIDARG-10}'; echo \$? > '$T/rc'" >"$T/stdout" 2>
     reap_in "$sh"
     if list_is 'com.one\ncom.two\n' && pm_has com.ok; then ok "$tg (g) two skips are listed one per line, in manifest order"
     else no "$tg (g) two-skip list: $(showlist)"; fi
+    if copy_is 'com.one\ncom.two\n'; then ok "$tg (g) the copy holds the same two names"
+    else no "$tg (g) two-skip copy: $(showcopy)"; fi
     rm -rf "$T/data/user/10/com.one" "$T/data/user_de/10/com.two"
     : > "$T/pm"
     reap_in "$sh"
     if list_is '' && pm_has com.one && pm_has com.two; then ok "$tg (g) a second call with nothing skipped rewrites the list empty"
     else no "$tg (g) second call: list $(showlist)"; fi
+    if copy_is ''; then ok "$tg (g) a second call with nothing skipped rewrites the copy empty"
+    else no "$tg (g) second call: copy $(showcopy)"; fi
     rm -rf "$T"
     newcase; manifest com.ok
     printf 'stale.pkg\n' > "$T/state/od-unparked.10"
+    printf 'stale.pkg\n' > "$T/od-unparked"
     reap_in "$sh"
     if list_is ''; then ok "$tg (g) nothing skipped: an earlier list is replaced by an empty one"
     else no "$tg (g) nothing skipped: list $(showlist)"; fi
+    if copy_is ''; then ok "$tg (g) nothing skipped: an earlier copy is replaced by an empty one"
+    else no "$tg (g) nothing skipped: copy $(showcopy)"; fi
     rm -rf "$T"
     run "$sh" -
     if list_is ''; then ok "$tg (g) no manifest: the list is written empty"
     else no "$tg (g) no manifest: list $(showlist)"; fi
+    if copy_is ''; then ok "$tg (g) no manifest, its dir there: the copy is written empty"
+    else no "$tg (g) no manifest: copy $(showcopy)"; fi
     rm -rf "$T"
 
     # (h) a list that cannot be written: the skip still holds, the failure is logged, rc 0
@@ -310,6 +353,46 @@ reap_stale_ondemand '$T/man' '${UIDARG-10}'; echo \$? > '$T/rc'" >"$T/stdout" 2>
        && grep -qF 'WARN reap-stale-ondemand: could not write the unparked list for user 10' "$T/log"; then
       ok "$tg (h) a failed list write still skips, logs the failure and returns 0"
     else no "$tg (h) failed list write: rc=$RC, pm: $(tr '\n' ';' < "$T/pm") log: $(tr '\n' ';' < "$T/log")"; fi
+    if copy_is 'com.one\n'; then ok "$tg (h) a failed \$STATE write still writes the copy"
+    else no "$tg (h) failed \$STATE write: copy $(showcopy)"; fi
+    rm -rf "$T"
+
+    # (i) a manifest whose dir is absent: no copy, no WARN (nothing failed), and the $STATE list is still written. The
+    #     WARN check convicts a write attempted there: that write fails and leaves no file either.
+    newcase
+    MANARG="$T/gone/manifest.tsv" reap_in "$sh"
+    if [ "$RC" = 0 ] && [ ! -e "$T/gone" ] && [ "$(warned)" = 0 ]; then ok "$tg (i) a manifest whose dir is absent writes no copy and logs no WARN"
+    else no "$tg (i) absent dir: rc=$RC, log: $(tr '\n' ';' < "$T/log")"; fi
+    if [ ! -e "$T/od-unparked" ] && list_is ''; then ok "$tg (i) the \$STATE list is still written"
+    else no "$tg (i) absent dir: list $(showlist), copy $(showcopy)"; fi
+    rm -rf "$T"
+
+    # (j) a copy that cannot be written (a failed stat, a failed chown): one WARN naming no package, no copy, no temp,
+    #     and the skip, the $STATE list and the reap of the control are unchanged
+    for m in statfail chownfail; do
+      newcase; manifest com.one com.ok
+      mk user/10/com.one
+      : > "$T/$m"
+      reap_in "$sh"
+      if [ "$RC" = 0 ] && [ "$(warned)" = 1 ] && [ ! -e "$T/od-unparked" ] && [ ! -e "$T/od-unparked.tmp" ]; then
+        ok "$tg (j) $m: one WARN, no copy, no temp, rc 0"
+      else no "$tg (j) $m: rc=$RC, $(warned) WARN(s), copy $(showcopy), log: $(tr '\n' ';' < "$T/log")"; fi
+      grep -F 'beside the manifest' "$T/log" > "$T/warn"
+      if grep -qF com.one "$T/warn"; then no "$tg (j) $m: the WARN names a package: $(cat "$T/warn")"
+      else ok "$tg (j) $m: the WARN names no package"; fi
+      if ! pm_has com.one && pm_has com.ok && list_is 'com.one\n'; then ok "$tg (j) $m: the skip, the reap and the \$STATE list are unchanged"
+      else no "$tg (j) $m: pm: $(tr '\n' ';' < "$T/pm") list: $(showlist)"; fi
+      rm -rf "$T"
+    done
+
+    # (k) a failed restorecon keeps the copy, as the in op's own restorecon of this dir ignores its rc: the new file
+    #     already inherits the dir's label, and a copy the chooser cannot read falls back to no copy at the read
+    newcase; manifest com.one
+    mk user/10/com.one
+    : > "$T/rconfail"
+    reap_in "$sh"
+    if copy_is 'com.one\n' && [ "$(warned)" = 0 ] && [ ! -e "$T/od-unparked.tmp" ]; then ok "$tg (k) a failed restorecon keeps the copy"
+    else no "$tg (k) failed restorecon: copy $(showcopy), $(warned) WARN(s)"; fi
     rm -rf "$T"
   done
 
@@ -353,6 +436,13 @@ if [ "$MUTATE" = yes ]; then
   mutant "uid guard removed"              '/case "\$uid" in ""|\*\[!0-9\]\*)/d'
   mutant "skip list appended"             's|mv -f "\$_tmp" "\$_out"|cat "$_tmp" >> "$_out"|'
   mutant "skip continue dropped"          '/continue   # NWP-20261125-01: no pm call for unparked data/d'
+  mutant "copy dropped"                   's/if \[ -d "\$_dir" \]; then/if false; then/'
+  mutant "copy written with no chown"     's/ && chown "\$_own:\$_own" "\$_ctmp"//'
+  mutant "copy written with no relabel"   's/ && { restorecon -D "\$_ctmp" || :; }//'
+  mutant "failed relabel drops the copy"  's/ && { restorecon -D "\$_ctmp" || :; }/ \&\& restorecon -D "$_ctmp"/'
+  mutant "copy written with no chmod"     's/ && chmod 600 "\$_ctmp"//'
+  mutant "copy written when dir absent"   's/if \[ -d "\$_dir" \]; then/if :; then/'
+  mutant "copy holds the parked control"  's/printf .%s. "\$_skipped" >> "\$_ctmp"/{ printf "%s" "$_skipped"; printf "com.parked\\n"; } >> "$_ctmp"/'
   [ "$MISSED" -eq 0 ] || { echo "RESULT: FAIL ($MISSED mutant(s) not convicted)"; exit 1; }
 fi
 echo "RESULT: PASS"

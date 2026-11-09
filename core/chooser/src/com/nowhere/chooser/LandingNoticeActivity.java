@@ -23,8 +23,8 @@ import android.widget.TextView;
 
 /**
  * NWP-20261122-15 (h50 #5, docs/product-decisions.md 2026-11-01): the card a sign-in shows when its Auto sweep has apps
- * to fetch. Started by {@link UnarchiveService}'s sweepAuto, once per sign-in, with the work list in sweep order
- * ({@link #EXTRA_PKGS}).
+ * to fetch. Started by {@link UnarchiveService}'s sweepAuto, once per sign-in, with its rows ({@link #EXTRA_PKGS}):
+ * since NWP-20261130-09 the deps that ride with the work list (Play services, GSF), then the work list in sweep order.
  *
  * NWP-20261126-05 (docs/product-decisions.md 2026-11-03, "the Auto sweep's landing notice is a checklist card, and
  * Profile Help's cards show where to tap", option D): a rounded card {@link LandingLine#WIDTH_SHARE} of the screen wide,
@@ -34,8 +34,8 @@ import android.widget.TextView;
  * opens Your apps. Fixed slots, so the card keeps one size and never scrolls. The rules and words are LandingLine's.
  *
  * sweepAuto records each app outcome and the end in {@link LandingLine.Sweep} (its id rides {@link #EXTRA_SWEEP}),
- * then sends {@link #ACTION_APP} (package-local; the package never goes to the daemon) or
- * {@link UnarchiveService#ACTION_SWEEP_DONE}. The card registers its receiver FIRST and reads the record AFTER, and
+ * and each dep that lands (NWP-20261130-09), then sends {@link #ACTION_APP} (package-local; the package never goes to
+ * the daemon) or {@link UnarchiveService#ACTION_SWEEP_DONE}. The card registers its receiver FIRST and reads the record AFTER, and
  * reads it again on each broadcast, so an outcome or the end sent before the card started, or while it was being
  * recreated, is never missed. Only an ok outcome ticks the app off: a failed app stays "coming back", keeps its row and
  * counts in "+<n> more" (the rows follow {@code landed}, as LandingLine.rows says). The card closes
@@ -45,7 +45,7 @@ import android.widget.TextView;
  */
 public class LandingNoticeActivity extends Activity {
     static final String EXTRA_COUNT = "nowhere.landing.count";
-    /** String[]: the sweep's work list, in sweep order. */
+    /** String[]: the card's rows (LandingLine.cardPkgs). */
     static final String EXTRA_PKGS = "nowhere.landing.pkgs";
     /** One app's outcome: {@link #EXTRA_PKG} and {@link #EXTRA_OK}. Package-local. */
     static final String ACTION_APP = "com.nowhere.chooser.action.LANDING_APP";
@@ -265,7 +265,8 @@ public class LandingNoticeActivity extends Activity {
     }
 
     /** The app's name as ProfileActivity.keptLabel resolves it: the installed label, else the archived placeholder's
-     *  launcher label, else the package name. Cached until the app's outcome arrives. */
+     *  launcher label, else a provider's fixed name (NWP-20261130-09: it has no placeholder to read), else the package
+     *  name. Cached until the app's outcome arrives. */
     private String label(int i) {
         if (labels[i] != null) return labels[i];
         String pkg = pkgs[i];
@@ -287,6 +288,7 @@ public class LandingNoticeActivity extends Activity {
                 }
             } catch (Throwable ignore) {}
         }
+        if (got == null) got = LandingLine.depLabel(pkg);
         labels[i] = got != null ? got : pkg;
         return labels[i];
     }

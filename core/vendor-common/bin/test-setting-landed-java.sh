@@ -17,7 +17,9 @@
 #      write.run();
 #   S2 showConfiguration's media lambda reads back after its cfgPut and, on false, toasts NOT_SAVED and redraws;
 #   S3 appDefaultRow's lambda does the same;
-#   S4 showWipePicker toasts NOT_SAVED on a failed read-back and reaches "applies next sign-in" only when saved.
+#   S4 showWipePicker toasts NOT_SAVED on a failed read-back and reaches "applies next sign-in" only when saved;
+#   S5 showIdlePicker toasts NOT_SAVED when any of its three writes failed and reaches its text only when all landed
+#      (NWP-20261129-15).
 #
 # ⚠ IT FAILS WHEN THERE IS NO JAVAC, IT NEVER SKIPS. javac comes from PATH, else from the build host's JDK below;
 # the version is printed first so the log proves which compiler ran.
@@ -165,6 +167,28 @@ pins() {
     echo "  FAIL  S4 showWipePicker does not toast NOT_SAVED on a failed read-back and the Auto-wipe text only when saved" >&2
     bad=1
   }
+
+  # S5: the Auto standby toast follows its three writes (NWP-20261129-15).
+  b=$(meth "$paf" showIdlePicker)
+  [ -n "$b" ] || { echo "  FAIL  S5 showIdlePicker( not found" >&2; return 1; }
+  ok=1
+  wr=$(first_line "$b" "if (idleOk && holdOk && audioOk) live = sendLivePrefs();")
+  n=$(printf '%s\n' "$b" | grep -nF -- 'if (!(idleOk && holdOk && audioOk)) android.widget.Toast.makeText(this, SettingLanded.NOT_SAVED,' | cut -d: -f1)
+  [ "$(printf '%s\n' "$n" | grep -c .)" -eq 1 ] && [ -n "$wr" ] && [ "$n" -gt "$wr" ] || ok=0
+  e=$(printf '%s\n' "$b" | grep -nF -- '"Auto standby when idle: "')
+  if [ "$(printf '%s\n' "$e" | grep -c .)" -ne 1 ] || ! [[ "$e" =~ ^[0-9]+:\ *else\  ]]; then
+    ok=0
+  else
+    e=${e%%:*}
+    [ -n "$n" ] && [ "$e" -gt "$n" ] || ok=0
+    has "$(printf '%s\n' "$b" | sed -n "${e},$((e + 1))p")" "applies next sign-in" || ok=0
+    s=$(printf '%s\n' "$b" | sed -n "$((e + 1)),\$p" | grep -nE '^ *showSecurity\(\);$' | head -1)
+    [ -n "$s" ] || ok=0
+  fi
+  [ "$ok" -eq 1 ] || {
+    echo "  FAIL  S5 showIdlePicker does not toast NOT_SAVED on a failed write and the Auto standby text only when all landed" >&2
+    bad=1
+  }
   [ "$bad" -eq 0 ]
 }
 
@@ -181,7 +205,7 @@ check_all() {
 echo "== $SUT"
 check_all "$SUT" "$PA"; rc=$?
 [ "$rc" -eq 0 ] || { echo "FAILED"; exit 1; }
-echo "ok: cases L1-L8 + pins S1-S4"
+echo "ok: cases L1-L8 + pins S1-S5"
 [ "$MUTATE" = yes ] || exit 0
 
 command -v perl >/dev/null 2>&1 || { echo "FAIL: --mutate needs perl, and there is none -- refusing to report" >&2; exit 1; }
@@ -218,4 +242,5 @@ mut "K8 landed is true on a null after"              class 's/if \(change == nul
 mut "K9 NOT_SAVED says it applies"                   class 's/static final String NOT_SAVED = "[^"]*";/static final String NOT_SAVED = "Saved — applies next sign-in.";/' || fails=$((fails+1))
 mut "K10 landed ignores a differing value"           class 's/if \(!Objects\.equals\(e\.getValue\(\), after\.get\(e\.getKey\(\)\)\)\) return false;//' || fails=$((fails+1))
 mut "K11 the wipe read-back is gone"                 pa    's/(\n *)final boolean saved = SettingLanded\.landed\(PresetPicker\.change\("wipe", String\.valueOf\(idx\)\),\n *presetCurrent\(\)\);/$1final boolean saved = true;/' || fails=$((fails+1))
-[ "$fails" -eq 0 ] && echo "== all 11 mutations convicted" || { echo "== $fails mutation(s) not convicted"; exit 1; }
+mut "K12 the idle Save's not-saved branch removed"    pa    's/(\n *)if \(!\(idleOk && holdOk && audioOk\)\) android\.widget\.Toast\.makeText\(this, SettingLanded\.NOT_SAVED,\n *android\.widget\.Toast\.LENGTH_LONG\)\.show\(\);\n *else (android\.widget\.Toast\.makeText\(this, "Auto standby when idle: ")/$1$2/' || fails=$((fails+1))
+[ "$fails" -eq 0 ] && echo "== all 12 mutations convicted" || { echo "== $fails mutation(s) not convicted"; exit 1; }

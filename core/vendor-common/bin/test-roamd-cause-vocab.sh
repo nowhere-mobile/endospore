@@ -150,11 +150,12 @@ done
 echo "== the exit-code PATH: a push that exits 5 reaches the verdict as unreachable, every shell =="
 # The table above is only half: acct_seal, appcode_seal and the `out` op's call sites carry the push's code to
 # _cause, and any of them could re-map a 5 on the way (`[ "$r" = 5 ] && r=6`) with the table still passing. So
-# acct_seal and appcode_seal run WHOLE, lifted by name, with /data/ pointed at a temp root and `$AGENT` a stub
-# that exits a chosen code; the `out` op's _note, its #sys/#apps call sites and its OK/PARTIAL emission are lifted
-# by anchor and run on top of them. `timeout` is a stub that drops its three arguments (`-k 5 <limit>`).
+# acct_seal and appcode_seal run WHOLE, lifted by name (with pw and pkgname_ok), with /data/ pointed at a temp root
+# and `$AGENT` a stub that exits a chosen code; the `out` op's _note, its #sys/#apps call sites and its OK/PARTIAL
+# emission are lifted by anchor and run on top of them. `timeout` is a stub that drops its three arguments
+# (`-k 5 <limit>`).
 SEALFUNCS=""
-for fn in pw acct_seal stage_apk_copy appcode_seal; do
+for fn in pw pkgname_ok acct_seal stage_apk_copy appcode_seal; do
   body=$(awk -v h="$fn() {" '$0 == h {f=1} f{print} f&&/^\}$/{exit}' "$ROAMD")
   case "$body" in "$fn() {"*'}') SEALFUNCS="$SEALFUNCS$body
 " ;; *) echo "EXTRACTION FAILED: $fn -- not found by name" >&2; exit 2 ;; esac
@@ -189,7 +190,7 @@ seal_run(){
     printf 'T=%s; STATE=$T/state; LANE=rw; LOG=$T/log; RES=$T/res; USERDIR=$T/user; name=probe; pass=x; uid=7; parts=""\n' "$T"
     printf 'agent_stub(){ echo "$*" >> "$T/calls"; return %s; }; AGENT=agent_stub\n' "$2"
     printf 'timeout(){ shift 3; "$@"; }\n'
-    printf 'keystore_register_all(){ :; }; _ms(){ echo 0; }; _apps_stage_prog(){ :; }; live_code_dir(){ :; }; stage_live_apks(){ :; }; stage_keep_mtimes(){ :; }\n'
+    printf 'keystore_register_all(){ :; }; appcode_pm_snapshot(){ :; }; _ms(){ echo 0; }; _apps_stage_prog(){ :; }; live_code_dir(){ :; }; stage_live_apks(){ :; }; stage_keep_mtimes(){ :; }\n'
     printf 'bt_reset(){ return 0; }; rc=%s; nc=0; refused=0; stopped=0; skind=%s; : > "$STATE/.btlogoff"\n' "${5:-0}" "${6:-periodic}"
     printf '%s\n' "$SEALFUNCS"
     case "$3" in

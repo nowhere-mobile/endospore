@@ -179,9 +179,9 @@ func TestAnrSnapshot_TakenWhereASessionBeginsAndOnlyThere(t *testing.T) {
 	// Everything between the markRoamSession call and the snapshot must be the whole error block: it ends in a
 	// return and its closing brace, so a call placed inside the branch (or before the return) fails here.
 	between := in[mark:callAt]
-	// NWP-20261030-02's resetSealSignals() also belongs right after the block (a new identity is recorded): drop it and
-	// any comment lines from the tail before checking that the block is complete.
-	between = regexp.MustCompile(`(?:\s*(?://[^\n]*|resetSealSignals\(\)))*\s*$`).ReplaceAllString(between, "")
+	// NWP-20261030-02's resetSealSignals() and NWP-20261129-17's dropInPark(dest) also belong right after the block (a
+	// new identity is recorded): drop them and any comment lines from the tail before checking that the block is complete.
+	between = regexp.MustCompile(`(?:\s*(?://[^\n]*|resetSealSignals\(\)|dropInPark\(dest\)))*\s*$`).ReplaceAllString(between, "")
 	if !strings.Contains(between, "ERR-UNRECORDED") || !regexp.MustCompile(`return\s*\}\s*$`).MatchString(between) {
 		t.Errorf("handleRoamIn must take the snapshot after the complete markRoamSession error block (return and closing brace)")
 	}

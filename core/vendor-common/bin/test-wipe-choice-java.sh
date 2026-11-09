@@ -96,7 +96,7 @@ pins() {
     || { echo "  FAIL  pins: showWipePicker does not save with writeWipePref(idx) as the condition of the live send" >&2; bad=1; }
   [ "$(count "$sp" 'int\[\] hours|"After 1 hour"')" -eq 0 ] \
     || { echo "  FAIL  pins: showWipePicker still holds its own hours or labels" >&2; bad=1; }
-  [ "$(count "$wp" 'prefsUpdatedWipe\(readPrefsText\(\), WipeChoice\.wipeValue\(i\), WipeChoice\.savedValue\(i\),')" -eq 1 ] \
+  [ "$(count "$wp" 'prefsUpdatedWipe\(cur, WipeChoice\.wipeValue\(i\), WipeChoice\.savedValue\(i\),')" -eq 1 ] \
     || { echo "  FAIL  pins: writeWipePref does not compose both keys with prefsUpdatedWipe" >&2; bad=1; }
   [ "$(count "$wp" 'StoreInstaller\.writeAtomic\(new java\.io\.File\(getFilesDir\(\), PREFS_FILE\), text\);')" -eq 1 ] \
     || { echo "  FAIL  pins: writeWipePref does not write the text in one writeAtomic" >&2; bad=1; }

@@ -134,8 +134,9 @@ agent_sim() {
 }
 pw() { printf '%s\n' "$ROOT/sim/pw"; }
 _ms() { echo 0; }
+_sum0=0; _sumt=0   # set above the `in` arm in the script (NWP-20261130-08); this harness runs the arm alone under set -u
 sleep() { return 0; }
-for t in usb_host remap_media_db remap_per_pkg _tlog remap_tree reown_ext_appdata keystore_push restorecon uiderrors_floor_take; do
+for t in usb_host remap_media_db insert_deferred_media remap_per_pkg _tlog _ssum remap_tree reown_ext_appdata keystore_push restorecon uiderrors_floor_take; do
   eval "$t() { :; }"
 done
 for t in relabel_launcher restore_media_tail ks_signin_reset keystore_restore tz_surface hold_ondemand \
@@ -293,8 +294,8 @@ L_VF='    if [ -n "$_innet" ]; then'
 L_CE='    elif NOWHERE_PHASE=apps NOWHERE_CLAIMS_SEED="$STATE/claims.seed" "$AGENT" restore s3 "$name" "$(pw "$pass")" "$USERDIR" >> "$LOG" 2>&1; then'
 L_SM='      stop_mediad   # NWP-20261117-16: a predecessor'"'"'s media daemon goes only once this sign-in has landed'
 L_HO='      hold_ondemand "$uid"'
-L_OK='      [ "$_parked" = 1 ] && rm -rf "$PARK" 2>> "$LOG"'
-for l in "$L_MD" "$L_GD" "$L_BN" "$L_VF" "$L_CE" "$L_SM" "$L_HO" "$L_OK"; do
+L_OR='      echo "OK $uid" > "$RES"; _inres=OK'
+for l in "$L_MD" "$L_GD" "$L_BN" "$L_VF" "$L_CE" "$L_SM" "$L_HO" "$L_OR"; do
   [ "$(grep -cxF -- "$l" "$SUT")" = 1 ] || { echo "EXTRACTION FAILED: anchor line not unique in $SUT: $l" >&2; exit 2; }
 done
 # mut <name> <awk-program>: convicted only by a failing line under EACH shell found; a harness error (rc 2) under any
@@ -302,7 +303,7 @@ done
 mut() {
   local name="$1" prog="$2" t s r
   t=$(mktemp -p "$W")
-  awk -v MD="$L_MD" -v GD="$L_GD" -v BN="$L_BN" -v VF="$L_VF" -v CE="$L_CE" -v SM="$L_SM" -v HO="$L_HO" -v OK="$L_OK" \
+  awk -v MD="$L_MD" -v GD="$L_GD" -v BN="$L_BN" -v VF="$L_VF" -v CE="$L_CE" -v SM="$L_SM" -v HO="$L_HO" -v OR="$L_OR" \
     "$prog" "$SUT" > "$t"
   if cmp -s "$t" "$SUT"; then echo "  FAIL  mutant did not apply: $name"; MFAIL=1; command rm -f "$t"; return; fi
   for s in $SHELLS; do
@@ -327,6 +328,6 @@ mut "M5 BLANK written instead of BLANK NET (the gate would offer the rollback)" 
 mut "M6 stop_mediad back at the head of the vault-OK branch" \
   '$0==SM{next} {print} $0==CE{print SM}'
 mut "M7 the verdict placed after bt_reset" \
-  '$0==VF{print "    if false; then"; next} $0==HO{print "      if [ -n \"$_innet\" ]; then echo \"BLANK NET\" > \"$RES\"; else"} {print} $0==OK{print "      fi"}'
+  '$0==VF{print "    if false; then"; next} $0==HO{print "      if [ -n \"$_innet\" ]; then echo \"BLANK NET\" > \"$RES\"; else"} {print} $0==OR{print "      fi"}'
 [ "$MFAIL" = 0 ] || exit 1
 echo "all mutants convicted"

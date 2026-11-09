@@ -45,7 +45,7 @@ if [ "$DO_RELEASE" = 1 ] && [ -z "$VERIFIED" ]; then
   exit 2
 fi
 
-TREE="${ENDOSPORE_TREE:-/mnt/build/graphene/grapheneos-2026110100}"
+TREE="${ENDOSPORE_TREE:-/mnt/build/graphene/grapheneos-2026110200}"
 REPO="${ENDOSPORE_REPO:-/mnt/build/nowhere-phone}"
 # NWP-20261125-02 (h55 #2): no build of a device past its GrapheneOS full-support date (devices/<device>/support-end); a --release also refuses a device with no file. Runs before the ring lookup and any write or prompt.
 sh "$REPO/editions/endospore/build/support-end-guard.sh" "$REPO" "$DEV" "$(date -u +%F)" "$( [ "$DO_RELEASE" = 1 ] && echo release || echo dev )" || exit $?
@@ -482,6 +482,13 @@ if [ "$DO_RELEASE" -eq 0 ]; then
   exit 0
 fi
 
+# NWP-20261105-19: the signing keys live outside every tree ($NOWHERE_KEYS_HOME, default /mnt/build/keys/endospore), and
+# GrapheneOS's script/generate-release.sh reads only keys/$DEV inside the tree. keys-home.sh links a tree that has no
+# keys/ to that home, uses a tree's own keys/ unless a public half differs from the home's copy, and refuses a link
+# elsewhere or a home inside a source tree; the two checks below then read the keys through it. It never creates a key,
+# so a missing one stops here, before the prompt.
+sh "$REPO/editions/endospore/build/keys-home.sh" "$TREE" "$DEV" || fail "signing keys for $DEV (keys-home.sh)"
+
 # generate-release.sh signs $DEV-install-$BN.zip only behind `if [ -f keys/$DEV/id_ed25519 ]` -- an absent
 # key is a SILENT skip and an unsigned CLI-install artifact, found a release later (2026081219: tegu and
 # stallion shipped .sig files, frankel didn't, and nothing said so). script/ belongs to the GrapheneOS tree
@@ -508,8 +515,8 @@ if [ ! -f "$TREE/keys/$DEV/avb_pkmd.bin" ]; then
   echo "   generate-release has prompted for the passphrase and signed for ~30 min. Failing now instead."
   echo "   Restore it from the off-box key backup for $DEV."
   echo "   DO NOT reach for gen-keys.sh on a device that has already shipped: it creates whatever is"
-  echo "   missing, and a missing avb.pem then means MINTING A NEW AVB ROOT KEY (gen-keys.sh:28), after"
-  echo "   which every relocked handset rejects the images (docs/build-box-migration.md:113)."
+  echo "   missing, and a missing avb.pem then means MINTING A NEW AVB ROOT KEY (its openssl genrsa), after"
+  echo "   which every relocked handset rejects the images (docs/build-box-migration.md, section 6)."
   fail "avb_pkmd.bin missing for $DEV -- refusing to sign a release that cannot be packaged"
 fi
 

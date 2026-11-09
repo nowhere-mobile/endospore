@@ -274,16 +274,16 @@ if [ "$MUTATE" = yes ]; then
   mutate "drop [ -d \"\$lcd\" ] || return 0 (a vanished dir is still sealed)" \
          '/^live_code_dir() {$/,/^}$/{/^  \[ -d "\$lcd" \] || return 0$/d}' pershell
   mutate "awk keeps the LAST codePath (a later block's codePath wins)" \
-         '/^live_code_dir() {$/,/^}$/s#^    !p \&\& /codePath=/ {#    /codePath=/ {#' pershell
+         '/^live_code_dir() {$/,/^}$/s#^      !p \&\& /codePath=/ {#      /codePath=/ {#' pershell
   mutate "the /data/app arm stops rejecting other paths" \
          '/^live_code_dir() {$/,/^}$/s#^  case "\$lcd" in /data/app/\*) ;; \*) return 0 ;; esac$#  case "$lcd" in /data/app/*) ;; *) ;; esac#' pershell
   # M1/M2: the dump captured in a variable and handed to printf again, for one field each.
   M1_SED=$(cat <<'EOF'
-/^live_code_dir() {$/,/^}$/s|^  lcd=\${lout%%"\$lnl"\*}$|  ldump=$(dumpsys package "$1" 2>/dev/null); lcd=$(printf '%s' "$ldump" \| sed -n 's/.*codePath=//p' \| head -1)|
+/^live_code_dir() {$/,/^}$/s|^    lcd=\${lout%%"\$lnl"\*}$|    ldump=$(dumpsys package "$1" 2>/dev/null); lcd=$(printf '%s' "$ldump" \| sed -n 's/.*codePath=//p' \| head -1)|
 EOF
 )
   M2_SED=$(cat <<'EOF'
-/^live_code_dir() {$/,/^}$/s|^  case "\$lout" in \*"\$lnl"\*) lflags=.*$|  ldump=$(dumpsys package "$1" 2>/dev/null); lflags=$(printf '%s' "$ldump" \| grep -m1 'flags=\\[')|
+/^live_code_dir() {$/,/^}$/s|^    case "\$lout" in \*"\$lnl"\*) lflags=.*$|    ldump=$(dumpsys package "$1" 2>/dev/null); lflags=$(printf '%s' "$ldump" \| grep -m1 'flags=\\[')|
 EOF
 )
   mutate "M1 the codePath read from printf '%s' \"\$ldump\" | sed again" "$M1_SED" pershell

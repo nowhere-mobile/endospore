@@ -983,8 +983,11 @@ func pullWalletStrictGuarded(base, name, pass string, dk []byte, walletPath stri
 // is the likeliest holder; well inside logoffStallLimit.
 var walletLogoffRetryWait = 60 * time.Second
 
-// walletHoldsCredit reports that the wallet file at wp holds something a lost publish loses: tokens, or a plan bought
-// and not yet activated. A file that cannot be read counts as holding credit (the notice errs toward saying so).
+// walletHoldsCredit reports that the wallet file at wp holds credit a lost publish loses: unspent tokens
+// (NWP-20261128-31). A plan bought and not yet activated still holds its tokens, so the balance covers it. A plan
+// whose tokens were spent is a grant the gateway holds under the profile's key, and the next lease relearns its term,
+// so its PlanGB/PaidThrough record is not credit. A file that cannot be read counts as holding credit (the notice
+// errs toward saying so).
 func walletHoldsCredit(wp string) bool {
 	if _, err := os.Stat(wp); os.IsNotExist(err) {
 		return false
@@ -993,7 +996,7 @@ func walletHoldsCredit(wp string) bool {
 	if err != nil {
 		return true
 	}
-	return w.balance() > 0 || w.PlanGB > 0
+	return w.balance() > 0
 }
 
 // ---- the gate's "credit could not be saved" notice (NWP-20261013-20, decided 2026-10-15; NWP-20261016-47) ----

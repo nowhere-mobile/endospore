@@ -57,7 +57,7 @@ arm_of() { awk -v a="  $2)" '$0 == a {f=1} f{print} f&&/^    ;;$/{exit}' "$1"; }
 nleft() { printf '%s\n' "$1" | sed -E 's/(^|[[:space:]])#.*$//' | sed 's#\$ROOT/data/##g' | grep -cE '(^|[^[:alnum:]_])/data/'; }
 
 suite() {  # suite <roamd.sh> [quiet] -> 0 all ok, 1 a case failed, 2 the harness could not run
-  local f="$1" quiet="${2:-}" p=0 x=0 ODH MIP SC SCR ARM ARMR n sh HARN="" R L V D T H X
+  local f="$1" quiet="${2:-}" p=0 x=0 ODH PKGOK MIP SC SCR ARM ARMR n sh HARN="" R L V D T H X
   say() { [ -n "$quiet" ] || printf '%s\n' "$1"; }
   chk() {
     local l="$1"; shift
@@ -71,10 +71,12 @@ suite() {  # suite <roamd.sh> [quiet] -> 0 all ok, 1 a case failed, 2 the harnes
   absent() { [ ! -e "$1" ]; }
 
   ODH=$(grep -m1 -E '^ODHOLD=' "$f")
+  PKGOK=$(anchor_of "$f" 'pkgname_ok() {')
   MIP=$(anchor_of "$f" 'mi_path() {')
   SC=$(anchor_of "$f" 'od_served_copy() {')
   ARM=$(arm_of "$f" odrestore)
   [ -n "$ODH" ] || { echo "EXTRACTION FAILED: ODHOLD= not found in $f" >&2; return 2; }
+  case "$PKGOK" in *'return 1'*'return 0'*) ;; *) echo "EXTRACTION FAILED: pkgname_ok in $f" >&2; return 2 ;; esac
   case "$MIP" in *'sed -e'*) ;; *) echo "EXTRACTION FAILED: mi_path in $f" >&2; return 2 ;; esac
   case "$ARM" in *'echo "ERR-PKG" > "$RES"'*'echo "OK NOSRC" > "$RES"'*'echo "ERR-NOTREADY" > "$RES"'*) ;; *) echo "EXTRACTION FAILED: the odrestore arm in $f" >&2; return 2 ;; esac
   # od_served_copy is absent before NWP-20261121-02: define nothing, so the cases RUN against that code and fail.
@@ -209,7 +211,7 @@ chcon() {
   return 0
 }
 EOF
-      printf '%s\n%s\n%s\n' "$ODH" "$MIP" "$SCR"
+      printf '%s\n%s\n%s\n%s\n' "$ODH" "$PKGOK" "$MIP" "$SCR"
       printf 'case "$op" in\n%s\nesac\necho "$odn" > "$ROOT/sim/odn"\n' "$ARMR"
     } > "$d"
   }

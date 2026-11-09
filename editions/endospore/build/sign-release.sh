@@ -10,7 +10,8 @@
 # HOW. Build each device unattended first (`VARIANT=user OUT_DIR=<out> build-device.sh <dev> <BN>`). This script never
 # runs `m`. It then, in this order:
 #   1. preflights EVERY device before any prompt: the verified commit; per device the target-files' build number, user
-#      build, os-ref, source commit, patch markers and release ring; the keys; GrapheneOS full support (support-guard.sh);
+#      build, os-ref, source commit, patch markers and release ring; the keys (a tree with no keys/ is linked to the keys
+#      home first, keys-home.sh); GrapheneOS full support (support-guard.sh);
 #      the OTA stamp; TMPDIR's free space; stale key dirs of this user in /dev/shm; decrypt-keys' password gate. Each
 #      refusal names the device; nothing is signed;
 #   2. refuses while another process of the signing user runs (sitting-guard.sh), and names each one;
@@ -44,7 +45,7 @@ for a in "$@"; do
   DEVS+=("$d"); OUTS+=("$o")
 done
 
-TREE="${ENDOSPORE_TREE:-/mnt/build/graphene/grapheneos-2026110100}"
+TREE="${ENDOSPORE_TREE:-/mnt/build/graphene/grapheneos-2026110200}"
 REPO="${ENDOSPORE_REPO:-/mnt/build/nowhere-phone}"
 B="$REPO/editions/endospore/build"
 SHM="${SIGN_SHM_DIR:-/dev/shm}"
@@ -142,6 +143,12 @@ check_image() {    # <dev> <out>: 2b, on the target-files zip build-device.sh le
 }
 check_keys() {     # <dev>: 2c, the key files build-device.sh checks before its own prompt
   local DEV="$1" K="$TREE/keys/$1" f
+  # NWP-20261105-19: as build-device.sh --release, keys-home.sh first links a tree with no keys/ to the keys home (it never
+  # creates a key). Its refusal is this device's; the file checks below would only repeat it.
+  if ! sh "$B/keys-home.sh" "$TREE" "$DEV" >&2; then
+    refuse "$DEV: no usable keys/$DEV (keys-home.sh, above)"
+    return
+  fi
   f=$(compgen -G "$K/*.pk8" || true)
   [ -n "$f" ] || refuse "$DEV: keys/$DEV/*.pk8 is MISSING"
   [ -f "$K/avb.pem" ] || refuse "$DEV: keys/$DEV/avb.pem is MISSING"

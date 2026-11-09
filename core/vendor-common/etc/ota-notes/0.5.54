@@ -1,0 +1,8 @@
+version 0.5.54
+previous 0.5.53
+- The Gallery lists your photos and videos right after sign-in, including ones that have not downloaded yet.
+- Texts and picture messages are filed under the SIM they arrived on, long texts go out as picture messages, and a failed picture message download tells you.
+- The Welcome back card shows Play services' progress beside Play Store, and an app install that takes over three minutes still finishes and keeps its setting.
+- Backup moves from the gate's settings into Owner settings.
+- Profile's main screen fits on one screen at the default display and font size.
+- Preparing your apps at sign-out finishes sooner.

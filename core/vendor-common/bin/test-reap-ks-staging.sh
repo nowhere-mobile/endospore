@@ -333,7 +333,7 @@ if [ "$MUTATE" = yes ]; then
   mutate "Q11: cleanstorage passes \$_ksv, not \$_kssv" -e 's@^  ks_reap_clear "\$uid" "\$_kssv"@  ks_reap_clear "$uid" "$_ksv"@'
   mutate "Q12: the KS_STAGE_VERDICT reset is deleted" -e '/^keystore_push() {$/,/^}$/ { /^  KS_STAGE_VERDICT=""/d; }'
   mutate "Q13: an unmapped export also sets notsealed-unmapped" \
-    -e '/^keystore_push() {$/,/^}$/ s@\[roamd\] keystore_push: ns \$_ns has no package mapping, dropped \$(date)" >> "\$LOG"; _knomap=\$((_knomap + 1));@&_knomapi=$((_knomapi + 1));@'
+    -e '/^keystore_push() {$/,/^}$/ s@\[roamd\] keystore_push: ns \$_ns has no package mapping, dropped \$_kmev \$(date)" >> "\$LOG"; _knomap=\$((_knomap + 1));@&_knomapi=$((_knomapi + 1));@'
   mutate "Q14: ks_reap_clear clears on notsealed-unmapped too" -e '/^ks_reap_clear() {$/,/^}$/ s@^    notsealed) _why=@    notsealed|notsealed-unmapped) _why=@'
 fi
 

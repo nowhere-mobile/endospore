@@ -194,7 +194,14 @@ pins() {
       *'return true;'*) ;;
       *) echo "  FAIL  P4 writeWipePref does not return true right after writeAtomic" >&2; bad=1 ;;
     esac
-    [ "$(count "$a" 'return false;')" -eq 1 ] || { echo "  FAIL  P4 writeWipePref does not return false on a failed write" >&2; bad=1; }
+    # Two: the strict read's refusal (NWP-20261129-15, test-settings-text-java.sh S8) and the failed write's, right
+    # after its log line.
+    l=$(first_line "$a" 'android\.util\.Log\.w\("NowhereChooser", "writeWipePref", e\);')
+    case "$(printf '%s\n' "$a" | sed -n "$((${l:-0} + 1))p")" in
+      *'return false;'*) ;;
+      *) echo "  FAIL  P4 writeWipePref does not return false on a failed write" >&2; bad=1 ;;
+    esac
+    [ "$(count "$a" 'return false;')" -eq 2 ] || { echo "  FAIL  P4 writeWipePref does not hold exactly two return false;" >&2; bad=1; }
   fi
 
   # G1: no new log line prints a profile name.

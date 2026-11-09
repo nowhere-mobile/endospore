@@ -166,6 +166,31 @@ public final class SettingsTextCases {
         truth(label + ": parses through " + parser, b.contains(parser), "no " + parser);
     }
 
+    private static final java.util.regex.Pattern CUR_NULL_BRANCH = java.util.regex.Pattern.compile(
+            "if\\s*\\(\\s*cur\\s*==\\s*null\\s*\\)\\s*\\{[^{}]*\\breturn\\s+false\\s*;");
+
+    /** NWP-20261129-15: a nowhere-prefs writer. It reads PREFS_FILE strictly into cur, returns false on null, and only
+     *  then composes from cur and writes. */
+    private static void prefsWriter(String code, String label, String sig, String compose) {
+        String b = method(code, sig);
+        if (b == null) { truth(label + ": found by its signature", false, "signature absent, duplicated or unbalanced"); return; }
+        int iRead = b.indexOf("SettingsText.read(new java.io.File(getFilesDir(), PREFS_FILE))");
+        java.util.regex.Matcher m = CUR_NULL_BRANCH.matcher(b);
+        int iNull = m.find() ? m.start() : -1;
+        int iCompose = b.indexOf(compose);
+        int iWrite = b.indexOf("StoreInstaller.writeAtomic(");
+        truth(label + ": reads PREFS_FILE through SettingsText.read(", iRead >= 0, "no strict read of PREFS_FILE");
+        truth(label + ": returns false on a null read", iNull >= 0, "no `if (cur == null) { ... return false; }`");
+        truth(label + ": the null check follows the read", iRead >= 0 && iNull > iRead, "read@" + iRead + " null@" + iNull);
+        truth(label + ": returns on null before " + compose, iNull >= 0 && iCompose > iNull, "null@" + iNull + " compose@" + iCompose);
+        truth(label + ": returns on null before StoreInstaller.writeAtomic(", iNull >= 0 && iWrite > iNull,
+                "null@" + iNull + " writeAtomic@" + iWrite);
+        truth(label + ": does not read through the swallowing readPrefsText()", !b.contains("readPrefsText()"), "calls readPrefsText()");
+        truth(label + ": logs the fixed line on a refused write",
+                java.util.regex.Pattern.compile("Log\\.w\\(\"NowhereChooser\",\\s*\"nowhere-prefs unreadable -- nothing written \\(NWP-20261129-15\\)\"\\)")
+                        .matcher(b).find(), "no fixed `nowhere-prefs unreadable` log line");
+    }
+
     private static void sourceChecks(String src) {
         String code = stripComments(src);
         // NWP-20261124-09: cfgPut's body moved into cfgPutStatic (PlayAtCreateReceiver shares it); cfgPut only delegates
@@ -184,5 +209,12 @@ public final class SettingsTextCases {
         reader(code, "S4 readConfig", "private java.util.Map<String,String> readConfig() {", "SettingsText.parseConfig(");
         reader(code, "S5 readTiers", "private java.util.Map<String,String> readTiers() {", "SettingsText.parseTiers(");
         reader(code, "S6 readPins", "private java.util.Set<String> readPins() {", "SettingsText.parsePins(");
+        prefsWriter(code, "S7 setPref", "private boolean setPref(String key, String value) {", "prefsUpdated(cur,");
+        prefsWriter(code, "S8 writeWipePref", "private boolean writeWipePref(int i) {", "prefsUpdatedWipe(cur,");
+        truth("S7 capturePrefs: logs \"captured prefs\" only when setPref answered true, else the fixed line",
+                java.util.regex.Pattern.compile("if\\s*\\(\\s*setPref\\(\"locale\",\\s*loc\\)\\s*\\)\\s*\\{[^{}]*\"captured prefs [^{}]*\\}\\s*else\\s*\\{\\s*"
+                        + "android\\.util\\.Log\\.w\\(\"NowhereChooser\",\\s*\"prefs not captured -- nowhere-prefs was not written \\(NWP-20261129-15\\)\"\\);\\s*\\}")
+                        .matcher(java.util.Objects.toString(method(code, "private void capturePrefs() {"), "")).find(),
+                "capturePrefs does not branch its log on setPref's answer");
     }
 }

@@ -170,7 +170,7 @@ sign_world() {   # <marker-dev|-> <dev>... -> prints its dir
   RB="$X/repo/editions/endospore/build"
   mkdir -p "$RB" "$X/repo/core/vendor-common/etc/rings" "$X/bin" "$X/tree/build" "$X/tree/script" "$X/shm"
   cp "$DIR/sign-release.sh" "$DIR/support-guard.sh" "$RB/"
-  for d in sitting-guard.sh verified-commit-guard.sh ring-for-build.sh ring-record.tsv assert-baked-ring.sh; do cp "$HERE/$d" "$RB/"; done
+  for d in sitting-guard.sh verified-commit-guard.sh ring-for-build.sh ring-record.tsv assert-baked-ring.sh keys-home.sh; do cp "$HERE/$d" "$RB/"; done
   cp "$ROOT"/core/vendor-common/etc/rings/*.conf "$X/repo/core/vendor-common/etc/rings/"
   empty_ended "$X/repo/editions/endospore/support-ended"
   [ "$mk" = - ] || mark "$X/repo/editions/endospore/support-ended" "$mk"
@@ -213,7 +213,7 @@ sign_run() {   # <X> <dev>...: RC, OUT, ERR
   : > "$X/rec"
   env -u TMUX -u NOWHERE_RING -u NOWHERE_RING_OVERRIDE -u BUILD_DATETIME -u BUILD_NUMBER -u OUT_DIR -u password \
     PATH="$X/bin:$PATH" ENDOSPORE_TREE="$X/tree" ENDOSPORE_REPO="$X/repo" SIGN_SHM_DIR="$X/shm" TMPDIR="$TMPDIR" \
-    SIGN_MIN_TMP_GIB=0 NOWHERE_OTA_STORE_CONF="$X/conf" NOWHERE_AGENT="$X/agent" FX_REC="$X/rec" \
+    SIGN_MIN_TMP_GIB=0 NOWHERE_OTA_STORE_CONF="$X/conf" NOWHERE_AGENT="$X/agent" FX_REC="$X/rec" NOWHERE_KEYS_HOME="$X/keyshome" \
     bash "$X/repo/editions/endospore/build/sign-release.sh" "$SBN" "$(git -C "$X/repo" rev-parse HEAD)" "$@" \
     < /dev/null > "$X/out" 2> "$X/err"
   RC=$?; OUT=$(cat "$X/out"); ERR=$(cat "$X/err")

@@ -7,11 +7,11 @@
 # with no Android SDK. $JAVAC / $JAVA come from the caller (core/chooser/test-loc-prefs-java.sh).
 #
 # What cannot run without Android is PINNED in the source, byte for byte where it is a block: setPref (only the file
-# I/O around prefsUpdated, written to PREFS_FILE, and a false when the write fails), readPrefsText (the whole file,
-# read from PREFS_FILE), the switch handler (write first; then APPLY-LOCATION whether or not the write landed, since
-# roamd applies what the file holds; a failed write redraws the screen from the file and toasts what the file holds,
-# else the toast is the tap's; either only for the choice still stored), the switch's initial state, the two rows' keys
-# in order, the one Preferences branch that offers the screen, and the provider test.
+# I/O around prefsUpdated, read strictly from and written to PREFS_FILE, and a false when either fails), readPrefsText
+# (the whole file, read from PREFS_FILE), the switch handler (write first; then APPLY-LOCATION whether or not the write
+# landed, since roamd applies what the file holds; a failed write redraws the screen from the file and toasts what the
+# file holds, else the toast is the tap's; either only for the choice still stored), the switch's initial state, the two
+# rows' keys in order, the one Preferences branch that offers the screen, and the provider test.
 #
 # Exit codes: 1 = a case or a pin failed; 2 = a member did not extract; 3 = the lifted class or the cases did not compile.
 set -euo pipefail
@@ -75,9 +75,14 @@ pin_block() {
 # line_of <exact line>: its line number when it is in the source exactly once, else nothing
 line_of() { [ "$(grep -cxF -- "$1" "$SRC" || true)" = 1 ] && grep -nxF -- "$1" "$SRC" | cut -d: -f1 || true; }
 
-pin_block "setPref is only the file I/O around prefsUpdated, writes PREFS_FILE through StoreInstaller.writeAtomic, and answers false when the write fails" <<'EOF'
+pin_block "setPref is only the file I/O around prefsUpdated, reads PREFS_FILE strictly and writes nothing when it exists and cannot be read, writes PREFS_FILE through StoreInstaller.writeAtomic, and answers false when the read or the write fails" <<'EOF'
     private boolean setPref(String key, String value) {
-        String text = prefsUpdated(readPrefsText(), key, value, java.util.Locale.getDefault().toLanguageTag());
+        String cur = SettingsText.read(new java.io.File(getFilesDir(), PREFS_FILE));
+        if (cur == null) {
+            android.util.Log.w("NowhereChooser", "nowhere-prefs unreadable -- nothing written (NWP-20261129-15)");
+            return false;
+        }
+        String text = prefsUpdated(cur, key, value, java.util.Locale.getDefault().toLanguageTag());
         try {
             StoreInstaller.writeAtomic(new java.io.File(getFilesDir(), PREFS_FILE), text);
             return true;

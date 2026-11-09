@@ -162,11 +162,12 @@ func roamInHead(base, name, pass, srcUnit string) (head string, v *vault, readab
 }
 
 // roamInHeadUnreadable is the sign-in's reply when roamInHead could not read the bare head: BLANK NET, through the same
-// steps as handleRoamIn's own BLANK NET arm and in its order. It runs before anything records the sign-in, so nothing
-// is left to undo. A helper, not inline, because no session exists yet and the failed-sign-in scrub is correct here,
-// while handleRoamIn's success part must never schedule one (TestFailedSigninScrub_SourcePins).
+// steps as handleRoamIn's own BLANK NET arm and in its order. It runs before anything records the sign-in, so the only
+// thing to undo is the park roamd kept on its OK (NWP-20261129-17). A helper, not inline, because no session exists yet
+// and the failed-sign-in scrub is correct here, while handleRoamIn's success part must never schedule one (TestFailedSigninScrub_SourcePins).
 func roamInHeadUnreadable(conn net.Conn, dest, name string) {
 	fmt.Fprintf(os.Stderr, "[logind] roam-in BLANK NET %q (the stored head could not be read) (NWP-20261124-07)\n", name)
+	putBackInPark(dest, "roam-in BLANK NET after the restore")
 	fmt.Fprint(conn, "BLANK NET\n")
 	scheduleFailedSigninScrub(dest) // NWP-20261027-02
 	forgetSessionKeys("blank sign-in")

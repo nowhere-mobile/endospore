@@ -3571,7 +3571,13 @@ func prefetchReadCapsOK(keys []string) bool {
 		if end > len(keys) {
 			end = len(keys)
 		}
-		caps, ttl, err := gw.readCaps(keys[i:end])
+		var caps map[string]string
+		var ttl int64
+		var err error
+		// NWP-20261130-08: a batch POST is a gateway round trip like capReadURL's, so signin_<scope>_cap_calls counts it.
+		traceSince(&traceCapN, &traceCapNs, func() {
+			caps, ttl, err = gw.readCaps(keys[i:end])
+		})
 		if err != nil || len(caps) == 0 {
 			fmt.Fprintf(os.Stderr, "  cap prefetch stopped at %d/%d (%v) -> per-chunk fallback\n", i, len(keys), err)
 			return false
@@ -8096,6 +8102,12 @@ func pushProfile(base, profile, pass, src string) {
 		chunks = append(chunks, footer)
 	}
 
+	// NWP-20261129-03: an unfetched package's stored chunks go forward by hash (unfetched_carry.go), before the sizes
+	// loop so a carried chunk is sized from oldSizes. The shrink guard counts them through carriedChunks. The guard
+	// block's "belongs to the fetch slice" sentence below predates this carry.
+	chunks, unfSpans, unfPkg, unfN := sealCarryUnfetched(profile, oldM, chunks, acct, deferredMap)
+	carriedChunks += unfN
+
 	// Per-chunk sealed sizes for the manifest (#85): freshly-sealed chunks come from sizeOf; unchanged ones are
 	// carried from the old manifest; a chunk in neither (a pre-#85 head being re-sealed for the first time) is
 	// sized once via blobSize, then recorded in every future manifest -- so this network cost is paid at most once.
@@ -8175,12 +8187,14 @@ func pushProfile(base, profile, pass, src string) {
 	// list over one concatenated tar). Deferred files are deliberately NOT included: Deferred[rel] already
 	// carries per-path Sz, so a reader sums those itself and cannot double-count them here.
 	pkgBytes := attributePkgBytes(acct, essIdx, sizes)
+	pkgBytes = mergeCarried(pkgBytes, unfPkg) // NWP-20261129-03: so the unfetched guard sees the package kept
 	// NWP-20261127-01: the per-package span index, for the bare vault and #de only (the unfetched guard's scope).
 	// The full-tar arm leaves acct empty, so it writes none. The line carries counts, never a package name.
 	var pkgSpans map[string][][2]int
 	if incrementalSeal() && (strings.IndexByte(profile, '#') < 0 || strings.HasSuffix(profile, "#de")) {
 		pkgSpans = buildPkgSpans(acct, essIdx, len(chunks))
 		fmt.Printf("push: profile %s pkg span index: %d package(s), %d left out (NWP-20261127-01)\n", logProfile(profile), len(pkgSpans), len(pkgSpanNamed(acct))-len(pkgSpans))
+		pkgSpans = mergeCarried(pkgSpans, unfSpans) // NWP-20261129-03: after the line, whose counts stay the walk's; so the next seal can carry it again
 	}
 	// Read AFTER the union above, so a carried package's line is in the index it publishes -- otherwise the
 	// next handset carries bytes it can never install.
@@ -8536,6 +8550,7 @@ func pushProfile(base, profile, pass, src string) {
 				// index against what this manifest still carries (deferred rels count as present), and an
 				// unexplained vanishing package refuses exactly as if no marker existed. The self-explain
 				// case above still outranks this one, so a byte-vouched drop never consumes the marker.
+				// NWP-20261129-04: an android marker vouches only for the sealed bytes its named packages lost.
 				in := readShrinkIntent(rcptRef) // ONE read under the intent lock: a marker that vanishes between two reads is no authority
 				shrinkIntentGenSeen = in.token
 				if !in.armed {
@@ -8551,10 +8566,21 @@ func pushProfile(base, profile, pass, src string) {
 					fmt.Printf("push: profile %s shrink intent is INFERRED and does not explain this shrink (unexplained: %v) -- refusing as if unarmed (NWP-20260903-13)\n",
 						logProfile(profile), unexplained)
 				}
+				if kind == "android" {
+					explained, short := shrinkAndroidExplains(declared, oldM.Pkg, pkgBytes, incrementalSeal(), loadDropList(), sealDropped, defMigrated, lost)
+					if explained {
+						allowed, usedShrinkIntent = true, true // set here so the case body does not print the deliberate line
+						fmt.Printf("push: profile %s shrink %d -> %d chunks ALLOWED -- %d package(s) Android cleared or removed account for %dB of %dB lost (NWP-20261129-04)\n", logProfile(profile), oldN, nchunks, len(declared), short, lost)
+					} else {
+						fmt.Printf("push: profile %s shrink intent names %d package(s) Android cleared or removed, whose %dB shortfall does not explain %dB lost -- refusing as if unarmed (NWP-20261129-04)\n", logProfile(profile), len(declared), short, lost)
+					}
+				}
 				return allowed
 			}():
-				usedShrinkIntent = true
-				fmt.Printf("push: profile %s shrink %d -> %d chunks ALLOWED -- the user deliberately cleared storage for this scope\n", logProfile(profile), oldN, nchunks)
+				if !usedShrinkIntent { // an android verdict above printed its own ALLOWED line
+					usedShrinkIntent = true
+					fmt.Printf("push: profile %s shrink %d -> %d chunks ALLOWED -- the user deliberately cleared storage for this scope\n", logProfile(profile), oldN, nchunks)
+				}
 			case len(seen) == 0:
 				// DIA-20260816-14: A WALK THAT SAW NOTHING IS NOT A SHRINK, and must not be described as one.
 				//
@@ -8651,7 +8677,7 @@ func pushProfile(base, profile, pass, src string) {
 			declaredOff, deliberate := map[string]bool{}, false
 			if in := readShrinkIntent(rcptRef); in.armed {
 				kind, declared := in.kind, in.declared
-				if kind == "inferred" {
+				if kind == "inferred" || kind == "android" { // no writer arms android on #apps: this arm is only a defence
 					for _, d := range declared {
 						declaredOff[d] = true
 					}
@@ -10161,6 +10187,11 @@ func refreshOtaCache() {
 	// NWP-20261113-27: and the build warning (Q098), whatever the offer: fetchBuildWarning recovers a store panic into
 	// an error, and refreshBuildWarning turns any error into no warning.
 	refreshBuildWarning(time.Now().Unix(), func() (*buildWarning, error) { return fetchBuildWarning("s3", time.Now().Unix()) })
+	// NWP-20261129-18, decision #8: and the index-key object, beside the build warning after each completed OTA check,
+	// whatever the offer. fetchIndexKey logs its own outcome and recovers a store panic.
+	if strings.TrimSpace(indexPubKey) != "" {
+		fetchIndexKey("s3", time.Now().Unix())
+	}
 	// NWP-20261006-12: and what is in it -- the notes chain from the offered version back to this one, fetched here so
 	// OTA-NOTES can answer from memory (ota_notes.go).
 	if latest != "" && avail {
@@ -10574,6 +10605,9 @@ func concurrentSafeCmd(name string) bool {
 		// PLACEHOLDER-OUTCOMES (NWP-20261127-08): one validated line of counts to stderr (login.log), no store, no
 		// session files. It is sent by a sign-in, which holds sessionMu, so serialised it would wait on itself.
 		"PLACEHOLDER-OUTCOMES",
+		// TELINGEST-SEEN (NWP-20261129-02): one validated line of counts to stderr (login.log), no store, no session
+		// files. It is sent from a session whose seals hold sessionMu for minutes.
+		"TELINGEST-SEEN",
 		// SET-SEAL-HOLD (NWP-20261011-01): writes one state file and the in-memory choice under its own sealHoldMu
 		// (then pendingReapMu) -- the SET-GATE-ALARM case. Serialised, it waited behind the very materialise whose hold
 		// it sets, the chooser gave up after two 90 s reads and said "next sign-in", and the queued handler applied the
@@ -10766,7 +10800,7 @@ func handleLogin(conn net.Conn, dest string) {
 	// concurrentSafeCmd lists run free -- pure reads such as STATUS/GET-COLDLOCK/OTA-*/the Profile and Storage probes,
 	// and the bindings.conf reads (GET-BINDINGS, TEL-OWNER, TEL-OWNED-*) -- plus a few writers with their own lock, so a
 	// wedged writer can't stall the gate's probes. The verbs in the TryLock set below answer BUSY instead of waiting.
-	if name == "BACKUP" || name == "DELETE" || name == "EXPECT-SHRINK" || name == "EXPECT-SHRINK-INFERRED" || name == "SET-BINDING" || name == "REPAIR-BINDINGS" || name == "SET-SIM-MINE" || name == "DELETE-BINDING" || name == "ROLLBACK" || name == "DELETE-SNAPSHOT" || name == "REMOVE-FIDO2-KEY" || name == "SET-PIN" || name == "ROTATE" || name == "ENROLL-FIDO2" || name == "FIDO2-NFC-ENROLL-FINISH" || name == "SE-TIE" || name == "SE-UNTIE" ||
+	if name == "BACKUP" || name == "DELETE" || name == "EXPECT-SHRINK" || name == "EXPECT-SHRINK-INFERRED" || name == "EXPECT-SHRINK-ANDROID" || name == "SET-BINDING" || name == "REPAIR-BINDINGS" || name == "SET-SIM-MINE" || name == "DELETE-BINDING" || name == "ROLLBACK" || name == "DELETE-SNAPSHOT" || name == "REMOVE-FIDO2-KEY" || name == "SET-PIN" || name == "ROTATE" || name == "ENROLL-FIDO2" || name == "FIDO2-NFC-ENROLL-FINISH" || name == "SE-TIE" || name == "SE-UNTIE" ||
 		name == "END-UNSAVED" || name == "RESTART-UNSAVED" {
 		// SET-PIN, ROTATE, ENROLL-FIDO2, FIDO2-NFC-ENROLL-FINISH, SE-TIE and SE-UNTIE joined with NWP-20261124-10. Each
 		// is a user-tapped write: a session PIN, the passphrase, a security key, a tie to this phone. Queued behind a
@@ -11244,6 +11278,10 @@ func handleLogin(conn net.Conn, dest string) {
 		handlePlaceholderOutcomes(conn, r) // NWP-20261127-08: a sign-in's placeholder outcome counts (placeholder_outcomes.go)
 		return
 	}
+	if name == "TELINGEST-SEEN" {
+		handleTelIngestSeen(conn, r) // NWP-20261129-02: a delivery run's read-back counts (telingest_seen.go)
+		return
+	}
 	if name == "MATERIALIZE-APP" {
 		// #204 on-demand apps: the chooser's unarchive receiver tapped an archived placeholder. Fetch just that
 		// package's DEFERRED APK bytes from the live profile's name#apps scope into the user-0 chooser's
@@ -11439,6 +11477,7 @@ func handleLogin(conn net.Conn, dest string) {
 				sweepGoneMailboxes()
 			})
 			clearMarkerOfGoneUser(dest) // NWP-20261006-15: and a marker that names a gone user (this verb holds sessionMu)
+			reapSessionLists(dest)      // NWP-20261129-19: and, with no session live or parked, its plaintext file-name lists (h59 #11)
 		}
 		out := triggerRoamWorker(dest, "cleanstorage", "x", "", uid, "", nil)
 		// DIA-20260812-11 (#115): the reap's verdict was discarded at THREE layers -- roamd published a
@@ -11808,6 +11847,13 @@ func handleLogin(conn net.Conn, dest string) {
 		// #media has no business being disarmed by an app drop -- the profile-wide arming was half
 		// the filed bug), with "inferred" provenance the guard verifies against the Pkg index.
 		handleExpectShrinkInferred(conn, r, dest)
+		return
+	}
+	if name == "EXPECT-SHRINK-ANDROID" {
+		// NWP-20261129-04: Android's own clear-data or uninstall event. A whole-line verb for the reason
+		// EXPECT-SHRINK-INFERRED gives. Payload: one line of space-separated package names. Marks the vault, #de
+		// and #media, never #apps, with "android" provenance the guard verifies by the bytes those packages lost.
+		handleExpectShrinkAndroid(conn, r, dest)
 		return
 	}
 	if name == "EXPECT-SHRINK" {
@@ -15198,6 +15244,11 @@ func runWorkerHeld(lane workerLane, dest, op, name, pass, uid, seSecret, kind, s
 			fmt.Fprintf(os.Stderr, "[logind] worker lane %s: discarded the late reply of the abandoned %s op (%s)\n",
 				lane.svc, abandoned, abandonedReplyToken(string(b)))
 		}
+		// NWP-20261129-17 (h59 #2): an abandoned `in` has no handler left to settle its park. A late OK kept it (put
+		// back now), a late not-landed answer already put it back (no park, nothing done), a killed instance left it.
+		if abandoned == "in" {
+			putBackInPark(dest, "worker lane "+lane.svc+": the abandoned in op")
+		}
 		clearLaneAbandoned(lane)
 	}
 	os.Remove(res)
@@ -15563,9 +15614,11 @@ func handleRoamIn(conn net.Conn, dest, name, pass, uid, seSecret, srcUnit string
 			// name"; this fault is the phone's and credential-independent (it runs before the empty-head
 			// throwaway branch, so right and wrong passphrases get the same reply: no existence oracle).
 			fmt.Fprintf(os.Stderr, "[logind] .roamsession WRITE FAILED: %v -- roam-in user %s REFUSED (unrecordable session)\n", err, uid)
+			putBackInPark(dest, "roam-in user "+uid+" not recorded") // NWP-20261129-17 (h59 #2)
 			fmt.Fprint(conn, "ERR-UNRECORDED\n")
 			return
 		}
+		dropInPark(dest) // NWP-20261129-17 (h59 #2): the sign-in is recorded, so the departed session's entries go
 		// NWP-20261030-02: a new identity is now recorded, so the departed session's seal signals go. Here, not at the
 		// top beside resetOdWindow: a sign-in refused before its marker must leave a parked cold-locked session's signals
 		// to its evict-recheck. Not inside markRoamSession: RESUME and the rotations call it and continue one session.
@@ -17700,10 +17753,11 @@ var (
 	// coldLockRunning, kept across a rerun (the same session), cleared with it in coldLockNext. Read only through
 	// coldLockPendingUID.
 	coldLockUID string
-	// coldLockStarts counts teardown goroutines actually SPAWNED. Production never reads it; it exists so a
-	// test can tell a refusal apart from a second teardown, which the reply alone cannot -- both answer
-	// LOCKING, and a test that only checked the reply passed with the guard deleted. Same shape as
-	// roamSessionWriteFile, which is a variable so a test can fail the first attempt.
+	// coldLockStarts counts teardown goroutines actually SPAWNED. Production reads it in one place: handleGetColdLock
+	// takes it as the identity of a cold lock, for its log lines only (NWP-20261129-36). It exists so a test can tell
+	// a refusal apart from a second teardown, which the reply alone cannot -- both answer LOCKING, and a test that
+	// only checked the reply passed with the guard deleted. Same shape as roamSessionWriteFile, which is a variable
+	// so a test can fail the first attempt.
 	coldLockStarts int
 	// NWP-20260923-03: the BELL an authenticated unlock rings to take a teardown that is still QUEUED for the RW
 	// slot out of the queue, untouched. It is non-nil while a teardown that STARTED abortable (an idle lock,
@@ -17727,6 +17781,16 @@ var (
 	// hold that reads it, and that shared hold is what makes "whichever claims the session first finishes" hold.
 	coldLockSignOutBar string
 )
+
+// getColdLockTrace is what GET-COLDLOCK has answered for one cold lock (NWP-20261129-36); handleGetColdLock says why.
+var getColdLockTrace struct {
+	mu      sync.Mutex
+	starts  int    // the coldLockStarts value the fields below belong to (0, no lock since the daemon started, is one)
+	noneUID string // the uid that lock named when it answered NONE
+	nones   int    // NONE answers while that lock was landing
+	offers  int    // COLDLOCK answers for that lock
+	firstMs int64  // answer 1, WALL unix ms: the monotonic clock stops in suspend, and the gate asks after a screen-off
+}
 
 // coldLockTeardowns tracks teardown GOROUTINES, which outlive coldLockRunning: the post-revoke mediad kick runs
 // after the flag clears. Production never waits on it; a test's cleanup does, so that no goroutine can write
@@ -18173,9 +18237,9 @@ func coldLockDecidedAt() int64 {
 // else -- ERR-*, ERR-TIMEOUT, "" -- is not landed: armcred is idempotent, so an ambiguous reply costs one sign-out,
 // never a lockout. fido2: only a definitive refusal of the forward rekey (fwdRekeyNeverMoved) means the keyguard never
 // moved. Every other reply is read as landed, because the rekey may have landed and unwinding it here is Check B's
-// job. An ERR-TIMEOUT reaches this only after coldLockAwaitLateRekey found no late reply by its bound (h56 #2,
-// NWP-20261126-01). ⚠ Residual, filed in docs/backlog.md: that unknown-at-the-bound case still commits; the sign-out
-// without the keep-on-save-failure arm at the bound is the follow-on.
+// job. An ERR-TIMEOUT never reaches this as the forward reply: the teardown first reads the late reply
+// (coldLockAwaitLateRekey, h56 #2, NWP-20261126-01) and acts on it, and one still unknown at the bound signs the
+// session out without the keep-on-save-failure arm, never commits (NWP-20261128-06).
 func coldLockArmLanded(needKey, armOut, fwdRekey string) bool {
 	if needKey == "fido2" {
 		return !fwdRekeyNeverMoved(fwdRekey)
@@ -18442,12 +18506,28 @@ func coldLockTeardown(dest, name, pass, uid string, bell <-chan struct{}) bool {
 		coldLockMu.Unlock()
 		fwdRekey = coldLockWorker(dest, "rekey", name, unlockSecret, uid, cred, false) // old=unlockSecret -> new=derived (two-rung)
 		if fwdRekey == "ERR-TIMEOUT" {
-			// h56 #2 (NWP-20261126-01): the timed-out instance still runs and writes its real reply later. Read it,
-			// bounded, so the decision below acts on what the keyguard did, not on a guess.
+			// h56 #2 (NWP-20261126-01; NWP-20261128-06): the timed-out instance still runs and writes its real reply
+			// later. Read it, bounded: OK commits, a never-moved refusal hands off below with no unwind, and a reply
+			// still unknown at the bound ends the session here, without the keep-on-save-failure arm (#7's end). No
+			// unwind is tried: it is a cred-lane op and answers ERR-WORKER-BUSY while the timed-out instance runs.
 			if late := coldLockAwaitLateRekey(dest); late != "" {
 				fwdRekey = late
 			} else {
-				fmt.Fprintf(os.Stderr, "[logind] cold-lock: the timed-out key-bound rekey is still unknown at the bound: committing as before; the no-keep sign-out is the follow-on (h56 #2)\n")
+				coldLockMu.Lock()
+				coldLockRevoking = true
+				// Q067: drop the sign-out bar BEFORE the sign-out: it calls the real handleLogout, which must not
+				// meet this lock's bar and be refused.
+				coldLockSignOutBar = ""
+				coldLockMu.Unlock()
+				os.Remove(stageTmp) // h46 #10: a revoke never leaves a staged marker
+				fmt.Fprintf(os.Stderr, "[logind] cold-lock ABORTED: the timed-out key-bound rekey is still unknown at the bound for user %s -- signing out without the keep-on-save-failure arm (h56 #2) (NWP-20261128-06)\n", uid)
+				// No queueIdleRearm: the session ends (#7).
+				if localOnlySession(dest) {
+					fmt.Fprintf(os.Stderr, "[logind] cold-lock bound for user %s: kept: a throwaway has nothing to save (h56 #2) (NWP-20261128-06)\n", uid)
+					return true
+				}
+				goSafe("coldlock-timeout-nokeep-signout", func() { coldLockSignOutNoKeep(dest) })
+				return true
 			}
 		}
 		if fwdRekey != "OK" {
@@ -18507,8 +18587,9 @@ func coldLockTeardown(dest, name, pass, uid string, bell <-chan struct{}) bool {
 	// NWP-20261017-13: a DEFINITIVE refusal of the forward rekey means the keyguard never moved (fwdRekeyNeverMoved,
 	// the one set coldLockArmLanded also reads; h56 #2, NWP-20261126-01). There is nothing to unwind, and an unwind
 	// would fail on its never-armed --old and decline the revoke under an owner who legitimately unlocked. OK and EVERY
-	// other reply -- an ERR-TIMEOUT still unknown at coldLockAwaitLateRekey's bound included, the op may have landed
-	// after the stall -- keep the unwind and the decline-on-failure at Check B and in stageHandOff below.
+	// other reply that reaches here keep the unwind and the decline-on-failure at Check B and in stageHandOff below. An
+	// ERR-TIMEOUT reaches here only as its late reply, read by coldLockAwaitLateRekey; one still unknown at the bound
+	// signed the session out above, without the keep-on-save-failure arm (h56 #2, NWP-20261128-06).
 	fwdNeverMoved := fwdRekeyNeverMoved(fwdRekey)
 
 	// The marker carries name+uid+se+keyflag+pinflag+passWrap+slots. NOT the pass/PIN/credential in the
@@ -18891,9 +18972,49 @@ func coldLockSlots(dest string) string {
 // "Welcome back <name>" resume prompt instead of (or above) the fresh-login form. uid is sent FIRST and
 // the name LAST so a profile name containing spaces survives the chooser's split parse; the key flag
 // (fido2|nokey) rides between them so a 2FA resume can show the insert-your-key hint up front (#81).
+//
+// NWP-20261129-36: the log says what this verb answered around a cold lock, because the backlog row "A sign-in at the
+// gate silently ends a just-locked session holding unsaved data: only parked credit is asked about" needs to know why
+// a gate drew the plain form. `.coldlock` is written only at the teardown's point of no return, so a reveal during the
+// wait (it can last minutes behind a seal) answers NONE and draws the plain form; Welcome back then appears only if
+// the gate asks again after the commit. The daemon cannot tell its callers apart, and one asks at every lock: the
+// teardown commits the marker and then queues the switch, whose reap-watcher SWITCH branch probes this verb. So
+// answer 1 is normally that probe's and says nothing about the gate; a later one is the gate's reveal or cover-retire
+// timer, or another caller (an OTA check, a create). Hence, per cold lock (per coldLockStarts value), the first NONE
+// answered while it lands and the first three COLDLOCK answers with their timing: the next report shows whether the
+// gate was asked during the wait, after the lock landed, or neither. These lines carry the uid and counts, never the
+// profile name, and only a lock a signed-in session took can produce the NONE line: blind login sees no change.
 func handleGetColdLock(conn net.Conn, dest string) {
+	coldLockMu.Lock()
+	lockRunning, lockUID, lockStarts := coldLockRunning, coldLockUID, coldLockStarts
+	coldLockMu.Unlock()
+	tr := &getColdLockTrace
+	// lockTrace returns true holding tr.mu, the trace reset if this is a newer lock. It returns false, not holding it,
+	// for a call that read lockStarts before a newer lock began: the trace holds only the newer lock now, so that call
+	// counts nowhere and logs nothing, though it still answers. Unlock before printing: GET-COLDLOCK runs concurrently
+	// with other verbs, and coldLockStatusLine locks coldLockMu.
+	lockTrace := func() bool {
+		tr.mu.Lock()
+		if lockStarts < tr.starts {
+			tr.mu.Unlock()
+			return false
+		}
+		if lockStarts > tr.starts {
+			tr.starts, tr.noneUID, tr.nones, tr.offers, tr.firstMs = lockStarts, "", 0, 0, 0
+		}
+		return true
+	}
 	name, uid, _, needKey, hasPin, _ := readColdLock(dest)
 	if name == "" {
+		if lockRunning && lockTrace() {
+			tr.noneUID = lockUID
+			tr.nones++
+			firstNone := tr.nones == 1
+			tr.mu.Unlock()
+			if firstNone {
+				fmt.Fprintf(os.Stderr, "[logind] GET-COLDLOCK: answered NONE while the cold lock of user %s is still landing (%s) -- a gate reveal that asked now shows the sign-in form, not Welcome back (NWP-20261129-36)\n", lockUID, coldLockStatusLine(time.Now()))
+			}
+		}
 		fmt.Fprint(conn, "NONE\n")
 		return
 	}
@@ -18915,6 +19036,26 @@ func handleGetColdLock(conn net.Conn, dest string) {
 	pinTok := "nopin"
 	if hasPin {
 		pinTok = "pin"
+	}
+	if lockTrace() {
+		tr.offers++
+		offerN := tr.offers
+		nowMs := time.Now().UnixMilli()
+		if offerN == 1 {
+			tr.firstMs = nowMs
+		}
+		offerSecs := (nowMs - tr.firstMs) / 1000
+		noneCount := 0
+		if tr.noneUID == uid {
+			noneCount = tr.nones
+		}
+		tr.mu.Unlock()
+		if offerSecs < 0 { // a wall clock that stepped back must not print a negative time
+			offerSecs = 0
+		}
+		if offerN <= 3 {
+			fmt.Fprintf(os.Stderr, "[logind] GET-COLDLOCK: offered user %s for resume, answer %d of the first 3 after its cold lock (+%ds after answer 1; %d NONE answer(s) while it landed) (NWP-20261129-36)\n", uid, offerN, offerSecs, noneCount)
+		}
 	}
 	fmt.Fprintf(conn, "COLDLOCK %s %s %s %s\n", uid, flag, pinTok, name)
 }
@@ -21703,6 +21844,43 @@ func main() {
 			fmt.Printf("build-warning-put: %s = %.12s\n", buildWarningRefName, h)
 		}
 
+	case "index-key-check", "index-key-put":
+		// index-key-check <file.env>
+		// index-key-put <store> <file.env>
+		// NWP-20261129-24 (build host, docs/release-runbook.md §5b): verify a signed index-key object (decision #8) with
+		// the phone's own code and key; -put then publishes it at ref/ota/index-key, only when its seq is strictly above
+		// the published one, and refuses on any store read error. Only public keys exist here.
+		need := 1
+		if os.Args[1] == "index-key-put" {
+			need = 2
+		}
+		if len(os.Args) < 2+need {
+			fmt.Printf("%s: missing arguments\n", os.Args[1])
+			os.Exit(2)
+		}
+		file := os.Args[1+need]
+		var obj *indexKeyObject
+		var h string
+		var err error
+		if need == 2 {
+			obj, h, err = indexKeyPut(os.Args[2], file, time.Now().Unix())
+		} else {
+			obj, _, err = indexKeyCheckFile(file, time.Now().Unix())
+		}
+		if err != nil {
+			fmt.Printf("%s: %s: %s\n", os.Args[1], file, logSafeErrText(err))
+			os.Exit(1)
+		}
+		key := obj.Key
+		if key == "" {
+			key = "none"
+		}
+		fmt.Printf("%s: seq %d issued %s key %s revoked %d\n", os.Args[1], obj.Seq,
+			time.Unix(obj.Issued, 0).UTC().Format(time.RFC3339), key, len(obj.Revoked))
+		if h != "" {
+			fmt.Printf("index-key-put: %s = %.12s\n", indexKeyRefName, h)
+		}
+
 	case "ota-check": // ota-check <store> [runningVersionFile]   (device: exit 0 if a newer OS is published)
 		runFile := ""
 		if len(os.Args) > 3 {
@@ -21773,6 +21951,7 @@ func main() {
 		// reaches the heal (a deleted name, an empty head, a death midway) leaves the pre-heal treatment -- serve
 		// and carry everything -- rather than a list from an earlier sign-in of the same profile this boot.
 		clearHealList(os.Getenv("NOWHERE_STATE"), profile, pass)
+		clearMediaRowsList()
 		// NWP-20260820-27: open the head-resolution window HERE, not at rStart, because profileDeleted below is
 		// part of the cost and part of the suspected redundancy -- it strips the #scope and probes the BARE ref,
 		// so all five of a login's invocations read the same object before touching their own. `key=` keeps its
@@ -21887,7 +22066,7 @@ func main() {
 			// NWP-20260923-02: the vault and #de no longer defer, so fetch whatever their head still carries
 			// deferred, before roamd reowns the tree (media_heal.go). Never counted in `skipped`: a file the
 			// heal cannot write stays deferred in the head and is carried, so the receipt is still earned.
-			restoreHeal(base, key, m, dest, profile, pass, os.Getenv("NOWHERE_STATE"))
+			hr := restoreHeal(base, key, m, dest, profile, pass, os.Getenv("NOWHERE_STATE"))
 			restMs := time.Since(cStart).Milliseconds()
 			pruneAfterRestore(chunkCacheDir, skipped, m)
 			if chunkCacheDir != "" {
@@ -21898,7 +22077,10 @@ func main() {
 			if isSharedMediaScope(profile) {
 				fmt.Println(mediaUserShareLine(m))
 			}
-			signinSummaryAppend(m, restMs) // NWP-20261122-09: the sign-in's summary as issue-report status keys
+			if isSharedMediaScope(profile) {
+				writeMediaRowsList(m.Deferred, dest) // NWP-20261130-02: roamd reads this for media-insert
+			}
+			signinSummaryAppend(m, restMs, hr.ms) // NWP-20261122-09: the sign-in's summary as issue-report status keys
 		} else {
 			skipped = untarFrom(dest, bytes.NewReader(pt)) // pre-CDC ref: the blob IS the tar
 			fmt.Printf("restore: profile %s (legacy %d B) -> %s [key=%dms restore=%dms | %s]\n", logProfile(profile), len(pt), dest, keyMs, time.Since(cStart).Milliseconds(), headSplit)

@@ -15,6 +15,14 @@
 # A missing or unknown argument is a usage error (exit 2) before anything is created. A fresh or empty
 # keys/<device> makes everything, as does avb.pem alone (avb_pkmd.bin is derived from it).
 #
+# WHERE (NWP-20261105-19). On a host with a keys home ($NOWHERE_KEYS_HOME, default /mnt/build/keys/endospore; it must be
+# an absolute path, else exit 2), keys/<device> above is <home>/<device>: the keys are made only in the home, so a
+# device's keys never live only in one tree and no tree gets a second set beside the home's. A tree with no keys/, or
+# whose keys/ is a link to the home, makes them in the home (build-device.sh --release then links a tree to it through
+# keys-home.sh). A tree whose keys/ does not resolve to the home (its own directory, a link elsewhere) is refused
+# (exit 3), as is a home path that is not a directory; nothing is created. Without a home, keys/<device> is in the
+# tree, as before. A keys directory that cannot be made or entered stops the script (exit 1) before any key is made.
+#
 # NOTE (proof build): keys are UNENCRYPTED at rest here so the build can run unattended. Production custody
 # -- script/encrypt-keys with a passphrase + an OFF-box backup of avb.pem (lose it after relock => can't
 # update the device; leak it => anyone can sign for it) -- is handled separately at the flash checkpoint.
@@ -32,7 +40,28 @@ esac
 DEV="$1"
 case "$DEV" in ""|-*) echo "$USAGE" >&2; exit 2 ;; esac
 CN=Endospore
+TOP=$(pwd)   # the tree root: the tools are reached from here, not by ../.. from a keys dir that may be the home
 KD="keys/$DEV"
+
+# NWP-20261105-19: with a keys home, the keys are made in it (WHERE, above). A tree whose own keys/ held a device the home
+# lacks would otherwise be the only copy, and one beside a home that holds the device would be a second set.
+KH="${NOWHERE_KEYS_HOME:-/mnt/build/keys/endospore}"
+case "$KH" in /*) ;; *) echo "gen-keys.sh: NOWHERE_KEYS_HOME must be an absolute path: $KH" >&2; exit 2 ;; esac
+if [ -e "$KH" ] || [ -L "$KH" ]; then
+  if [ ! -d "$KH" ]; then
+    echo "gen-keys.sh: REFUSING. The keys home $KH exists but is not a directory. Nothing was created." >&2
+    exit 3
+  fi
+  if [ -e keys ] || [ -L keys ]; then
+    if [ "$(readlink -f keys 2>/dev/null)" != "$(readlink -f "$KH")" ]; then
+      echo "gen-keys.sh: REFUSING. This host has a keys home, $KH, and keys are made only there; this tree's keys/ is not it." >&2
+      echo "  If this tree's keys/$DEV is not in the keys home yet, copy it there first (docs/release-runbook.md section 1b)." >&2
+      echo "  Then move this tree's keys/ aside and re-run. Nothing was created." >&2
+      exit 3
+    fi
+  fi
+  KD="$KH/$DEV"
+fi
 
 if [ "$NEW_ROOT" = 1 ] && [ -f "$KD/avb.pem" ]; then
   echo "gen-keys.sh: --new-avb-root given but $KD/avb.pem exists; this script never moves or overwrites an existing avb.pem." >&2
@@ -65,21 +94,22 @@ if [ -d "$KD" ] && [ ! -f "$KD/avb.pem" ]; then
   fi
 fi
 
-mkdir -p "$KD"
-cd "$KD"
+# Fail closed: a failed cd would leave the cwd at the tree root, and the steps below would make keys THERE.
+mkdir -p "$KD" || { echo "FAILED mkdir $KD"; exit 1; }
+cd "$KD" || { echo "FAILED cd $KD"; exit 1; }
 
 for k in releasekey platform shared media networkstack bluetooth sdk_sandbox gmscompat_lib nfc; do
   if [ -f "$k.pk8" ] && [ -f "$k.x509.pem" ]; then echo "skip $k (exists)"; continue; fi
-  ../../development/tools/make_key "$k" "/CN=$CN/" </dev/null || true
+  "$TOP/development/tools/make_key" "$k" "/CN=$CN/" </dev/null || true
   if [ -f "$k.pk8" ] && [ -f "$k.x509.pem" ]; then echo "made $k"; else echo "FAILED $k"; exit 1; fi
 done
 
 [ -f avb.pem ]      || openssl genrsa -out avb.pem 4096 || true
 [ -f avb.pem ]      && echo "avb.pem ok"      || { echo "FAILED avb.pem"; exit 1; }
-[ -f avb_pkmd.bin ] || ../../external/avb/avbtool.py extract_public_key --key avb.pem --output avb_pkmd.bin || true
+[ -f avb_pkmd.bin ] || "$TOP/external/avb/avbtool.py" extract_public_key --key avb.pem --output avb_pkmd.bin || true
 [ -f avb_pkmd.bin ] && echo "avb_pkmd.bin ok" || { echo "FAILED avb_pkmd.bin"; exit 1; }
 [ -f id_ed25519 ]   || ssh-keygen -t ed25519 -f id_ed25519 -N "" -q || true
 [ -f id_ed25519 ]   && echo "id_ed25519 ok"   || { echo "FAILED id_ed25519"; exit 1; }
 
-echo "--- keys/$DEV ---"
+echo "--- $KD ---"
 ls -la

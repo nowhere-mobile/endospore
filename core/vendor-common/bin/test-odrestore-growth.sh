@@ -55,7 +55,7 @@ arm_of() { awk -v a="  $2)" '$0 == a {f=1} f{print} f&&/^    ;;$/{exit}' "$1"; }
 nleft() { printf '%s\n' "$1" | sed -E 's/(^|[[:space:]])#.*$//' | sed 's#\$ROOT/data/##g' | grep -cE '(^|[^[:alnum:]_])/data/'; }
 
 suite() {  # suite <roamd.sh> [quiet] -> 0 all ok, 1 a case failed, 2 the harness could not run
-  local f="$1" quiet="${2:-}" p=0 x=0 ODH ARM ARMR PROG OW n sh L R HARN=""
+  local f="$1" quiet="${2:-}" p=0 x=0 ODH PKGOK ARM ARMR PROG OW n sh L R HARN=""
   say() { [ -n "$quiet" ] || printf '%s\n' "$1"; }
   chk() {
     local l="$1"; shift
@@ -70,9 +70,11 @@ suite() {  # suite <roamd.sh> [quiet] -> 0 all ok, 1 a case failed, 2 the harnes
   ODH=$(grep -m1 -E '^ODHOLD=' "$f")
   ARM=$(arm_of "$f" odrestore)
   PROG=$(anchor_of "$f" 'cutoff_prog() {')
+  PKGOK=$(anchor_of "$f" 'pkgname_ok() {')
   # od_watched is absent before NWP-20261124-03: define nothing, so the cases RUN against that code and fail.
   OW=$(anchor_of "$f" 'od_watched() {')
   [ -n "$ODH" ] || { echo "EXTRACTION FAILED: ODHOLD= not found in $f" >&2; return 2; }
+  case "$PKGOK" in *'return 1'*'return 0'*) ;; *) echo "EXTRACTION FAILED: pkgname_ok in $f" >&2; return 2 ;; esac
   case "$ARM" in *'echo "ERR-PKG" > "$RES"'*'echo "OK NOSRC" > "$RES"'*'echo "ERR-NOTREADY" > "$RES"'*) ;; *) echo "EXTRACTION FAILED: the odrestore arm in $f" >&2; return 2 ;; esac
   case "$PROG" in *'NOWHERE_PROGRESS.tmp'*'mv -f'*) ;; *) echo "EXTRACTION FAILED: cutoff_prog in $f" >&2; return 2 ;; esac
   case "$OW" in ''|*'du -sk "$dst"'*) ;; *) echo "EXTRACTION FAILED: od_watched in $f" >&2; return 2 ;; esac
@@ -165,7 +167,7 @@ od_served_copy() {
   return 0
 }
 EOF
-      printf '%s\n%s\n%s\n' "$ODH" "$PROG" "$OW"
+      printf '%s\n%s\n%s\n%s\n' "$ODH" "$PKGOK" "$PROG" "$OW"
       printf 'case "$op" in\n%s\nesac\n' "$ARMR"
     } > "$1/driver.sh"
   }

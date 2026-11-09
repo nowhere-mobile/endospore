@@ -22,13 +22,16 @@ import java.util.List;
  * Delivery runs THREE passes (after an initial settle delay): the roam-in E2E showed a row can vanish
  * AFTER an apparently-successful insert (the provider DB is being settled/clobbered during session
  * bring-up -- roamd's warmed insert was lost even though an identical one minutes later persisted), so a
- * verified row is re-verified -- and re-inserted if gone -- on the later passes. Best-effort by contract:
- * the buffer is ACKed (dropped) after the passes either way; it is session-scoped tmpfs.
+ * verified row is re-verified -- and re-inserted if gone -- on the later passes. The buffer is session-scoped tmpfs, and
+ * the claim empties it. ~~Best-effort by contract: the buffer is ACKed (dropped) after the passes either way.~~
+ * (Superseded by NWP-20261006-05 and NWP-20261130-01: each row keeps a sealed copy until ackLanded names it, and an SMS
+ * or MMS is named only once this session has read it back.)
  */
 final class TelIngest {
     private static final long SETTLE_MS = 20_000;               // initial wait: let grant/seed/restore churn pass
     private static final long[] REVERIFY_MS = {15_000, 45_000}; // later passes catch a clobbered-after-insert row
     private static final int MAX_TEL_RETRIES = 3;               // #135 Part 3: cap RESTAGE re-attempts of a call that won't persist
+    private static final long LIVE_READBACK_MS = 1_500;         // NWP-20261130-01: a live run has one read-back; let the insert commit
     private static final String MESSAGING = "com.android.messaging"; // the roamed default SMS app (the #148 cede)
 
     // NWP-20261010-13: there is no record here of which notices are showing. The tag of each message notice names its
@@ -41,16 +44,17 @@ final class TelIngest {
 
     /** NWP-20261019-27: which token of a claimed row carries its retry count, or -1 for a row this loop does not
      *  re-stage. calls=true is the call-log loop (a "call" row of 6+ tokens: deliver() reads f[0..5], retry is f[6]);
-     *  calls=false is the SMS/MMS loop (sms: 6 fields then the retry; mms: 3 fields then the retry). A call row is never
-     *  taken by the SMS/MMS loop, or a missing call would be re-staged twice and land twice in the call log. */
+     *  calls=false is the SMS/MMS loop (sms: 6 fields, mms: 3 fields, then the "sim:<tag>" slot if the row has one, then
+     *  the retry, NWP-20261130-01). A call row is never taken by the SMS/MMS loop, or a missing call would be re-staged
+     *  twice and land twice in the call log. */
     static int restageBase(String[] f, boolean calls) {
         if (calls) return f.length >= 6 && "call".equals(f[0]) ? 6 : -1;
-        if ("sms".equals(f[0]) && f.length >= 6) return 6;
-        if ("mms".equals(f[0]) && f.length >= 3) return 3;
+        if ("sms".equals(f[0]) && f.length >= 6) return f.length > 6 && f[6].startsWith("sim:") ? 7 : 6;
+        if ("mms".equals(f[0]) && f.length >= 3) return f.length > 3 && f[3].startsWith("sim:") ? 4 : 3;
         return -1;
     }
 
-    /** The row to hand back to the daemon: f[0..base-1] verbatim (a call's f[5] "-<simTag>" included) plus the retry
+    /** The row to hand back to the daemon: f[0..base-1] verbatim (a call's f[5] "-<simTag>" or a row's "sim:<tag>" included) plus the retry
      *  count + 1, or null once the count has reached maxRetries. A retry token that does not parse counts as 0. */
     static String restageLine(String[] f, int base, int maxRetries) {
         int retry = 0;
@@ -98,8 +102,8 @@ final class TelIngest {
         ensureNotificationListener(ctx); // task_c272758a (force-ours): our listener cancels Bugle's duplicate SMS notice
         if (!live) { try { Thread.sleep(SETTLE_MS); } catch (InterruptedException ignored) { return; } }
         int verified = 0;
-        // insertedThisRun: SMS/MMS dedup across the 3 passes (#371) -- the in-memory guard, kept for an image or
-        // session where the read grant below did not take. Since NWP-20261006-07 the chooser reads its own
+        // insertedThisRun: SMS/MMS dedup across the 3 passes (#371) -- the in-memory guard, kept for a row this run
+        // inserted and cannot see (a fallback row on GrapheneOS 2026110200, NWP-20261130-01). Since NWP-20261006-07 the chooser reads its own
         // Messages back (ensureSmsRead), so a text that is ALREADY there -- from an earlier session whose
         // acknowledgement was lost, NWP-20261006-05 -- is found and not inserted again. CALL rows do NOT use it
         // (a completed exists() is authoritative via READ_CALL_LOG), so their re-verify passes re-check + re-insert a
@@ -108,18 +112,28 @@ final class TelIngest {
         final java.util.Set<Long> insertedThisRun = new java.util.HashSet<>();
         final java.util.Set<Long> notified = new java.util.HashSet<>();
         final int[] unknown = new int[1];
+        final TelSeen seen = new TelSeen(); // NWP-20261129-02: this run's read-back evidence
         final int passes = live ? 1 : REVERIFY_MS.length + 1; // login: settle + 2 re-verifies; live: once
         final boolean[] everOk = new boolean[reply.size()]; // NWP-20261005-15: did this row land on ANY pass
         final boolean[] acked = new boolean[reply.size()];  // NWP-20261006-05: its sealed copy released
+        final boolean[] readOk = new boolean[reply.size()]; // NWP-20261130-01: an SMS or MMS this session read back
+        final TelSub.Tally tally = new TelSub.Tally();      // NWP-20261130-01: the batch's one log line
         for (int pass = 0; pass < passes; pass++) {
             verified = 0;
+            final TelSub.Sims sims = activeSims(ctx);
             for (int i = 1; i < reply.size(); i++) {
-                if (deliver(ctx, reply.get(i), insertedThisRun, notified, unknown)) { verified++; everOk[i] = true; }
+                if (deliver(ctx, reply.get(i), insertedThisRun, notified, unknown, sims, tally, seen)) { verified++; everOk[i] = true; }
             }
+            // NWP-20261130-01: read each inserted SMS and MMS back, as the session's Messages would. A sign-in's later
+            // passes ride out a commit race; a live run has only this pass, so it waits once.
+            if (live && TelSub.notReadBack(reply, everOk, readOk) > 0) {
+                try { Thread.sleep(LIVE_READBACK_MS); } catch (InterruptedException ignored) { Thread.currentThread().interrupt(); }
+            }
+            readBackRows(ctx, reply, everOk, readOk, unknown);
             // NWP-20261006-05: release the sealed copy of each SMS/MMS that landed, as soon as its pass ends -- not
             // after the settle and the re-verify passes, so a session that ends mid-run does not get back a text it
             // already holds. Calls wait for the final call-log check below.
-            ackLanded(ctx, reply, everOk, acked, false, unknown);
+            ackLanded(ctx, reply, everOk, readOk, acked, false, unknown);
             if (pass + 1 >= passes) break;
             try { Thread.sleep(REVERIFY_MS[pass]); } catch (InterruptedException ignored) { break; }
         }
@@ -179,10 +193,24 @@ final class TelIngest {
                         + " did NOT land after " + MAX_TEL_RETRIES + " retries -- DROPPED");
             }
         }
-        ackLanded(ctx, reply, everOk, acked, true, unknown);
+        ackLanded(ctx, reply, everOk, readOk, acked, true, unknown);
+        // NWP-20261130-01: one line per batch, counts only (Tally takes only ints).
+        android.util.Log.i("NowhereChooser", tally.line(live, TelSub.notReadBack(reply, everOk, readOk)));
         // NWP-20261112-21: counts only, never a number, a body or a time.
         if (unknown[0] > 0) android.util.Log.w("NowhereChooser", "telingest: " + unknown[0]
                 + " row lookup(s) did not complete -- not inserted or acknowledged on that answer, asked again later");
+        // NWP-20261129-02: can the session's reader see what this run inserted? Read after the last pass, so a provider
+        // still settling at sign-in is not counted hidden. A read that cannot see (OP_READ_SMS ignored answers an empty
+        // cursor, clearReadNotices' rule) is unknown, never hidden. A live run (one per text reaching a signed-in
+        // session) sends nothing, since a line per arrival puts each text's time into login.log (telSlowWait's rule);
+        // sign-in and resume deliveries insert through the same deliver() with the same sub_id, and the daemon's
+        // "staged <n> sealed telephony item(s)" line already dates them. Counts only.
+        if (!live) {
+            final boolean canRead = canReadMessages(ctx);
+            for (long w : seen.sms) seen.readBack("sms", canRead ? exists(ctx, android.provider.Telephony.Sms.Inbox.CONTENT_URI, w) : null);
+            for (long w : seen.mms) seen.readBack("mms", canRead ? mmsExists(ctx, w) : null);
+        }
+        if (TelSeen.sends(live, seen)) DaemonSocket.roundTrip("TELINGEST-SEEN\n" + seen.line() + "\n", 5_000);
         DaemonSocket.roundTrip("ACK-TELINGEST\n", 5_000);
         // NB (task_c272758a): deliver() posts OUR own in-session SMS notice for every injected row (single,
         // consistent ping, live + backlog); the default messaging app's OWN duplicate notice for a live row is
@@ -351,20 +379,60 @@ final class TelIngest {
         }
     }
 
+    /** NWP-20261130-01: the snapshot of the active SIMs this user can see, for TelSub.file. The plain list, which the
+     *  platform filters by user: a row must go under a SIM this session can read. A failure, or an ICCID that does not
+     *  read, leaves no match for that SIM, so its rows take the fallback and count in the batch line. */
+    private static TelSub.Sims activeSims(Context ctx) {
+        try {
+            android.telephony.SubscriptionManager sm = ctx.getSystemService(android.telephony.SubscriptionManager.class);
+            List<android.telephony.SubscriptionInfo> list = sm == null ? null : sm.getActiveSubscriptionInfoList();
+            if (list == null) return TelSub.Sims.NONE;
+            int[] ids = new int[list.size()];
+            String[] iccids = new String[list.size()];
+            for (int i = 0; i < ids.length; i++) {
+                ids[i] = list.get(i).getSubscriptionId();
+                try { iccids[i] = list.get(i).getIccId(); } catch (Throwable ignore) {}
+            }
+            return new TelSub.Sims(ids, iccids);
+        } catch (Throwable t) {
+            return TelSub.Sims.NONE;
+        }
+    }
+
+    /** NWP-20261130-01: read back each SMS and MMS that landed and has not read back yet, through the provider the
+     *  session's Messages reads, under the same per-user filter. Only a lookup that found the row sets readOk; a
+     *  blind or failed lookup counts in unknown. */
+    private static void readBackRows(Context ctx, List<String> reply, boolean[] everOk, boolean[] readOk, int[] unknown) {
+        boolean canRead = canReadMessages(ctx);
+        for (int i = 1; i < reply.size(); i++) {
+            if (!everOk[i] || readOk[i]) continue;
+            String[] f = reply.get(i).split(" ");
+            boolean mms = "mms".equals(f[0]);
+            if (!mms && !"sms".equals(f[0])) continue;
+            try {
+                long when = Long.parseLong(f[1]);
+                Boolean present = TelSub.lookup(canRead, mms ? mmsExists(ctx, when)
+                        : exists(ctx, android.provider.Telephony.Sms.Inbox.CONTENT_URI, when));
+                readOk[i] = readBack(present, unknown);
+            } catch (Throwable ignore) {}
+        }
+    }
+
     /** NWP-20261006-05: tell the daemon which rows LANDED, so it drops their sealed copies (ACK-TELROWS). A row never
      *  acknowledged keeps its copy, pending, and comes back at the profile's next sign-in if this session ends first.
-     *  An SMS or MMS landed when deliver() said so on some pass; a call (only when calls is set, after the final pass)
-     *  only if the call log shows it -- the check the call re-stage uses, so a call that vanished keeps its copy.
+     *  An SMS or MMS landed when this session read it back (readBackRows, NWP-20261130-01: a Uri from the insert is not
+     *  enough, because the provider takes a row its filter then hides); a call (only when calls is set, after the final
+     *  pass) only if the call log shows it -- the check the call re-stage uses, so a call that vanished keeps its copy.
      *  Each row is acknowledged once; acked records which. A call lookup that did not complete counts in unknown and
      *  acknowledges nothing (NWP-20261112-21). */
-    private static void ackLanded(Context ctx, List<String> reply, boolean[] everOk, boolean[] acked, boolean calls,
-                                  int[] unknown) {
+    private static void ackLanded(Context ctx, List<String> reply, boolean[] everOk, boolean[] readOk, boolean[] acked,
+                                  boolean calls, int[] unknown) {
         StringBuilder keys = new StringBuilder();
         int n = 0;
         for (int i = 1; i < reply.size(); i++) {
-            if (acked[i] || !everOk[i]) continue;
+            if (acked[i]) continue;
             String[] f = reply.get(i).split(" ");
-            if (f.length < 2) continue;
+            if (f.length < 2 || !TelSub.ackable(f[0], everOk[i], readOk[i])) continue;
             if ("call".equals(f[0])) {
                 if (!calls) continue;
                 try {
@@ -383,20 +451,22 @@ final class TelIngest {
     /** One row, verify-first: "&lt;kind&gt; &lt;when_ms&gt; &lt;call_type&gt; &lt;dur_sec&gt; &lt;from_b64&gt; &lt;body_b64&gt;"
      *  (the agent's telingest wire format; an EMPTY from/body is the "-" sentinel -- an empty base64 token would not survive
      *  DaemonSocket's line trim + split(" ")'s trailing-empty drop, which silently rejected every call row in the first cut;
-     *  a CALL's body slot is "-" or "-<simTag>", never read, NWP-20260924-07). Returns true when the row is VERIFIED present;
+     *  a CALL's body slot is "-" or "-<simTag>", never read, NWP-20260924-07; an SMS may carry "sim:&lt;tag&gt;" after its
+     *  body, NWP-20261130-01). Returns true when the row is VERIFIED present;
      *  false, inserting nothing, when its lookup did not complete (counted in unknown, NWP-20261112-21). */
     private static boolean deliver(Context ctx, String line, java.util.Set<Long> insertedThisRun,
-                                   java.util.Set<Long> notified, int[] unknown) {
+                                   java.util.Set<Long> notified, int[] unknown, TelSub.Sims sims, TelSub.Tally tally, TelSeen seen) {
         try {
             String[] f = line.split(" ");
             // #150 P4: MMS arrives as "mms <when> <telItem_json_b64>" (3 tokens, not the 6-token sms/call
             // line) -- route it to the multi-table content://mms insert before the 6-token guard.
-            if (f.length >= 3 && "mms".equals(f[0])) return deliverMms(ctx, f, insertedThisRun, unknown);
+            if (f.length >= 3 && "mms".equals(f[0])) return deliverMms(ctx, f, insertedThisRun, unknown, sims, tally, seen);
             if (f.length < 6) return false;
             long when = Long.parseLong(f[1]);
             String from = decTok(f[4]);
             Uri uri;
             boolean missedCall = false;
+            int sub = TelSub.NO_SUB;
             final boolean isCall = "call".equals(f[0]);
             ContentValues v = new ContentValues();
             if ("sms".equals(f[0])) {
@@ -405,13 +475,15 @@ final class TelIngest {
                 v.put("body", decTok(f[5]));
                 v.put("date", when);
                 v.put("read", 0);
-                // #148: INVALID_SUBSCRIPTION_ID(-1). The telephony provider filters SMS reads by
-                // allowInteractingWithEntryOfSubscription = sub-associated-with-caller-user OR sub_id==-1. We do
-                // NOT associate the SIM (that reroutes inbound delivery natively to Messaging, which as an
-                // ordinary app cannot WRITE it) -- instead our privileged agent stays the writer and tags the
-                // row -1 so the roamed user's Messaging can DISPLAY it. Safe now that the provider is PER-USER:
-                // the row lives in this user's own CE mmssms.db (wipes with the session, no cross-profile leak).
-                v.put("sub_id", -1);
+                // NWP-20261130-01: filed under the real subscription of the SIM it arrived on. The provider's read
+                // filter is sub-associated-with-caller-user, plus sub_id==-1 only for user 0 since GrapheneOS
+                // 2026110200 (c756a6ab4). We still do NOT associate the SIM with the session (that reroutes inbound
+                // delivery natively to Messaging, which as an ordinary app cannot WRITE it): our privileged agent stays
+                // the writer. ~~#148: tag the row -1 so the roamed user's Messaging can DISPLAY it.~~ (Superseded by the
+                // 2026-11-06 decision. -1 stays only as the fallback for a row with no tag or a SIM not in this session;
+                // on 2026110200 such a row is hidden, does not read back, and keeps its sealed copy.) The row lives in
+                // this user's own CE mmssms.db (wipes with the session, no cross-profile leak).
+                sub = TelSub.file(v, TelSub.rowTag(f), sims);
             } else if (isCall) {
                 uri = android.provider.CallLog.Calls.CONTENT_URI; // WRITE/READ_CALL_LOG granted per-user (ensureCallLogGrant)
                 int callType = Integer.parseInt(f[2]);            // agent stores CallLog.Calls types (incoming/missed)
@@ -433,13 +505,17 @@ final class TelIngest {
             //    inserts: a lookup that did not complete (the provider restarting during bring-up) answers unknown and
             //    inserts nothing (rowStep RETRY, NWP-20261112-21).
             if (!isCall && insertedThisRun.contains(when)) return true; // SMS dedup
-            int step = rowStep(exists(ctx, uri, when));
+            // NWP-20261130-01: an SMS lookup by a reader without READ_SMS is unknown, never "absent" (TelSub.lookup).
+            Boolean found = exists(ctx, uri, when);
+            int step = rowStep(isCall ? found : TelSub.lookup(canReadMessages(ctx), found));
             if (step == DONE) return true; // present: fresh dedup, or confirmed-persisted on a re-verify pass
             if (step != INSERT) { unknown[0]++; return false; } // NWP-20261112-21: unknown -- insert nothing, ask again later
             // insert() returns the new row's Uri on success -- trust it on the FIRST insert (an immediate exists()
             // re-read races the provider's async commit and false-negatives). A later re-verify pass then re-checks
             // exists() (settled by then) and, for a CALL, re-inserts if the row vanished.
             Uri ins = ctx.getContentResolver().insert(uri, v);
+            if (ins != null && !isCall) seen.inserted("sms", when); // NWP-20261129-02: a call is never counted
+            if (ins != null && !isCall) tally.inserted(sub); // NWP-20261130-01: the batch line
             boolean ok = ins != null || readBack(exists(ctx, uri, when), unknown); // read back only on a null result
             if (ok) {
                 if (!isCall) insertedThisRun.add(when); // SMS: remember it so no later pass re-inserts (calls rely on exists())
@@ -468,22 +544,24 @@ final class TelIngest {
     }
 
     /** #150 P4: insert one sealed-then-decrypted MMS into THIS roamed user's own per-user MMS provider so
-     *  its Messaging displays it. Wire: "mms &lt;when_ms&gt; &lt;telItem_json_b64&gt;" (serializeTelIngest).
+     *  its Messaging displays it. Wire: "mms &lt;when_ms&gt; &lt;telItem_json_b64&gt; [sim:&lt;tag&gt;]" (serializeTelIngest).
      *  Multi-table, mirroring an inbound M-Retrieve.conf persist (a minimal PduPersister): a pdu row
-     *  (content://mms, msg_box=inbox, m_type=RETRIEVE_CONF, date in SECONDS, sub_id=-1 so the read-filter's
-     *  INVALID clause lets the roamed Messaging show it -- the same #148 trick as SMS), the FROM address row,
+     *  (content://mms, msg_box=inbox, m_type=RETRIEVE_CONF, date in SECONDS, sub_id the row's SIM's subscription, as an
+     *  SMS, NWP-20261130-01, ~~sub_id=-1 so the read-filter's INVALID clause lets the roamed Messaging show it~~
+     *  (superseded by the 2026-11-06 decision)), the FROM address row,
      *  then each part (text/smil -&gt; the "text" column; media -&gt; the bytes via openOutputStream). Dedup
      *  via insertedThisRun within a run, and across sessions by the message id it stamps (mmsExists,
      *  NWP-20261006-07). OP_WRITE_SMS (ensureSmsWrite, run())
      *  authorises the mms write too. A lookup that did not complete inserts nothing (unknown, NWP-20261112-21). */
-    private static boolean deliverMms(Context ctx, String[] f, java.util.Set<Long> insertedThisRun, int[] unknown) {
+    private static boolean deliverMms(Context ctx, String[] f, java.util.Set<Long> insertedThisRun, int[] unknown,
+                                      TelSub.Sims sims, TelSub.Tally tally, TelSeen seen) {
         try {
             long when = Long.parseLong(f[1]);
             if (insertedThisRun.contains(when)) return true; // dedup across the 3 verify passes
             // NWP-20261006-07: and across sessions -- an MMS an earlier session inserted, redelivered because its
             // acknowledgement was lost (NWP-20261006-05), is already in this profile's Messages. Found by the
             // message id we stamp on every insert below: its date is only in SECONDS, too coarse to name one message.
-            int step = rowStep(mmsExists(ctx, when));
+            int step = rowStep(TelSub.lookup(canReadMessages(ctx), mmsExists(ctx, when)));
             if (step == DONE) return true;
             if (step != INSERT) { unknown[0]++; return false; } // NWP-20261112-21: unknown -- insert nothing, ask again later
             byte[] jb = android.util.Base64.decode(f[2], android.util.Base64.NO_WRAP);
@@ -514,12 +592,14 @@ final class TelIngest {
             pdu.put("seen", 0);
             pdu.put("m_type", 132);        // PduHeaders.MESSAGE_TYPE_RETRIEVE_CONF
             pdu.put("ct_t", "application/vnd.wap.multipart.related");
-            pdu.put("sub_id", -1);         // #148 INVALID_SUBSCRIPTION_ID: lets the roamed Messaging display it
+            int sub = TelSub.file(pdu, TelSub.rowTag(f), sims); // NWP-20261130-01: its SIM's subscription, as an SMS
             pdu.put("m_id", mmsKey(when)); // NWP-20261006-07: names this delivery, so a redelivery finds it (mmsExists)
             if (threadId > 0) pdu.put("thread_id", threadId); // join the sender's conversation (fixes attribution + notify)
             if (!subject.isEmpty()) { pdu.put("sub", subject); pdu.put("sub_cs", 106); }
             Uri mmsUri = ctx.getContentResolver().insert(Uri.parse("content://mms"), pdu);
             if (mmsUri == null) return false;
+            seen.inserted("mms", when); // NWP-20261129-02
+            tally.inserted(sub); // NWP-20261130-01: the batch line
             long id = android.content.ContentUris.parseId(mmsUri);
 
             // FROM address (type 137) so Messaging attributes the sender; charset 106 = UTF-8.
@@ -527,7 +607,9 @@ final class TelIngest {
             addr.put("address", from.isEmpty() ? "insert-address-token" : from);
             addr.put("type", 137);
             addr.put("charset", 106);
-            try { ctx.getContentResolver().insert(Uri.parse("content://mms/" + id + "/addr"), addr); } catch (Throwable ignore) {}
+            Uri addrUri = null; // NWP-20261129-02: still non-fatal; a throw counts as not inserted
+            try { addrUri = ctx.getContentResolver().insert(Uri.parse("content://mms/" + id + "/addr"), addr); } catch (Throwable ignore) {}
+            seen.addr(addrUri != null);
 
             int n = parts == null ? 0 : parts.length();
             StringBuilder preview = new StringBuilder();
@@ -538,7 +620,7 @@ final class TelIngest {
                 String ct = p.optString("ct", "application/octet-stream");
                 String name = p.optString("name", "");
                 byte[] data = android.util.Base64.decode(p.optString("data", ""), android.util.Base64.NO_WRAP);
-                insertMmsPart(ctx, id, i, ct, name, data);
+                seen.part(insertMmsPart(ctx, id, i, ct, name, data));
                 if (ct.startsWith("text/plain")) {
                     String s = new String(data, java.nio.charset.StandardCharsets.UTF_8).trim();
                     if (!s.isEmpty()) { if (preview.length() > 0) preview.append(' '); preview.append(s); }
@@ -556,8 +638,8 @@ final class TelIngest {
                 String hint = "too-large".equals(note)
                         ? "[Attachment too large to download]"
                         : "[Message couldn't be downloaded]";
-                insertMmsPart(ctx, id, n, "text/plain", "hint.txt",
-                        hint.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                seen.part(insertMmsPart(ctx, id, n, "text/plain", "hint.txt",
+                        hint.getBytes(java.nio.charset.StandardCharsets.UTF_8)));
                 preview.append(hint);
             }
             insertedThisRun.add(when);
@@ -630,6 +712,7 @@ final class TelIngest {
             // id keyed on the arrival-ms so a re-verify pass or re-login updates rather than stacks duplicates,
             // while two different MMS still get distinct notifications.
             nm.notify(tag, (int) (when ^ (when >>> 32)), b.build());
+            traceNoticeReadBack(ctx, tag, (int) (when ^ (when >>> 32)), false, named.getString(SmsDeliverReceiver.EXTRA_SUBST_APP_NAME)); // NWP-20261128-33
             syncMessageSummary(ctx); // NWP-20261118-16: the group's own summary, so Android never posts its own
         } catch (Throwable t) {
             android.util.Log.w("NowhereChooser", "roamed message notice", t);
@@ -741,6 +824,7 @@ final class TelIngest {
                         .setContentIntent(tap)
                         .build();
                 nm.notify(MessageGroup.SUMMARY_TAG, MessageGroup.SUMMARY_ID, summary);
+                traceNoticeReadBack(ctx, MessageGroup.SUMMARY_TAG, MessageGroup.SUMMARY_ID, true, extras.getString(SmsDeliverReceiver.EXTRA_SUBST_APP_NAME)); // NWP-20261128-33
             } else {
                 nm.cancel(MessageGroup.SUMMARY_TAG, MessageGroup.SUMMARY_ID);
             }
@@ -749,10 +833,52 @@ final class TelIngest {
         }
     }
 
+    /** NWP-20261128-33: the backlog row 'On the lock screen an SMS notice shows as "Profile" with a legacy glyph and
+     *  no public text'. About 1 s after a notify (NMS enqueues it asynchronously), read back what Android kept for
+     *  (tag, id) and put ONE line into login.log through IDLE-TRACE: whether the posted android.substName survived,
+     *  whether a public version is there, and whether the small icon is ours (MsgNoticeTrace.line, integers only).
+     *  Its own thread: it never delays the notice and never throws into it. */
+    private static void traceNoticeReadBack(final Context ctx, final String tag, final int id, final boolean summary,
+                                            final String expected) {
+        try {
+            Thread t = new Thread(() -> {
+                try {
+                    Thread.sleep(1000);
+                    android.app.NotificationManager nm = ctx.getSystemService(android.app.NotificationManager.class);
+                    if (nm == null) return;
+                    android.service.notification.StatusBarNotification[] active = nm.getActiveNotifications();
+                    android.app.Notification n = null;
+                    if (active != null) {
+                        for (android.service.notification.StatusBarNotification sbn : active) {
+                            if (sbn.getId() == id && java.util.Objects.equals(sbn.getTag(), tag)) {
+                                n = sbn.getNotification();
+                                break;
+                            }
+                        }
+                    }
+                    String sub = null;
+                    boolean pub = false, icon = false;
+                    if (n != null) {
+                        if (n.extras != null) sub = n.extras.getString(SmsDeliverReceiver.EXTRA_SUBST_APP_NAME);
+                        pub = n.publicVersion != null;
+                        android.graphics.drawable.Icon ic = n.getSmallIcon();
+                        icon = ic != null && ic.getType() == android.graphics.drawable.Icon.TYPE_RESOURCE
+                                && ic.getResId() == R.drawable.ic_notif_message;
+                    }
+                    ChooserActivity.idleTrace(MsgNoticeTrace.line(n != null, summary, sub, expected, pub, icon));
+                } catch (Throwable ignore) {}
+            }, "nowhere-smsnotice-trace");
+            t.setDaemon(true);
+            t.start();
+        } catch (Throwable ignore) {}
+    }
+
     /** #150 P4: insert one MMS part row + (for media) stream its bytes into the provider. text/plain +
      *  application/smil go in the "text" column; binary media (image/...) is written via openOutputStream on
-     *  the returned part Uri (the provider stores it at _data). */
-    private static void insertMmsPart(Context ctx, long mid, int seq, String ct, String name, byte[] data) {
+     *  the returned part Uri (the provider stores it at _data). NWP-20261129-02: returns whether the part row's insert
+     *  returned a Uri; a byte write that fails after it still returns true, since the row is there. */
+    private static boolean insertMmsPart(Context ctx, long mid, int seq, String ct, String name, byte[] data) {
+        boolean inserted = false;
         try {
             ContentValues v = new ContentValues();
             v.put("mid", mid);
@@ -765,6 +891,7 @@ final class TelIngest {
                 v.put("text", new String(data, java.nio.charset.StandardCharsets.UTF_8));
             }
             Uri partUri = ctx.getContentResolver().insert(Uri.parse("content://mms/" + mid + "/part"), v);
+            inserted = partUri != null;
             if (!isText && partUri != null && data.length > 0) {
                 // Write the media bytes. During login bring-up the per-user provider is still settling, so the
                 // just-inserted part row can be briefly invisible to openFile's lookup -> FileNotFoundException
@@ -786,14 +913,14 @@ final class TelIngest {
         } catch (Throwable t) {
             android.util.Log.w("NowhereChooser", "mms part", t);
         }
+        return inserted;
     }
 
     /** #149: grant OUR OWN OP_WRITE_SMS in this roamed user so the ContentResolver.insert into content://sms
      *  lands. cede makes Messaging the default SMS app, which moves OP_WRITE_SMS to Messaging and leaves ours
      *  at "ignore". We hold MANAGE_APP_OPS_MODES (platform-signed) so we can set our own app-op. Idempotent
      *  and cheap. (READ_SMS is not granted here: a runtime permission needs the profile-owner path, which
-     *  ensureSmsRead takes since NWP-20261006-07. insertedThisRun in run() still prevents the multi-pass
-     *  duplicate on its own, whether or not exists() can read.) */
+     *  ensureSmsRead takes since NWP-20261006-07.) */
     private static void ensureSmsWrite(Context ctx) {
         try {
             android.app.AppOpsManager ao = ctx.getSystemService(android.app.AppOpsManager.class);
@@ -813,7 +940,8 @@ final class TelIngest {
      *  profile-owner path as ensureCallLogGrant (the chooser cannot self-grant a runtime permission, and READ_SMS is
      *  hard-restricted like CALL_LOG; the chooser is RESTRICTION_SYSTEM_EXEMPT), plus our OP_READ_SMS app-op, which
      *  cede moved to Messaging with the write op. It adds no knowledge: the chooser decrypted and wrote every row it
-     *  will look for, and the lookups ask only whether one exists. A failure leaves the read-back blind, as before. */
+     *  will look for, and the lookups ask only whether one exists. A failure leaves the read-back blind: since
+     *  NWP-20261130-01 a blind run inserts and acknowledges no SMS or MMS (TelSub.lookup), and the sealed copy stays. */
     private static void ensureSmsRead(Context ctx) {
         try {
             android.app.admin.DevicePolicyManager dpm = ctx.getSystemService(android.app.admin.DevicePolicyManager.class);

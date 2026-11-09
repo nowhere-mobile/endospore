@@ -151,7 +151,7 @@ and live **only in the running session's memory** — never sent to us, never wr
 | **Network** (MITM) | TLS-protected traffic | your content (even if TLS were broken) | TLS **plus** client-side encryption (defense in depth) |
 | **Malicious OS update** | nothing useful | a forged OS on the device | signed A/B payload, verified boot under our key, rollback protection |
 | **Legal process** | the identified side (billing / tax records) | useful store content; the usage↔payment link | the data-domain split; the store holds only ciphertext |
-| **Us** (insider / "just trust us") | what the gateway/store see (ciphertext, pseudonymous refs) | your content; the usage↔payment link | client-side keys + **open, reproducible source** you can audit |
+| **Us** (insider / "just trust us") | what the gateway/store see (ciphertext, pseudonymous refs) | your content; the usage↔payment link | client-side keys + **open source** you can audit |
 
 ⚠ **The powered-on, locked row held only while resume checked the credential** (`NWP-20260924-01`). Until
 that slice, resume took a readable CE as proof of the credential, so a thief who reached *“Welcome back”*

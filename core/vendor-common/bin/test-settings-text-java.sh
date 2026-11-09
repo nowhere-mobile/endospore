@@ -11,11 +11,15 @@
 # SettingsText is java.* only and compiled here with its cases (core/chooser/tests/settings-text); the same run holds
 # the source checks on the real ProfileActivity.java (comments stripped).
 #
+# NWP-20261129-15: setPref and writeWipePref read nowhere-prefs the same way (S7, S8). They composed from readPrefsText,
+# which returns "" on any failure, and capturePrefs calls setPref at every sign-out, so one sign-out over an unreadable
+# file kept only tz= (empty) and locale=. readPrefsText stays lenient for the screens.
+#
 # ⚠ IT FAILS WHEN THERE IS NO JAVAC, IT NEVER SKIPS. javac comes from PATH, else from the build host's JDK below;
 # the version is printed first so the log proves which compiler ran.
 #
 #   bash test-settings-text-java.sh            # the cases and the source checks
-#   bash test-settings-text-java.sh --mutate   # ... plus M1-M5, each of which must be CONVICTED
+#   bash test-settings-text-java.sh --mutate   # ... plus M1-M8, each of which must be CONVICTED
 #
 # SETTINGS_TEXT_SRC / PROFILE_SRC override the two sources (to prove the suite red on an older tree).
 # Exit: 0 all pass, 1 a check failed or a mutant was not convicted, 2 the suite itself could not run.
@@ -86,4 +90,10 @@ mut "M4 parseConfig stops skipping # lines (P1)" st \
   's/if \(ln\.isEmpty\(\) \|\| ln\.startsWith\("#"\) \|\| eq <= 0\)/if (ln.isEmpty() || eq <= 0)/' || fails=$((fails+1))
 mut "M5 parseTiers splits on the last space (P2)" st \
   's/int sp = ln\.indexOf\(\x27 \x27\);/int sp = ln.lastIndexOf(\x27 \x27);/' || fails=$((fails+1))
+mut "M6 setPref composes from readPrefsText() again (S7)" pa \
+  's/prefsUpdated\(cur, key, value,/prefsUpdated(readPrefsText(), key, value,/' || fails=$((fails+1))
+mut "M7 writeWipePref's null branch removed (S8)" pa \
+  's/(private boolean writeWipePref\(int i\) \{\n[^\n]*\n)[ \t]*if \(cur == null\) \{\n[^\n]*\n[ \t]*return false;\n[ \t]*\}\n/$1/' || fails=$((fails+1))
+mut "M8 setPref's null branch returns true (S7)" pa \
+  's/(private boolean setPref\(String key, String value\) \{\n[^\n]*\n[ \t]*if \(cur == null\) \{\n[^\n]*\n[ \t]*)return false;/$1return true;/' || fails=$((fails+1))
 [ "$fails" -eq 0 ] && echo "== all mutations convicted" || { echo "== $fails mutation(s) not convicted"; exit 1; }

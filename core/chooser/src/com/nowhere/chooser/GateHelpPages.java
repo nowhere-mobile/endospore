@@ -74,9 +74,10 @@ final class GateHelpPages {
             // "Lock screen notices"
             "Messages & calls: the Inbox and Compose for a SIM not assigned to a profile, and Lock screen notices.",
             // buildOwnerMenu: settingsRow("Lock screen clock", "Show a dim clock while the phone is resting");
-            // buildOwnerMenu: settingsRow("Store settings", "Where your encrypted data is saved") -> buildStoreScreen
+            // buildOwnerMenu: settingsRow("Store settings", "Where your encrypted data is saved") -> buildStoreScreen;
+            // buildOwnerMenu: settingsRow("Backup", "How often your data is saved") -> buildOwnerBackupScreen
             "Lock screen clock: show a dim clock while the phone is resting. Store settings: choose where profiles "
-                    + "are saved.",
+                    + "are saved. Backup: choose how often.",
             // buildOwnerMenu: settingsRow("System settings", "USB debugging, eSIM and more. ..."),
             // settingsRow("Leave Nowhere", "Go back to the stock Android this phone shipped with")
             "System settings: USB debugging, eSIM and more, for every profile. Leave Nowhere: go back to the stock "

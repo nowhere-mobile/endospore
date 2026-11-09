@@ -91,7 +91,7 @@ mut "J15 netloc is carried from the geocoder line"  's/(String netloc = PREF_NET
 mut "J16 any other write drops geocoder"            's/String geocoder = PREF_GEOCODER\.equals\(key\) \? value : prefValueIn\(cur, PREF_GEOCODER\);/String geocoder = PREF_GEOCODER.equals(key) ? value : "";/' || fails=$((fails+1))
 mut "J17 holdlock and vpn trade places"             's/return prefsText\(tz, loc, idle, wipe, holdlock, holdaudio, vpn, /return prefsText(tz, loc, idle, wipe, vpn, holdaudio, holdlock, /' || fails=$((fails+1))
 mut "J18 the empty-locale fallback is dropped"      's/if \(loc\.isEmpty\(\)\) loc = defaultLocale;/if (loc.isEmpty()) loc = "";/' || fails=$((fails+1))
-mut "J19 setPref no longer passes the device locale" 's/prefsUpdated\(readPrefsText\(\), key, value, java\.util\.Locale\.getDefault\(\)\.toLanguageTag\(\)\)/prefsUpdated(readPrefsText(), key, value, "")/' || fails=$((fails+1))
+mut "J19 setPref no longer passes the device locale" 's/prefsUpdated\(cur, key, value, java\.util\.Locale\.getDefault\(\)\.toLanguageTag\(\)\)/prefsUpdated(cur, key, value, "")/' || fails=$((fails+1))
 mut "J20 setPref reports a failed write as landed"  's/(android\.util\.Log\.w\("NowhereChooser", "setPref " \+ key, e\);\n)            return false;/${1}            return true;/' || fails=$((fails+1))
 mut "J21 the switch shows Network location's state on both rows" 's/        sw\.setChecked\(locPrefOn\(readPrefValue\(key\)\)\);/        sw.setChecked(locPrefOn(readPrefValue(PREF_NETLOC)));/' || fails=$((fails+1))
 mut "J22 a failed write is not redrawn: the switches keep the tap, not the file" 's/            if \(!saved\) showLocationServices\(\);/            if (false) showLocationServices();/' || fails=$((fails+1))

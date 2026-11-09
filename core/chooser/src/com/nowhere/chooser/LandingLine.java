@@ -1,5 +1,10 @@
 package com.nowhere.chooser;
 
+import java.util.ArrayList;
+import java.util.List;
+import java.util.function.Function;
+import java.util.function.Predicate;
+
 /**
  * NWP-20261122-15 (h50 #5, docs/product-decisions.md, 2026-11-01 "twenty-two answers to harvests 50, 51 and 52 ..."):
  * a sign-in whose Auto sweep has apps to fetch tells the user once, so the empty-looking home reads as filling in.
@@ -9,11 +14,16 @@ package com.nowhere.chooser;
  * {@code ROWS_MAX + 1}: a headline count, a bar, at most {@link #ROWS_BIG} rows and one "+<n> more" row, so the card
  * keeps one size and never scrolls. The notification stays the record.
  *
+ * NWP-20261130-09 (Chester, 2026-11-06, "Play store is already in it, but not play service"): the sweep fetches Play
+ * services and GSF as deps of the first app that needs them, for minutes and outside its work list, so the card read as
+ * if nothing was installing. {@link #cardPkgs} gives them rows ahead of the work list, and {@link Sweep#depLanded} ticks
+ * them. The stack still installs in keep-set order; only the card's order differs.
+ *
  * ⚠ The words are the mockup's and stay DRAFTS for Chester to correct (the 2026-11-03 entry's inference).
  * {@link #CLOSE_AFTER_MS} = 4000 is this slice's inference for the decision's "a few seconds".
  *
  * Once per sign-in: {@link UnarchiveService} keys it on the Android user's serial, which is new at every sign-in and
- * unchanged across a cold-lock resume, and stamps the serial it showed the card for. Pure (java.lang only), so
+ * unchanged across a cold-lock resume, and stamps the serial it showed the card for. Pure (java.* only), so
  * test-landing-line-java.sh runs it under javac.
  */
 final class LandingLine {
@@ -40,6 +50,38 @@ final class LandingLine {
     /** ProfileActivity opens Your apps when its intent carries EXTRA_OPEN = OPEN_YOUR_APPS ("+<n> more"). */
     static final String EXTRA_OPEN = "nowhere.profile.open";
     static final String OPEN_YOUR_APPS = "your-apps";
+
+    /** The launcher-less providers: ProfileActivity.GMS_PKG and GSF_PKG. */
+    static final String GMS = "com.google.android.gms";
+    static final String GSF = "com.google.android.gsf";
+
+    /** The card's rows: GMS, then GSF, each when the sweep will fetch it as a dep and it is not in {@code work}, then
+     *  {@code work} in sweep order. It will fetch one when it has no code and is in the deps of an app in {@code work}:
+     *  {@code depsOf} and {@code hasCode} are the inputs pendingDeps reads, so the row and the install cannot disagree.
+     *  GSF is absent on modern GrapheneOS, so it is in no dep list there and gets no row. First, because rows() shows the
+     *  first apps not landed: a row at its true install position could sit under "+<n> more" while it installs. */
+    static String[] cardPkgs(List<String> work, Function<String, List<String>> depsOf, Predicate<String> hasCode) {
+        List<String> out = new ArrayList<>();
+        for (String dep : new String[] {GMS, GSF}) {
+            if (work.contains(dep) || hasCode.test(dep)) continue;
+            for (String p : work) {
+                if (depsOf.apply(p).contains(dep)) {
+                    out.add(dep);
+                    break;
+                }
+            }
+        }
+        out.addAll(work);
+        return out.toArray(new String[0]);
+    }
+
+    /** A provider's name, the words ProfileActivity.keptLabel uses (they equal its installed label, so the row does not
+     *  change when it lands); null for any other package. It has no archived placeholder to read a label from. */
+    static String depLabel(String pkg) {
+        if (GMS.equals(pkg)) return "Google Play services";
+        if (GSF.equals(pkg)) return "Google Services Framework";
+        return null;
+    }
 
     /** The headline of the card from ROWS_MAX + 1 apps. */
     static String headline(int landed, int total) {
@@ -108,7 +150,7 @@ final class LandingLine {
         private static boolean[] landed = new boolean[0], settled = new boolean[0];
         private static boolean done;
 
-        /** A new card sweep over {@code work}, in sweep order; returns its id (never 0). */
+        /** A new card sweep over {@code work}, the card's rows ({@link #cardPkgs}); returns its id (never 0). */
         static synchronized long begin(String[] work) {
             id = ++seq;
             pkgs = work == null ? new String[0] : work.clone();
@@ -128,6 +170,21 @@ final class LandingLine {
                 landed[i] = ok;
                 return;
             }
+        }
+
+        /** A dep's code landed: its row ticks, and returns true when that changed a row. It takes no sweep id, because
+         *  materializeLocked has none (a tap can land a dep during the sweep). It overrides an earlier failed outcome,
+         *  because the code is now there, and {@link #outcome} cannot undo it. A failed dep records nothing: the next
+         *  entry point retries the group, so its row stays open for that retry. */
+        static synchronized boolean depLanded(String pkg) {
+            if (pkg == null) return false;
+            for (int i = 0; i < pkgs.length; i++) {
+                if (!pkg.equals(pkgs[i]) || landed[i]) continue;
+                settled[i] = true;
+                landed[i] = true;
+                return true;
+            }
+            return false;
         }
 
         /** The sweep ended. */

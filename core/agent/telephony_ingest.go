@@ -164,8 +164,14 @@ func deleteSimMailboxes(tag string) (int, error) {
 // NWP-20260924-07: a CALL row's body slot carries its SIM tag, "-<tag>", instead of the plain "-". A call has no
 // body, and the chooser never reads that slot for a call (TelIngest.deliver reads f[5] only for an SMS) but echoes
 // it back verbatim when it re-stages a call row (RESTAGE-TELINGEST) -- so the tag survives the round trip, and a
-// re-staged row returns to its SIM's mailbox, or is dropped if that SIM was unassigned meanwhile. Only call rows
-// are ever re-staged, so SMS and MMS rows need no in-row tag; their mailbox file carries it.
+// re-staged row returns to its SIM's mailbox, or is dropped if that SIM was unassigned meanwhile.
+//
+// NWP-20261130-01: an SMS or MMS row carries its tag too, in a slot of its own, "sim:<tag>", directly after the row's
+// fixed fields and before any retry token (simSlot). The session's chooser files the row under that SIM's subscription:
+// on GrapheneOS 2026110200 the provider shows a session no sub_id=-1 row (docs/product-decisions.md, 2026-11-06). A
+// row with no slot stays valid (the chooser files it under sub_id=-1), and a reader that predates the slot reads only
+// the fixed fields. A call row keeps its body slot and never has this one. The sealed blob needs no change: its tag
+// is in its file name (blobTag), and a row is rendered from that.
 func serializeTelIngest(items []telItem, tag string) string {
 	var sb strings.Builder
 	for _, it := range items {
@@ -183,6 +189,7 @@ func serializeTelIngest(items []telItem, tag string) string {
 			sb.WriteString(strconv.FormatInt(it.When, 10))
 			sb.WriteByte(' ')
 			sb.WriteString(base64.StdEncoding.EncodeToString(j))
+			sb.WriteString(simSlot(tag))
 			sb.WriteByte('\n')
 			continue
 		}
@@ -203,6 +210,7 @@ func serializeTelIngest(items []telItem, tag string) string {
 			}
 		} else {
 			sb.WriteString(b64tok(it.Body))
+			sb.WriteString(simSlot(tag))
 		}
 		sb.WriteByte('\n')
 	}
@@ -217,14 +225,33 @@ func b64tok(s string) string {
 	return base64.StdEncoding.EncodeToString([]byte(s))
 }
 
-// rowTag is the SIM tag a serialized row carries in-band: only a call row, whose body slot is "-<tag>". "" for
-// anything else, including an untagged "-".
-func rowTag(row string) string {
-	f := strings.Fields(row)
-	if len(f) < 6 || f[0] != "call" || !strings.HasPrefix(f[5], "-") {
+// simSlotPrefix marks the SIM tag's own slot in an SMS or MMS row. No base64 token, number or "-" sentinel starts
+// with it, so it also tells a tagged row from an untagged one with a retry token.
+const simSlotPrefix = "sim:"
+
+// simSlot is the token an SMS or MMS row appends for its SIM, with its separating space: nothing for an empty tag.
+func simSlot(tag string) string {
+	if !isSimTag(tag) {
 		return ""
 	}
-	if t := f[5][1:]; isSimTag(t) {
+	return " " + simSlotPrefix + tag
+}
+
+// rowTag is the SIM tag a serialized row carries in-band: a call row's body slot "-<tag>", or the "sim:<tag>" slot of
+// an SMS row (f[6]) or an MMS row (f[3]), at exactly that position. "" for anything else, including an untagged "-".
+// TelSub.rowTag is the chooser's copy of the SMS and MMS rule.
+func rowTag(row string) string {
+	f := strings.Fields(row)
+	var t string
+	switch {
+	case len(f) >= 6 && f[0] == "call" && strings.HasPrefix(f[5], "-"):
+		t = f[5][1:]
+	case len(f) >= 7 && f[0] == "sms" && strings.HasPrefix(f[6], simSlotPrefix):
+		t = f[6][len(simSlotPrefix):]
+	case len(f) >= 4 && f[0] == "mms" && strings.HasPrefix(f[3], simSlotPrefix):
+		t = f[3][len(simSlotPrefix):]
+	}
+	if isSimTag(t) {
 		return t
 	}
 	return ""
@@ -259,9 +286,10 @@ func appendTelIngestRaw(uid, line string) error {
 func restageTelIngest(uid, row string) (dropped bool, err error) {
 	t := rowTag(row)
 	if t == "" {
-		// NWP-20261005-15: an SMS or MMS row carries no in-row tag; its SIM is the one whose mailbox it was claimed
-		// from. Without this a re-staged SMS went to the bare mailbox, which an unassign never deletes -- against
-		// the decision that an unbind deletes that line's undelivered texts (2026-09-24).
+		// NWP-20261005-15: an SMS or MMS row with no in-row tag (one from before NWP-20261130-01, or one an older
+		// chooser re-staged without its slot); its SIM is the one whose mailbox it was claimed from. Without this a
+		// re-staged SMS went to the bare mailbox, which an unassign never deletes -- against the decision that an
+		// unbind deletes that line's undelivered texts (2026-09-24).
 		t = takeClaimedTag(uid, row)
 	}
 	if t != "" && simUnboundNow(t) { // NWP-20260930-04: a damaged bindings.conf keeps the row
@@ -290,7 +318,9 @@ func claimedKey(uid, row string) string {
 	return uid + "\x00" + f[0] + " " + f[1]
 }
 
-// noteClaimedTags records tag for every untagged row of one claimed mailbox file.
+// noteClaimedTags records tag for every row of one claimed mailbox file that a re-stage can bring back without an
+// in-row tag: every row except a tagged call. A tagged SMS or MMS row counts, because a chooser that predates
+// NWP-20261130-01 re-stages it without its slot.
 func noteClaimedTags(uid, tag string, b []byte) {
 	if !isSimTag(tag) {
 		return
@@ -298,7 +328,7 @@ func noteClaimedTags(uid, tag string, b []byte) {
 	claimedTagsMu.Lock()
 	defer claimedTagsMu.Unlock()
 	for _, line := range strings.Split(string(b), "\n") {
-		if rowTag(line) != "" {
+		if strings.HasPrefix(line, "call ") && rowTag(line) != "" {
 			continue
 		}
 		if k := claimedKey(uid, line); k != "" {

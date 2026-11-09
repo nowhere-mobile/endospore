@@ -77,8 +77,10 @@ pw() { printf '%s\n' x; }
 agent_sim() { echo "agent \$1 \$3" >> "\$ROOT/calls"; return "\$SIM_RC"; }
 _ms() { echo 0; }
 _tlog() { :; }
+_ssum() { :; }
 remap_per_pkg() { echo tail >> "\$ROOT/calls"; }
 remap_media_db() { :; }   # NWP-20261124-01: the #de tail calls it before remap_per_pkg
+insert_deferred_media() { :; }   # NWP-20261130-02: the #media tail calls it after restore_media_tail
 restorecon() { :; }
 restore_media_tail() { echo tail >> "\$ROOT/calls"; }
 . "$W/seg-$2.sh"

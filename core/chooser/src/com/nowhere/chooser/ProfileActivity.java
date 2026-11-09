@@ -120,11 +120,23 @@ public class ProfileActivity extends Activity {
     private android.view.View shownView;
     private android.view.View confirmView;
 
+    // NWP-20261128-10: Back (the button or the swipe) goes to the shown screen's parent, the one its on-screen Back
+    // link names, not to a history: a screen reached through a side path still goes where its link says. backLink()
+    // records the link's target in pendingBack while a screen is built; setContentView moves it into backTarget (null
+    // when that screen has no Back link), so pendingBack is null between UI tasks. All UI-thread only, like shownView.
+    private Runnable backTarget;
+    private Runnable pendingBack;
+    private Object backCallback; // android.window.OnBackInvokedCallback on API 33+, made lazily
+    private boolean backRegistered;
+
     @Override
     public void setContentView(android.view.View view) {
         if (getWindow() != null) PassReveal.maskAll(getWindow().getDecorView());
         shownView = view;
+        backTarget = pendingBack;
+        pendingBack = null;
         super.setContentView(view);
+        syncBackCallback();
     }
     @Override
     protected void onCreate(Bundle b) {
@@ -140,6 +152,7 @@ public class ProfileActivity extends Activity {
         if (look == GatePalette.LIGHT) setTheme(android.R.style.Theme_Material_Light_NoActionBar);
         super.onCreate(b);
         applyProfileLook(look);
+        syncBackCallback();
         // L4: the failed-unlock auto-logoff backstop (AdminReceiver) launches this with auto=true -> skip the
         // confirmation and seal+reap immediately. (The idle timeout does not come here: it COLD-LOCKS, and the
         // daemon withdraws any "Sign out & install" request when that lock is taken.) Otherwise this is the
@@ -298,7 +311,7 @@ public class ProfileActivity extends Activity {
         LinearLayout ll = new LinearLayout(this);
         ll.setOrientation(LinearLayout.VERTICAL);
         ll.setBackgroundColor(BG);
-        ll.setPadding(dp(22), dp(44), dp(22), dp(30));
+        ll.setPadding(dp(22), dp(ProfileHomeFit.PAD_TOP), dp(22), dp(ProfileHomeFit.PAD_BOTTOM));
 
         // --- identity header (centered): name + a one-line status ---
         TextView nameTv = new TextView(this);
@@ -366,9 +379,12 @@ public class ProfileActivity extends Activity {
         status.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
         status.setTextColor(MUTED);
         status.setGravity(Gravity.CENTER);
+        // NWP-20261130-10: the line is a tap target, so it is 48dp high in every state: a state change does not move the
+        // screen, and the space above and below the text is part of the target instead of a margin.
+        status.setMinHeight(dp(ProfileHomeFit.MIN_TOUCH));
         LinearLayout.LayoutParams stlp = new LinearLayout.LayoutParams(MATCH, WRAP);
-        stlp.topMargin = dp(5);
-        stlp.bottomMargin = dp(26);
+        stlp.topMargin = dp(ProfileHomeFit.NAME_TO_STATUS);
+        stlp.bottomMargin = dp(ProfileHomeFit.STATUS_TO_LOCK);
         ll.addView(status, stlp);
 
         // --- offline session (#49): explain the state instead of offering Save (this is an existing stored
@@ -413,7 +429,7 @@ public class ProfileActivity extends Activity {
         final String logoffLabel = name == null ? "Log off" : "Log off " + name;
         if (!local) {
             ll.addView(accentButton("Lock — keep on this device", () -> doColdLock()), btnLp(0));
-            ll.addView(secondaryButton(logoffLabel, () -> doLogoff()), btnLp(dp(10)));
+            ll.addView(secondaryButton(logoffLabel, () -> doLogoff()), btnLp(dp(ProfileHomeFit.LOCK_TO_LOGOFF)));
         } else {
             ll.addView(secondaryButton(logoffLabel, () -> doLogoff()), btnLp(dp(16)));
         }
@@ -439,11 +455,11 @@ public class ProfileActivity extends Activity {
             sectionCard(ll, null,
                     new String[]{"Storage", "Security", "Preferences", "Your data", "Report an issue", "Help"},
                     new Runnable[]{() -> showStorage(), () -> showSecurity(), () -> showPreferences(),
-                            () -> showYourData(), () -> showReportIssue(), () -> showHelp()}, false);
+                            () -> showYourData(), () -> showReportIssue(), () -> showHelp()}, false, ProfileHomeFit.MENU_GAP);
         } else { // a throwaway: device-local Security (idle/wipe) + Preferences; no store/delete
             sectionCard(ll, null,
                     new String[]{"Security", "Preferences", "Help"},
-                    new Runnable[]{() -> showSecurity(), () -> showPreferences(), () -> showHelp()}, false);
+                    new Runnable[]{() -> showSecurity(), () -> showPreferences(), () -> showHelp()}, false, ProfileHomeFit.MENU_GAP);
         }
 
         // Delete: a deliberate, separate destructive action (stored profiles only) -- a quiet centered link, NOT a
@@ -462,8 +478,9 @@ public class ProfileActivity extends Activity {
             del.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
             del.setTextColor(DANGER);
             del.setGravity(Gravity.CENTER);
-            del.setPadding(dp(8), dp(30), dp(8), dp(8));
-            ll.addView(del, new LinearLayout.LayoutParams(MATCH, WRAP));
+            del.setPadding(dp(8), dp(ProfileHomeFit.LINK_PAD), dp(8), dp(ProfileHomeFit.LINK_PAD));
+            del.setMinHeight(dp(ProfileHomeFit.MIN_TOUCH));
+            ll.addView(del, btnLp(dp(ProfileHomeFit.LINK_GAP)));
             del.setOnClickListener(v -> showDeleteConfirm(name));
         }
 
@@ -474,7 +491,8 @@ public class ProfileActivity extends Activity {
         done.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
         done.setTextColor(MUTED);
         done.setGravity(Gravity.CENTER);
-        done.setPadding(dp(8), dp(18), dp(8), dp(8));
+        done.setPadding(dp(8), dp(ProfileHomeFit.LINK_PAD), dp(8), dp(ProfileHomeFit.LINK_PAD));
+        done.setMinHeight(dp(ProfileHomeFit.MIN_TOUCH));
         ll.addView(done, new LinearLayout.LayoutParams(MATCH, WRAP));
         done.setOnClickListener(v -> finish());
 
@@ -612,6 +630,11 @@ public class ProfileActivity extends Activity {
 
     /** A titled card of tappable rows (label left, chevron right) with hairline dividers. danger -> red, no chevron. */
     private void sectionCard(LinearLayout parent, String header, String[] labels, Runnable[] actions, boolean danger) {
+        sectionCard(parent, header, labels, actions, danger, 20);
+    }
+
+    /** The same card; gapDp is the space above a card with no header. */
+    private void sectionCard(LinearLayout parent, String header, String[] labels, Runnable[] actions, boolean danger, int gapDp) {
         if (header != null) {
             TextView h = new TextView(this);
             h.setText(header.toUpperCase(java.util.Locale.US));
@@ -622,7 +645,7 @@ public class ProfileActivity extends Activity {
             parent.addView(h, new LinearLayout.LayoutParams(MATCH, WRAP));
         } else {
             android.view.View sp = new android.view.View(this);
-            parent.addView(sp, new LinearLayout.LayoutParams(MATCH, dp(20)));
+            parent.addView(sp, new LinearLayout.LayoutParams(MATCH, dp(gapDp)));
         }
         LinearLayout card = new LinearLayout(this);
         card.setOrientation(LinearLayout.VERTICAL);
@@ -714,9 +737,16 @@ public class ProfileActivity extends Activity {
         back.setGravity(Gravity.CENTER);
         back.setPadding(dp(8), dp(22), dp(8), dp(8));
         ll.addView(back, new LinearLayout.LayoutParams(MATCH, WRAP));
-        back.setOnClickListener(v -> onBack.run());
+        backLink(back, onBack);
         if (head == null) presentMenuScreen(ll);
         else presentMenuScreen(head, ll);
+    }
+
+    /** NWP-20261128-10: wires a screen's Back link and records its target as the parent of the screen being built, so
+     *  Back (the button or the swipe) goes where the link goes. Every Back link of a screen uses this. */
+    private void backLink(TextView back, Runnable onBack) {
+        back.setOnClickListener(v -> onBack.run());
+        pendingBack = onBack;
     }
 
     /** finishMenuScreen with the DEFAULT destination: the Profile hub. Correct for every screen entered from
@@ -968,6 +998,8 @@ public class ProfileActivity extends Activity {
         ll.addView(card, clp);
         final Runnable[] close = new Runnable[HelpPages.TITLES.length];
         final int[] open = {-1};
+        // NWP-20261128-10: Help's own Back target while a topic is open; the topic's close puts it back.
+        final Runnable[] helpBack = {null};
         for (int i = 0; i < HelpPages.TITLES.length; i++) {
             final int k = i;
             if (i > 0) {
@@ -1000,11 +1032,13 @@ public class ProfileActivity extends Activity {
                 body.removeAllViews();
                 body.setVisibility(View.GONE);
                 if (open[0] == k) open[0] = -1;
+                backTarget = helpBack[0];
             };
             row.setOnClickListener(v -> {
                 boolean was = open[0] == k;
                 if (open[0] >= 0) close[open[0]].run();
                 if (was) return;
+                helpBack[0] = backTarget;
                 body.setVisibility(View.VISIBLE);
                 showHelpPage(body, k, close[k]);
                 open[0] = k;
@@ -1140,6 +1174,7 @@ public class ProfileActivity extends Activity {
             else go.accept(dir);
         };
         back.setOnClickListener(v -> swipe.accept(-1));
+        backTarget = () -> swipe.accept(-1); // NWP-20261128-10: Back (button or swipe) moves a card, as this link does
         next.setOnClickListener(v -> swipe.accept(1));
         helpCardFling(area, swipe);
         go.accept(0);
@@ -1834,7 +1869,7 @@ public class ProfileActivity extends Activity {
         back.setGravity(Gravity.CENTER);
         back.setPadding(dp(8), dp(20), dp(8), dp(8));
         ll.addView(back, new LinearLayout.LayoutParams(MATCH, WRAP));
-        back.setOnClickListener(v -> { NfcFido2.stop(this); showSecurity(); }); // cancel any pending NFC read
+        backLink(back, () -> { NfcFido2.stop(this); showSecurity(); }); // cancel any pending NFC read
 
         android.widget.ScrollView sc = new android.widget.ScrollView(this);
         sc.setBackgroundColor(BG);
@@ -2105,20 +2140,31 @@ public class ProfileActivity extends Activity {
         }, "nowhere-phone-tie-status").start();
     }
 
-    /** NWP-20261008-04: the background re-key of the photos, files and installed apps, under the Tie screen's text. Polls
-     *  SE-PROGRESS every 5 s while the screen is up and says, per scope, how far it has got or why it is waiting; a
-     *  scope that is done drops out, and once both are done one line says so. Stops when the screen goes away. */
+    /** NWP-20261008-04: the background re-key of the photos, files and installed apps, under the Tie screen's text. Reads
+     *  SE-PROGRESS every TieProgressPoll.POLL_MS and says, per scope, how far it has got or why it is waiting; a scope
+     *  that is done drops out, and once both are done one line says so.
+     *  NWP-20261129-32: each SE-PROGRESS takes sessionMu and up to a dozen store reads, so every pass asks TieProgressPoll
+     *  first: a block already off screen never polls, a paused Profile reads nothing, and an answer where every scope is
+     *  done (or OK NONE) ends the poll. The last answer stays on screen. */
     private void showTieProgress(final LinearLayout prog) {
-        final java.util.concurrent.atomic.AtomicBoolean up = new java.util.concurrent.atomic.AtomicBoolean(true);
+        final java.util.concurrent.atomic.AtomicBoolean up =
+                new java.util.concurrent.atomic.AtomicBoolean(prog.isAttachedToWindow());
         prog.addOnAttachStateChangeListener(new android.view.View.OnAttachStateChangeListener() {
             @Override public void onViewAttachedToWindow(android.view.View v) {}
             @Override public void onViewDetachedFromWindow(android.view.View v) { up.set(false); }
         });
         new Thread(() -> {
-            while (up.get()) {
-                final String r = sendDaemonMulti("SE-PROGRESS\n");
-                runOnUiThread(() -> { if (up.get()) renderTieProgress(prog, r); });
-                try { Thread.sleep(5000); } catch (InterruptedException e) { return; }
+            boolean settled = false;
+            while (true) {
+                final TieProgressPoll.Step step =
+                        TieProgressPoll.step(up.get(), isFinishing() || isDestroyed(), paused, settled);
+                if (step == TieProgressPoll.Step.STOP) return;
+                if (step == TieProgressPoll.Step.READ) {
+                    final String r = sendDaemonMulti("SE-PROGRESS\n");
+                    settled = TieProgressPoll.settled(r);
+                    runOnUiThread(() -> { if (up.get()) renderTieProgress(prog, r); });
+                }
+                try { Thread.sleep(TieProgressPoll.POLL_MS); } catch (InterruptedException e) { return; }
             }
         }, "nowhere-tie-progress").start();
     }
@@ -2344,7 +2390,7 @@ public class ProfileActivity extends Activity {
         back.setGravity(Gravity.CENTER);
         back.setPadding(dp(8), dp(20), dp(8), dp(8));
         ll.addView(back, new LinearLayout.LayoutParams(MATCH, WRAP));
-        back.setOnClickListener(v -> showSecurity());
+        backLink(back, this::showSecurity);
 
         android.widget.ScrollView sc = new android.widget.ScrollView(this);
         sc.setBackgroundColor(BG);
@@ -2468,14 +2514,14 @@ public class ProfileActivity extends Activity {
         final String shown = presetShown();
         LinearLayout card = new LinearLayout(this);
         card.setOrientation(LinearLayout.VERTICAL);
-        card.setPadding(dp(16), dp(14), dp(16), dp(14));
+        card.setPadding(dp(16), dp(ProfileHomeFit.CARD_PAD_TOP), dp(16), dp(ProfileHomeFit.CARD_PAD_BOTTOM));
         GradientDrawable cbg = new GradientDrawable();
         cbg.setColor(FIELD_BG);
         cbg.setCornerRadius(dp(14));
         cbg.setStroke(dp(1), FIELD_LN);
         card.setBackground(cbg);
         LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(MATCH, WRAP);
-        clp.topMargin = dp(20);
+        clp.topMargin = dp(ProfileHomeFit.CARD_GAP);
         parent.addView(card, clp);
 
         TextView title = new TextView(this);
@@ -2498,7 +2544,7 @@ public class ProfileActivity extends Activity {
             scale.addView(seg, slp);
         }
         LinearLayout.LayoutParams sclp = new LinearLayout.LayoutParams(MATCH, WRAP);
-        sclp.topMargin = dp(12);
+        sclp.topMargin = dp(ProfileHomeFit.SCALE_GAP);
         card.addView(scale, sclp);
 
         TextView level = new TextView(this);
@@ -2506,14 +2552,16 @@ public class ProfileActivity extends Activity {
         level.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
         level.setTextColor(MUTED);
         LinearLayout.LayoutParams llp = new LinearLayout.LayoutParams(MATCH, WRAP);
-        llp.topMargin = dp(6);
+        llp.topMargin = dp(ProfileHomeFit.LEVEL_GAP);
         card.addView(level, llp);
 
         TextView pick = new TextView(this);
         pick.setText(PresetPicker.rowOf(shown) + "  ▾");
         pick.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
         pick.setTextColor(INK);
-        pick.setPadding(0, dp(10), 0, dp(4));
+        pick.setPadding(0, dp(ProfileHomeFit.PICK_PAD), 0, dp(ProfileHomeFit.PICK_PAD));
+        pick.setMinHeight(dp(ProfileHomeFit.MIN_TOUCH));
+        pick.setGravity(Gravity.CENTER_VERTICAL);
         pick.setOnClickListener(v -> showPresetPicker());
         card.addView(pick, new LinearLayout.LayoutParams(MATCH, WRAP));
     }
@@ -3106,7 +3154,7 @@ public class ProfileActivity extends Activity {
         back.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
         back.setGravity(Gravity.CENTER);
         back.setPadding(dp(8), dp(22), dp(8), dp(8));
-        back.setOnClickListener(v -> showPreferences());
+        backLink(back, this::showPreferences);
         return back;
     }
 
@@ -3120,6 +3168,7 @@ public class ProfileActivity extends Activity {
             offlineMediaBack = null;
         }
         TextView back = offlineMediaBackLink();
+        pendingBack = null; // NWP-20261128-10: this link joins a screen already shown; its parent came from the pre-load link
         ll.addView(back, new LinearLayout.LayoutParams(MATCH, WRAP));
         // ll is already attached to the ScrollView presented in showOfflineMedia (screen shown before the
         // load), so just append Back to the live layout -- re-wrapping in a new ScrollView would throw
@@ -4651,7 +4700,7 @@ public class ProfileActivity extends Activity {
         back.setGravity(Gravity.CENTER);
         back.setPadding(dp(8), dp(22), dp(8), dp(8));
         ll.addView(back, new LinearLayout.LayoutParams(MATCH, WRAP));
-        back.setOnClickListener(v -> showYourData());
+        backLink(back, this::showYourData);
 
         android.widget.ScrollView sc = new android.widget.ScrollView(this);
         sc.setBackgroundColor(BG);
@@ -5279,6 +5328,7 @@ public class ProfileActivity extends Activity {
      *  stands, which is until the reap or the reboot ends it. */
     private void showEndingSession(boolean restart, String warning) {
         loggingOff = true;
+        syncBackCallback();
         getWindow().addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         TextView tv = new TextView(this);
         if (restart) {
@@ -5459,6 +5509,7 @@ public class ProfileActivity extends Activity {
         setContentView(lo);
         getWindow().addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON); // don't sleep mid-logoff
         loggingOff = true; // from here on, block Back + re-front on Home/recents until the reap tears this down
+        syncBackCallback();
         // ...and drop this task from Recents so it can't be swipe-CLOSED there mid-seal. #143 made the seal
         // SYNCHRONOUS, so this screen now lives for the whole upload (not ~1.5 s) -- long enough to wander into
         // recents and kill it. With Recents-exclusion + onUserLeaveHint (re-front) + Back-swallow, the screen
@@ -5882,6 +5933,7 @@ public class ProfileActivity extends Activity {
         setContentView(col);
         getWindow().addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         loggingOff = true; // unescapable until the stop tears it down (same swallow-Back + re-front as logoff)
+        syncBackCallback();
         try {
             android.app.ActivityManager am = (android.app.ActivityManager) getSystemService(ACTIVITY_SERVICE);
             for (android.app.ActivityManager.AppTask t : am.getAppTasks()) t.setExcludeFromRecents(true);
@@ -6086,7 +6138,7 @@ public class ProfileActivity extends Activity {
         back.setGravity(Gravity.CENTER);
         back.setPadding(dp(8), dp(20), dp(8), dp(8));
         ll.addView(back, new LinearLayout.LayoutParams(MATCH, WRAP));
-        back.setOnClickListener(v -> showConfirm());
+        backLink(back, this::showConfirm);
 
         android.widget.ScrollView sc = new android.widget.ScrollView(this);
         sc.setBackgroundColor(BG);
@@ -7172,11 +7224,57 @@ public class ProfileActivity extends Activity {
         return pct < 0 ? 0 : (pct > 100 ? 100 : (int) pct);
     }
 
-    /** Once logoff has started the screen is unescapable: Back is swallowed... */
+    /** NWP-20261128-10: Back (the button or the swipe) on a sub-screen goes to its parent, the one its Back link names,
+     *  and a screen with no Back link goes to Profile home; only Profile home leaves the app. Once logoff has started
+     *  the screen is unescapable: Back is swallowed... (ProfileBack decides.) */
     @Override
     public void onBackPressed() {
-        if (loggingOff) return; // swallow Back during logoff (before that, Back == Cancel/normal)
-        super.onBackPressed();
+        goBack();
+    }
+
+    /** The one Back path: onBackPressed before API 33, and the OnBackInvokedCallback from API 33. It reads loggingOff
+     *  when Back arrives, so a callback still registered after a sign-out ended can only swallow or go home. */
+    private void goBack() {
+        switch (ProfileBack.decide(loggingOff, shownView == confirmView, backTarget != null)) {
+            case SWALLOW: return; // swallow Back during logoff
+            case TARGET: backTarget.run(); return;
+            case HOME: showConfirm(); return;
+            case LEAVE: super.onBackPressed(); return;
+        }
+    }
+
+    /** NWP-20261128-10: on API 33+ (predictive back, enableOnBackInvokedCallback on this activity only) Back reaches
+     *  goBack through a callback, registered while Back must stay in the app: on a sub-screen, or during sign-out.
+     *  Unregistered on Profile home, so the platform plays its own back-to-home with its peek. Never throws. */
+    private void syncBackCallback() {
+        if (android.os.Build.VERSION.SDK_INT < 33) return;
+        try {
+            boolean want = ProfileBack.wantCallback(loggingOff, shownView == confirmView);
+            if (want == backRegistered) return;
+            if (backCallback == null) backCallback = (android.window.OnBackInvokedCallback) this::goBack;
+            android.window.OnBackInvokedDispatcher d = getOnBackInvokedDispatcher();
+            if (want) d.registerOnBackInvokedCallback(android.window.OnBackInvokedDispatcher.PRIORITY_DEFAULT,
+                    (android.window.OnBackInvokedCallback) backCallback);
+            else d.unregisterOnBackInvokedCallback((android.window.OnBackInvokedCallback) backCallback);
+            backRegistered = want;
+        } catch (Throwable t) {
+            android.util.Log.w("NowhereChooser", "profile back callback not synced: " + t);
+        }
+    }
+
+    @Override
+    protected void onDestroy() {
+        super.onDestroy();
+        // NWP-20261128-10: drop the Back callback with the activity.
+        if (android.os.Build.VERSION.SDK_INT >= 33 && backRegistered) {
+            try {
+                getOnBackInvokedDispatcher().unregisterOnBackInvokedCallback(
+                        (android.window.OnBackInvokedCallback) backCallback);
+            } catch (Throwable t) {
+                android.util.Log.w("NowhereChooser", "profile back callback not unregistered: " + t);
+            }
+            backRegistered = false;
+        }
     }
 
     /** ...and a Home/recents attempt bounces the screen straight back to the front, so you can't drop into
@@ -7488,7 +7586,7 @@ public class ProfileActivity extends Activity {
         back.setGravity(Gravity.CENTER);
         back.setPadding(dp(8), dp(20), dp(8), dp(8));
         ll.addView(back, new LinearLayout.LayoutParams(MATCH, WRAP));
-        back.setOnClickListener(v -> showConfirm());
+        backLink(back, this::showConfirm);
 
         android.widget.ScrollView sc = new android.widget.ScrollView(this);
         sc.setBackgroundColor(BG);
@@ -7788,7 +7886,7 @@ public class ProfileActivity extends Activity {
         back.setGravity(Gravity.CENTER);
         back.setPadding(dp(8), dp(20), dp(8), dp(8));
         ll.addView(back, new LinearLayout.LayoutParams(MATCH, WRAP));
-        back.setOnClickListener(v -> showStorage()); // NOT finishMenuScreen -- its Back goes to showConfirm
+        backLink(back, this::showStorage); // NOT finishMenuScreen -- its Back goes to showConfirm
 
         android.widget.ScrollView sc = new android.widget.ScrollView(this);
         sc.setBackgroundColor(BG);
@@ -8225,7 +8323,8 @@ public class ProfileActivity extends Activity {
      *
      *  It reuses applyStorageDrop UNCHANGED. That already does the whole correct sequence: EXPECT-SHRINK first
      *  (so the logoff seal is allowed to shrink), setAppMode(null) -- a harmless no-op for a row that has no
-     *  keep line -- recordTurnedOff, and the session flag. Nothing is deleted here: on an
+     *  keep line -- recordTurnedOff, and the session flag, the last two only when the keep-set rewrite landed
+     *  (NWP-20261128-15). Nothing is deleted here: on an
      *  amnesiac device the tap records INTENT, and the release happens in the logoff seal by the new manifest
      *  not referencing those chunks. */
     private void confirmStopCarrying(final String pkg, final Runnable repaint) {
@@ -8243,7 +8342,8 @@ public class ProfileActivity extends Activity {
     /** Off-thread: declare the shrink intent FIRST, and only change the keep-set if the daemon accepted it.
      *  Order matters -- a keep-set change whose intent was never recorded can have its logoff seal refused by
      *  the shrink guard, which would silently undo the user's choice. Off the UI thread because EXPECT-SHRINK
-     *  is deliberately not on the daemon's concurrent-safe list, so it can queue behind a materialise. */
+     *  is deliberately not on the daemon's concurrent-safe list, so it can queue behind a materialise. The turn-off
+     *  is recorded, and the toast says it stopped, only when the keep-set rewrite landed (NWP-20261128-15). */
     private void applyStorageDrop(final String pkg, final Runnable repaint) {
         new Thread(() -> {
             // NWP-20260826-01: name the failure. This gate is correct -- a keep-set change whose shrink intent
@@ -8255,28 +8355,29 @@ public class ProfileActivity extends Activity {
             final DaemonReply rep = sendDaemonReply("EXPECT-SHRINK\n");
             final String r = rep.text;
             final boolean ok = r.startsWith("OK"); // "" is a dead socket, NOT success
+            java.util.Set<String> dropped = KEEPSET_UNREADABLE;
             if (ok) {
                 // setAppMode, never writeAppModes: it also maintains nowhere-playdeps and reconciles the Play
                 // stack, so writing the map directly would strand gms/gsf/vending kept with no client left.
-                setAppMode(pkg, null);
+                try {
+                    dropped = setAppMode(pkg, null);
+                } catch (Throwable t) {
+                    android.util.Log.w("NowhereChooser", "setAppMode " + pkg, t);
+                }
+            }
+            // NWP-20261128-15: the turn-off is recorded, and the toast says it stopped, only when the keep-set
+            // rewrite landed. KEEPSET_UNREADABLE (an unreadable keep-set, or a rewrite that did not land on a full
+            // phone) and a throw both mean the keep line is still there, so the next sign-out seals the app again.
+            final boolean saved = ok && dropped != KEEPSET_UNREADABLE;
+            if (saved) {
                 recordTurnedOff(pkg);   // so captureAppDrops can name it even once PM stops presenting it
                 clearedStorageThisSession = true;
             }
             runOnUiThread(() -> {
                 if (isFinishing() || isDestroyed()) return;
-                if (ok) repaint.run();
+                if (saved) repaint.run();
                 android.widget.Toast.makeText(this,
-                        ok ? "Stopped keeping " + keptLabel(pkg) + ". It's still here until you log off."
-                           : r.startsWith("NONE") ? "No active session."
-                           // NWP-20260826-05: the daemon now answers BUSY rather than blocking, so this is
-                           // the case that used to reach us as a 90s timeout -- or, before -01, as nothing
-                           // at all. Same words as the timeout branch on purpose: from where the user is
-                           // standing they ARE the same event, and the difference (we gave up vs the daemon
-                           // declined) is ours to log, not theirs to parse.
-                           : r.startsWith("BUSY") ? "The phone is busy saving or downloading. Nothing "
-                                   + "changed — tap it again in a moment."
-                           : rep.failed() ? "Nothing changed — " + rep.reason() + ". Tap it again in a moment."
-                           : "Couldn't prepare that change — try again.",
+                        StorageDropCopy.line(ok, saved, r, rep.failed(), rep.reason(), keptLabel(pkg)),
                         android.widget.Toast.LENGTH_LONG).show();
             });
         }).start();
@@ -8535,7 +8636,7 @@ public class ProfileActivity extends Activity {
         back.setGravity(Gravity.CENTER);
         back.setPadding(dp(8), dp(20), dp(8), dp(8));
         ll.addView(back, new LinearLayout.LayoutParams(MATCH, WRAP));
-        back.setOnClickListener(v -> showStorage());
+        backLink(back, this::showStorage);
 
         android.widget.ScrollView sc = new android.widget.ScrollView(this);
         sc.setBackgroundColor(BG);
@@ -9368,7 +9469,7 @@ public class ProfileActivity extends Activity {
         back.setGravity(Gravity.CENTER);
         back.setPadding(dp(8), dp(20), dp(8), dp(8));
         ll.addView(back, new LinearLayout.LayoutParams(MATCH, WRAP));
-        back.setOnClickListener(v -> showPreferences());
+        backLink(back, this::showPreferences);
 
         android.widget.ScrollView sc = new android.widget.ScrollView(this);
         sc.setBackgroundColor(BG);
@@ -9586,11 +9687,18 @@ public class ProfileActivity extends Activity {
 
     /** Set one key of nowhere-prefs, keeping every other, and report whether the write landed. Only the file I/O is
      *  here: what the new file says is prefsUpdated's, which runs under javac (core/chooser/test-loc-prefs-java.sh).
-     *  The Location services switches act on a false (NWP-20261016-45); every other caller ignores it, as before.
-     *  The write is StoreInstaller.writeAtomic's temp + rename (NWP-20261021-06), so a false means nowhere-prefs is
-     *  exactly as it was: every other pref in it is kept, and nothing is left beside it. */
+     *  The read is strict (NWP-20261129-15): a file that exists and cannot be read is left alone and answers false,
+     *  because rewriting it from an empty read would drop every other pref in it. The write is
+     *  StoreInstaller.writeAtomic's temp + rename (NWP-20261021-06). So a false means unreadable, nothing written, or
+     *  a failed write, and nowhere-prefs is exactly as it was: every other pref in it is kept, and nothing is left
+     *  beside it. */
     private boolean setPref(String key, String value) {
-        String text = prefsUpdated(readPrefsText(), key, value, java.util.Locale.getDefault().toLanguageTag());
+        String cur = SettingsText.read(new java.io.File(getFilesDir(), PREFS_FILE));
+        if (cur == null) {
+            android.util.Log.w("NowhereChooser", "nowhere-prefs unreadable -- nothing written (NWP-20261129-15)");
+            return false;
+        }
+        String text = prefsUpdated(cur, key, value, java.util.Locale.getDefault().toLanguageTag());
         try {
             StoreInstaller.writeAtomic(new java.io.File(getFilesDir(), PREFS_FILE), text);
             return true;
@@ -9763,7 +9871,9 @@ public class ProfileActivity extends Activity {
                         final boolean audioOk = setPref("holdaudio", audioBox.isChecked() ? "" : "0");
                         boolean live = false;
                         if (idleOk && holdOk && audioOk) live = sendLivePrefs();
-                        android.widget.Toast.makeText(this, "Auto standby when idle: " + labels[idx].toLowerCase()
+                        if (!(idleOk && holdOk && audioOk)) android.widget.Toast.makeText(this, SettingLanded.NOT_SAVED,
+                                android.widget.Toast.LENGTH_LONG).show();
+                        else android.widget.Toast.makeText(this, "Auto standby when idle: " + labels[idx].toLowerCase()
                                 + (live ? "" : " — applies next sign-in"), android.widget.Toast.LENGTH_LONG).show();
                         showSecurity();
                     }, () -> showSecurity());
@@ -9830,9 +9940,15 @@ public class ProfileActivity extends Activity {
 
     /** Write choice i of WipeChoice into nowhere-prefs, preserving the other prefs: wipe= and wipesaved= are composed
      *  into one text (prefsUpdatedWipe) and land in ONE StoreInstaller.writeAtomic, so the two keys never land apart.
-     *  Reports whether that write landed (NWP-20261119-21: the Save tells the gate only then). */
+     *  Reports whether that write landed (NWP-20261119-21: the Save tells the gate only then). The read is setPref's
+     *  strict read (NWP-20261129-15): a file that exists and cannot be read is left alone and answers false. */
     private boolean writeWipePref(int i) {
-        String text = prefsUpdatedWipe(readPrefsText(), WipeChoice.wipeValue(i), WipeChoice.savedValue(i),
+        String cur = SettingsText.read(new java.io.File(getFilesDir(), PREFS_FILE));
+        if (cur == null) {
+            android.util.Log.w("NowhereChooser", "nowhere-prefs unreadable -- nothing written (NWP-20261129-15)");
+            return false;
+        }
+        String text = prefsUpdatedWipe(cur, WipeChoice.wipeValue(i), WipeChoice.savedValue(i),
                 java.util.Locale.getDefault().toLanguageTag());
         try {
             StoreInstaller.writeAtomic(new java.io.File(getFilesDir(), PREFS_FILE), text);
@@ -10416,6 +10532,7 @@ public class ProfileActivity extends Activity {
                         // the user-0 chooser switches to the gate and removes this user, ending this screen;
                         // watchDeleted reboots if the switch does not come (Q117).
                         loggingOff = true;
+                        syncBackCallback();
                         TextView done = new TextView(this);
                         done.setText("Profile deleted");
                         done.setTextColor(RED);
@@ -11330,9 +11447,13 @@ public class ProfileActivity extends Activity {
             // profile's always-on-VPN choice never survived the seal (#159). tz stays the override; locale is
             // refreshed to the live (identity-pinned) value.
             String loc = java.util.Locale.getDefault().toLanguageTag();
-            setPref("locale", loc);
-            android.util.Log.i("NowhereChooser",
-                    "captured prefs tzOverride=[" + tzOverride + "] locale=" + loc + " for roaming");
+            if (setPref("locale", loc)) {
+                android.util.Log.i("NowhereChooser",
+                        "captured prefs tzOverride=[" + tzOverride + "] locale=" + loc + " for roaming");
+            } else {
+                android.util.Log.w("NowhereChooser",
+                        "prefs not captured -- nowhere-prefs was not written (NWP-20261129-15)");
+            }
         } catch (Throwable t) {
             android.util.Log.w("NowhereChooser", "capture prefs", t);
         }
@@ -11794,8 +11915,9 @@ public class ProfileActivity extends Activity {
         return m;
     }
 
-    /** NWP-20261112-03: what setAppModeLocked and writeAppModes (and so setAppMode) return when they wrote NOTHING
-     *  because the keep-set could not be read. Compare by identity (==), never by contents. */
+    /** NWP-20261112-03: what setAppModeLocked and writeAppModes (and so setAppMode) return when NOTHING reached disk:
+     *  the keep-set or its group tokens could not be read, or (NWP-20261128-15) its rewrite did not land. Compare by
+     *  identity (==), never by contents. */
     static final java.util.Set<String> KEEPSET_UNREADABLE = java.util.Collections.unmodifiableSet(new java.util.HashSet<>());
 
     /** Persist the keep-set (pkg -> mode). Writes a bare `pkg` for installed (back-compat + diff-friendly),
@@ -11894,7 +12016,9 @@ public class ProfileActivity extends Activity {
      *  is null. Only setAppModeLocked calls this, and setAppMode then asks the gate off the lock and runs again.
      *
      *  NWP-20261112-03: returns KEEPSET_UNREADABLE, having written nothing, when the keep-set or its group tokens
-     *  cannot be read -- this rewrites every line, so a rewrite from a failed read would drop what it missed. */
+     *  cannot be read -- this rewrites every line, so a rewrite from a failed read would drop what it missed.
+     *  NWP-20261128-15: it also returns KEEPSET_UNREADABLE when the rewrite itself does not land (a full /data), and
+     *  then records no sighting and retires no Off record: the old keep-set is still on disk. */
     private java.util.Set<String> writeAppModes(java.util.Map<String,String> modes, Boolean overPlanNow) {
       // NWP-20260819-03 review: every nowhere-appkeep read-modify-write serializes on the shared lock --
       // StoreService's binder threads (StoreInstaller.keepAuto) made this file concurrently written for the
@@ -11972,6 +12096,7 @@ public class ProfileActivity extends Activity {
             StoreInstaller.writeAtomic(f, sb.toString());
         } catch (Exception e) {
             android.util.Log.w("NowhereChooser", "writeAppModes", e);
+            return KEEPSET_UNREADABLE; // NWP-20261128-15: the rewrite did not land -- no sighting, no Off retired
         }
         // NWP-20260904-06: A KEEP LINE IS A CLAIM THAT THE APP EXISTS, SO RECORD THE SIGHTING HERE.
         //
@@ -13873,27 +13998,28 @@ public class ProfileActivity extends Activity {
      *
      *  ⚠ A CACHED LABEL NEVER OUTRANKS A LIVE ONE. It is consulted AFTER PackageManager, after the archived
      *  placeholder, and after the three fixed Play names -- so a stale entry (an app renamed since) or a
-     *  planted one can never shadow what the device itself reports. Bounded at 200 entries and 80 chars.
+     *  planted one can never shadow what the device itself reports. The file keeps the most recent 200 labels
+     *  (LabelCache.CAP, newest last), each at most 80 chars.
      *
      *  NWP-20261016-48: keptLabel runs on the UI thread and on list threads (Your apps' A to Z, the Storage screen's
-     *  prefetch), so the map and its file are touched only under the activity's monitor. */
+     *  prefetch), so the map and its file are touched only under the activity's monitor.
+     *
+     *  NWP-20261128-43: the write used to keep the first 200 entries of a HashMap, an arbitrary subset that could drop
+     *  the label just learned, and wrote by FileWriter + renameTo, which could leave a .tmp in the sealed files dir.
+     *  LabelCache keeps file order and moves a new or changed label to the end, and the write goes through
+     *  StoreInstaller.writeAtomic, which deletes its .tmp on any failure. */
     private static final String LABEL_CACHE = "nowhere-applabels";
-    private java.util.HashMap<String,String> labelCacheMap;
+    private java.util.LinkedHashMap<String,String> labelCacheMap;
 
-    private synchronized java.util.HashMap<String,String> labelCache() {
+    private synchronized java.util.LinkedHashMap<String,String> labelCache() {
         if (labelCacheMap != null) return labelCacheMap;
-        java.util.HashMap<String,String> m = new java.util.HashMap<>();
-        try (java.io.BufferedReader br = new java.io.BufferedReader(
-                new java.io.FileReader(new java.io.File(getFilesDir(), LABEL_CACHE)))) {
-            String line;
-            while ((line = br.readLine()) != null) {
-                int t = line.indexOf((char) 9);
-                if (t <= 0 || t == line.length() - 1) continue;
-                m.put(line.substring(0, t), line.substring(t + 1));
-            }
-        } catch (Throwable ignore) {}
-        labelCacheMap = m;
-        return m;
+        String text = null;
+        try {
+            text = new String(java.nio.file.Files.readAllBytes(new java.io.File(getFilesDir(), LABEL_CACHE).toPath()),
+                    java.nio.charset.StandardCharsets.UTF_8);
+        } catch (Throwable ignore) {}   // no file yet, or unreadable -> an empty cache, as before
+        labelCacheMap = LabelCache.parse(text);
+        return labelCacheMap;
     }
 
     /** Record a resolved label. No-op when it adds nothing (empty, over-long, or just the package again). */
@@ -13901,20 +14027,13 @@ public class ProfileActivity extends Activity {
         if (label == null) return;
         String l = label.toString().replace((char) 9, ' ').replace((char) 10, ' ').trim();
         if (l.isEmpty() || l.length() > 80 || l.equals(pkg)) return;
-        java.util.HashMap<String,String> m = labelCache();
-        if (l.equals(m.get(pkg))) return;   // unchanged -> no write at all
-        m.put(pkg, l);
+        java.util.LinkedHashMap<String,String> m = labelCache();
+        if (!LabelCache.put(m, pkg, l)) return;   // unchanged -> no write at all
         try {
-            StringBuilder sb = new StringBuilder();
-            int i = 0;
-            for (java.util.Map.Entry<String,String> e : m.entrySet()) {
-                if (++i > 200) break;
-                sb.append(e.getKey()).append((char) 9).append(e.getValue()).append((char) 10);
-            }
-            java.io.File tmp = new java.io.File(getFilesDir(), LABEL_CACHE + ".tmp");
-            try (java.io.FileWriter w = new java.io.FileWriter(tmp)) { w.write(sb.toString()); }
-            if (!tmp.renameTo(new java.io.File(getFilesDir(), LABEL_CACHE))) tmp.delete();
-        } catch (Throwable ignore) {}
+            StoreInstaller.writeAtomic(new java.io.File(getFilesDir(), LABEL_CACHE), LabelCache.render(m, LabelCache.CAP));
+        } catch (Throwable t) {
+            Log.w("NowhereChooser", "app label cache not written (NWP-20261128-43): " + t.getClass().getSimpleName());
+        }
     }
 
     private CharSequence keptLabel(String pkg) {

@@ -28,7 +28,7 @@ DEVICES=("$@")
 [ ${#DEVICES[@]} -gt 0 ] || mapfile -t DEVICES < <(ls "$HERE/../devices" | LC_ALL=C sort)
 
 REPO_STAMP="$(tr -d '[:space:]' < "$HERE/../../../core/vendor-common/etc/nowhere-ota-version" 2>/dev/null)"
-TREE="${TREE:-/mnt/build/graphene/grapheneos-2026110100}"
+TREE="${TREE:-/mnt/build/graphene/grapheneos-2026110200}"
 
 # ro.build.date.utc must be epoch(the BN's DATE) + NN. That is what makes update_engine's post-timestamp
 # monotonicity check pass; when it derived from a warm out dir instead, EVERY Endospore device failed to OTA

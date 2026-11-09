@@ -1,8 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.nowhere.chooser"
-    android:versionCode="600"
-    android:versionName="8.35">
+    android:versionCode="622"
+    android:versionName="8.57">
   <uses-sdk android:minSdkVersion="24" android:targetSdkVersion="34"/>
   <!-- #747 (DIA-20260818-08): the storefront UI now lives in its OWN package (nApps) so it appears in
        Settings > Apps as its own app. It cannot talk to the login daemon: the daemon pins the first peer's
@@ -331,11 +331,14 @@
     </activity>
     <!-- "Profile" launcher-drawer entry: the signed-in profile's controls (log off, change passphrase, time
          zone, delete). Renamed from "Log off" (DIA-20260617-07) now that it's more than just logging off. This
-         is the only LAUNCHER activity (the gate is not), so the drawer shows just this "Profile" entry. -->
+         is the only LAUNCHER activity (the gate is not), so the drawer shows just this "Profile" entry.
+         NWP-20261128-10: predictive back is on for this activity only, never on <application>, so the gate
+         (ChooserActivity) and the other activities keep onBackPressed exactly. -->
     <activity android:name=".ProfileActivity" android:exported="true"
               android:label="Profile"
               android:theme="@style/Theme.Nowhere"
               android:excludeFromRecents="true"
+              android:enableOnBackInvokedCallback="true"
               android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|uiMode|keyboard|keyboardHidden|navigation|mcc|mnc">
       <intent-filter>
         <action android:name="android.intent.action.MAIN"/>
@@ -376,6 +379,12 @@
          Started by UnarchiveService.sweepAuto once per sign-in. Dismissible, not pinned: no noHistory, so it stays
          until OK; excluded from recents. -->
     <activity android:name=".LandingNoticeActivity" android:exported="false"
+              android:theme="@android:style/Theme.Material.Dialog.NoActionBar"
+              android:excludeFromRecents="true"/>
+    <!-- NWP-20261128-08 (h48 #5, h50 #6): the card a sign-in shows when a phone's sign-out skipped its seal after a
+         passphrase change on another phone. Started by SkipNoticeActivity.check from UnarchiveService's
+         switch-landing start. Dismissible, not pinned; excluded from recents. -->
+    <activity android:name=".SkipNoticeActivity" android:exported="false"
               android:theme="@android:style/Theme.Material.Dialog.NoActionBar"
               android:excludeFromRecents="true"/>
     <!-- NWP-20261127-07 (h50 #4 A1): the blocked-encrypted-DNS dialog in a signed-in session, opened by the notification

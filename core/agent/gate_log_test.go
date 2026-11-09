@@ -368,3 +368,27 @@ func TestGateLogNeverWritesAnExactElapsedTime(t *testing.T) {
 		t.Errorf("gate.log carries an exact elapsed time (h53 #7 asks for a bucket):\n%s", strings.Join(all, "\n"))
 	}
 }
+
+// TestGateLogBarsLight pins NWP-20261128-35: the chooser's light-mode trace of its window's dark-icon bits
+// reaches gate.log as `bars-light fields=<n>`, directly and through the GATE-TRACE wire parser, and a typo of
+// the verb is recorded as trace-unknown, never as its own text.
+func TestGateLogBarsLight(t *testing.T) {
+	p := gateLogTestFile(t)
+	gateLog("bars-light", "fields", 24)
+	gateLog("bars-lite", "fields", 24)
+	v, k, n := gateTraceLine("bars-light fields=0")
+	gateLog(v, k, n)
+	lines := gateLogTestLines(t, p)
+	if len(lines) != 3 {
+		t.Fatalf("gate.log has %d lines, want 3:\n%s", len(lines), strings.Join(lines, "\n"))
+	}
+	if !strings.HasSuffix(lines[0], " bars-light fields=24") {
+		t.Errorf("line 1 = %q, want it to end \" bars-light fields=24\" -- bars-light is not in gateLogVerbs", lines[0])
+	}
+	if !strings.HasSuffix(lines[1], " trace-unknown fields=24") || strings.Contains(lines[1], "bars-lite") {
+		t.Errorf("line 2 = %q, want a typo of the verb written as \" trace-unknown fields=24\"", lines[1])
+	}
+	if !strings.HasSuffix(lines[2], " bars-light fields=0") {
+		t.Errorf("line 3 = %q, want the GATE-TRACE line written as \" bars-light fields=0\"", lines[2])
+	}
+}

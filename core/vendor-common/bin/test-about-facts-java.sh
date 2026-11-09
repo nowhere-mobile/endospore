@@ -144,7 +144,7 @@ mut "A4 0 mapped to Locked" 's/t\.equals\("0"\)\) return "Unlocked"/t.equals("0"
 mutsrc "A5 CANNOT_PROVE not shown on the page" 's/setText\(AboutFacts\.CANNOT_PROVE\)/setText("")/' || fails=$((fails+1))
 mutsrc "A6 the Settings row removed" 's/ll\.addView\(settingsRow\(AboutFacts\.TITLE.*?\n.*?\n//' || fails=$((fails+1))
 mutsrc "A7 verifiedbootstate read from a different key" 's/sysProp\("ro\.boot\.verifiedbootstate"/sysProp("ro.boot.vbmeta.device_state"/' || fails=$((fails+1))
-mutsrc "A8 the About row moved back between Wi-Fi and the Backup block" 'my $blk; s/(        LinearLayout\.LayoutParams alp = [^\n]*\n        alp\.topMargin = dp\(22\);\n        ll\.addView\(settingsRow\(AboutFacts\.TITLE[^\n]*\n[^\n]*\n)\n?/$blk = $1; ""/e; die "A8: About block not found" unless defined $blk; s/(        ll\.addView\(settingsRow\("Wi-Fi"[^\n]*\n[^\n]*\n)/$1 . $blk/e' || fails=$((fails+1))
+mutsrc "A8 the About row moved back to right after Wi-Fi" 'my $blk; s/(        LinearLayout\.LayoutParams alp = [^\n]*\n        alp\.topMargin = dp\(22\);\n        ll\.addView\(settingsRow\(AboutFacts\.TITLE[^\n]*\n[^\n]*\n)\n?/$blk = $1; ""/e; die "A8: About block not found" unless defined $blk; s/(        ll\.addView\(settingsRow\("Wi-Fi"[^\n]*\n[^\n]*\n)/$1 . $blk/e' || fails=$((fails+1))
 mut "A9 TITLE back to About this phone" 's/TITLE = "About";/TITLE = "About this phone";/' || fails=$((fails+1))
 mutsrc "A10 the row names a literal About this phone" 's/settingsRow\(AboutFacts\.TITLE,/settingsRow("About this phone",/' || fails=$((fails+1))
 mutsrc "A11 the page title a literal" 's/ownerColumn\(AboutFacts\.TITLE\)/ownerColumn("About")/' || fails=$((fails+1))

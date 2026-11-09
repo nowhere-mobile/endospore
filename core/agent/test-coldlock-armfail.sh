@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # test-coldlock-armfail.sh [--mutate] -- runs coldlock_armfail_test.go (NWP-20261031-06) and coldlock_late_rekey_test.go
-# (NWP-20261126-01); --mutate re-runs them against main.go with each guard of the arm-fail hand-off, the never-moved
-# set and the late-rekey read broken in turn, restoring the file on exit. Each mutant must be CONVICTED (a real
+# (NWP-20261126-01, NWP-20261128-06); --mutate re-runs them against main.go with each guard of the arm-fail hand-off,
+# the never-moved set, the late-rekey read and the bound's no-keep sign-out broken in turn, restoring the file on exit. Each mutant must be CONVICTED (a real
 # `--- FAIL`); one that fails to apply, or fails to compile, counts as a failure.
 set -uo pipefail
 cd "$(dirname "$0")"
@@ -44,4 +44,5 @@ mut "A8 ERR-UID dropped from the never-moved set" ', workerBusy, "ERR-UID":' ', 
 mut "A9 the late-reply read skipped" 'if late := coldLockAwaitLateRekey\(dest\); late != ""' 'if late := ""; late != ""'
 mut "A10 the record not re-checked under the slot" '(\t// roamcred.res may now hold that op.s reply.\n)\tif laneAbandonedOp\(laneCred\) != "rekey" \{\n\t\treturn ""\n\t\}\n' '\1'
 mut "A11 the record cleared without a reply" '\tif !ok \{\n\t\treturn "" // the record stays' '\tclearLaneAbandoned(laneCred)\n\tif !ok {\n\t\treturn "" // the record stays'
+mut "A12 the bound commits as before" '(fwdRekey = late\n\t\t\t\}) else \{' '\1 else if false {'
 [ "$fails" -eq 0 ] && echo "== all mutations convicted" || { echo "== $fails mutation(s) not convicted"; exit 1; }

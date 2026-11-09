@@ -142,6 +142,7 @@ type healResult struct {
 	bytes                             int64
 	handledRels                       []string       // fetched, present or held: ordinary files from now on (healListFile)
 	reasons                           map[string]int // why a file stayed deferred -> count
+	ms                                int64          // restoreHeal's wall clock for healDeferred (signin_heal_ms, NWP-20261130-08)
 }
 
 // healDeferred writes every fetchable deferred file of m into dest. It never fails the restore: a file it
@@ -511,8 +512,9 @@ func restoreHeal(base string, key []byte, m chunkManifest, dest, profile, pass, 
 	if len(m.Deferred) > 0 {
 		hStart := time.Now()
 		hr = healDeferred(base, key, m, dest)
+		hr.ms = time.Since(hStart).Milliseconds()
 		fmt.Printf("restore: heal %s: fetched %d (%d B), already held %d, already present %d, still deferred %d %v [%dms] (NWP-20260923-02)\n",
-			logProfile(profile), hr.fetched, hr.bytes, hr.held, hr.present, hr.unfetched, hr.reasons, time.Since(hStart).Milliseconds())
+			logProfile(profile), hr.fetched, hr.bytes, hr.held, hr.present, hr.unfetched, hr.reasons, hr.ms)
 	}
 	if err := writeHealList(stateDir, profile, pass, hr.handledRels); err != nil {
 		fmt.Fprintf(os.Stderr, "[restore] heal list write failed: %v -- every deferred file keeps the pre-heal treatment\n", err)

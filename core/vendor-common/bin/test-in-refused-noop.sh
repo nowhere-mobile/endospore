@@ -19,6 +19,8 @@
 # makes exactly one, after its CE restore and before its reply (C1, C2), and S1-S4 convict the other positions.
 # Since NWP-20261124-05 the stop is the first line of the landing branch, after the scope verdict; its anchor is the
 # line it precedes there (L_AP). test-in-scope-net-blank.sh covers a scope restore that cannot reach the store.
+# Since NWP-20261129-17 a landed sign-in keeps its park (C1, C2): the daemon drops or restores it once it knows whether
+# the OK became a session (core/agent/in_park.go, in_park_test.go, test-in-park.sh).
 #
 # Since NWP-20261113-24 each case writes the extracted arm, its variables and the stubs into a runner file in the
 # case root and executes that file in a CHILD of each shell found among bash, sh, dash and mksh (the device's
@@ -152,8 +154,9 @@ agent_sim() {
 }
 pw() { printf '%s\n' "$ROOT/sim/pw"; }
 _ms() { echo 0; }
+_sum0=0; _sumt=0   # set above the `in` arm in the script (NWP-20261130-08); this harness runs the arm alone under set -u
 sleep() { return 0; }
-for t in usb_host relabel_launcher remap_media_db remap_per_pkg _tlog acct_restore remap_tree reown_ext_appdata \
+for t in usb_host relabel_launcher remap_media_db insert_deferred_media remap_per_pkg _tlog _ssum acct_restore remap_tree reown_ext_appdata \
          keystore_push keystore_restore ks_signin_reset hold_ondemand od_parked_report reap_stale_ondemand reap_orphan_provisioned restorecon \
          uiderrors_floor_take uiderrors_floor_commit tz_surface; do
   eval "$t() { :; }"
@@ -260,7 +263,7 @@ STUB
   chk "C1 .fido2hmac is gone (cleared, not inherited)" absent "$S/.fido2hmac"
   chk "C1 .fido2slots is gone" absent "$S/.fido2slots"
   chk "C1 .fido2slots.pre is gone" absent "$S/.fido2slots.pre"
-  chk "C1 no park is left" nopark "$S"
+  chk "C1 the park still holds the session's six entries (the daemon's to drop)" six_held "$S/.in-park"
   chk "C1 ORDER: the first restore saw neither restore-receipts nor media.restore-ok" eqv "$(cat "$R/sim/first" 2>/dev/null)" none
   chk "C1 the media daemon was stopped once, after the CE restore and before the reply" holds "$R/sim/stopmd" "restored unreplied"
   command rm -rf "$R"
@@ -273,7 +276,7 @@ STUB
   chk "C2 .fido2hmac holds the fresh assertion" holds "$S/.fido2hmac" "$HEX"
   chk "C2 .fido2slots holds the promoted spec (P)" holds "$S/.fido2slots" P
   chk "C2 .fido2slots.pre was consumed by the promotion" absent "$S/.fido2slots.pre"
-  chk "C2 no park is left" nopark "$S"
+  chk "C2 the park still holds the session's six entries (the daemon's to drop)" six_held "$S/.in-park"
   chk "C2 ORDER: the first restore saw neither restore-receipts nor media.restore-ok" eqv "$(cat "$R/sim/first" 2>/dev/null)" none
   chk "C2 the media daemon was stopped once, after the CE restore and before the reply" holds "$R/sim/stopmd" "restored unreplied"
   command rm -rf "$R"
@@ -469,6 +472,7 @@ L_IF='    if [ -z "$_probe" ] && { [ "$fido2_needed" = 0 ] || [ -n "$fresh_hmac"
 L_CE='    elif NOWHERE_PHASE=apps NOWHERE_CLAIMS_SEED="$STATE/claims.seed" "$AGENT" restore s3 "$name" "$(pw "$pass")" "$USERDIR" >> "$LOG" 2>&1; then'
 L_PC='    case $? in'
 L_HM='      [ -e "$STATE/.fido2hmac" ] && mv "$STATE/.fido2hmac" "$PARK/" 2>> "$LOG"'
+# The line the OK arm no longer holds (NWP-20261129-17). Its anchor is L_OR; the mutant below puts it back there.
 L_OK='      [ "$_parked" = 1 ] && rm -rf "$PARK" 2>> "$LOG"'
 L_PF='    if [ "$_parked" = 1 ] && [ "$_inres" != OK ]; then'
 L_PB='        rm -rf "$STATE/$_pn" 2>> "$LOG"'
@@ -486,9 +490,10 @@ L_HU='    export NOWHERE_HEAL_UNTIL=$(( $(date +%s) + 2400 ))'
 L_SM='      stop_mediad   # NWP-20261117-16: a predecessor'"'"'s media daemon goes only once this sign-in has landed'
 L_AP='      # App provisioning: surface the roamed launchable-app list (the chooser sealed it into its own files'
 L_OR='      echo "OK $uid" > "$RES"; _inres=OK'
-for l in "$L_PK" "$L_RR" "$L_RF" "$L_SL" "$L_IF" "$L_CE" "$L_PC" "$L_HM" "$L_OK" "$L_PF" "$L_PB" "$L_PM" "$L_MK" "$L_P1" "$L_DL" "$L_FN" "$L_HU" "$L_SM" "$L_AP" "$L_OR" '  in)'; do
+for l in "$L_PK" "$L_RR" "$L_RF" "$L_SL" "$L_IF" "$L_CE" "$L_PC" "$L_HM" "$L_PF" "$L_PB" "$L_PM" "$L_MK" "$L_P1" "$L_DL" "$L_FN" "$L_HU" "$L_SM" "$L_AP" "$L_OR" '  in)'; do
   [ "$(grep -cxF -- "$l" "$SUT")" = 1 ] || { echo "EXTRACTION FAILED: anchor line not unique in $SUT: $l" >&2; exit 2; }
 done
+[ "$(grep -cxF -- "$L_OK" "$SUT")" = 0 ] || { echo "EXTRACTION FAILED: the OK arm's park removal is back in $SUT" >&2; exit 2; }
 [ "$(awk -v RP="$L_RP" -v MK="$L_MK" 'p == RP && $0 == MK {c++} {p = $0} END {print c + 0}' "$SUT")" = 1 ] ||
   { echo "EXTRACTION FAILED: the line before the park's mkdir is not, exactly once, the rm: $L_RP" >&2; exit 2; }
 [ "$(awk -v SM="$L_SM" -v AP="$L_AP" 'p == SM && $0 == AP {c++} {p = $0} END {print c + 0}' "$SUT")" = 1 ] ||
@@ -527,8 +532,8 @@ mut "the key check collapsed back to && fido2_needed=1 (5 and 2 read as not enro
   '$0==PC{print "    case $(( $? == 0 ? 0 : 1 )) in"; next} {print}'
 mut "the put-back is removed" \
   '$0==PM{next} {print}'
-mut "the OK arm no longer removes the park" \
-  '$0==OK{next} {print}'
+mut "the OK arm removes the park again" \
+  '{print} $0==OR{print OK}'
 mut "the park flag is ignored, so any park is restored" \
   '$0==PF{print "    if [ \"$_inres\" != OK ]; then"; next} {print}'
 mut ".fido2hmac is left out of the park" \

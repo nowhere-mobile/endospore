@@ -23,6 +23,7 @@ type renewBatchFixture struct {
 	mu                        sync.Mutex
 	leases                    []leaseReq
 	failAt                    map[int]bool // /lease request indexes answered 500
+	epoch                     int64        // the CurrentEpoch /quote answers
 }
 
 // renewBatchSetup builds a rotated profile (so its vault holds a !bill-retag record and `prior` is non-empty) with at
@@ -30,7 +31,7 @@ type renewBatchFixture struct {
 func renewBatchSetup(t *testing.T, name string, tokens int) *renewBatchFixture {
 	t.Helper()
 	t.Setenv("GATEWAY_URL", "")
-	f := &renewBatchFixture{name: name, p1: "old horse battery staple", p2: "new maple stone cloud lantern", failAt: map[int]bool{}}
+	f := &renewBatchFixture{name: name, p1: "old horse battery staple", p2: "new maple stone cloud lantern", failAt: map[int]bool{}, epoch: 42}
 	f.base = newHTTPStore(t)
 	if createVault(f.base, name, f.p1) == "" {
 		t.Fatal("createVault returned no recovery code")
@@ -54,8 +55,11 @@ func renewBatchSetup(t *testing.T, name string, tokens int) *renewBatchFixture {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /quote", func(w http.ResponseWriter, _ *http.Request) {
+		f.mu.Lock()
+		epoch := f.epoch
+		f.mu.Unlock()
 		json.NewEncoder(w).Encode(quoteInfo{Denom: "1GBmo", GBPerToken: 1, EpochSeconds: 86400, EpochsPerLease: 30,
-			PriceCents: 200, CurrentEpoch: 42, FreeGB: 1})
+			PriceCents: 200, CurrentEpoch: epoch, FreeGB: 1})
 	})
 	mux.HandleFunc("POST /entitlement", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNotFound)

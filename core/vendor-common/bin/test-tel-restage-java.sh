@@ -75,10 +75,12 @@ mut() { # mut <label> <perl-expr>
 fails=0
 mut "M1 the retry is not incremented"                 's/append\(retry \+ 1\)\.toString/append(retry).toString/' || fails=$((fails+1))
 mut "M2 the cap compare is > (one try too many)"       's/if \(retry >= maxRetries\) return null;/if (retry > maxRetries) return null;/' || fails=$((fails+1))
-mut "M3 the sms base is 5"                            's/(f\.length >= 6\) return )6;(\n        if \("mms")/${1}5;$2/' || fails=$((fails+1))
-mut "M4 the mms base is 2"                            's/(f\.length >= 3\) return )3;/${1}2;/' || fails=$((fails+1))
+mut "M3 the sms base is 5"                            's/(f\.length > 6 && f\[6\]\.startsWith\("sim:"\) \? 7 : )6;/${1}5;/' || fails=$((fails+1))
+mut "M4 the mms base is 2"                            's/(f\.length > 3 && f\[3\]\.startsWith\("sim:"\) \? 4 : )3;/${1}2;/' || fails=$((fails+1))
 mut "M5 the call row's f[5] is dropped"               's/for \(int k = 1; k < base; k\+\+\)/for (int k = 1; k < base - 1; k++)/' || fails=$((fails+1))
 mut "M6 the SMS/MMS loop accepts a call row"          's/if \("sms"\.equals\(f\[0\]\) && f\.length >= 6\)/if (("sms".equals(f[0]) || "call".equals(f[0])) \&\& f.length >= 6)/' || fails=$((fails+1))
 mut "M7 an unparseable retry counts as max"           's/(retry = Integer\.parseInt\(f\[base\]\);) \} catch \(Throwable ignore\) \{\}/$1 } catch (Throwable ignore) { retry = maxRetries; }/' || fails=$((fails+1))
+mut "M9 the sms SIM slot is not counted in the base"   's/return f\.length > 6 && f\[6\]\.startsWith\("sim:"\) \? 7 : 6;/return 6;/' || fails=$((fails+1))
+mut "M10 the mms SIM slot is not counted in the base"  's/return f\.length > 3 && f\[3\]\.startsWith\("sim:"\) \? 4 : 3;/return 3;/' || fails=$((fails+1))
 mut "M8 the SMS/MMS loop bypasses restageLine"        's/String line = restageLine\(f, base, MAX_TEL_RETRIES\);/String line = String.join(" ", f);/' || fails=$((fails+1))
 [ "$fails" -eq 0 ] && echo "== all mutations convicted" || { echo "== $fails mutation(s) not convicted"; exit 1; }

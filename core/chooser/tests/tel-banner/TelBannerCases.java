@@ -41,6 +41,14 @@ public class TelBannerCases {
         eq("two loss notices are counted", P + "2 may not have been saved", sum(loss("", "call"), loss("", "message")));
         eq("a count on a call and a message add per kind", P + "Sim1 — 2 missed calls · 4 new messages",
                 sum(n("Sim1", "call", 2), n("Sim1", "message", 4)));
+        // NWP-20261128-18: a call answered at the gate is "incoming", not missed; "call" stays a missed call.
+        eq("B1 an answered call and a text on one line", P + "Sim1 — Incoming call · New message",
+                sum(n("Sim1", "incoming", 1), n("Sim1", "message", 1)));
+        eq("B2 a missed and an answered call on one line", P + "Sim1 — Missed call · Incoming call",
+                sum(n("Sim1", "call", 1), n("Sim1", "incoming", 1)));
+        eq("B3 one notice standing for two answered calls", P + "Sim1 — 2 incoming calls", sum(n("Sim1", "incoming", 2)));
+        eq("B5 every kind on one line, in order", P + "Sim1 — 2 missed calls · Incoming call · New message · 1 may not have been saved",
+                sum(n("Sim1", "message", 1), loss("Sim1", "incoming"), n("Sim1", "incoming", 1), n("Sim1", "call", 2)));
 
         System.out.println("== the wiring ==");
         String ca = read(a[0]), sd = read(a[1]);
@@ -51,6 +59,13 @@ public class TelBannerCases {
         yes("the receiver looks the old notice up by the id it posts under", sd.contains("old.getId() != nid") && sd.contains("nm.notify(TEL_CHANNEL, nid, b.build());"));
         yes("the banner reads each notice's count and its line", ca.contains("ex.getInt(\"nowhere_count\", 1)") && ca.contains("notices.add(new String[]{noticeLabel(sbn),"));
         yes("telNoticeSummary hands telNotices' entries to summarize", ca.contains("return n == null ? null : summarize(n);"));
+        yes("R1 the receiver keys an answered call apart, and a missed call keeps \"c\"",
+                sd.contains("(isCall ? (callType == 1 ? \"ci\" : \"c\") : \"m\")") && !sd.contains("(isCall ? \"c\" : \"m\")"));
+        yes("R2 the receiver marks which call a call notice is",
+                sd.contains("if (isCall) nx.putString(\"nowhere_call\", callType == 1 ? \"incoming\" : \"missed\");"));
+        yes("R3 telNotices takes its second field from TelNoticeClear.kindOf",
+                ca.contains("String kind = TelNoticeClear.kindOf(ex.getString(\"nowhere_kind\", \"\"), ex.getString(\"nowhere_call\", \"\"), title.toString());")
+                && ca.contains("notices.add(new String[]{noticeLabel(sbn), kind,"));
         System.out.println("passed " + pass + ", failed " + fail);
         System.exit(fail == 0 ? 0 : 1);
     }

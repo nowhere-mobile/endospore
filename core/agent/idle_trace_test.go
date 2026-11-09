@@ -27,6 +27,8 @@ func TestIdleTraceKeepsTheChooserEvents(t *testing.T) {
 		"fire late=3 screenon=0 live=1 locked=1",
 		"cancel userpresent",
 		"pushdoze other appid=10330 ok=1",
+		"smsnotice sum=0 subst=0 pub=1 icon=1",
+		"smsnotice sum=1 subst=-1",
 	} {
 		if got := idleTraceLine(ev + "\n"); got != ev {
 			t.Errorf("idleTraceLine(%q) = %q, want it kept byte for byte", ev, got)
@@ -36,14 +38,15 @@ func TestIdleTraceKeepsTheChooserEvents(t *testing.T) {
 
 func TestIdleTraceDropsFreeText(t *testing.T) {
 	for in, want := range map[string]string{
-		"arm alice":       "arm ?",
-		"screen ms=alice": "screen ?",
-		"alice on":        "trace-unknown",
-		"arm ms=":         "arm ?",
-		"arm ms=1x":       "arm ?",
-		"arm alice=1":     "arm ?",
-		"":                "",
-		"OK\n":            "",
+		"arm alice":             "arm ?",
+		"screen ms=alice":       "screen ?",
+		"alice on":              "trace-unknown",
+		"arm ms=":               "arm ?",
+		"arm ms=1x":             "arm ?",
+		"arm alice=1":           "arm ?",
+		"smsnotice subst=alice": "smsnotice ?",
+		"":                      "",
+		"OK\n":                  "",
 	} {
 		if got := idleTraceLine(in); got != want {
 			t.Errorf("idleTraceLine(%q) = %q, want %q", in, got, want)

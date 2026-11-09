@@ -178,7 +178,7 @@ mut "M3 finish uncounts another SIM" 's/REFS\.merge\(subId, -1, Integer::sum\)/R
 mut "M4 finish is true for an unknown name" 's/if \(subId == null\) return false;/if (subId == null) return true;/' || fails=$((fails+1))
 mut "M5 claimTxn never prunes" 's/if \(nowMs - it\.next\(\) > TXN_WINDOW_MS\) it\.remove\(\);/it.next();/' || fails=$((fails+1))
 mutsrc "M6 armDownloadTimeout frees the txn outside the if" \
-  's/(if \(finishDownload\(app, name, uriStr, subId\)\) \{\n[^\n]*\n)\s*releaseTxn\(txn\);[^\n]*\n(\s*\})/$1$2\n            releaseTxn(txn);/' || fails=$((fails+1))
+  's/(if \(finishDownload\(app, name, uriStr, subId\)\) \{\n[^\n]*\n)\s*releaseTxn\(txn\);[^\n]*\n([^\n]*postDownloadLoss[^\n]*\n\s*\})/$1$2\n            releaseTxn(txn);/' || fails=$((fails+1))
 mut "M7 resetIdle ignores the count" \
   's/if \(subId == null \|\| REFS\.getOrDefault\(subId, 0\) != 0\) continue;/if (subId == null) continue;/' || fails=$((fails+1))
 mut "M8 resetIdle runs outside the lock" \

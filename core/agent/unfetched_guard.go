@@ -10,12 +10,13 @@ import (
 // seal carries every unfetched package's sealed data forward, never drops it and never seals an empty copy over
 // it". This file is the "never seals an empty copy over it" half.
 //
-// The carry half is NOT here, because the vault and #de heads cannot express it today: chunkManifest.Ess is
+// ~~The carry half is NOT here, because the vault and #de heads cannot express it today: chunkManifest.Ess is
 // written only under NOWHERE_CARRY_ESSENTIAL=1, which roamd pins to 0 on every non-#apps push, and the small-file
-// tail is grouped across packages, so no per-package chunk span exists to carry. What those heads DO carry is
-// Pkg, the sealed bytes per package (built through attrPkgForRel, which files the on-demand hold under the held
-// package). Pkg cannot carry bytes, but it can see a package's data vanish -- the same use the #apps presence
-// guard makes of it. The carry, with the span index it needs, belongs to the fetch slice.
+// tail is grouped across packages, so no per-package chunk span exists to carry.~~ (Superseded by NWP-20261127-01,
+// the span index, and NWP-20261129-03, the carry: unfetched_carry.go. This guard still refuses what that carry leaves
+// out.) What those heads DO carry is Pkg, the sealed bytes per package (built through attrPkgForRel, which files the
+// on-demand hold under the held package). Pkg cannot carry bytes, but it can see a package's data vanish -- the same use the #apps presence
+// guard makes of it. ~~The carry, with the span index it needs, belongs to the fetch slice.~~ (Superseded as above.)
 //
 // Nothing writes the list yet, so the guard is inert until the fetch slice does.
 

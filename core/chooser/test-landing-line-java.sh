@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# test-landing-line-java.sh [--mutate] -- NWP-20261122-15, NWP-20261126-05: the sign-in's Auto sweep shows ONE
-# dismissible checklist card, once per sign-in, when it has apps to fetch.
+# test-landing-line-java.sh [--mutate] -- NWP-20261122-15, NWP-20261126-05, NWP-20261130-09: the sign-in's Auto sweep
+# shows ONE dismissible checklist card, once per sign-in, when it has apps to fetch, and it lists Play services.
 #
 # WHY. The switch-landing sweep materialises quietly, so a sign-in with 40 Auto apps pending landed on an empty-looking
 # home for most of an hour with only a shade notification. DECIDED 2026-11-01 (h50 #5, docs/product-decisions.md
@@ -10,20 +10,25 @@
 # checklist card, and Profile Help's cards show where to tap", option D): a rounded card 85 % of the screen wide in the
 # gate's look, titled "Welcome back"; up to 4 apps one row each ticking off live, "You can keep using the phone." and
 # "Got it"; from 5 a headline count, a bar, 3 rows and "+<n> more" opening Your apps; it closes a few seconds after the
-# sweep ends. The words are drafts for Chester.
+# sweep ends. The words are drafts for Chester. NWP-20261130-09 (Chester, 2026-11-06): the sweep fetches Play services as
+# a dep of the first app that needs it, for minutes and outside its work list, so the card read as if nothing installed.
 #
-# WHAT RUNS. LandingLine (pure Java) is compiled with tests/landing-line/LandingLineCases.java ALONE and RUN: show()
+# WHAT RUNS. LandingLine and AppDeps (pure Java) are compiled with tests/landing-line/LandingLineCases.java and RUN: show()
 # (C1-C7: landing with 1 and 12 to fetch, nothing to fetch, not landing, a resume, another serial, no serial);
 # headline() and more() verbatim; the constants verbatim; widthPx(1080) == 918; rows()/moreCount() for 1, 4, 5 and 50
 # apps, with landed apps making the rows advance and 2 rows near the end; LandingLine.Sweep, the in-process record the
 # card reads (C26-C32): a failed app keeps its row and counts in "+<n> more" (RF-001), outcomes and the end recorded
 # before the card reads are all there and a recreated card reads them again (RF-002), another sweep's calls change
-# nothing, and an unknown sweep reads as ended so its card closes.
+# nothing, and an unknown sweep reads as ended so its card closes; cardPkgs() through the real AppDeps rule (C33-C41,
+# C47): Play on, ordered first, Play off, code already there, GSF separate and absent, keep-set order, a client that still
+# demands gms, plain apps; Sweep.depLanded (C42-C45): the tick, a failed dep, an earlier failed outcome, the from-5 rows;
+# depLabel (C46).
 # WHAT IS PINNED BY ANCHOR (the activities and the service cannot be compiled off the build host), on comment-stripped
 # sources: (P1) sweepAuto reads and removes LANDING and calls LandingLine.show(landing, work.size(), ...) after the
 # AutoSweepNet.mayFetch block and before qEnqueue(work); (P2) the stamp is written before startActivity, which starts
-# LandingNoticeActivity with FLAG_ACTIVITY_NEW_TASK, the count, EXTRA_PKGS from `work` and EXTRA_SWEEP, the id
-# LandingLine.Sweep.begin gave between the stamp and the start, inside a try whose catch (Throwable) logs; (P3) LANDING.set(!byHand); is the file's one LANDING.set outside sweepAutoJoined, after the netRekick
+# LandingNoticeActivity with FLAG_ACTIVITY_NEW_TASK, the count, EXTRA_PKGS from `cardRows` (LandingLine.cardPkgs, built
+# after the stamp) and EXTRA_SWEEP, the id LandingLine.Sweep.begin(cardRows) gave between the stamp and the start, inside
+# a try whose catch (Throwable) logs; (P3) LANDING.set(!byHand); is the file's one LANDING.set outside sweepAutoJoined, after the netRekick
 # block and before the presence snapshot and `try { sweepAutoJoined(byHand); }`; (P4) the netRekick block holds no LANDING.set; (P5) the sweepAuto
 # signature and its two call sites (sweepAutoJoined since NWP-20261126-04) are unchanged, byte for byte; (P6) the manifest declares LandingNoticeActivity
 # exported="false" and excludeFromRecents="true"; (P7) the stamp is "landing-line-shown" under getNoBackupFilesDir()
@@ -36,12 +41,16 @@
 # outcome, package-local, after the SweepOutcome.request round trip, never in the RETRY arm, in a try that logs, and
 # records the end just before ACTION_SWEEP_DONE; (P10) the "+<n> more" row starts ProfileActivity with EXTRA_OPEN = OPEN_YOUR_APPS and
 # FLAG_ACTIVITY_NEW_TASK, then finishes; (P11) ProfileActivity calls showYourApps() under that extra, removes it
-# first, from the first drawn menu and from onNewIntent.
+# first, from the first drawn menu and from onNewIntent; (P12) cardDepLanded(dep) runs in materializeLocked's dep loop
+# after the `if (!dok)` abort and just before qFinish(dep), and first in pendingDeps' AUTO_WHOLE and AUTO_RESTORE_ONLY
+# branches, and it records in LandingLine.Sweep.depLanded before one package-local ACTION_APP in a try that logs; (P13) the
+# card's label() falls to LandingLine.depLabel after the archived read; (P14) LandingLine's names and words equal
+# ProfileActivity's, and the list reads ProfileActivity.appDeps and hasInstalledCode, as pendingDeps does.
 # The merger's full javac / `m NowhereChooser` covers UnarchiveService, LandingNoticeActivity and ProfileActivity.
 #
 # What this does NOT prove: the card on a handset in both looks (sign-ins with 2 and with 12 Auto apps pending: the
 # width, the rows ticking off, the bar, "+<n> more" opening Your apps, the close after the sweep) stays the merger's
-# device follow-up.
+# device follow-up, and so does a sign-in with Google Play On that shows Play services from the first second.
 #
 #   bash test-landing-line-java.sh              # the cases and the pins
 #   bash test-landing-line-java.sh --mutate     # ... plus mutants that must each CONVICT the suite
@@ -68,9 +77,9 @@ fi
 W=$(mktemp -d) || exit 2; trap 'rm -rf "$W"' EXIT
 export TMPDIR="$W"
 
-LL="$SRC/LandingLine.java"; US="$SRC/UnarchiveService.java"; LA="$SRC/LandingNoticeActivity.java"
+LL="$SRC/LandingLine.java"; US="$SRC/UnarchiveService.java"; LA="$SRC/LandingNoticeActivity.java"; AD="$SRC/AppDeps.java"
 PA="$SRC/ProfileActivity.java"; MF="$HERE/AndroidManifest.xml"; CASES="$HERE/tests/landing-line/LandingLineCases.java"
-for f in "$CASES" "$US" "$MF" "$PA"; do
+for f in "$CASES" "$US" "$MF" "$PA" "$AD"; do
   if [ ! -f "$f" ]; then echo "test-landing-line-java: FAIL -- $f is missing"; exit 2; fi
 done
 
@@ -81,7 +90,7 @@ cases() { # cases <LandingLine.java> [quiet]: 0 pass, 1 a case failed, 2 did not
     [ -z "$quiet" ] && echo "FAIL $ll is missing"
     rm -rf "$cls"; return 1
   fi
-  if ! out=$("$JAVAC" -J-Djava.io.tmpdir="$W" -encoding UTF-8 -d "$cls" "$ll" "$CASES" 2>&1); then
+  if ! out=$("$JAVAC" -J-Djava.io.tmpdir="$W" -encoding UTF-8 -d "$cls" "$ll" "$AD" "$CASES" 2>&1); then
     [ -z "$quiet" ] && printf '%s\n' "$out"
     rm -rf "$cls"; return 2
   fi
@@ -93,11 +102,11 @@ cases() { # cases <LandingLine.java> [quiet]: 0 pass, 1 a case failed, 2 did not
   return 1
 }
 
-pins() { # pins <UnarchiveService.java> <AndroidManifest.xml> <LandingNoticeActivity.java> <ProfileActivity.java>:
-  #        0 hold, 1 failed, 2 extract
-  python3 - "$1" "$2" "$3" "$4" <<'PY'
+pins() { # pins <UnarchiveService.java> <AndroidManifest.xml> <LandingNoticeActivity.java> <ProfileActivity.java>
+  #        <LandingLine.java>: 0 hold, 1 failed, 2 extract
+  python3 - "$1" "$2" "$3" "$4" "$5" <<'PY'
 import io, os, re, sys
-us_path, mf_path, la_path, pa_path = sys.argv[1:5]
+us_path, mf_path, la_path, pa_path, ll_path = sys.argv[1:6]
 raw = io.open(us_path, encoding='utf-8').read()
 
 def strip(s):
@@ -171,13 +180,16 @@ if wr < 0 or st < 0 or sweep.count('startActivity(') != 1 or not (wr < st):
 else:
     stmt = sweep[st:sweep.find(';', st)]
     if 'LandingNoticeActivity.class' not in stmt or 'Intent.FLAG_ACTIVITY_NEW_TASK' not in stmt \
-            or 'LandingNoticeActivity.EXTRA_COUNT, work.size()' not in stmt:
+            or 'LandingNoticeActivity.EXTRA_COUNT, cardRows.length' not in stmt:
         bad.append('(P2) startActivity does not start LandingNoticeActivity with FLAG_ACTIVITY_NEW_TASK and the count')
-    if 'LandingNoticeActivity.EXTRA_PKGS, work.toArray(new String[0])' not in stmt:
-        bad.append('(P2) startActivity does not give LandingNoticeActivity EXTRA_PKGS from work, in order')
-    bg = sweep.find('card = LandingLine.Sweep.begin(work.toArray(new String[0]));')
+    if 'LandingNoticeActivity.EXTRA_PKGS, cardRows' not in stmt:
+        bad.append('(P2) startActivity does not give LandingNoticeActivity EXTRA_PKGS from cardRows')
+    cr = sweep.find('String[] cardRows = LandingLine.cardPkgs(work, ')
+    bg = sweep.find('card = LandingLine.Sweep.begin(cardRows);')
+    if sweep.count('LandingLine.cardPkgs(') != 1 or not (wr < cr < bg):
+        bad.append('(P2) cardRows is not built once (LandingLine.cardPkgs) between the stamp and begin')
     if sweep.count('LandingLine.Sweep.begin(') != 1 or not (wr < bg < st) or 'long card = 0;' not in sweep:
-        bad.append('(P2) the card sweep is not begun once (card = LandingLine.Sweep.begin(work...)) between the stamp '
+        bad.append('(P2) the card sweep is not begun once (card = LandingLine.Sweep.begin(cardRows)) between the stamp '
                    'and the start, from long card = 0')
     if 'LandingNoticeActivity.EXTRA_SWEEP, card' not in stmt:
         bad.append('(P2) startActivity does not give LandingNoticeActivity its sweep id (EXTRA_SWEEP, card)')
@@ -408,9 +420,71 @@ else:
             if nb_.count('openYourAppsIfAsked();') != 1 or nb_.find('openYourAppsIfAsked();') < ag1:
                 bad.append('(P11) onNewIntent does not call openYourAppsIfAsked() once, after the AutoLogoffGate block')
 
+# P12 a dep's tick: after the abort and before qFinish in the dep loop, first in both pendingDeps branches that find code
+ml0, ml1 = block(src, one(src, 'private boolean materializeLocked(String pkg, boolean quiet) {', 'UnarchiveService.java'))
+ml = src[ml0:ml1]
+dl0, dl1 = block(ml, one(ml, 'for (String dep : deps) {', 'materializeLocked'))
+dl = ml[dl0:dl1]
+tk = 'cardDepLanded(dep);'
+_, ab1 = block(dl, one(dl, 'if (!dok) {', 'the dep loop'))
+if dl.count(tk) != 1 or not re.match(r'\s*cardDepLanded\(dep\);\s*qFinish\(dep\);', dl[ab1:]):
+    bad.append('(P12) the dep loop does not call %s once, after the if (!dok) block and just before qFinish(dep);' % tk)
+pd0, pd1 = block(src, one(src, 'private java.util.List<String> pendingDeps(', 'UnarchiveService.java'))
+pd = src[pd0:pd1]
+for arm in ('AUTO_WHOLE', 'AUTO_RESTORE_ONLY'):
+    a0, a1 = block(pd, one(pd, 'if (action == %s) {' % arm, 'pendingDeps'))
+    if not pd[a0 + 1:a1].lstrip().startswith(tk) or pd[a0:a1].count(tk) != 1 or 'continue;' not in pd[a0:a1]:
+        bad.append('(P12) the pendingDeps %s branch does not start with %s' % (arm, tk))
+if pd.count(tk) != 2:
+    bad.append('(P12) pendingDeps calls %s %d times, not twice' % (tk, pd.count(tk)))
+h0, h1 = block(src, one(src, 'private void cardDepLanded(String dep) {', 'UnarchiveService.java'))
+hl = src[h0:h1]
+rec = hl.find('if (!LandingLine.Sweep.depLanded(dep)) return;')
+snd = hl.find('sendBroadcast(new Intent(LandingNoticeActivity.ACTION_APP)')
+if rec < 0 or snd < 0 or not rec < snd or hl.count('sendBroadcast(') != 1:
+    bad.append('(P12) cardDepLanded does not record in LandingLine.Sweep.depLanded first and then send one ACTION_APP')
+else:
+    st12 = hl[snd:hl.find(';', snd)]
+    for t in ('.setPackage(getPackageName())', 'LandingNoticeActivity.EXTRA_PKG, dep', 'LandingNoticeActivity.EXTRA_OK, true'):
+        if t not in st12:
+            bad.append('(P12) the dep ACTION_APP broadcast does not carry %s' % t)
+    tr12 = hl.find('try {')
+    if tr12 < 0 or not rec < tr12 < snd or hl[tr12 + 5:snd].strip() != '':
+        bad.append('(P12) the dep ACTION_APP broadcast is not alone in a try')
+    else:
+        _, t12 = block(hl, tr12)
+        if not re.match(r'\s*catch \(Throwable \w+\) \{ android\.util\.Log\.w\(', hl[t12:]):
+            bad.append('(P12) the dep ACTION_APP broadcast is not in a try whose catch (Throwable) logs')
+
+# P13 the card names a provider: after the archived read, before the package name
+if os.path.isfile(la_path):
+    la13 = strip(io.open(la_path, encoding='utf-8').read())
+    l0, l1 = block(la13, one(la13, 'private String label(int i) {', 'LandingNoticeActivity.java'))
+    lb = la13[l0:l1]
+    ga, dl13, fin = lb.find('getArchivedPackage('), lb.find('if (got == null) got = LandingLine.depLabel(pkg);'), lb.find('labels[i] = got != null')
+    if not (0 <= ga < dl13 < fin):
+        bad.append('(P13) label() does not fall to LandingLine.depLabel(pkg) after the archived read and before the package name')
+
+# P14 the names and words equal ProfileActivity's, and the list reads what pendingDeps reads
+ll14 = strip(io.open(ll_path, encoding='utf-8').read())
+pa14 = strip(io.open(pa_path, encoding='utf-8').read()) if os.path.isfile(pa_path) else ''
+for ln, pn in (('GMS', 'GMS_PKG'), ('GSF', 'GSF_PKG')):
+    n1 = re.search(r'static final String %s = "([^"]*)";' % ln, ll14)
+    n2 = re.search(r'static final String %s = "([^"]*)";' % pn, pa14)
+    if not n1 or not n2 or n1.group(1) != n2.group(1):
+        bad.append('(P14) LandingLine.%s does not equal ProfileActivity.%s' % (ln, pn))
+    w1 = re.search(r'if \(%s\.equals\(pkg\)\)\s*return "([^"]*)";' % ln, ll14)
+    w2 = re.search(r'if \(%s\.equals\(pkg\)\)\s*return "([^"]*)";' % pn, pa14)
+    if not w1 or not w2 or w1.group(1) != w2.group(1):
+        bad.append("(P14) LandingLine.depLabel's word for %s does not equal ProfileActivity.keptLabel's" % ln)
+if 'LandingLine.cardPkgs(work, p -> ProfileActivity.appDeps(this, p), p -> hasInstalledCode(p));' not in sweep:
+    bad.append('(P14) sweepAuto does not build the card list from ProfileActivity.appDeps and hasInstalledCode')
+if 'ProfileActivity.appDeps(this, pkg)' not in pd or 'hasInstalledCode(dep)' not in pd:
+    bad.append('(P14) pendingDeps no longer reads ProfileActivity.appDeps and hasInstalledCode, so the row can disagree')
+
 for b in bad: print('PIN FAILED: ' + b)
-if not bad: print('ok P1-P11 the LANDING flag, the sweepAuto block, the stamp, the manifest entry, the per-app broadcast, '
-                  'the card and the Your apps hook')
+if not bad: print('ok P1-P14 the LANDING flag, the sweepAuto block, the stamp, the manifest entry, the per-app broadcast, '
+                  'the card, the Your apps hook and the Play services row')
 sys.exit(1 if bad else 0)
 PY
 }
@@ -420,7 +494,7 @@ suite() { # suite <LandingLine.java> <UnarchiveService.java> <AndroidManifest.xm
   local ll=$1 us=$2 mf=$3 la=$4 pa=$5 quiet=${6:-} rc=0 prc=0 pout
   cases "$ll" "$quiet" || rc=$?
   [ "$rc" -eq 2 ] && return 2
-  pout=$(pins "$us" "$mf" "$la" "$pa" 2>&1) || prc=$?
+  pout=$(pins "$us" "$mf" "$la" "$pa" "$ll" 2>&1) || prc=$?
   [ -z "$quiet" ] && [ -n "$pout" ] && printf '%s\n' "$pout"
   [ "$prc" -eq 2 ] && return 2
   if [ "$rc" -ne 0 ] || [ "$prc" -ne 0 ]; then return 1; fi
@@ -469,7 +543,7 @@ mutant "M2 show ignores the stamp" ll ' && !thisSignIn\.equals\(shownFor\);' ';'
 mutant "M3 toFetch >= 0" ll 'toFetch > 0' 'toFetch >= 0'
 mutant "M4 the netRekick block sets LANDING" us '(\n(\s*)try \{ sweepAutoJoined\(false\); \})' '\n\2LANDING.set(true);\1'
 mutant "M5 the switch-landing set is LANDING.set(true)" us 'LANDING\.set\(!byHand\);' 'LANDING.set(true);'
-mutant "M6 the stamp written after the start" us '(\n[^\n]*StoreInstaller\.writeAtomic\(stamp, serial\);[^\n]*)(\n[^\n]*card = LandingLine\.Sweep\.begin\([^\n]*\n[^\n]*startActivity\(.*?\)\);)' '\2\1'
+mutant "M6 the stamp written after the start" us '(\n[^\n]*StoreInstaller\.writeAtomic\(stamp, serial\);[^\n]*)(\n[^\n]*String\[\] cardRows = [^\n]*\n[^\n]*card = LandingLine\.Sweep\.begin\([^\n]*\n[^\n]*startActivity\(.*?\)\);)' '\2\1'
 mutant "M7 the manifest entry removed" mf '\n[^\n]*<activity android:name="\.LandingNoticeActivity".*?/>' ''
 mutant "M8 rows shows 4 rows at total 5" ll 'ROWS_BIG = 3;' 'ROWS_BIG = 4;'
 mutant "M9 rows ignores landed" ll 'if \(!landed\[i\]\) pick\[k\+\+\] = i;' 'if (true) pick[k++] = i;'
@@ -483,7 +557,7 @@ mutant "M16 ProfileActivity ignores the extra" pa '(private void openYourAppsIfA
 mutant "M17 the first menu never honours the extra" pa '(\n[^\n]*showConfirm\(\);)\n[^\n]*openYourAppsIfAsked\(\);' '\1'
 mutant "M18 the bar built outside the from-5 arm" la '(\n[^\n]*if \(!LandingLine\.big\(n\)\) \{)(.*?)(\n[^\n]*bar = new ProgressBar\(this, null, android\.R\.attr\.progressBarStyleHorizontal\);)' '\3\1\2'
 mutant "M19 the card never closes after the sweep" la '\n[^\n]*handler\.postDelayed\(this::finish, LandingLine\.CLOSE_AFTER_MS\);' ''
-mutant "M20 the start carries no work list" us '\n[^\n]*\.putExtra\(LandingNoticeActivity\.EXTRA_PKGS, work\.toArray\(new String\[0\]\)\)' ''
+mutant "M20 the start carries no work list" us '\n[^\n]*\.putExtra\(LandingNoticeActivity\.EXTRA_PKGS, cardRows\)' ''
 mutant "M21 a failed outcome lands the app" ll 'landed\[i\] = ok;' 'landed[i] = true;'
 mutant "M22 Sweep.done ignores the end" ll 'return sweep == 0 \|\| sweep != id \|\| done;' 'return sweep == 0 || sweep != id;'
 mutant "M23 the card rows follow a settled set" la 'LandingLine\.rows\(pkgs, landed\)' 'LandingLine.rows(pkgs, settled)'
@@ -495,5 +569,31 @@ mutant "M28 sync never closes the card" la '\n[^\n]*if \(LandingLine\.Sweep\.don
 mutant "M29 the service broadcasts before it records" us '(\n[^\n]*LandingLine\.Sweep\.outcome\(card, pkg, ok\);)(\n[^\n]*try \{\n[^\n]*sendBroadcast\(new Intent\(LandingNoticeActivity\.ACTION_APP\).*?\n[^\n]*\} catch \(Throwable t\) \{[^\n]*)' '\2\1'
 mutant "M30 the end is never recorded" us '\n[^\n]*LandingLine\.Sweep\.end\(card\);[^\n]*' ''
 mutant "M31 the start carries no sweep id" us '\n[^\n]*\.putExtra\(LandingNoticeActivity\.EXTRA_SWEEP, card\)\);' ');'
+# NWP-20261130-09. Each names the assertion that convicts it.
+mutant "M32 no services row (C33)" ll 'new String\[\] \{GMS, GSF\}' 'new String[] {GSF}'
+mutant "M33 the rows after the work list (C34)" ll '(List<String> out = new ArrayList<>\(\);)(.*?)\n[^\n]*out\.addAll\(work\);' '\1\n        out.addAll(work);\2'
+mutant "M34 the list ignores hasCode (C36)" ll 'work\.contains\(dep\) \|\| hasCode\.test\(dep\)' 'work.contains(dep)'
+mutant "M35 the list ignores depsOf (C35, C41)" ll 'if \(depsOf\.apply\(p\)\.contains\(dep\)\) \{' 'if (true) {'
+mutant "M36 no GSF row (C37)" ll 'new String\[\] \{GMS, GSF\}' 'new String[] {GMS}'
+mutant "M37 gsf before gms (C37, C39)" ll 'new String\[\] \{GMS, GSF\}' 'new String[] {GSF, GMS}'
+mutant "M38 depLanded lands nothing (C42)" ll '(settled\[i\] = true;)\n[^\n]*landed\[i\] = true;' '\1'
+mutant "M39 depLanded stops at a settled row (C44)" ll '!pkg\.equals\(pkgs\[i\]\) \|\| landed\[i\]' '!pkg.equals(pkgs[i]) || settled[i] || landed[i]'
+mutant "M40 depLanded leaves the row unsettled (C44)" ll '\n[^\n]*settled\[i\] = true;(\n[^\n]*landed\[i\] = true;)' '\1'
+mutant "M41 depLabel gives no name (C46)" ll 'if \(GMS\.equals\(pkg\)\) return "Google Play services";' 'if (GMS.equals(pkg)) return null;'
+mutant "M42 the card starts with the work list (P2)" us 'EXTRA_PKGS, cardRows' 'EXTRA_PKGS, work.toArray(new String[0])'
+mutant "M43 begin takes the work list (P2)" us 'Sweep\.begin\(cardRows\)' 'Sweep.begin(work.toArray(new String[0]))'
+mutant "M44 the list built before the stamp (P2)" us '(\n[^\n]*StoreInstaller\.writeAtomic\(stamp, serial\);)(\n[^\n]*String\[\] cardRows = [^\n]*)' '\2\1'
+mutant "M45 no tick after a dep install (P12)" us '\n[^\n]*cardDepLanded\(dep\);(\n[^\n]*qFinish\(dep\);)' '\1'
+mutant "M46 the tick before the abort (P12)" us '(\n[^\n]*if \(!dok\) \{.*?)\n[^\n]*cardDepLanded\(dep\);' '\n            cardDepLanded(dep);\1'
+mutant "M47 no tick in the WHOLE branch (P12)" us '(if \(action == AUTO_WHOLE\) \{)\n[^\n]*cardDepLanded\(dep\);[^\n]*' '\1'
+mutant "M48 no tick in the RESTORE_ONLY branch (P12)" us '(if \(action == AUTO_RESTORE_ONLY\) \{)\n[^\n]*cardDepLanded\(dep\);[^\n]*' '\1'
+mutant "M49 the helper does not broadcast (P12)" us '\n[^\n]*sendBroadcast\(new Intent\(LandingNoticeActivity\.ACTION_APP\)\.setPackage\(getPackageName\(\)\)\n[^\n]*EXTRA_PKG, dep\)[^\n]*' ''
+mutant "M50 the card has no depLabel (P13)" la '\n[^\n]*if \(got == null\) got = LandingLine\.depLabel\(pkg\);' ''
+mutant "M51 the label drifts from Your apps (C46, P14)" ll 'return "Google Play services";' 'return "Play Services";'
+mutant "M52 gms in the work list gets a second row (C47)" ll 'if \(work\.contains\(dep\) \|\| hasCode' 'if (hasCode'
+mutant "M53 the helper broadcasts for a package with no row (P12)" us 'if \(!LandingLine\.Sweep\.depLanded\(dep\)\) return;' 'LandingLine.Sweep.depLanded(dep);'
+mutant "M54 the helper broadcast is not package-local (P12)" us '(ACTION_APP\))\.setPackage\(getPackageName\(\)\)(\n[^\n]*EXTRA_PKG, dep\))' '\1\2'
+mutant "M55 the list reads another dep source (P14)" us 'p -> ProfileActivity\.appDeps\(this, p\)' 'p -> ProfileActivity.groupDeps(this, p)'
+mutant "M56 ProfileActivity's word for gms drifts from the card's (P14)" pa 'return "Google Play services";' 'return "Play services";'
 if [ "$fails" -ne 0 ]; then echo "test-landing-line-java: FAIL -- $fails mutant(s) not convicted"; exit 1; fi
 echo "test-landing-line-java: all mutants convicted"

@@ -91,6 +91,9 @@ var (
 	// dnsEmptySince is, so an idle daemon's first empty discovery keeps a list that was good one lookup ago.
 	dnsGoodAt     time.Time
 	dnsEmptySince time.Time // first empty discovery of the current empty run; zero = the last discovery was not empty
+	// NWP-20261129-29: what the current empty run has logged. "" nothing yet, "printed" the keep line, "dropped" the
+	// keep line and then the fallback, "silent" the fallback with no keep line before it.
+	dnsKeepRun string
 	// NWP-20261119-25: the egress interface the seeded list was discovered on, from the cache file's iface line.
 	// "" = no seed, a seed with no interface, or a real discovery has replaced the seed. A seeded fork has
 	// netIface "", so the interface-change key cannot fire for it; this one does.
@@ -268,22 +271,53 @@ func refreshNet(force bool) {
 		dnsEmptySince = time.Now() // NWP-20261113-19: the empty run starts here; later empties do not move it
 	}
 	keep := dnsServers
+	dropReason := "" // NWP-20261129-29: the key that dropped the keep, for the fallback's src
 	switch {
 	case dnsGoodAt.IsZero():
 		keep = nil // nothing was ever discovered, so the cache can only be a previous bootstrap
+		dropReason = "never-discovered"
 	case !dnsEmptySince.IsZero() && time.Since(dnsEmptySince) > dnsKeepMax:
 		keep = nil // empty for longer than a switch window: a broken dumpsys, or a network we cannot read
+		dropReason = fmt.Sprintf("empty-over-%ds", int(dnsKeepMax/time.Second))
 	case iface != "" && netIface != "" && iface != netIface:
 		keep = nil // different egress network -- this list was never validated for it
+		dropReason = "iface-changed"
 	case dnsSeedIface != "" && iface != "" && iface != dnsSeedIface:
 		keep = nil // NWP-20261119-25: the seed belongs to another network -- the daemon discovered it on dnsSeedIface
+		dropReason = "seed-other-iface"
 	case dnsFromVPN && vpnGone:
 		keep = nil // #219: the ULA is filtered out of discoveredDNS, so it could never be re-derived
+		dropReason = "vpn-gone"
 	case force:
 		keep = nil // every cached address just failed to dial; handing it back is a guaranteed-identical retry
+		dropReason = "forced"
 	}
 	adopted, usedFallback := dnsAdopt(addrs, keep, fallbackAddrs())
 	dnsServers = adopted
+	// NWP-20261129-29: a kept list IS the current list, so the change-only egress line below cannot show a keep. The
+	// empty run says so itself, once at its start and once at its end. This runs before a good discovery zeroes
+	// dnsEmptySince, and outside the egress block because a fall can leave the list unchanged. "silent" is a state of
+	// its own: after a drop with no keep line, dnsServers is the public fallback and the next empty discovery "keeps"
+	// it with no key firing, so without it this would print a keep and a "held" over a known-good list already gone.
+	switch {
+	case len(addrs) > 0:
+		switch dnsKeepRun {
+		case "printed":
+			fmt.Fprintf(os.Stderr, "[resolver] discovery back after %dms empty; the kept list held (NWP-20261129-29)\n", time.Since(dnsEmptySince).Milliseconds())
+		case "dropped":
+			fmt.Fprintf(os.Stderr, "[resolver] discovery back after %dms empty; the kept list was dropped (NWP-20261129-29)\n", time.Since(dnsEmptySince).Milliseconds())
+		}
+		dnsKeepRun = ""
+	case usedFallback:
+		if dnsKeepRun == "printed" {
+			dnsKeepRun = "dropped"
+		} else if dnsKeepRun == "" {
+			dnsKeepRun = "silent"
+		}
+	case dnsKeepRun == "":
+		fmt.Fprintf(os.Stderr, "[resolver] discovery empty: keeping the last discovered list (%d server(s)) for up to %ds (NWP-20261129-29)\n", len(adopted), int(dnsKeepMax/time.Second))
+		dnsKeepRun = "printed"
+	}
 	prevDoT := dotHost
 	if postureKnown {
 		dotHost, dotAddrs = nextHost, nextAddrs
@@ -323,6 +357,9 @@ func refreshNet(force bool) {
 		src := "discovered"
 		if usedFallback {
 			src = "PUBLIC-FALLBACK (discovery empty, nothing cached)"
+			if dropReason != "" && dropReason != "never-discovered" {
+				src = "PUBLIC-FALLBACK (discovery empty, kept list dropped: " + dropReason + ")"
+			}
 		} else if len(addrs) == 0 {
 			src = "kept (discovery empty, cache still valid)"
 		} else if tunnelPublic {

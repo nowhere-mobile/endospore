@@ -1,7 +1,7 @@
 package com.nowhere.chooser;
 
-/** NWP-20261122-15, NWP-20261126-05: LandingLine's rules and words, compiled with LandingLine.java ALONE
- *  (test-landing-line-java.sh). */
+/** NWP-20261122-15, NWP-20261126-05, NWP-20261130-09: LandingLine's rules and words, compiled with LandingLine.java
+ *  and AppDeps.java, the rule the card's list reads (test-landing-line-java.sh). */
 public class LandingLineCases {
     static int fails = 0;
 
@@ -46,6 +46,28 @@ public class LandingLineCases {
     static void rows(String what, int total, boolean[] landed, int[] want, int wantMore) {
         eqa(what + ": rows", LandingLine.rows(pkgs(total), landed), want);
         eqi(what + ": moreCount", LandingLine.moreCount(pkgs(total), landed), wantMore);
+    }
+
+    static final String GMS = "com.google.android.gms", GSF = "com.google.android.gsf", VENDING = "com.android.vending";
+    static final String YT = "com.google.android.youtube";
+
+    /** The card's rows through the real AppDeps rule, with ProfileActivity's three names and groups: {@code deferred}
+     *  is the deferred keep-set, {@code clients} is nowhere-playdeps, {@code installed} has code. */
+    static String[] card(java.util.List<String> work, java.util.List<String> deferred, java.util.List<String> clients,
+            java.util.List<String> installed) {
+        java.util.Map<String, String> none = new java.util.HashMap<>(), groups = new java.util.HashMap<>();
+        for (String s : new String[] {VENDING, GMS, GSF}) groups.put(s, "sandboxed-play");
+        return LandingLine.cardPkgs(work,
+                p -> AppDeps.appDeps(p, none, groups, deferred, new java.util.HashSet<>(clients), GMS, GSF, VENDING),
+                installed::contains);
+    }
+
+    static java.util.List<String> list(String... s) {
+        return java.util.Arrays.asList(s);
+    }
+
+    static void eqs(String what, String[] got, String... want) {
+        eq(what, java.util.Arrays.toString(got), java.util.Arrays.toString(want));
     }
 
     public static void main(String[] a) {
@@ -140,6 +162,67 @@ public class LandingLineCases {
         is("C32 an older sweep has no landed flags", LandingLine.Sweep.landed(s2) == null, true);
         is("C32 id 0 (no card) reads as ended", LandingLine.Sweep.done(0), true);
         is("C32 id 0 has no landed flags", LandingLine.Sweep.landed(0) == null, true);
+
+        // C33-C41 NWP-20261130-09: the card's rows, through the real AppDeps rule.
+        java.util.List<String> none = list();
+        eqs("C33 Play on: Play Store in the work list, gms deferred: the services row is there",
+                card(list(VENDING, "a"), list(VENDING, GMS, "a"), none, none), GMS, VENDING, "a");
+        eqs("C34 ordered first, the work list's order unchanged, for a client at the end of it",
+                card(list("a", "b", YT), list("a", "b", YT, GMS), list(YT), none), GMS, "a", "b", YT);
+        eqs("C35 Play off: no stack deferred, a client still listed: the list is the work list",
+                card(list("a", YT), list("a", YT), list(YT), none), "a", YT);
+        eqs("C36 Play services already has code: no row",
+                card(list(VENDING, "a"), list(VENDING, GMS, "a"), none, list(GMS)), VENDING, "a");
+        eqs("C37 GSF separate: both rows, gms first",
+                card(list(VENDING, "a"), list(VENDING, GMS, GSF, "a"), none, none), GMS, GSF, VENDING, "a");
+        eqs("C38 GSF absent (Endospore): no GSF row",
+                card(list(VENDING), list(VENDING, GMS), none, none), GMS, VENDING);
+        eqs("C39 gms first whatever the keep-set order",
+                card(list(VENDING), list(GSF, VENDING, GMS), none, none), GMS, GSF, VENDING);
+        eqs("C40 Play Off with a client that still demands gms: the sweep fetches it, so the row is there",
+                card(list(YT), list(YT, GMS), list(YT), none), GMS, YT);
+        eqs("C41 plain apps only: no row, even with gms deferred",
+                card(list("a", "b"), list("a", "b", GMS), none, none), "a", "b");
+        eqs("C47 gms in the work list itself: one row, at its place",
+                card(list(VENDING, GMS), list(VENDING, GMS), none, none), VENDING, GMS);
+
+        // C42-C45 NWP-20261130-09: the tick. The work loop gives a dep no outcome, so depLanded is its only way.
+        long d1 = LandingLine.Sweep.begin(new String[] {GMS, "a"});
+        is("C42 depLanded changed a row", LandingLine.Sweep.depLanded(GMS), true);
+        is("C42 the row ticked", LandingLine.Sweep.landed(d1)[0], true);
+        is("C42 another row did not", LandingLine.Sweep.landed(d1)[1], false);
+        is("C42 a second call changes nothing", LandingLine.Sweep.depLanded(GMS), false);
+        is("C42 null changes nothing", LandingLine.Sweep.depLanded(null), false);
+        is("C42 a package with no row changes nothing", LandingLine.Sweep.depLanded(GSF), false);
+        long d2 = LandingLine.Sweep.begin(new String[] {GMS, "a"});
+        // A failed dep calls nothing (materializeLocked aborts first): the entry point's outcome settles the entry point.
+        LandingLine.Sweep.outcome(d2, "a", false);
+        is("C43 a failed dep leaves its row open", LandingLine.Sweep.landed(d2)[0], false);
+        is("C43 the retry's landing ticks it", LandingLine.Sweep.depLanded(GMS), true);
+        is("C43 the row is ticked after the retry", LandingLine.Sweep.landed(d2)[0], true);
+        long d3 = LandingLine.Sweep.begin(new String[] {"p", "q"});
+        LandingLine.Sweep.outcome(d3, "p", false);
+        is("C44 depLanded beats an earlier failed outcome", LandingLine.Sweep.depLanded("p"), true);
+        LandingLine.Sweep.outcome(d3, "p", false);
+        is("C44 a later failed outcome cannot undo it", LandingLine.Sweep.landed(d3)[0], true);
+        // depLanded settled the row, so this outcome is the next row's of that package, never this one's again.
+        long d4 = LandingLine.Sweep.begin(new String[] {VENDING, "a"});
+        LandingLine.Sweep.depLanded(VENDING);
+        LandingLine.Sweep.outcome(d4, VENDING, false);
+        is("C44 a Play Store a client's dep loop landed stays ticked at its own outcome", LandingLine.Sweep.landed(d4)[0], true);
+        String[] six = {GMS, "a", "b", "c", "d", "e"};
+        long d5 = LandingLine.Sweep.begin(six);
+        for (String p : new String[] {"a", "b", "c"}) LandingLine.Sweep.outcome(d5, p, true);
+        eqa("C45 from-5 card: the services row stays on top while plain apps land",
+                LandingLine.rows(six, LandingLine.Sweep.landed(d5)), new int[] {0, 4, 5});
+        LandingLine.Sweep.depLanded(GMS);
+        eqa("C45 from-5 card: its row leaves when it lands",
+                LandingLine.rows(six, LandingLine.Sweep.landed(d5)), new int[] {4, 5});
+
+        eq("C46 depLabel names Play services", LandingLine.depLabel(GMS), "Google Play services");
+        eq("C46 depLabel names GSF", LandingLine.depLabel(GSF), "Google Services Framework");
+        is("C46 depLabel names nothing else", LandingLine.depLabel("a") == null, true);
+        is("C46 depLabel of null is null", LandingLine.depLabel(null) == null, true);
         System.exit(fails == 0 ? 0 : 1);
     }
 }

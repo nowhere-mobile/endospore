@@ -59,10 +59,11 @@ public final class MmsDownloadedReceiver extends BroadcastReceiver {
         // unlink the staging body, drop the MmsService's grant, release the MMS-PDN ref (IN_FLIGHT arbitrates), finish.
         final java.util.concurrent.atomic.AtomicBoolean fin = new java.util.concurrent.atomic.AtomicBoolean();
         final Runnable done = () -> { if (fin.compareAndSet(false, true)) { WapPushDeliverReceiver.finishDownload(app, name, uriStr, subId); pr.finish(); } };
+        final java.util.concurrent.atomic.AtomicBoolean sealStarted = new java.util.concurrent.atomic.AtomicBoolean();
         new Thread(() -> {
             boolean delivered = false;
             try {
-                delivered = sealDownloaded(app, result, httpStatus, staged, subId, when, fromHint, done, aid, mono);
+                delivered = sealDownloaded(app, result, httpStatus, staged, subId, when, fromHint, done, aid, mono, sealStarted);
             } catch (Throwable t) {
                 android.util.Log.w("NowhereChooser", "#150 downloaded-MMS handling failed", t);
             } finally {
@@ -75,15 +76,21 @@ public final class MmsDownloadedReceiver extends BroadcastReceiver {
                 // per-boot su:s0 janitor are the backstops.
                 TelScrub.mms(app);
                 done.run(); // if the parse never got that far; whatever happened, the cleartext body does not outlive this
+                // docs/product-decisions.md 2026-11-05, #14: a body that never reached the seal leaves the loss notice. A seal
+                // that started keeps settle's own answer, so one failure never posts two. This comes after the cleanup, which
+                // never waits for a notice.
+                if (!delivered && !sealStarted.get()) SmsDeliverReceiver.postDownloadLoss(app, subId, aid);
             }
         }).start();
     }
 
     /** Returns true when the daemon answered the seal -- kept, unbound (now sealed to the device-owner inbox, Slice D),
      *  unassigned since, UNRESOLVED or FULL -- so the transaction-id claim is kept: it answers a repeat of this arrival id
-     *  the same (its replay table). False on a download or parse failure, or a seal that failed, so a re-push retries. */
+     *  the same (its replay table). False on a download or parse failure, or a seal that failed, so a re-push retries.
+     *  sealStarted is set just before the seal: a false return with it unset means the body never reached the seal. */
     private static boolean sealDownloaded(Context app, int result, int httpStatus, File staged, int subId, long when,
-                                          String fromHint, Runnable done, String aid, long mono) throws Exception {
+                                          String fromHint, Runnable done, String aid, long mono,
+                                          java.util.concurrent.atomic.AtomicBoolean sealStarted) throws Exception {
         if (result != Activity.RESULT_OK) {
             android.util.Log.w("NowhereChooser", "#150 MMS download FAILED: result=" + result
                     + " httpStatus=" + httpStatus);
@@ -118,6 +125,7 @@ public final class MmsDownloadedReceiver extends BroadcastReceiver {
             String ct = bytesToStr(p.getContentType());
             parts.add(new SmsDeliverReceiver.MmsPart(ct, nm, MmsText.toUtf8(ct, p.getCharset(), d)));
         }
+        sealStarted.set(true);
         int outcome = SmsDeliverReceiver.sealMmsAndNotify(app, subId, from, when, subject, parts, aid, mono);
         android.util.Log.i("NowhereChooser", "#150 MMS sealed: from=" + WapPushDeliverReceiver.redact(from)
                 + " parts=" + parts.size() + " totalBytes=" + totalBytes + " outcome=" + outcome);

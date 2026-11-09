@@ -166,7 +166,7 @@ IFS= read -r -d '' P_FINISH <<'EOF'
         back.setGravity(Gravity.CENTER);
         back.setPadding(dp(8), dp(22), dp(8), dp(8));
         ll.addView(back, new LinearLayout.LayoutParams(MATCH, WRAP));
-        back.setOnClickListener(v -> onBack.run());
+        backLink(back, onBack);
         if (head == null) presentMenuScreen(ll);
         else presentMenuScreen(head, ll);
     }
@@ -329,7 +329,7 @@ IFS= read -r -d '' P_HIDE <<'EOF'
     }
 EOF
 IFS= read -r -d '' P_LBLREAD <<'EOF'
-    private synchronized java.util.HashMap<String,String> labelCache() {
+    private synchronized java.util.LinkedHashMap<String,String> labelCache() {
 EOF
 IFS= read -r -d '' P_LBLWRITE <<'EOF'
     private synchronized void rememberLabel(String pkg, CharSequence label) {
@@ -559,7 +559,7 @@ mut "C17 the keyboard stays up after you leave"       P 's/\{ hideKeyboard\(fals
 mut "C18 the keyboard may learn the query"            P 's/\n                \| android\.view\.inputmethod\.EditorInfo\.IME_FLAG_NO_PERSONALIZED_LEARNING\);/);/' || fails=$((fails+1))
 mut "C19 Clear does nothing"                          P 's/clear\.setOnClickListener\(v -> search\.setText\(""\)\);/clear.setOnClickListener(v -> {});/' || fails=$((fails+1))
 mut "C20 the matches are left below the fold"         P 's/\n                    sv\.post\(\(\) -> sv\.scrollTo\(0, list\.getTop\(\)\)\);//' || fails=$((fails+1))
-mut "C21 the label cache read without the lock"       P 's/private synchronized java\.util\.HashMap<String,String> labelCache\(\) \{/private java.util.HashMap<String,String> labelCache() {/' || fails=$((fails+1))
+mut "C21 the label cache read without the lock"       P 's/private synchronized java\.util\.LinkedHashMap<String,String> labelCache\(\) \{/private java.util.LinkedHashMap<String,String> labelCache() {/' || fails=$((fails+1))
 mut "C22 a label looked up without the lock"          P 's/synchronized \(this\) \{ cached = labelCache\(\)\.get\(pkg\); \}/{ cached = labelCache().get(pkg); }/' || fails=$((fails+1))
 mut "C23 the count line is not announced"             P 's/\n        count\.setAccessibilityLiveRegion\(View\.ACCESSIBILITY_LIVE_REGION_POLITE\);//' || fails=$((fails+1))
 mut "C24 hidden rows are counted as matches"          P 's/if \(hit\) \{ shown\+\+; if \(t\.kept\) keptShown = true; \}/shown++; if (hit \&\& t.kept) keptShown = true;/' || fails=$((fails+1))
@@ -610,7 +610,7 @@ mut "C45 the search never filters"                    P 's/(        head\.addVie
     "PIN   the count line sits in the head, hidden and announced, and every keystroke re-applies the search and brings the matches up" || fails=$((fails+1))
 mut "C46 Your apps is never presented"                P 's/\n(        finishMenuScreen\(ll, this::showPreferences, head\);)/\n        if (false)\n$1/' \
     "PIN   Your apps is presented with its head pinned" || fails=$((fails+1))
-mut "C47 Back does nothing"                           P 's/\n(        back\.setOnClickListener\(v -> onBack\.run\(\)\);\n        if \(head == null\))/\n        if (false)\n$1/' \
+mut "C47 Back does nothing"                           P 's/\n(        backLink\(back, onBack\);\n        if \(head == null\))/\n        if (false)\n$1/' \
     "PIN   finishMenuScreen adds Back and presents a head outside the scroll" || fails=$((fails+1))
 mut "C48 the order block is commented out"            P 's/\n(                java\.util\.List<String> sorted = KeepOrder\.keptFirst\(pkgs, keptNow\);\n(?:.*\n){10}                \/\/ NWP-20261012-06: each kept row\x27s "Wake for notifications"[^\n]*\n)/\n                \/*\n$1                *\/\n/' \
     "PIN   the other rows go A to Z after keptFirst, on the list thread" || fails=$((fails+1))

@@ -22,6 +22,20 @@
 #   G4 a well-formed line (base + split under /data/app): staged byte for byte and in the manifest, as before
 #   G5 a trailing `group:` token still reaches the manifest
 #
+# NWP-20261128-38: the KEEP-SET sweep had the same hole. It took nowhere-appkeep's field 1 (the chooser's file in the
+# same roamed CE dir) and passed it to live_code_dir (`dumpsys package <name>`), "$STAGE/<name>" and a manifest line
+# with no name check. PackageManagerService reads an argument with no dot as a section command (or dumps everything),
+# so live_code_dir took the FIRST codePath of the whole dump: a line `p` staged another app's APKs under the name `p`,
+# and counted toward want_installed, so a keep-set whose only installed line was bogus turned every seal into the
+# "staged 0 apk" refusal. Now the sweep skips a line whose field 1 fails pkgname_ok, after its progress line and
+# before want_installed++. The K cases plant no code list, and dumpsys answers the X dir for ANY name (the full-dump
+# shape), so only the guard stands between a bogus name and the stage.
+#
+#   K1 a bare keep-set line `p` beside a kept com.k: no stage dir or manifest line `p`, com.k as before, a nameless skip
+#   K2 a keep-set line `../../x<TAB>installed`: no dir made off the stage, nothing of it pushed
+#   K3 a keep-set holding only a bogus installed line: rc 0, the empty stage sealed, no "staged 0 apk" refusal
+#   K4 a well-formed on-demand line with live code and placeholder metadata: staged deferred with _meta, as before
+#
 #   bash test-appcode-list-guard.sh            # the cases, under every shell found (bash sh dash mksh)
 #   bash test-appcode-list-guard.sh --mutate   # ... plus mutants that must each be CONVICTED under each shell
 set -uo pipefail
@@ -41,6 +55,10 @@ no(){ FAIL=$((FAIL+1)); printf '  FAIL  %s\n' "$1"; }
 
 PRINT_SHIM='command -v print >/dev/null 2>&1 || print() { _pn=1; while [ $# -gt 0 ]; do case "$1" in -rn|-nr) _pn=0; shift ;; -r) shift ;; --) shift; break ;; *) break ;; esac; done; if [ "$_pn" = 1 ]; then printf "%s\n" "$*"; else printf "%s" "$*"; fi; }'
 
+# The run's `date` stub prints this fixed stamp. It holds a `p`, as April and September dates do, so a check that
+# refused a name byte anywhere after the fixed text would fail on a correct line.
+FIXED_DATE='Wed Apr 01 12:00:00 UTC 2026'
+
 FUNCS=""
 for fn in qn pw pkgname_ok appcode_stage_play_dormant live_code_dir stage_apk_copy stage_live_apks stage_keep_mtimes appcode_seal; do
   body=$(awk -v h="$fn() {" '$0 == h {f=1} f{print} f&&/^\}$/{exit}' "$ROAMD")
@@ -54,10 +72,11 @@ SHELLS=""
 for s in bash sh dash mksh; do command -v "$s" >/dev/null 2>&1 && SHELLS="$SHELLS $s"; done
 [ -n "$SHELLS" ] || { echo "no shell to run under" >&2; exit 2; }
 
-# seal_case <shell> <case: G1..G5>
+# seal_case <shell> <case: G1..G5, K1..K4>
 # Sets RES (appcode_seal's status), CALLS (the stub's push line), NCALLS, LOGTXT, DATALS (the entries of $T/data after
-# the seal), XDIR (y when $T/data/x exists), SENTHITS (pushed files that hold the sentinel's bytes), and BYTES_A /
-# BYTES_D / BYTES_E (y when the pushed stage holds that package's listed APKs byte for byte).
+# the seal), XDIR (y when $T/data/x exists), SENTHITS (pushed files that hold the sentinel's bytes), BYTES_A /
+# BYTES_D / BYTES_E / BYTES_K (y when the pushed stage holds that package's listed APKs byte for byte), and DEFERTXT
+# (the defer list the push was given, one `,` after each line).
 seal_case(){
   local T F A D E X S SENT t
   T=$(mktemp -d -p "$W") && [ -n "$T" ] && [ -d "$T" ] || exit 2
@@ -91,24 +110,36 @@ seal_case(){
     G5)
       printf 'com.e\t1\t0\tinstalled\t%s\tgroup:grp1\n' "$E/base.apk" > "$F/nowhere-appcode.list"
       printf 'com.e\tinstalled\n' > "$F/nowhere-appkeep" ;;
+    K1|K2|K3|K4)
+      # The full-dump shape: dumpsys answers the X dir for any argument, as PackageManagerService does for `p`.
+      printf '    codePath=%s\n    flags=[ HAS_CODE ALLOW_CLEAR_USER_DATA ]\n' "$X" > "$T/dumps/_any" ;;
+  esac
+  case "$2" in
+    K1) printf 'p\ncom.k\tinstalled\n' > "$F/nowhere-appkeep" ;;
+    K2) printf '../../x\tinstalled\ncom.k\tinstalled\n' > "$F/nowhere-appkeep" ;;
+    K3) printf 'p\tinstalled\n' > "$F/nowhere-appkeep" ;;
+    K4) printf 'com.o\tondemand\n' > "$F/nowhere-appkeep"
+        mkdir -p "$F/nowhere-appmeta/com.o"; printf 'o-meta-bytes' > "$F/nowhere-appmeta/com.o/meta.bin" ;;
   esac
   : > "$T/calls"
   {
     printf '%s\n' "$PRINT_SHIM"
     printf 'T=%s; LOG=$T/log; USERDIR=$T/user; name=probe; pass=x; NOWHERE_CARRY_ESSENTIAL=0\n' "$T"
     cat <<'STUBS'
-dumpsys(){ [ "$1" = package ] && [ -f "$T/dumps/$2" ] && cat "$T/dumps/$2"; return 0; }
+dumpsys(){ [ "$1" = package ] || return 0; if [ -f "$T/dumps/_any" ]; then cat "$T/dumps/_any"; elif [ -f "$T/dumps/$2" ]; then cat "$T/dumps/$2"; fi; return 0; }
 agent_stub(){
   local last a
   for a; do last=$a; done
   rm -rf "$T/pushed"; command cp -r "$last" "$T/pushed"
+  cat "${NOWHERE_DEFER_LIST:-/dev/null}" > "$T/deferred" 2>/dev/null
   echo "STAGE=$(cd "$last" && find . | LC_ALL=C sort | tr '\n' ',') | MAN=$(tr '\t\n' ':,' < "$last/manifest.tsv")" >> "$T/calls"
   return 0
 }
 STUBS
     printf 'AGENT=agent_stub\n'
     printf 'timeout(){ shift 3; "$@"; }\n'
-    printf 'keystore_register_all(){ :; }; _ms(){ echo 0; }; _apps_stage_prog(){ :; }\n'
+    printf 'date(){ printf "%%s\\n" "%s"; }\n' "$FIXED_DATE"
+    printf 'keystore_register_all(){ :; }; appcode_pm_snapshot(){ :; }; _ms(){ echo 0; }; _apps_stage_prog(){ :; }\n'
     printf '%s\n' "$FUNCS"
     printf 'appcode_seal; echo "$?" > "$T/res"\n'
   } > "$T/run.sh"
@@ -122,11 +153,28 @@ STUBS
   BYTES_A=$(cmp -s "$T/pushed/com.a/base.apk" "$A/base.apk" && cmp -s "$T/pushed/com.a/split.apk" "$A/split.apk" && echo y)
   BYTES_D=$(cmp -s "$T/pushed/com.d/base.apk" "$D/base.apk" && cmp -s "$T/pushed/com.d/split.apk" "$D/split.apk" && echo y)
   BYTES_E=$(cmp -s "$T/pushed/com.e/base.apk" "$E/base.apk" && echo y)
+  BYTES_K=$(cmp -s "$T/pushed/com.k/base.apk" "$X/base.apk" && echo y)
+  DEFERTXT=$(tr '\n' ',' < "$T/deferred" 2>/dev/null)
   rm -rf "$T"
 }
 
 has(){ case "$1" in *"$2"*) return 0 ;; *) return 1 ;; esac; }
 SKIP_LINE='appcode: code-list line skipped -- not a package name'
+KSKIP_LINE='appcode: keep-set line skipped -- not a package name'
+# The keep-set guard, byte for byte as roamd holds it: mutant M5 moves exactly this line.
+KGUARD='      pkgname_ok "$kpkg" || { echo "[roamd] appcode: keep-set line skipped -- not a package name $(date)" >> "$LOG"; continue; }'
+# kskips_nameless <log>: true when the log has a keep-set skip line and every one is exactly the fixed text and stamp.
+kskips_nameless(){
+  local l k=0
+  while IFS= read -r l; do
+    case "$l" in *"$KSKIP_LINE"*) ;; *) continue ;; esac
+    [ "$l" = "[roamd] $KSKIP_LINE $FIXED_DATE" ] || return 1
+    k=$((k+1))
+  done <<EOF_LOG
+$1
+EOF_LOG
+  [ "$k" -gt 0 ]
+}
 
 echo "shells:$SHELLS"
 for s in $SHELLS; do
@@ -166,14 +214,41 @@ for s in $SHELLS; do
   if [ "$NCALLS" = 1 ] && has "$CALLS" 'MAN=com.e:1:0:installed:base.apk:group:grp1,' && ! has "$CALLS" './com.e/group' && [ "$BYTES_E" = y ]; then
     ok "$t G5 a trailing group: token reaches the manifest and is not staged as a file"
   else no "$t G5 group token -> $NCALLS call(s) [$CALLS] bytes E=[$BYTES_E]"; fi
+
+  seal_case "$s" K1
+  if [ "$RES" = 0 ] && [ "$NCALLS" = 1 ] && [ "$CALLS" = 'STAGE=.,./com.k,./com.k/base.apk,./manifest.tsv, | MAN=com.k:0:0:installed:base.apk,' ] \
+     && [ "$BYTES_K" = y ]; then
+    ok "$t K1 a bare keep-set line p stages nothing and takes no manifest line; com.k beside it stages as before"
+  else no "$t K1 bare p -> rc [$RES] $NCALLS call(s) [$CALLS] bytes K=[$BYTES_K]"; fi
+  if kskips_nameless "$LOGTXT" && ! has "$LOGTXT" 'recovered p '; then ok "$t K1 the log counts the keep-set skip and holds no refused name"
+  else no "$t K1 log -> [$LOGTXT]"; fi
+
+  seal_case "$s" K2
+  if [ -z "$XDIR" ] && [ "$DATALS" = "app nowhere " ]; then ok "$t K2 a keep-set line ../../x makes no dir off the stage"
+  else no "$t K2 ../../x -> \$T/data/x exists=[$XDIR], \$T/data holds [$DATALS]"; fi
+  if [ "$NCALLS" = 1 ] && [ "$CALLS" = 'STAGE=.,./com.k,./com.k/base.apk,./manifest.tsv, | MAN=com.k:0:0:installed:base.apk,' ] \
+     && kskips_nameless "$LOGTXT" && ! has "$LOGTXT" '../../x'; then
+    ok "$t K2 nothing of the ../../x keep-set line is pushed, and the log holds no refused name"
+  else no "$t K2 push -> $NCALLS call(s) [$CALLS] log [$LOGTXT]"; fi
+
+  seal_case "$s" K3
+  if [ "$RES" = 0 ] && [ "$NCALLS" = 1 ] && [ "$CALLS" = 'STAGE=.,./manifest.tsv, | MAN=' ] \
+     && ! has "$LOGTXT" 'staged 0 apk' && has "$LOGTXT" '#apps sealed (0 pkg)'; then
+    ok "$t K3 a keep-set holding only a bogus installed line seals the empty stage: it is no wanted installed app"
+  else no "$t K3 bogus-only -> rc [$RES] $NCALLS call(s) [$CALLS] log [$LOGTXT]"; fi
+
+  seal_case "$s" K4
+  if [ "$RES" = 0 ] && [ "$NCALLS" = 1 ] && [ "$CALLS" = 'STAGE=.,./com.o,./com.o/_meta,./com.o/_meta/meta.bin,./com.o/base.apk,./manifest.tsv, | MAN=com.o:0:0:ondemand:base.apk,' ] \
+     && [ "$DEFERTXT" = 'com.o/base.apk,' ] && ! has "$LOGTXT" 'skipped'; then
+    ok "$t K4 a well-formed on-demand keep-set line stages deferred with its _meta, as before"
+  else no "$t K4 on-demand -> rc [$RES] $NCALLS call(s) [$CALLS] defer [$DEFERTXT] log [$LOGTXT]"; fi
 done
 
 if [ "$MUTATE" = yes ]; then
   echo "mutants (each must FAIL a line under EACH shell):"
   MT=$(mktemp -d -p "$W")
-  mut(){ # mut <label> <sed script>
+  mut_file(){ # mut_file <label>: the conviction check, on a prepared $MT/roamd.sh
     local rc s bad=""
-    sed -e "$2" "$ROAMD" > "$MT/roamd.sh"
     if cmp -s "$ROAMD" "$MT/roamd.sh"; then no "MUTANT DID NOT APPLY: $1"; return; fi
     ROAMD="$MT/roamd.sh" bash "$0" > "$MT/out" 2>&1; rc=$?
     for s in $SHELLS; do grep -q "FAIL  \[$s\]" "$MT/out" || bad="$bad $s"; done
@@ -181,9 +256,23 @@ if [ "$MUTATE" = yes ]; then
     elif [ "$rc" = 1 ] && [ -z "$bad" ]; then ok "convicted under every shell: $1"
     else no "NOT CONVICTED (rc $rc, shells with no FAIL line:$bad): $1"; fi
   }
+  mut(){ # mut <label> <sed script>
+    sed -e "$2" "$ROAMD" > "$MT/roamd.sh"
+    mut_file "$1"
+  }
   mut "M1 the pkgname_ok line deleted (G1)" '/^    pkgname_ok "\$pkg" || { echo "\[roamd\] appcode: code-list line skipped/d'
   mut "M2 the APK path case line deleted (G2)" '/^      case "\$ap" in \*\/\.\.\/\*|/d'
   mut "M3 the */../* alternative removed (G3)" 's#^\(      case "\$ap" in \)\*/\.\./\*|#\1#'
+  mut "M4 (task M1) the keep-set guard deleted (K1)" '/^      pkgname_ok "\$kpkg" || {/d'
+  # M5 (task M2): the guard moved after want_installed++. awk, not sed, so the moved text is KGUARD byte for byte.
+  # A guard or anchor that is not there exactly once leaves roamd unchanged, so mut_file reports DID NOT APPLY.
+  KG="$KGUARD" awk '
+    $0 == ENVIRON["KG"] { g++; next }
+    { print }
+    $0 == "      want_installed=$((want_installed+1))" { print ENVIRON["KG"]; w++ }
+    END { exit !(g == 1 && w == 1) }' "$ROAMD" > "$MT/roamd.sh" || cp "$ROAMD" "$MT/roamd.sh"
+  mut_file "M5 (task M2) the keep-set guard moved after want_installed++ (K3)"
+  mut "M6 (task M3) pkgname_ok replaced by a bare */* case (K1)" 's#^      pkgname_ok "\$kpkg" || {.*#      case "$kpkg" in */*) continue;; esac#'
 fi
 
 echo "$PASS passed, $FAIL failed"

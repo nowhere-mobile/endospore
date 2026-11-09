@@ -9,7 +9,7 @@
 # there only when the keep-set FILE is absent; otherwise it seals an empty stage and the agent's shrink and
 # presence guards decide it (core/agent/apps_empty_stage_test.go pins that side).
 #
-# appcode_seal is lifted WHOLE, by name, from nowhere_roamd.sh (with pw, qn and appcode_stage_play_dormant), every
+# appcode_seal is lifted WHOLE, by name, from roamd (with pw, qn, pkgname_ok, appcode_stage_play_dormant), every
 # /data/ path pointed into a scratch root. `$AGENT` is a stub that records one line per call -- its arguments, the
 # drop/keep/defer lists it was handed and a listing of the stage -- and exits with the code the case chooses;
 # `timeout` and the helpers the function calls are stubs; `print` is shimmed where the shell has none.
@@ -35,7 +35,7 @@ no(){ FAIL=$((FAIL+1)); printf '  FAIL  %s\n' "$1"; }
 PRINT_SHIM='command -v print >/dev/null 2>&1 || print() { _pn=1; while [ $# -gt 0 ]; do case "$1" in -rn|-nr) _pn=0; shift ;; -r) shift ;; --) shift; break ;; *) break ;; esac; done; if [ "$_pn" = 1 ]; then printf "%s\n" "$*"; else printf "%s" "$*"; fi; }'
 
 FUNCS=""
-for fn in qn pw appcode_stage_play_dormant stage_apk_copy appcode_seal _cause; do
+for fn in qn pw pkgname_ok appcode_stage_play_dormant stage_apk_copy appcode_seal _cause; do
   body=$(awk -v h="$fn() {" '$0 == h {f=1} f{print} f&&/^\}$/{exit}' "$ROAMD")
   case "$body" in "$fn() {"*'}') FUNCS="$FUNCS$body
 " ;; *) echo "EXTRACTION FAILED: $fn -- not found by name" >&2; exit 2 ;; esac
@@ -75,7 +75,7 @@ agent_stub(){
 STUBS
     printf 'AGENT=agent_stub; AGENT_RC=%s\n' "$4"
     printf 'timeout(){ shift 3; "$@"; }\n'
-    printf 'keystore_register_all(){ :; }; _ms(){ echo 0; }; _apps_stage_prog(){ :; }\n'
+    printf 'keystore_register_all(){ :; }; appcode_pm_snapshot(){ :; }; _ms(){ echo 0; }; _apps_stage_prog(){ :; }\n'
     printf 'live_code_dir(){ [ -d "$T/apk/$1" ] && echo "$T/apk/$1"; return 0; }\n'
     printf 'stage_live_apks(){ cp "$1"/*.apk "$2"/ && (cd "$1" && ls *.apk | tr "\\n" " "); }\n'
     printf 'stage_keep_mtimes(){ :; }\n'

@@ -94,7 +94,7 @@ _ms(){ local _t; _t=$(date +%s%3N 2>/dev/null); case "$_t" in ''|*[!0-9]*) echo 
 STUBS
   printf 'AGENT=agent_stub\n'
   printf 'timeout(){ shift 3; "$@"; }\n'
-  printf 'keystore_register_all(){ :; }; _apps_stage_prog(){ :; }; appcode_stage_play_dormant(){ :; }\n'
+  printf 'keystore_register_all(){ :; }; appcode_pm_snapshot(){ :; }; _apps_stage_prog(){ :; }; appcode_stage_play_dormant(){ :; }\n'
   printf '%s\n' "$FUNCS"
 }
 

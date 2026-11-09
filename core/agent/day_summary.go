@@ -20,6 +20,8 @@ package main
 //	v=1 t=<unix s> ev=save ms=<n> rc=<ok|partial|refused|timeout|busy|err> kib=<n|->   triggerRoamWorkerKind, periodic + manual
 //	v=1 t=<unix s> ev=sweep apps=<n> ok=<n> fail=<n> ms=<n>                            DIAG-EVENT sweep (the chooser's Auto sweep)
 //
+// The signin line's times exclude the heal since NWP-20261130-08 (signin_summary.go); this line carries no heal figure.
+//
 // A save line's kib (NWP-20261128-29) is that run's upload KiB, the sum of <dest>/seal-split (push_stat.go), or "-"
 // when the run left none. A save line without kib (written before NWP-20261128-29) still reads.
 //

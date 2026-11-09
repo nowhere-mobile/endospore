@@ -192,7 +192,16 @@ public final class GateAlarmActivity extends Activity {
     @Override public boolean dispatchKeyEvent(KeyEvent event) {
         int kc = event.getKeyCode();
         if (kc == KeyEvent.KEYCODE_VOLUME_UP || kc == KeyEvent.KEYCODE_VOLUME_DOWN || kc == KeyEvent.KEYCODE_VOLUME_MUTE) {
-            if (event.getAction() == KeyEvent.ACTION_DOWN) stopRinging(); // a volume press silences the alarm
+            if (event.getAction() == KeyEvent.ACTION_DOWN) {
+                stopRinging(); // a volume press silences the alarm
+                // NWP-20261128-34: ... and lets the screen go. onCreate holds it on and only onDestroy cleared it, but
+                // nothing finishes this activity after a volume press (stopRinging cancelled the unattended timer), so
+                // a silenced alarm held the display on until the battery died: the end state dn-1023 #12 prevents. The
+                // screen now times out under the gate's own timeout; this surface stays on top, so the next wake shows
+                // Snooze/Dismiss. What a volume key does to the ring is unchanged. No GateTrace event: the trace
+                // vocabulary is closed.
+                try { getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON); } catch (Throwable ignore) {}
+            }
             return true; // consumed -- PhoneWindow must never see these (no MediaSessionManager here)
         }
         return super.dispatchKeyEvent(event);

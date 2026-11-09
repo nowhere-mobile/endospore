@@ -316,6 +316,13 @@ pin "SmsDeliverReceiver.postLossNotice" "$(body "$SD" 'static void postLossNotic
     }
 PIN
 )"
+pin "SmsDeliverReceiver.postDownloadLoss" "$(body "$SD" 'static void postDownloadLoss(Context ctx, int subId, String aid)' '    ')" "$(cat <<'PIN'
+    static void postDownloadLoss(Context ctx, int subId, String aid) {
+        android.util.Log.w("NowhereChooser", "#150 gate MMS download failed: loss notice unless the line is known Private");
+        if (!TelArrival.knownPrivate(safe(iccidForSub(ctx, subId)))) postLossNotice(ctx, "mms", 0, aid);
+    }
+PIN
+)"
 pin "SmsDeliverReceiver.postMessageNotice" "$(body "$SD" 'private static void postMessageNotice(Context ctx, String label, String kind, int callType, String number)' '    ')" "$(cat <<'PIN'
     private static void postMessageNotice(Context ctx, String label, String kind, int callType, String number) {
         try {
@@ -329,7 +336,10 @@ pin "SmsDeliverReceiver.postMessageNotice" "$(body "$SD" 'private static void po
             String title = isCall ? (callType == 1 ? "Incoming call" : "Missed call") : "New message";
             // Distinct id per (line, KIND): a call and a message on the SAME line must NOT replace each other
             // (keying on the line alone collapsed them to whichever arrived last -- the "only the latest" bug).
-            final int nid = Math.abs(("t" + line + "|" + (isCall ? "c" : "m")).hashCode());
+            // NWP-20261128-18: an answered call ("ci") and a missed call ("c") are apart too: on one id the last call
+            // re-titled the whole running count, so an answered call then a missed one read "2 missed calls". A missed
+            // call keeps "c", so a missed-call notice posted before this build is still found and counted.
+            final int nid = Math.abs(("t" + line + "|" + (isCall ? (callType == 1 ? "ci" : "c") : "m")).hashCode());
             // NWP-20261013-41: a second arrival replaces the first in place, so the running count rides on the notice
             // (nowhere_count) -- 1 for a notice posted before this build, 0 when there is none -- and the title says so.
             int count = 1;
@@ -350,6 +360,7 @@ pin "SmsDeliverReceiver.postMessageNotice" "$(body "$SD" 'private static void po
             // BOTH a missed call AND a new message on one line ("Missed call · New message"), not just the latest.
             android.os.Bundle nx = new android.os.Bundle();
             nx.putString("nowhere_kind", isCall ? "call" : "message");
+            if (isCall) nx.putString("nowhere_call", callType == 1 ? "incoming" : "missed"); // NWP-20261128-18: which call, for the banner (TelNoticeClear.kindOf)
             nx.putInt("nowhere_count", count);
             // NWP-20261006-04: mark the unassigned line's notice, so the gate banner knows a tap may lead to the owner inbox.
             if (UNBOUND_LINE.equals(line)) nx.putString("nowhere_line", "unbound");
@@ -654,8 +665,9 @@ pin "WapPushDeliverReceiver.handleNotification" "$(body "$WP" 'private static vo
             // kept, so leave the loss notice, the same as an unresolved text or call (docs/product-decisions.md
             // 2026-09-30, answer 2). No txn is claimed, so a later push that DOES name a SIM is not skipped.
             final String t0 = txnId(nInd);
+            final String aid = TelArrival.mmsId(subId, t0, loc, when); // NWP-20260930-05: a re-push has the same id
             if (subId == SubscriptionManager.INVALID_SUBSCRIPTION_ID) {
-                SmsDeliverReceiver.postLossNotice(app, "mms", 0, TelArrival.mmsId(subId, t0, loc, when));
+                SmsDeliverReceiver.postLossNotice(app, "mms", 0, aid);
                 return;
             }
 
@@ -685,7 +697,7 @@ pin "WapPushDeliverReceiver.handleNotification" "$(body "$WP" 'private static vo
                     .putExtra(MmsDownloadedReceiver.EXTRA_WHEN, when)
                     .putExtra(MmsDownloadedReceiver.EXTRA_FROM, from)
                     .putExtra(MmsDownloadedReceiver.EXTRA_TXN, txn).putExtra(MmsDownloadedReceiver.EXTRA_MONO, mono)
-                    .putExtra(MmsDownloadedReceiver.EXTRA_AID, TelArrival.mmsId(subId, t0, loc, when)); // NWP-20260930-05
+                    .putExtra(MmsDownloadedReceiver.EXTRA_AID, aid); // NWP-20260930-05
             PendingIntent pi = PendingIntent.getBroadcast(app, name.hashCode(), done,
                     PendingIntent.FLAG_ONE_SHOT | PendingIntent.FLAG_MUTABLE);
 
@@ -707,10 +719,11 @@ pin "WapPushDeliverReceiver.handleNotification" "$(body "$WP" 'private static vo
             } catch (Throwable kick) {
                 finishDownload(app, fName, fUri, subId); // undo the grant + PDN ref + token on a failed kick
                 releaseTxn(txn);                         // and free the txn so the next re-push retries
+                SmsDeliverReceiver.postDownloadLoss(app, subId, aid); // docs/product-decisions.md 2026-11-05, #14
                 throw kick;
             }
             android.util.Log.i("NowhereChooser", "#150 download kicked (uri=" + contentUri + ")");
-            armDownloadTimeout(app, fName, fUri, subId, txn);
+            armDownloadTimeout(app, fName, fUri, subId, txn, aid);
         } catch (Throwable t) {
             android.util.Log.w("NowhereChooser", "#150 notification handling failed", t);
         }
@@ -737,10 +750,11 @@ pin "MmsDownloadedReceiver.onReceive" "$(body "$MD" '@Override public void onRec
         // unlink the staging body, drop the MmsService's grant, release the MMS-PDN ref (IN_FLIGHT arbitrates), finish.
         final java.util.concurrent.atomic.AtomicBoolean fin = new java.util.concurrent.atomic.AtomicBoolean();
         final Runnable done = () -> { if (fin.compareAndSet(false, true)) { WapPushDeliverReceiver.finishDownload(app, name, uriStr, subId); pr.finish(); } };
+        final java.util.concurrent.atomic.AtomicBoolean sealStarted = new java.util.concurrent.atomic.AtomicBoolean();
         new Thread(() -> {
             boolean delivered = false;
             try {
-                delivered = sealDownloaded(app, result, httpStatus, staged, subId, when, fromHint, done, aid, mono);
+                delivered = sealDownloaded(app, result, httpStatus, staged, subId, when, fromHint, done, aid, mono, sealStarted);
             } catch (Throwable t) {
                 android.util.Log.w("NowhereChooser", "#150 downloaded-MMS handling failed", t);
             } finally {
@@ -753,6 +767,10 @@ pin "MmsDownloadedReceiver.onReceive" "$(body "$MD" '@Override public void onRec
                 // per-boot su:s0 janitor are the backstops.
                 TelScrub.mms(app);
                 done.run(); // if the parse never got that far; whatever happened, the cleartext body does not outlive this
+                // docs/product-decisions.md 2026-11-05, #14: a body that never reached the seal leaves the loss notice. A seal
+                // that started keeps settle's own answer, so one failure never posts two. This comes after the cleanup, which
+                // never waits for a notice.
+                if (!delivered && !sealStarted.get()) SmsDeliverReceiver.postDownloadLoss(app, subId, aid);
             }
         }).start();
     }
@@ -760,7 +778,8 @@ PIN
 )"
 pin "MmsDownloadedReceiver.sealDownloaded" "$(body "$MD" 'private static boolean sealDownloaded(Context app, int result, int httpStatus, File staged, int subId, long when,' '    ')" "$(cat <<'PIN'
     private static boolean sealDownloaded(Context app, int result, int httpStatus, File staged, int subId, long when,
-                                          String fromHint, Runnable done, String aid, long mono) throws Exception {
+                                          String fromHint, Runnable done, String aid, long mono,
+                                          java.util.concurrent.atomic.AtomicBoolean sealStarted) throws Exception {
         if (result != Activity.RESULT_OK) {
             android.util.Log.w("NowhereChooser", "#150 MMS download FAILED: result=" + result
                     + " httpStatus=" + httpStatus);
@@ -795,6 +814,7 @@ pin "MmsDownloadedReceiver.sealDownloaded" "$(body "$MD" 'private static boolean
             String ct = bytesToStr(p.getContentType());
             parts.add(new SmsDeliverReceiver.MmsPart(ct, nm, MmsText.toUtf8(ct, p.getCharset(), d)));
         }
+        sealStarted.set(true);
         int outcome = SmsDeliverReceiver.sealMmsAndNotify(app, subId, from, when, subject, parts, aid, mono);
         android.util.Log.i("NowhereChooser", "#150 MMS sealed: from=" + WapPushDeliverReceiver.redact(from)
                 + " parts=" + parts.size() + " totalBytes=" + totalBytes + " outcome=" + outcome);
@@ -914,15 +934,13 @@ pin "ChooserActivity.telNotices" "$(body "$CA" 'private java.util.List<String[]>
                 if (ex == null) continue;
                 CharSequence title = ex.getCharSequence(android.app.Notification.EXTRA_TITLE);
                 if (title == null || title.length() == 0) continue;
-                String kind = ex.getString("nowhere_kind", "");
-                boolean isCall = "call".equals(kind)
-                        || (kind.isEmpty() && (title.toString().startsWith("Missed call")
-                                            || title.toString().startsWith("Incoming call")));
+                // "call" (missed) | "incoming" (answered at the gate) | "message" (NWP-20261128-18)
+                String kind = TelNoticeClear.kindOf(ex.getString("nowhere_kind", ""), ex.getString("nowhere_call", ""), title.toString());
                 boolean isLoss = !ex.getString("nowhere_class", "").isEmpty(); // "may not have been saved" (NWP-20260930-05)
                 boolean unbound = "unbound".equals(ex.getString("nowhere_line", ""))
                         || title.toString().endsWith(SmsDeliverReceiver.UNBOUND_LINE); // the unassigned line's (NWP-20261006-04)
                 CharSequence text = ex.getCharSequence(android.app.Notification.EXTRA_TEXT); // opted-in "From <number>"
-                notices.add(new String[]{noticeLabel(sbn), isCall ? "call" : "message",
+                notices.add(new String[]{noticeLabel(sbn), kind,
                         String.valueOf(Math.max(1, ex.getInt("nowhere_count", 1))), String.valueOf(isLoss),
                         (text != null && text.length() > 0) ? title + "  ·  " + text : title.toString(),
                         String.valueOf(unbound)});
@@ -1003,6 +1021,8 @@ WR=$(body "$WP" '@Override public void onReceive(Context ctx, Intent intent)' ' 
 WH=$(body "$WP" 'private static void handleNotification(Context app, byte[] data, int subId, long when, long mono)' '    ')
 MR=$(body "$MD" '@Override public void onReceive(Context ctx, Intent intent)' '    ')
 SDn=$(body "$MD" 'private static boolean sealDownloaded(Context app, int result, int httpStatus, File staged, int subId, long when,' '    ')
+AT=$(body "$WP" 'private static void armDownloadTimeout(Context app, String name, String uriStr, int subId, String txn, String aid)' '    ')
+PL=$(body "$SD" 'static void postDownloadLoss(Context ctx, int subId, String aid)' '    ')
 BS=$(body "$CA" 'private java.util.List<String[]> bindingSummaries(java.util.List<String> lines)' '    ')
 FS=$(body "$CA" 'private void fillSimRows(LinearLayout rows, java.util.List<String[]> sums, java.util.List<SimInfo> sims, int inactiveEsims)' '    ')
 TS=$(body "$CA" 'static String summarize(java.util.List<String[]> notices)' '    ')
@@ -1015,7 +1035,7 @@ if has "$R" 'final long when = System.currentTimeMillis(), mono = TelArrival.sta
 if [ "$(count "$U" 'DaemonSocket.roundTrip(req, timeoutMs)')" = 1 ] && ! has "$U" 'req ='; then ok "every attempt sends the same request bytes"; else no "an attempt builds a new request -- a retry would be a new arrival"; fi
 if has "$F" 'final long mono = TelArrival.callStamp(call);' && has "$F" 'true, TelArrival.callId(subId, when), mono);' && has "$IA" 'super.onCallAdded(call); TelArrival.stampCall(call);'; then ok "a call's stamp is taken at its first onCallAdded, before the #145 re-check"; else no "a call's stamp is not its arrival's"; fi
 if has "$(body "$TA" 'static String callId(int subId, long createdMs)' '    ')" 'return sha256Hex("call\0" + subId + "\0" + createdMs);'; then ok "the call id is its subId and creation time, as both call services compute it"; else no "the call id is not its subId and creation time"; fi
-if has "$WH" '.putExtra(MmsDownloadedReceiver.EXTRA_AID, TelArrival.mmsId(subId, t0, loc, when));' && has "$WH" '.putExtra(MmsDownloadedReceiver.EXTRA_TXN, txn).putExtra(MmsDownloadedReceiver.EXTRA_MONO, mono)' && has "$MR" 'aid = intent.hasExtra(EXTRA_AID) ? intent.getStringExtra(EXTRA_AID)' && has "$MR" 'mono = intent.getLongExtra(EXTRA_MONO, TelArrival.stamp());'; then ok "an MMS's id and stamp are taken at its push and carried to the seal"; else no "an MMS's id or stamp is taken at its download"; fi
+if has "$WH" 'final String aid = TelArrival.mmsId(subId, t0, loc, when);' && has "$WH" '.putExtra(MmsDownloadedReceiver.EXTRA_AID, aid);' && has "$WH" '.putExtra(MmsDownloadedReceiver.EXTRA_TXN, txn).putExtra(MmsDownloadedReceiver.EXTRA_MONO, mono)' && has "$MR" 'aid = intent.hasExtra(EXTRA_AID) ? intent.getStringExtra(EXTRA_AID)' && has "$MR" 'mono = intent.getLongExtra(EXTRA_MONO, TelArrival.stamp());'; then ok "an MMS's id and stamp are taken at its push and carried to the seal"; else no "an MMS's id or stamp is taken at its download"; fi
 if has "$(body "$TA" 'static String mmsId(int subId, String txn, String loc, long when)' '    ')" 'String key = txn != null && !txn.isEmpty() ? "t" + txn : loc != null && !loc.isEmpty() ? "l" + loc : "w" + when;'; then ok "an MMS is named by its transaction id first, so a carrier re-push has the same id"; else no "an MMS is named by something a re-push changes"; fi
 
 echo
@@ -1042,7 +1062,7 @@ if has "$L" 'nm.notify(TEL_LOSS_TAG, java.util.Objects.hashCode(aid),'; then ok 
 if has "$L" 'if (LOSS_ANNOUNCED.add(String.valueOf(aid)) && !isCall) alertGateArrival(gate);' && has "$L" 'if (LOSS_ANNOUNCED.size() >= 4096) LOSS_ANNOUNCED.clear();'; then ok "a text's loss notice chimes once per arrival, from a bounded set"; else no "a repeat chimes again, or the set grows without bound"; fi
 if has "$L" '.setContentTitle((isCall ? (callType == 1 ? "Incoming call" : "Missed call") : "New message") + " — may not have been saved").build());'; then ok "an answered call's loss notice says Incoming call, as the gate's own notice does"; else no "an answered call's loss notice says Missed call"; fi
 if has "$N" 'if (!sbn.getNotification().extras.getString("nowhere_class", "").isEmpty()) continue;'; then ok "no label-based clear removes a loss notice"; else no "a login or a resume clears a loss notice"; fi
-if has "$TS" 'if ("true".equals(n[3])) c[2] += k; else if ("call".equals(n[1])) c[0] += k; else c[1] += k;'; then ok "the gate's banner counts loss notices as their own kind"; else no "the banner counts a loss notice as a missed call or a message"; fi
+if has "$TS" 'if ("true".equals(n[3])) c[2] += k; else if ("call".equals(n[1])) c[0] += k; else if ("incoming".equals(n[1])) c[3] += k; else c[1] += k;'; then ok "the gate's banner counts loss notices as their own kind"; else no "the banner counts a loss notice as a missed call or a message"; fi
 
 echo
 echo "== the SIM is never guessed =="
@@ -1051,7 +1071,7 @@ for f in "$SD" "$IC" "$CC" "$WP" "$MD" "$TA" "$RC"; do
 done
 if has "$SI" 'if (named != SubscriptionManager.INVALID_SUBSCRIPTION_ID) return named;' && has "$SI" 'int slot = intent.getIntExtra(SubscriptionManager.EXTRA_SLOT_INDEX, -1);' && has "$SI" 'SubscriptionInfo si = sm == null ? null : sm.getActiveSubscriptionInfoForSimSlotIndex(slot);' && has "$SI" 'if (si != null) return si.getSubscriptionId();' && ! has "$SI" 'getActiveSubscriptionInfoList'; then ok "an arrival's SIM is the one named, else its slot's, else unidentified"; else no "an arrival's SIM is guessed"; fi
 if has "$R" 'final int subId = TelArrival.subIdOr(ctx, intent, intent.getIntExtra("subscription", SubscriptionManager.INVALID_SUBSCRIPTION_ID));' && has "$WR" 'final int subId = TelArrival.subIdOr(ctx, intent, intent.getIntExtra("subscription",'; then ok "a text's and a WAP push's SIM both go through subIdOr"; else no "a text's or a WAP push's SIM is only what the intent names -- one whose subscription came up late is unidentified"; fi
-if has "$WH" 'if (subId == SubscriptionManager.INVALID_SUBSCRIPTION_ID) {' && has "$WH" 'SmsDeliverReceiver.postLossNotice(app, "mms", 0, TelArrival.mmsId(subId, t0, loc, when));'; then ok "an MMS whose SIM is not identified leaves the loss notice and is not downloaded on subscription -1"; else no "an MMS whose SIM is not identified is downloaded on subscription -1, or dropped with no trace"; fi
+if has "$WH" 'if (subId == SubscriptionManager.INVALID_SUBSCRIPTION_ID) {' && has "$WH" 'SmsDeliverReceiver.postLossNotice(app, "mms", 0, aid);'; then ok "an MMS whose SIM is not identified leaves the loss notice and is not downloaded on subscription -1"; else no "an MMS whose SIM is not identified is downloaded on subscription -1, or dropped with no trace"; fi
 
 echo
 echo "== the calls: the scrub does not wait, and a rejected call is sealed in user 0 =="
@@ -1072,6 +1092,21 @@ if [ "$(code "$(cat "$WP")" | grep -cF 'final String txn = t0.isEmpty() ? "" : s
 pa=$(line "$SDn" 'GenericPdu pdu = new PduParser(body, true).parse(); done.run();'); sm=$(line "$SDn" 'SmsDeliverReceiver.sealMmsAndNotify(')
 if [ "$pa" -gt 0 ] && [ "$pa" -lt "$sm" ]; then ok "the download is finished (body unlinked, grant and PDN released, broadcast finished) before the seal's retries"; else no "the download is finished only after the seal -- the retries hold the body and the MMS PDN"; fi
 if has "$SDn" 'return outcome != SmsDeliverReceiver.SEAL_FAILED;' && has "$MR" 'if (!delivered) WapPushDeliverReceiver.releaseTxn(txn);'; then ok "an answered seal keeps the claim, and only a failed one releases it for the re-push"; else no "an MMS the daemon answered is downloaded again, or a failed one is never retried"; fi
+
+echo
+echo "== a failed download leaves the loss notice, once per failure (docs/product-decisions.md 2026-11-05, #14) =="
+LP='SmsDeliverReceiver.postDownloadLoss(app, subId, aid);'
+if has "$PL" 'if (!TelArrival.knownPrivate(safe(iccidForSub(ctx, subId)))) postLossNotice(ctx, "mms", 0, aid);' && [ "$(count "$PL" 'postLossNotice(')" = 1 ]; then ok "a failed download posts the 2026-09-30 notice, unless the line is known Private"; else no "a failed download's notice ignores the Private rule, a Private line would show one"; fi
+if [ "$(count "$PL" 'android.util.Log.')" = 1 ] && [ "$(code "$PL" | grep -F 'android.util.Log.' | grep -cF '+')" = 0 ]; then ok "its one log line is fixed text: no number and no id"; else no "its log line is missing or carries a value"; fi
+kc=$(line "$WH" 'catch (Throwable kick)'); kf=$(line "$WH" 'finishDownload(app, fName, fUri, subId);'); kr=$(line "$WH" 'releaseTxn(txn);'); kp=$(line "$WH" "$LP"); kt=$(line "$WH" 'throw kick;')
+if [ "$(count "$WH" "$LP")" = 1 ] && [ "$kc" -gt 0 ] && [ "$kc" -lt "$kf" ] && [ "$kf" -lt "$kr" ] && [ "$kr" -lt "$kp" ] && [ "$kp" -lt "$kt" ]; then ok "a failed kick posts it once, after the cleanup and before the rethrow"; else no "a failed kick leaves no trace, or posts outside its catch"; fi
+af=$(line "$AT" 'if (finishDownload(app, name, uriStr, subId)) {'); ar=$(line "$AT" 'releaseTxn(txn);'); ap=$(line "$AT" "$LP"); ae=$(code "$AT" | awk -v s="$af" 'NR > s && $0 == "            }" { print NR; exit }')
+if [ "$(count "$AT" "$LP")" = 1 ] && [ "$af" -gt 0 ] && [ "$af" -lt "$ar" ] && [ "$ar" -lt "$ap" ] && [ "$ap" -lt "${ae:-0}" ]; then ok "a timeout posts it once, inside its finishDownload test: a callback that finished the download posts nothing more"; else no "a timeout leaves no trace, or posts after a callback already finished the download"; fi
+ml=$(line "$MR" 'finally {'); md=$(line "$MR" 'done.run();'); mf=$(line "$MR" "if (!delivered && !sealStarted.get()) $LP")
+if [ "$(count "$MR" 'postDownloadLoss(')" = 1 ] && [ "$ml" -gt 0 ] && [ "$ml" -lt "$md" ] && [ "$md" -lt "$mf" ] && has "$MR" 'fromHint, done, aid, mono, sealStarted);'; then ok "a body that never reached the seal posts it once, after the cleanup, and a started seal keeps settle's answer"; else no "a failed callback leaves no trace, or a failed seal posts two notices"; fi
+fs=$(line "$SDn" 'sealStarted.set(true);')
+if [ "$(count "$SDn" 'sealStarted.set(')" = 1 ] && [ "$fs" -gt 0 ] && [ "$sm" = "$((fs+1))" ]; then ok "the flag is set immediately before the seal"; else no "the flag is set too early (a parse failure reads as a started seal), or too late"; fi
+if [ "$(count "$SDn" 'postDownloadLoss(')" = 0 ]; then ok "the delivered path posts no loss notice"; else no "an MMS the daemon answered also posts the loss notice"; fi
 
 echo
 echo "== the v2 wire =="
@@ -1152,7 +1187,7 @@ if [ "$MUTATE" = yes ]; then
   # each reply's meaning
   mutate "OK read by its count"                             SmsDeliverReceiver.java '/^        \/\/ Private (owner opted out) OR gateNotice=false/{n;n;s/return SEAL_SEALED;/return r.label.isEmpty() ? SEAL_NONE : SEAL_SEALED;/}'
   mutate "the OK count field parsed"                        TelArrival.java 's/r.vis = f.length > 1 ? f\[1\] : "open";/r.vis = f.length > 3 ? f[3] : f.length > 1 ? f[1] : "open";/'
-  mutate "an unidentified MMS dropped with no notice"       WapPushDeliverReceiver.java 's/                SmsDeliverReceiver.postLossNotice(app, "mms", 0, TelArrival.mmsId(subId, t0, loc, when));//'
+  mutate "an unidentified MMS dropped with no notice"       WapPushDeliverReceiver.java 's/                SmsDeliverReceiver.postLossNotice(app, "mms", 0, aid);//'
   mutate "an unidentified MMS downloaded on subscription -1" WapPushDeliverReceiver.java 's/if (subId == SubscriptionManager.INVALID_SUBSCRIPTION_ID) {/if (false) {/'
   mutate "an UNRESOLVED read as a failure"                  SmsDeliverReceiver.java 's/return r == null || "ERR".equals(r.kind) ? SEAL_FAILED : SEAL_UNKEPT;/return SEAL_FAILED;/'
   mutate "the unassigned-SIM notice in the caller's user"   SmsDeliverReceiver.java 's/postMessageNotice(asGate(ctx), UNBOUND_LINE, kind, callType, null);/postMessageNotice(ctx, UNBOUND_LINE, kind, callType, null);/'
@@ -1196,6 +1231,15 @@ if [ "$MUTATE" = yes ]; then
   mutate "the download finished after the seal"             MmsDownloadedReceiver.java 's/GenericPdu pdu = new PduParser(body, true).parse(); done.run();/GenericPdu pdu = new PduParser(body, true).parse();/'
   mutate "an answered MMS releases its claim"               MmsDownloadedReceiver.java 's/return outcome != SmsDeliverReceiver.SEAL_FAILED;/return outcome == SmsDeliverReceiver.SEAL_SEALED || outcome == SmsDeliverReceiver.SEAL_NONE;/'
   mutate "a failed MMS keeps its claim"                     MmsDownloadedReceiver.java 's/if (!delivered) WapPushDeliverReceiver.releaseTxn(txn);/if (false) WapPushDeliverReceiver.releaseTxn(txn);/'
+  mutate "X1 a failed kick posts nothing"                   WapPushDeliverReceiver.java '/catch (Throwable kick)/,/throw kick;/{/SmsDeliverReceiver.postDownloadLoss(app, subId, aid);/d}'
+  mutate "X2 a timeout posts nothing"                       WapPushDeliverReceiver.java '/private static void armDownloadTimeout(/,/^    }$/{/SmsDeliverReceiver.postDownloadLoss(app, subId, aid);/d}'
+  mutate "X3 a failed callback posts nothing"               MmsDownloadedReceiver.java '/if (!delivered \&\& !sealStarted.get()) SmsDeliverReceiver.postDownloadLoss(app, subId, aid);/d'
+  mutate "X4 the Private rule dropped"                      SmsDeliverReceiver.java 's/if (!TelArrival.knownPrivate(safe(iccidForSub(ctx, subId)))) postLossNotice(ctx, "mms", 0, aid);/postLossNotice(ctx, "mms", 0, aid);/'
+  mutate "X5 a started seal posts a second notice"          MmsDownloadedReceiver.java 's/if (!delivered \&\& !sealStarted.get()) SmsDeliverReceiver/if (!delivered) SmsDeliverReceiver/'
+  mutate "X6 the timeout posts outside its test"            WapPushDeliverReceiver.java '/private static void armDownloadTimeout(/,/^    }$/{/SmsDeliverReceiver.postDownloadLoss(app, subId, aid);/{N;s/^\([^\n]*\)\n\([^\n]*\)$/\2\n            SmsDeliverReceiver.postDownloadLoss(app, subId, aid);/}}'
+  mutate "X7 the flag set at the top of the method"         MmsDownloadedReceiver.java '/^        sealStarted.set(true);$/d; /AtomicBoolean sealStarted) throws Exception {$/a\        sealStarted.set(true);'
+  mutate "X8 a delivered MMS posts the loss notice"         MmsDownloadedReceiver.java 's/^        return outcome != SmsDeliverReceiver.SEAL_FAILED;$/        SmsDeliverReceiver.postDownloadLoss(app, subId, aid);\n&/'
+  mutate "X9 the log line carries the arrival id"           SmsDeliverReceiver.java 's/known Private");$/known Private " + aid);/'
   # the wire
   mutate "SEAL-TEL v1 again"                                TelArrival.java 's/return "SEAL-TEL\\nv2\\n" + aid + "\\n" + kind/return "SEAL-TEL\\n" + kind/'
   mutate "the sender raw again"                             TelArrival.java 's/+ iccid + "\\n" + b64(from) + "\\n" + when + "\\n"/+ iccid + "\\n" + from + "\\n" + when + "\\n"/'

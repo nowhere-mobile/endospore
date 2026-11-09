@@ -331,11 +331,11 @@ func TestCallRowCarriesItsSIM(t *testing.T) {
 		t.Fatalf("call row = %q; want its body slot to be -<tag>", call)
 	}
 	sms := strings.TrimRight(serializeTelIngest([]telItem{testSMS}, tx), "\n")
-	if f := strings.Fields(sms); len(f) != 6 || f[5] != b64tok(testSMS.Body) {
-		t.Fatalf("sms row = %q; its body slot must still be the body", sms)
+	if f := strings.Fields(sms); len(f) != 7 || f[5] != b64tok(testSMS.Body) || f[6] != "sim:"+tx {
+		t.Fatalf("sms row = %q; its body slot must still be the body, and its tag in the slot after it", sms)
 	}
 	for row, want := range map[string]string{
-		call: tx, call + " 2": tx, sms: "", "call 5 3 0 KzE - 1": "", "call 5 3 0 KzE -zz 1": "",
+		call: tx, call + " 2": tx, sms: tx, "call 5 3 0 KzE - 1": "", "call 5 3 0 KzE -zz 1": "",
 		"sms 1 0 0 - -" + tx: "", "mms 1 abc": "", "": "",
 	} {
 		if got := rowTag(row); got != want {

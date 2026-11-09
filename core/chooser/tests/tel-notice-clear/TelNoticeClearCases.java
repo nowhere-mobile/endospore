@@ -57,6 +57,25 @@ public final class TelNoticeClearCases {
                 of("Work", "Büro")));
         c("U5 first token never decoded", () -> set("U5 first token never decoded",
                 TelNoticeClear.unboundLabels("LV29yaw== LQQ=="), of("A")));
+
+        // NWP-20261128-18: the kind a gate notice stands for. The nowhere_call extra wins over the title; a notice
+        // posted before that extra is read by its title, before the "  -  <label>" suffix.
+        c("K1 an answered call by its extra", () -> eq("K1 an answered call by its extra",
+                TelNoticeClear.kindOf("call", "incoming", "Missed call  -  Sim1"), "incoming"));
+        c("K2 a missed call by its extra", () -> eq("K2 a missed call by its extra",
+                TelNoticeClear.kindOf("call", "missed", "Incoming call  -  Sim1"), "call"));
+        c("K3 an older answered call by its title", () -> eq("K3 an older answered call by its title",
+                TelNoticeClear.kindOf("call", "", "Incoming call  -  Sim1"), "incoming"));
+        c("K4 an older count of answered calls by its title", () -> eq("K4 an older count of answered calls by its title",
+                TelNoticeClear.kindOf("call", "", "2 incoming calls  -  Sim1"), "incoming"));
+        c("K5 an older missed call by its title", () -> eq("K5 an older missed call by its title",
+                TelNoticeClear.kindOf("call", "", "Missed call"), "call"));
+        c("K6 a notice with no extras by its title", () -> eq("K6 a notice with no extras by its title",
+                TelNoticeClear.kindOf("", "", "Incoming call"), "incoming"));
+        c("K7 a message", () -> eq("K7 a message", TelNoticeClear.kindOf("message", "", "New message"), "message"));
+        c("K8 the label cannot change the kind", () -> eq("K8 the label cannot change the kind",
+                TelNoticeClear.kindOf("call", "", "2 missed calls  -  x incoming calls"), "call"));
+        c("K9 null extras and title", () -> eq("K9 null extras and title", TelNoticeClear.kindOf(null, null, null), "message"));
         System.exit(bad == 0 ? 0 : 1);
     }
 }

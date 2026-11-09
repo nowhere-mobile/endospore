@@ -18,6 +18,8 @@
 #   bash test-appcode-stage-mtime.sh            # the cases, under every shell found (bash sh dash mksh)
 #   bash test-appcode-stage-mtime.sh --mutate   # ... plus mutants that must each be CONVICTED under each shell
 #   ONLY="a b" ROAMD=<file> bash test-appcode-stage-mtime.sh   # a subset, e.g. against an older roamd
+# Assertions feed grep -q from a here-string, never from a pipe: bash's printf writes line by line, so a grep -q that
+# matches early leaves printf a closed pipe, and pipefail reads that as no match (the b case failed so, 2026-11-05).
 set -uo pipefail
 
 MUTATE=no
@@ -79,7 +81,7 @@ _ms(){ local _t; _t=$(date +%s%3N 2>/dev/null); case "$_t" in ''|*[!0-9]*) echo 
 STUBS
   printf 'AGENT=agent_stub\n'
   printf 'timeout(){ shift 3; "$@"; }\n'
-  printf 'keystore_register_all(){ :; }; _apps_stage_prog(){ :; }; appcode_stage_play_dormant(){ :; }\n'
+  printf 'keystore_register_all(){ :; }; appcode_pm_snapshot(){ :; }; _apps_stage_prog(){ :; }; appcode_stage_play_dormant(){ :; }\n'
   printf '%s\n' "$FUNCS"
   [ -f "$2/touchfail" ] && printf 'touch(){ return 1; }\n'
   return 0
@@ -170,7 +172,7 @@ for s in $SHELLS; do
       good=y
       for e in ./com.l ./com.l/base.apk ./com.r ./com.r/split.apk ./com.o ./com.o/_meta ./com.o/_meta/meta ./com.o/_meta/sub \
                ./com.o/_meta/sub/x ./com.k ./com.k/base.apk ./com.q ./com.q/_meta ./com.q/_meta/0.png ./com.z; do
-        printf '%s\n' "$P1" | grep -q "^$e " || good=n
+        grep -q "^$e " <<<"$P1" || good=n
       done
       [ "$good" = y ] && ok "$t b the staged set holds every package dir, its APKs, _meta and its nested entries" \
         || no "$t b the staged set is missing entries: [$P1]"
@@ -182,9 +184,9 @@ for s in $SHELLS; do
       else no "$t b the two stagings differ: $(diff <(printf '%s\n' "$P1") <(printf '%s\n' "$P2") | grep '^[<>]' | head -6 | tr '\n' '|')"; fi
     fi
     if want e; then
-      has "$LOGTXT" "] #apps staged 5 pkg(s), " && printf '%s\n' "$LOGTXT" | grep -q "$STAGED_RE" \
+      has "$LOGTXT" "] #apps staged 5 pkg(s), " && grep -q "$STAGED_RE" <<<"$LOGTXT" \
         && ok "$t e the staging line carries 'copy <n>ms' and the kept-failed count" || no "$t e staging line: [$(printf '%s\n' "$LOGTXT" | grep '#apps staged')]"
-      printf '%s\n' "$LOGTXT" | grep '#apps staged' | grep -q 'com\.' && no "$t e the staging line names a package" || ok "$t e the staging line names no package"
+      grep -q 'com\.' <<<"$(grep '#apps staged' <<<"$LOGTXT")" && no "$t e the staging line names a package" || ok "$t e the staging line names no package"
     fi
     if want f; then
       [ ! -s "$T/tf1.txt" ] && [ ! -s "$T/tf2.txt" ] && grep -q . "$T/stat1.txt" \
@@ -196,8 +198,8 @@ for s in $SHELLS; do
     run_seal "$s" "$T" 1
     LOGTXT=$(cat "$T/log"); MANTXT=$(cat "$T/man1.txt")
     if want c; then
-      if printf '%s\n' "$MANTXT" | grep -qx 'com.l:7:0:installed:base.apk:split.apk' && printf '%s\n' "$MANTXT" | grep -qx 'com.r:7:0:installed:base.apk:split.apk' \
-         && printf '%s\n' "$MANTXT" | grep -qx 'com.k:0:0:installed:base.apk:split.apk' && printf '%s\n' "$MANTXT" | grep -qx 'com.o:7:0:ondemand:base.apk:split.apk' \
+      if grep -qx 'com.l:7:0:installed:base.apk:split.apk' <<<"$MANTXT" && grep -qx 'com.r:7:0:installed:base.apk:split.apk' <<<"$MANTXT" \
+         && grep -qx 'com.k:0:0:installed:base.apk:split.apk' <<<"$MANTXT" && grep -qx 'com.o:7:0:ondemand:base.apk:split.apk' <<<"$MANTXT" \
          && [ "$(cat "$T/res")" = 0 ] && ! has "$LOGTXT" 'did not copy whole'; then
         ok "$t c every touch failing: every package is still STAGED whole (manifest names its APKs, status 0)"
       else no "$t c a failed touch cut a package: man [$MANTXT] log [$LOGTXT]"; fi

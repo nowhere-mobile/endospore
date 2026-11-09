@@ -86,7 +86,7 @@ func aftergateMarkerPresent(ref string) bool {
 
 // landedRosterFile maps a store ref to the LANDED ROSTER (§5 item 2): a keyed digest per background rel the lander
 // has placed, in the walked roster's shape (walkedDigest, one per line), never a name. Its writer is the lander
-// (slice S4a); this slice only reads it. "" when receipts are off or ref is empty.
+// (recordLandedRoster, slice S4a). "" when receipts are off or ref is empty.
 func landedRosterFile(ref string) string {
 	d := restoreReceiptDir()
 	if d == "" || ref == "" {
@@ -101,6 +101,37 @@ func landedRosterFile(ref string) string {
 func loadLandedRoster(ref string, dk []byte) func(rel string) bool {
 	set := readWalkedDigests(landedRosterFile(ref))
 	return func(rel string) bool { return set[walkedDigest(dk, rel)] }
+}
+
+// recordLandedRoster UNIONS the digests of rels into the landed roster, as recordWalkedRoster does for the walked one:
+// read, add, sorted, temp file + rename in the same directory, 0600. Best effort: a rel whose digest does not reach the
+// file reads as unlanded, so it is walked if present and carried if the user deleted it (§5). A "" file is a no-op.
+func recordLandedRoster(ref string, dk []byte, rels []string) {
+	f := landedRosterFile(ref)
+	if f == "" || len(rels) == 0 {
+		return
+	}
+	set := readWalkedDigests(f)
+	for _, rel := range rels {
+		set[walkedDigest(dk, rel)] = true
+	}
+	lines := make([]string, 0, len(set))
+	for d := range set {
+		lines = append(lines, d)
+	}
+	slices.Sort(lines)
+	if os.MkdirAll(filepath.Dir(f), 0o700) != nil {
+		return
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(f), ".landed-")
+	if err != nil {
+		return
+	}
+	_, werr := tmp.WriteString(strings.Join(lines, "\n") + "\n")
+	cerr := tmp.Close()
+	if werr != nil || cerr != nil || os.Chmod(tmp.Name(), 0o600) != nil || os.Rename(tmp.Name(), f) != nil {
+		os.Remove(tmp.Name())
+	}
 }
 
 // unlandedBackground is the set of bgSplit(restoredM)'s background rels that landed does not hold. A nil landed

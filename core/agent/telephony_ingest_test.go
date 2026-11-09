@@ -49,6 +49,10 @@ func TestSerializeMmsIngest(t *testing.T) {
 func parseIngestLine(t *testing.T, line string) telItem {
 	t.Helper()
 	f := strings.Split(strings.TrimSpace(line), " ")
+	// NWP-20261130-01: an SMS row may carry its SIM's slot after the six fixed fields.
+	if len(f) == 7 && f[0] != "call" && strings.HasPrefix(f[6], simSlotPrefix) && isSimTag(f[6][len(simSlotPrefix):]) {
+		f = f[:6]
+	}
 	if len(f) != 6 {
 		t.Fatalf("line has %d fields, want 6: %q", len(f), line)
 	}

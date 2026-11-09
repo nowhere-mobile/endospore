@@ -196,7 +196,9 @@ incompatible → clear message; `INDEX_URL`/`CATALOG_URL` export assertion; SEAR
 ## Unresolved (track, decide before/at build)
 Index-key **rotation/revocation** (a baked `indexPubKey` rotates only via OTA; a leaked online key can push poisoned
 overrides until every device OTAs — amnesia limits each device to one power cycle of exposure, but state it) *(decided 2026-11-02, `docs/product-decisions.md`, the entry *"twenty-four answers to the open-decisions list ..."*, #8: a rollover or revocation object signed by the release key, as Q098's bad-build object is, built before the prod store opens)*;
-  **The object: verifier built (NWP-20261124-25), not fetched yet** (`core/agent/index_key.go`). The envelope is
+  **The object: verifier built (NWP-20261124-25); fetch and durable seq floor built (NWP-20261126-14); the /data refresh
+  checked with the selected key and the fetch after each OTA check built (NWP-20261129-18)** (`core/agent/index_key.go`,
+  `index_key_fetch.go`, `index.go`). The envelope is
   `nowhere-index-key 1`, a newline, the base64url signature, a newline, then the body. The release key
   (`releasePubKey`) signs `nowhere-index-key-v1\0` plus the body, so a release manifest or a build warning cannot pass
   as this object. The phone checks the signature before it parses the body, and refuses a body over 4 KiB. The body is
@@ -207,6 +209,6 @@ overrides until every device OTAs — amnesia limits each device to one power cy
   the decoded bytes. The object has no expiry: a rollover stands until an object with a higher seq replaces it. An
   expiry would put every phone back on the leaked key. A rollover's key checks the `/data` refresh. A revoked baked key
   with no new key means the phone accepts no `/data` refresh. The baked `/system` copy keeps the baked key. Left for the
-  next slice: the fetch, the durable seq floor, the operator's put command, and the call in `index.go`;
+  next slice: `publish-fdroid-index.sh` following a rollover, and a device moved to a new key without an OTA;
 curation policy (above); icon strategy (above); ~~metered-pref persistence under amnesia; multi-APK/split handling;~~ *(both decided 2026-10-20, Q079)*
 `/system` size budget for the baked index (~10 MB into read-only).

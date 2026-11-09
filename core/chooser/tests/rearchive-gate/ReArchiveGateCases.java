@@ -1,7 +1,8 @@
 package com.nowhere.chooser;
 
-/** NWP-20261102-15: ReArchiveReceiver's archive verdict, NWP-20261120-12: when its next sweep runs (armAt), and
- *  NWP-20261122-10: an app that holds a job (holdsJob) is kept, and visible and foreground-service time count as use.
+/** NWP-20261102-15: ReArchiveReceiver's archive verdict, NWP-20261120-12: when its next sweep runs (armAt),
+ *  NWP-20261122-10: an app that holds a job (holdsJob) is kept, and visible and foreground-service time count as use,
+ *  and NWP-20261129-14: a Play stack member an app with code on the phone needs (playNeeded) holds a job.
  *  Compiled with ReArchiveGate ALONE (java.* only). */
 public class ReArchiveGateCases {
     static final long DAY = 86_400_000L;
@@ -20,13 +21,14 @@ public class ReArchiveGateCases {
 
     static final long OLD = NOW - 10 * DAY; // well past IDLE
     static final String P = "com.foo";
+    static final String VENDING = "com.android.vending", GMS = "com.google.android.gms", GSF = "com.google.android.gsf";
 
     static boolean a(long idle, long used, long vis, long fgs, long update, boolean job) {
         return ReArchiveGate.archive(NOW, idle, used, vis, fgs, update, job);
     }
 
     static boolean held(String ime, String vpn, String a11y, String listeners, java.util.Set<String> roles) {
-        return ReArchiveGate.holdsJob(P, ime, vpn, a11y, listeners, roles);
+        return ReArchiveGate.holdsJob(P, ime, vpn, a11y, listeners, roles, null);
     }
 
     /** The job alone keeps the app: the same old times with no job archive it. */
@@ -34,6 +36,10 @@ public class ReArchiveGateCases {
         boolean control = a(IDLE, OLD, OLD, OLD, OLD, false);
         boolean verdict = a(IDLE, OLD, OLD, OLD, OLD, job);
         check(name, job && control && !verdict, "held=" + job + " control=" + control + " archived=" + verdict);
+    }
+
+    static java.util.Set<String> needed(String app, String... deps) {
+        return ReArchiveGate.playNeeded(java.util.Map.of(app, java.util.List.of(deps)));
     }
 
     static long at(long pending) { return ReArchiveGate.armAt(pending, NOW, NOW + H); }
@@ -65,10 +71,27 @@ public class ReArchiveGateCases {
                 !held("com.foo2/.Ime", "com.foo2", "com.foo2/.A", "com.foo2/.L", java.util.Set.of("com.foo2")), "held");
         check("a component without a slash holds nothing", !held("com.foo", null, "com.foo", "com.foo", null), "held");
         check("null sources hold nothing", !held(null, null, null, null, null)
-                && !ReArchiveGate.holdsJob(null, "com.foo/.Ime", "com.foo", null, null, null), "held");
+                && !ReArchiveGate.holdsJob(null, "com.foo/.Ime", "com.foo", null, null, null, null), "held");
         check("empty sources hold nothing", !held("", "", "", "", java.util.Collections.emptySet())
-                && !held("::", null, ":", ":", null) && !ReArchiveGate.holdsJob("", "/.Ime", "", ":/.A", "/.L", null),
+                && !held("::", null, ":", ":", null)
+                && !ReArchiveGate.holdsJob("", "/.Ime", "", ":/.A", "/.L", null, null), "held");
+        check("a Play client's deps name the whole stack",
+                needed("com.google.android.youtube", GMS, GSF, VENDING).equals(java.util.Set.of(GMS, GSF, VENDING)),
+                "" + needed("com.google.android.youtube", GMS, GSF, VENDING));
+        check("a stack member names its sibling", needed(VENDING, GMS).equals(java.util.Set.of(GMS)),
+                "" + needed(VENDING, GMS));
+        check("a non-stack dep is not needed", needed(P, "com.foo.dep").isEmpty(), "" + needed(P, "com.foo.dep"));
+        check("no apps with code need nothing", ReArchiveGate.playNeeded(java.util.Map.of()).isEmpty(),
+                "" + ReArchiveGate.playNeeded(java.util.Map.of()));
+        java.util.Set<String> stack = java.util.Set.of(VENDING);
+        kept("a needed stack member is kept past idle",
+                ReArchiveGate.holdsJob(VENDING, null, null, null, null, null, stack));
+        check("a needed stack member holds with every other source empty",
+                ReArchiveGate.holdsJob(VENDING, "", "", "", "", java.util.Collections.emptySet(), stack), "not held");
+        check("a member not in the set holds nothing",
+                !ReArchiveGate.holdsJob(VENDING, null, null, null, null, java.util.Set.of(), java.util.Set.of(GMS)),
                 "held");
+        check("a null set holds nothing", !ReArchiveGate.holdsJob(VENDING, null, null, null, null, null, null), "held");
         check("visible inside the window is kept", !a(IDLE, OLD, NOW - IDLE + 1, OLD, OLD, false), "archived");
         check("a foreground service inside the window is kept", !a(IDLE, OLD, OLD, NOW - IDLE + 1, OLD, false),
                 "archived");

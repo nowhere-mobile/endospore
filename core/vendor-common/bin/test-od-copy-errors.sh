@@ -117,7 +117,9 @@ od_watched() { shift; "$@" 2>&1; }
 grant_perms_for() { :; }
 keystore_register() { :; }
 # pm: an app with code -- `list packages -U ... <pkg>` lists the package's own line (the arm's NWP-20261122-03 read)
-pm() { case "$*" in "list packages -U "*) echo "package:$srcunit uid:1110234" ;; esac; return 0; }
+# ... and hold_ondemand's two listings name none of this suite's packages (NWP-20261129-27).
+pm() { case "$*" in "list packages -U "*) echo "package:$srcunit uid:1110234" ;; "list packages -s -u") echo package:android ;; esac; return 0; }
+timeout() { while [ "${1:-}" = -k ]; do shift 2; done; shift; "$@"; }
 reown_ext_appdata() { :; }
 wait_acct_authenticator() { :; }
 acct_reload() { :; }
@@ -152,7 +154,7 @@ EOF
       if [ "$2" = hold ]; then
         printf '%s\n%s\nhold_ondemand "$uid"\n' "$PKGOK" "$FNR"
       else
-        printf 'case "$op" in\n%s\nesac\n' "$ARMR"
+        printf '%s\ncase "$op" in\n%s\nesac\n' "$PKGOK" "$ARMR"
       fi
     } > "$d"
   }

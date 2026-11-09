@@ -6,6 +6,8 @@
 # recovered from a notice's title (TelNoticeClear.labelOf, after the FIRST "  -  "). test-tel-seal.sh pins
 # cancelTelNotices byte for byte but nothing ran these two parsers. They are lifted into a pure class, compiled here with
 # their cases, and a source check pins that ChooserActivity delegates to them and that cancelTelNotices is untouched.
+# NWP-20261128-18: TelNoticeClear.kindOf, the kind telNotices hands the banner ("call" a missed call, "incoming" an
+# answered one, "message"), is run here too, so an answered gate call is never counted as missed.
 #
 # ⚠ IT FAILS WHEN THERE IS NO JAVAC, IT NEVER SKIPS. javac comes from PATH, else from the build host's JDK below.
 #
@@ -136,4 +138,7 @@ mut "M4 labelOf drops one character too many" 's/substring\(i \+ 5\)/substring(i
 mut "M5 unboundLabels starts at token 0" 's/int i = 1; i < t\.length/int i = 0; i < t.length/' || fails=$((fails+1))
 mut "M6 an undecodable token throws out" 's/try \{\s*(out\.add\(.*?\);)\s*\} catch \(Throwable ignore\) \{\}/$1/s' || fails=$((fails+1))
 mutsrc "M7 noticeLabel keeps its own parse" 's/return TelNoticeClear\.labelOf\(t\);/if (t == null) return ""; String s = t.toString(); int i = s.indexOf("  -  "); return i >= 0 ? s.substring(i + 5) : "";/' || fails=$((fails+1))
+mut "M8 (NWP-20261128-18, task M2) kindOf drops the title fallback" 's/\n[^\n]*head\.(?:startsWith|contains)\([^\n]*//g' || fails=$((fails+1))
+mut "M9 (NWP-20261128-18, task M6) kindOf reads nowhere_call incoming as call" 's/"incoming"\.equals\(c\)\) return "incoming";/"incoming".equals(c)) return "call";/' || fails=$((fails+1))
+mut "M10 (NWP-20261128-18) kindOf reads the label too" 's/String head = i >= 0 \? t\.substring\(0, i\) : t;/String head = t;/' || fails=$((fails+1))
 [ "$fails" -eq 0 ] && echo "== all mutations convicted" || { echo "== $fails mutation(s) not convicted"; exit 1; }

@@ -213,7 +213,7 @@ func parseMediaOverlayUndersPub(r io.Reader, src string, pub map[string]string) 
 		// collapse, the shrink guard refused it, and the refusal blamed "likely a partial restore", pointing
 		// whoever read it at the wrong layer entirely. One line here is the difference between a two-hour
 		// investigation and a grep.
-		fmt.Fprintf(os.Stderr, "[seal] media overlay %s UNRESOLVED (no published map entry, no live .under bind) -> skipping its subtree; this scope's manifest will be short\n", mp)
+		fmt.Fprintf(os.Stderr, "[seal] media overlay %q UNRESOLVED (no published map entry, no live .under bind) -> skipping its subtree; this scope's manifest will be short\n", mp)
 		out[mp] = src + "/" + mediaCacheRel + "/.under/" + leaf
 	}
 	return out, nil
@@ -236,7 +236,10 @@ func mediaTombstones(src string) map[string]bool {
 			return
 		}
 		for _, ln := range strings.Split(string(b), "\n") {
-			if ln = strings.TrimSpace(ln); ln != "" {
+			// NWP-20261129-46: keep the line as written. appendTombstone writes rel+"\n" exactly, and a file name may
+			// begin or end in whitespace, so a trimmed key can name another file: this deletion is undone and that
+			// file's record is dropped. Same defect class as NWP-20261016-43.
+			if ln != "" {
 				out[ln] = true
 			}
 		}

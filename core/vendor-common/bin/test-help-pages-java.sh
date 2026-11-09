@@ -18,7 +18,9 @@
 # step made Gate settings 645 characters, so the page limit is 650 (it was 600 before NWP-20261124-15).
 # NWP-20261126-03 (decision 2026-11-03): Store settings moved from Gate settings to Owner settings. The cases pin that
 # Gate settings does not name it and that Owner settings' Lock screen clock step does, byte for byte (page 2 keeps 6
-# steps). Gate settings is now 596 characters and Owner settings 622.
+# steps). Gate settings is now 596 characters.
+# NWP-20261130-14 (decision 2026-11-06): Backup moved from Gate settings to Owner settings. The cases pin that Gate
+# settings does not name it and that the same Owner settings step does, byte for byte. Owner settings is now 648.
 #
 # ⚠ IT FAILS WHEN THERE IS NO JAVAC, IT NEVER SKIPS. javac comes from PATH, else from the build host's JDK below;
 # the version is printed first so the log proves which compiler ran.
@@ -119,7 +121,7 @@ source_check() {
 
   # S2 both home arrays: "Help" last, and the runnable at the same index is showHelp.
   arrays=$(printf '%s\n' "$home" | perl -0ne '
-    my @calls = /sectionCard\(ll, null,(.*?)\}, false\);/sg;
+    my @calls = /sectionCard\(ll, null,(.*?)\}, false, ProfileHomeFit\.MENU_GAP\);/sg;
     print scalar(@calls), "\n";
     for my $c (@calls) {
       my ($l) = $c =~ /new String\[\]\{(.*?)\}/s; my ($r) = $c =~ /new Runnable\[\]\{(.*)$/s;
@@ -269,6 +271,12 @@ mut "M14 Store settings named on Gate settings again" gate \
   's/"The gear at the top right opens Settings\. Wi-Fi: join a network\.",/"The gear at the top right opens Settings. Wi-Fi: join a network. Store settings: choose where profiles are saved.",/ or die "M14"' \
   || fails=$((fails+1))
 mut "M15 Store settings dropped from Owner settings" gate \
-  's/ Store settings: choose where profiles "\n\s+\+ "are saved\.",/",/ or die "M15"' \
+  's/ Store settings: choose where profiles "\n\s+\+ "are saved\. Backup: choose how often\.",/",/ or die "M15"' \
+  || fails=$((fails+1))
+mut "M16 Backup named on Gate settings (case: Backup under Owner settings only)" gate \
+  's/"The gear at the top right opens Settings\. Wi-Fi: join a network\.",/"The gear at the top right opens Settings. Wi-Fi: join a network. Backup: choose how often.",/ or die "M16"' \
+  || fails=$((fails+1))
+mut "M17 Backup dropped from Owner settings (case: GateHelpPages.body(2) has no step WANT_OWNER_STORE)" gate \
+  's/are saved\. Backup: choose how often\.",/are saved.",/ or die "M17"' \
   || fails=$((fails+1))
 [ "$fails" -eq 0 ] && echo "== all mutations convicted" || { echo "== $fails mutation(s) not convicted"; exit 1; }

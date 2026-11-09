@@ -30,6 +30,11 @@
 # before. `pm` answers `list packages -U` from sim/pm-U and `list packages -U -a` from sim/pm-Ua; mkroot plants the
 # package's line in both, so E1-E14 read an app with code, as they did before the read existed.
 #
+# Since NWP-20261128-42 cases P1-P3 pin the package check: the arm calls pkgname_ok (extracted by name, beside the
+# arm), so `..`, `.`, `a..b` and `1a.b` answer ERR-PKG before the hold probe, with no helper call, no `pm` call and no
+# copy. P1 plants another app's external hold: with the old slash/space filter, `..` joined the chooser's own
+# Android/data dir to /data/media/<uid>/Android in the recursive copy, and the arm force-stopped `..` first.
+#
 # Since NWP-20261112-33 the arm runs under EVERY shell found (bash, sh, dash, mksh -- an `sh` that is one of the
 # others is skipped), not inside a bash `eval`: each case writes a runner file holding its variables, the ODHOLD=
 # line, the recorder stubs and `case "$op" in <the arm> esac`, and runs it with `"$sh"`, after `"$sh" -n` has parsed
@@ -86,7 +91,7 @@ reroot() { printf '%s\n' "$1" | sed -E 's#([" |])/data/#\1$ROOT/data/#g'; }
 nleft() { printf '%s\n' "$1" | sed -E 's/(^|[[:space:]])#.*$//' | sed 's#\$ROOT/data/##g' | grep -cE '(^|[^[:alnum:]_])/data/'; }
 
 suite() {  # suite <roamd.sh> <sh> [quiet] -> 0 all ok, 1 a case failed, 2 the harness could not run
-  local f="$1" sh="$2" quiet="${3:-}" p=0 x=0 ARM RA n R ODH d
+  local f="$1" sh="$2" quiet="${3:-}" p=0 x=0 ARM RA n R ODH PKGOK d
   say() { [ -n "$quiet" ] || printf '%s\n' "$1"; }
   # a FAIL line prints even when quiet: it is the mutant runner's evidence, per shell
   chk() {
@@ -105,6 +110,8 @@ suite() {  # suite <roamd.sh> <sh> [quiet] -> 0 all ok, 1 a case failed, 2 the h
   ODH=$(grep -m1 -E '^ODHOLD=' "$f")
   case "$ARM" in *'echo "ERR-PKG" > "$RES"'*'echo "OK NOSRC" > "$RES"'*'echo "ERR-NOTREADY" > "$RES"'*) ;; *) echo "EXTRACTION FAILED: the odrestore arm in $f" >&2; return 2 ;; esac
   [ -n "$ODH" ] || { echo "EXTRACTION FAILED: ODHOLD= not found in $f" >&2; return 2; }
+  PKGOK=$(awk -v a='pkgname_ok() {' '$0 == a {f=1} f{print} f&&/^}$/{exit}' "$f")
+  case "$PKGOK" in *'return 1'*'return 0'*) ;; *) echo "EXTRACTION FAILED: pkgname_ok in $f" >&2; return 2 ;; esac
   RA=$(reroot "$ARM")
   n=$(printf '%s\n' "$RA" | grep -o '\$ROOT/data/' | grep -c .)
   [ "$n" -ge 8 ] || { echo "RE-ROOT FAILED: the odrestore arm has $n rewritten paths, want >= 8" >&2; return 2; }
@@ -119,7 +126,7 @@ suite() {  # suite <roamd.sh> <sh> [quiet] -> 0 all ok, 1 a case failed, 2 the h
     { printf '%s\n' "$PRINT_SHIM"
       printf "%s='%s'\n" ROOT "$1" uid "$UID_" PKG "$PKG" op odrestore srcunit "$2" LOG "$1/roam.log" RES "$1/res" \
         ACCT_AUTH_PKG com.example.authenticator STATE "$1/state" C "$1/sim/calls"
-      printf '%s\n' 'USERDIR="$ROOT/data/user/$uid"' "$ODH"
+      printf '%s\n' 'USERDIR="$ROOT/data/user/$uid"' "$ODH" "$PKGOK"
       for t in am pidof pkg_live_pids reown_restored od_relabel grant_perms_for keystore_register reown_ext_appdata restorecon \
                wait_acct_authenticator acct_reload sync_apply a11y_apply autofill_apply; do
         printf '%s() { echo "%s $*" >> "$C"; }\n' "$t" "$t"
@@ -133,6 +140,7 @@ reown_ext_appdata() {
 cutoff_prog() { :; }
 od_watched() { shift; "$@" 2>&1; }
 pm() {
+  echo "pm $*" >> "$ROOT/sim/pm-calls"
   case "$*" in
     "list packages -U -a "*) cat "$ROOT/sim/pm-Ua" 2>/dev/null ;;
     "list packages -U "*) cat "$ROOT/sim/pm-U" 2>/dev/null ;;
@@ -223,6 +231,35 @@ STUBS
   run_od "$sh" "$R" "a/b"
   chk "E5 the reply is ERR-PKG" eqv "$(cat "$R/res" 2>/dev/null)" ERR-PKG
   chk "E5 no helper ran" eqv "$(grep -c . "$R/sim/calls")" 0
+
+  OTHER="$UID_/Android/data/com.nowhere.chooser/.nowhere-odhold/com.example.other"
+  plant_other() {  # plant_other <root>: another app's external hold, the copy source a `..` package reaches
+    mkdir -p "$1/data/media/$OTHER"; echo other > "$1/data/media/$OTHER/f.txt"
+  }
+  bad_pkg() {  # bad_pkg <case> <pkg>: ERR-PKG before the hold probe, no helper or pm call, the other hold untouched
+    mkroot; plant_other "$R"
+    run_od "$sh" "$R" "$2"
+    chk "$1 '$2': the reply is ERR-PKG" eqv "$(cat "$R/res" 2>/dev/null)" ERR-PKG
+    chk "$1 '$2': no helper ran (no am, no pkg_live_pids)" eqv "$(grep -c . "$R/sim/calls")" 0
+    chk "$1 '$2': no pm call" eqv "$([ -e "$R/sim/pm-calls" ] && echo called || echo none)" none
+    chk "$1 '$2': nothing copied into Android/" eqv "$([ -e "$R/data/media/$UID_/Android/.nowhere-odhold" ] && echo copied || echo none)" none
+    chk "$1 '$2': the other app's hold is untouched" eqv "$(cat "$R/data/media/$OTHER/f.txt" 2>/dev/null)" other
+  }
+
+  say "== [$sh] P1: package '..' with another app's external hold planted -> ERR-PKG, no copy, no call =="
+  bad_pkg P1 ..
+
+  say "== [$sh] P2: packages '.', 'a..b', '1a.b' -> ERR-PKG, no call =="
+  bad_pkg P2 .
+  bad_pkg P2 a..b
+  bad_pkg P2 1a.b
+
+  say "== [$sh] P3: a well-formed package with another app's external hold planted -> the arm runs as before =="
+  mkroot; plant_other "$R"
+  run_od "$sh" "$R" "$PKG"
+  chk "P3 the reply is OK NOSRC" eqv "$(cat "$R/res" 2>/dev/null)" "OK NOSRC"
+  chk "P3 reown_ext_appdata <pkg> ran" has "$R/sim/calls" "$A"
+  chk "P3 the other app's hold is untouched" eqv "$(cat "$R/data/media/$OTHER/f.txt" 2>/dev/null)" other
 
   MARK="data/user/$UID_/com.nowhere.chooser/files/nowhere-od-materialised"
   GP="grant_perms_for $UID_ $PKG"
@@ -349,8 +386,10 @@ L_APPID='            _odappid=$(NW_PKG="$pkg" awk '"'"'$1 == ENVIRON["NW_PKG"] {
 L_KEPT_OWN='              odkept=$((odkept+1))'
 L_APPID_OLD='            _odappid=$(grep -m1 "^$pkg " /data/system/packages.list 2>/dev/null | cut -d" " -f2)'
 L_A11Y='      a11y_apply "$uid" "$pkg"  # NWP-20261108-18: Q024 -- this app'"'"'s carried a11y entries, once per session (.a11ydone)'
+L_GUARD='    pkgname_ok "$pkg" || { echo "[roamd] odrestore bad pkg $(date)" >> "$LOG"; echo "ERR-PKG" > "$RES"; chmod 600 "$RES"; exit 0; }'
+L_GUARD_OLD='    case "$pkg" in ""|*/*|*" "*) echo "[roamd] odrestore bad pkg $(date)" >> "$LOG"; echo "ERR-PKG" > "$RES"; chmod 600 "$RES"; exit 0;; esac'
 L_AF='      autofill_apply "$uid" "$pkg"  # NWP-20261112-12: Q078 -- this app'"'"'s carried autofill service, once per session (.autofilldone)'
-for l in "$L_RE" "$L_LOOP" "$L_PROBE" "$L_FIRST" "$L_APPID" "$L_KEPT_OWN" "$L_A11Y" "$L_AF" '  odrestore)'; do
+for l in "$L_RE" "$L_LOOP" "$L_PROBE" "$L_FIRST" "$L_APPID" "$L_KEPT_OWN" "$L_A11Y" "$L_AF" "$L_GUARD" '  odrestore)'; do
   [ "$(grep -cxF -- "$l" "$SUT")" = 1 ] || { echo "EXTRACTION FAILED: anchor line not unique in $SUT: $l" >&2; exit 2; }
 done
 # A mutant convicts only with rc 1 AND a FAIL line under each shell's own tag; rc 0 is NOT CONVICTED, rc 1 without
@@ -359,7 +398,7 @@ mut() {
   local name="$1" prog="$2" t out r sh ev
   t=$(mktemp -p "$W")
   awk -v RE="$L_RE" -v LOOP="$L_LOOP" -v PROBE="$L_PROBE" -v FIRST="$L_FIRST" -v APPID_L="$L_APPID" -v APPID_OLD="$L_APPID_OLD" \
-      -v KEPT_OWN="$L_KEPT_OWN" -v A11Y="$L_A11Y" -v AF="$L_AF" "$prog" "$SUT" > "$t"
+      -v KEPT_OWN="$L_KEPT_OWN" -v A11Y="$L_A11Y" -v AF="$L_AF" -v GUARD="$L_GUARD" -v GUARD_OLD="$L_GUARD_OLD" "$prog" "$SUT" > "$t"
   if cmp -s "$t" "$SUT"; then echo "  FAIL  mutant did not apply: $name"; MFAIL=1; command rm -f "$t"; return; fi
   for sh in "${SHELLS[@]}"; do
     out=$(suite "$t" "$sh" quiet 2>&1); r=$?
@@ -398,5 +437,9 @@ mut "the autofill call moved above a11y_apply (E14)" \
   '$0==AF{next} $0==A11Y{print AF} {print}'
 mut "the not-app-owned path leaves odkept non-numeric (E3, E13)" \
   '$0==KEPT_OWN{print "              odkept=kept"; next} {print}'
+mut "the old slash/space filter restored (P1)" \
+  '$0==GUARD{print GUARD_OLD; next} {print}'
+mut "the package check moved after the force-stop (P1)" \
+  '$0==GUARD{next} $0==LOOP{print GUARD} {print}'
 [ "$MFAIL" = 0 ] || exit 1
 echo "all mutants convicted"

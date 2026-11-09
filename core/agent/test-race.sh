@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 # test-race.sh [--mutate] -- runs the agent's concurrency tests under the race detector (NWP-20261102-08). The
 # agent is the concurrent half of the phone (worker lanes, cap brackets, seal fences, goSafe jobs) and a plain
-# `go test` passes an unsynchronised read on amd64, so these eighteen files run with -race: since NWP-20261113-38
+# `go test` passes an unsynchronised read on amd64, so these twenty files run with -race: since NWP-20261113-38
 # also the wallet lock, the on-demand window under pendingReapMu, telMu, the seal hold, the cold-lock teardown's
 # RW-slot queue and the gate-only verbs' wait group; since NWP-20261125-24 also the sign-in's late-work job and
 # its abandon flag, the logoff cutoff's wake goroutine, RESTART-UNSAVED's watchdog on the RW slot and the owner
 # key's concurrent ensure; since NWP-20261128-02 also the store client's lazy setup against concurrent store
-# switches. A CONTROL then runs
+# switches; since NWP-20261128-32 also LOGOUT raising the sign-out signal while it waits for the session lock, and
+# FETCH-APP's reader and its sign-out watcher. logout_wait_test.go stays out: its W1/W2 bound wall time with 300 ms and
+# 150 ms margins that a -race stall on a one-CPU quota'd lane can eat. A CONTROL then runs
 # race_canary_test.go (build tag racecanary), which races on purpose: the detector must report it, or it did not run.
 # --mutate re-runs copies of this script with one edit each (M1 -race removed everywhere, M2 an empty FILES list,
 # M3 the -run regex drops a name, M4 the control's DATA RACE assertion inverted); each must exit non-zero with the
@@ -38,6 +40,8 @@ FILES=(
   end_unsaved_test.go
   owner_key_test.go
   s3_init_race_test.go
+  signout_signal_test.go
+  fetchapp_signout_test.go
 )
 # EXCLUDE names one test per line that fails raced (a reported race, or a timeout only -race's slowdown causes),
 # with the reason and its backlog section B row title. All other tests of FILES pass under -race on main.

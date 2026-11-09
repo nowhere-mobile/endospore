@@ -266,6 +266,18 @@ public class UnarchiveService extends Service {
                     rc.setDaemon(true);
                     rc.start();
                 } catch (Throwable t) { android.util.Log.w("NowhereChooser", "phantom reconcile start", t); }
+                // NWP-20261128-08 (#119, h50 #6): the sign-in reads its skip notice and shows the h48 #5 words. Only on the
+                // switch-landing: a by-hand start ("Install pending apps now") must not show it again. Own daemon thread
+                // with the APPLICATION context, as the phantom reconcile above: the read may take up to 70 s and must
+                // delay neither the sweep nor the service lifetime.
+                if (!byHand) {
+                    try {
+                        final android.content.Context appCtx = getApplicationContext();
+                        Thread sn = new Thread(() -> SkipNoticeActivity.check(appCtx), "nowhere-skip-notice");
+                        sn.setDaemon(true);
+                        sn.start();
+                    } catch (Throwable t) { android.util.Log.w("NowhereChooser", "skip notice start", t); }
+                }
                 try { wakeRestored(restoredOk); }
                 catch (Throwable t) { android.util.Log.w("NowhereChooser", "wake restored", t); }
                 try { sweepAutoJoined(byHand); }
@@ -993,7 +1005,9 @@ public class UnarchiveService extends Service {
      *  pendingAutoApps list, so each app is processed once and the daemon sees one AUTO-SWEEP lease at a time. The
      *  landing flag is read here first and carried by the join; each pass sets it again for sweepAuto's own read. The
      *  catch is inside the loop and exit() is in the finally: a pass that throws must still end the join or run its
-     *  rerun, or every later start in this process joins a sweep that never runs. */
+     *  rerun, or every later start in this process joins a sweep that never runs. NWP-20261128-07: the owner holds
+     *  `nowhere:autosweep` (SweepWake) from its first pass to the end of its last, at most 2 hours; a joined start
+     *  returns before it and takes nothing. */
     private void sweepAutoJoined(boolean byHand) {
         boolean landing = Boolean.TRUE.equals(LANDING.get());
         LANDING.remove();
@@ -1002,16 +1016,49 @@ public class UnarchiveService extends Service {
             android.util.Log.i("NowhereChooser", "#130 sweep: joined the running sweep -- it runs once more when it ends (NWP-20261126-04)");
             return;
         }
-        while (true) {
-            LANDING.set((flags & SweepJoin.LANDING) != 0);
-            int next;
-            try { sweepAuto((flags & SweepJoin.BY_HAND) != 0); }
-            catch (Throwable t) { android.util.Log.w("NowhereChooser", "#130 auto sweep", t); }
-            finally { next = SweepJoin.exit(); }
-            if (next < 0) return;
-            android.util.Log.i("NowhereChooser", "#130 sweep: a start joined this sweep -- one more pass over a fresh list (NWP-20261126-04)");
-            flags = next;
+        SweepWake.Lock wake = sweepWakeLock();
+        SweepWake.begin(wake);
+        try {
+            while (true) {
+                LANDING.set((flags & SweepJoin.LANDING) != 0);
+                int next;
+                try { sweepAuto((flags & SweepJoin.BY_HAND) != 0); }
+                catch (Throwable t) { android.util.Log.w("NowhereChooser", "#130 auto sweep", t); }
+                finally { next = SweepJoin.exit(); }
+                if (next < 0) return;
+                android.util.Log.i("NowhereChooser", "#130 sweep: a start joined this sweep -- one more pass over a fresh list (NWP-20261126-04)");
+                flags = next;
+            }
+        } finally { SweepWake.end(wake); }
+    }
+
+    /** NWP-20261128-07: the sweep's own PARTIAL lock (`nowhere:autosweep`), not reference-counted, so one acquire and
+     *  one release whatever happens between them. A new one per sweep: a fresh lock carries no count from an earlier
+     *  one. It never throws and never returns null: it runs after SweepJoin.enter, so a throw here would leave the join
+     *  running and every later start would join a sweep that never runs. With no lock, the sweep runs unheld. */
+    private SweepWake.Lock sweepWakeLock() {
+        android.os.PowerManager.WakeLock w = null;
+        try {
+            android.os.PowerManager pm = getSystemService(android.os.PowerManager.class);
+            if (pm != null) {
+                w = pm.newWakeLock(android.os.PowerManager.PARTIAL_WAKE_LOCK, "nowhere:autosweep");
+                w.setReferenceCounted(false);
+            }
+        } catch (Throwable t) {
+            android.util.Log.w("NowhereChooser", "#130 sweep wake lock: no lock, the sweep runs unheld (NWP-20261128-07)", t);
+            w = null;
         }
+        final android.os.PowerManager.WakeLock wl = w;
+        return new SweepWake.Lock() {
+            @Override public void acquire(long ms) { if (wl != null) wl.acquire(ms); }
+            @Override public void release() { if (wl != null) wl.release(); }
+            @Override public boolean isHeld() { return wl != null && wl.isHeld(); }
+            @Override public long now() { return android.os.SystemClock.elapsedRealtime(); }
+            @Override public void log(String line, Throwable t) {
+                if (t == null) android.util.Log.i("NowhereChooser", line);
+                else android.util.Log.w("NowhereChooser", line, t);
+            }
+        };
     }
 
     private void sweepAuto(boolean byHand) {
@@ -1109,6 +1156,8 @@ public class UnarchiveService extends Service {
         // NWP-20261126-05: the line is the checklist card, given the work list in sweep order (EXTRA_PKGS) and its
         // sweep's id in LandingLine.Sweep (EXTRA_SWEEP), where each outcome and the end are recorded before they are
         // broadcast, so a card that starts late or is recreated still reads them. 0: no card for this sweep.
+        // NWP-20261130-09: the rows lead with the deps that ride with the work list (Play services, GSF), which this
+        // sweep fetches for minutes before its first tick. The card still starts before the first MATERIALIZE-APP.
         boolean landing = Boolean.TRUE.equals(LANDING.get());
         LANDING.remove();
         long card = 0;
@@ -1117,10 +1166,11 @@ public class UnarchiveService extends Service {
             String serial = landingSerial();
             if (LandingLine.show(landing, work.size(), readLandingStamp(stamp), serial)) {
                 StoreInstaller.writeAtomic(stamp, serial);
-                card = LandingLine.Sweep.begin(work.toArray(new String[0]));
+                String[] cardRows = LandingLine.cardPkgs(work, p -> ProfileActivity.appDeps(this, p), p -> hasInstalledCode(p));
+                card = LandingLine.Sweep.begin(cardRows);
                 startActivity(new Intent(this, LandingNoticeActivity.class).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                        .putExtra(LandingNoticeActivity.EXTRA_COUNT, work.size())
-                        .putExtra(LandingNoticeActivity.EXTRA_PKGS, work.toArray(new String[0]))
+                        .putExtra(LandingNoticeActivity.EXTRA_COUNT, cardRows.length)
+                        .putExtra(LandingNoticeActivity.EXTRA_PKGS, cardRows)
                         .putExtra(LandingNoticeActivity.EXTRA_SWEEP, card));
             }
         } catch (Throwable t) { android.util.Log.w("NowhereChooser", "landing line", t); }
@@ -1464,6 +1514,7 @@ public class UnarchiveService extends Service {
                 matEnd = SweepOutcome.FETCH_FAILED; // NWP-20261113-17: a dependency did not land
                 return false;
             }
+            cardDepLanded(dep);
             qFinish(dep);
         }
         qStart(pkg); // #84: the entry point is the last member -- its position now comes from the queue
@@ -1710,10 +1761,12 @@ public class UnarchiveService extends Service {
             // means "fetch it with this entry point", which is what the group is for.
             final int action = autoAction(code, code && odRestored(dep), false);
             if (action == AUTO_WHOLE) {
+                cardDepLanded(dep); // another path restored it (the install heal): its row must not read "coming back"
                 android.util.Log.i("NowhereChooser", "app dep " + dep + " -> already installed + restored, skipping");
                 continue;
             }
             if (action == AUTO_RESTORE_ONLY) {
+                cardDepLanded(dep); // installApks' latch can time out while PackageManager finishes: the code is there
                 // NWP-20261012-04: installed (by us or by anything else, e.g. Play Services from an app store) and
                 // its restore unconfirmed. Its code is live and usable, so it is never re-fetched or re-installed
                 // over -- only its restore is retried.
@@ -1724,6 +1777,16 @@ public class UnarchiveService extends Service {
             out.add(dep);
         }
         return out;
+    }
+
+    /** NWP-20261130-09: the landing card ticks a dep off. Recorded first and broadcast after, as each outcome is. The
+     *  package rides this package-local broadcast only. */
+    private void cardDepLanded(String dep) {
+        if (!LandingLine.Sweep.depLanded(dep)) return; // no row for it, or already ticked: nothing to tell the card
+        try {
+            sendBroadcast(new Intent(LandingNoticeActivity.ACTION_APP).setPackage(getPackageName())
+                    .putExtra(LandingNoticeActivity.EXTRA_PKG, dep).putExtra(LandingNoticeActivity.EXTRA_OK, true));
+        } catch (Throwable t) { android.util.Log.w("NowhereChooser", "#130 sweep: tell the landing card", t); }
     }
 
     private boolean materializeMember(String pkg) {

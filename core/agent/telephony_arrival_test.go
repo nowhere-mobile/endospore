@@ -152,8 +152,9 @@ func TestHandleSealTelLiveDelivery(t *testing.T) {
 		t.Fatalf("telingest.11 not staged: %v", err)
 	}
 	row := strings.Fields(strings.TrimSpace(string(b)))
-	if len(row) != 6 || row[0] != "sms" || row[1] != "1720000000000" {
-		t.Fatalf("staged row = %q, want the sms live row", b)
+	// NWP-20261130-01: the row carries its SIM's tag in its own seventh slot.
+	if len(row) != 7 || row[0] != "sms" || row[1] != "1720000000000" || row[6] != simSlotPrefix+simTag(iccid) {
+		t.Fatalf("staged row = %q, want the sms live row with its SIM slot", b)
 	}
 	from, _ := base64.StdEncoding.DecodeString(row[4])
 	body, _ := base64.StdEncoding.DecodeString(row[5])
@@ -258,8 +259,9 @@ func TestHandleSealMmsLiveDelivery(t *testing.T) {
 		t.Fatalf("telingest.11 not staged: %v", err)
 	}
 	row := strings.Fields(strings.TrimSpace(string(b)))
-	if len(row) != 3 || row[0] != "mms" || row[1] != "1720000000000" {
-		t.Fatalf("staged row = %q, want an mms live row", b)
+	// NWP-20261130-01: the row carries its SIM's tag in its own fourth slot.
+	if len(row) != 4 || row[0] != "mms" || row[1] != "1720000000000" || row[3] != simSlotPrefix+simTag(iccid) {
+		t.Fatalf("staged row = %q, want an mms live row with its SIM slot", b)
 	}
 	j, err := base64.StdEncoding.DecodeString(row[2])
 	if err != nil {

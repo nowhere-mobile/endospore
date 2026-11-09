@@ -16,6 +16,9 @@ public class RestageCases {
     static final String CALL6 = CALL5 + " " + SIM;
     static final String SMS6 = "sms 1700000000000 +15550100 aGk= 0 1";
     static final String MMS3 = "mms 1700000000000 eyJhIjoxfQ==";
+    static final String SLOT = "sim:0123456789abcdef";
+    static final String SMS7 = SMS6 + " " + SLOT;
+    static final String MMS4 = MMS3 + " " + SLOT;
 
     public static void main(String[] a) {
         // restageBase
@@ -49,8 +52,24 @@ public class RestageCases {
         eq("mms retry 2", MMS3 + " 3", Lifted.restageLine(row(MMS3 + " 2"), 3, 3));
         eq("mms retry 3", null, Lifted.restageLine(row(MMS3 + " 3"), 3, 3));
 
+        // NWP-20261130-01: a row's "sim:<tag>" slot counts in the base, so it stays ahead of the retry
+        eq("base tagged sms", 7, Lifted.restageBase(row(SMS7), false));
+        eq("base tagged sms retry", 7, Lifted.restageBase(row(SMS7 + " 2"), false));
+        eq("base tagged mms", 4, Lifted.restageBase(row(MMS4), false));
+        eq("base tagged mms retry", 4, Lifted.restageBase(row(MMS4 + " 2"), false));
+        eq("base untagged sms retry", 6, Lifted.restageBase(row(SMS6 + " 2"), false));
+        eq("base untagged mms retry", 3, Lifted.restageBase(row(MMS3 + " 2"), false));
+        eq("tagged sms no retry", SMS7 + " 1", Lifted.restageLine(row(SMS7), 7, 3));
+        eq("tagged sms retry 2", SMS7 + " 3", Lifted.restageLine(row(SMS7 + " 2"), 7, 3));
+        eq("tagged sms cap", null, Lifted.restageLine(row(SMS7 + " 3"), 7, 3));
+        eq("tagged mms no retry", MMS4 + " 1", Lifted.restageLine(row(MMS4), 4, 3));
+        eq("tagged mms cap", null, Lifted.restageLine(row(MMS4 + " 3"), 4, 3));
+        eq("a call keeps base 6", 6, Lifted.restageBase(row(CALL6 + " 1"), true));
+        // an older chooser's fixed base reads the slot as a retry that does not parse, and drops only the slot
+        eq("older base on a tagged sms", SMS6 + " 1", Lifted.restageLine(row(SMS7), 6, 3));
+
         // the line keeps deliver()'s fields and adds exactly one token
-        String[][] shapes = { {CALL6, "6"}, {SMS6, "6"}, {MMS3, "3"} };
+        String[][] shapes = { {CALL6, "6"}, {SMS6, "6"}, {MMS3, "3"}, {SMS7, "7"}, {MMS4, "4"} };
         for (String[] sh : shapes) {
             String[] in = row(sh[0]);
             int base = Integer.parseInt(sh[1]);

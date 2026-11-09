@@ -43,7 +43,7 @@ import (
 // Counters are process-global and monotonic; callers take a snapshot around the window they care about and
 // diff it, so one binary can measure several windows (head resolution, then the chunk phase) independently.
 var (
-	traceCapN, traceCapNs int64 // gateway /cap fetches (capReadCache MISSES only) + ns spent in them
+	traceCapN, traceCapNs int64 // gateway round trips (capReadCache MISSES and batch /caps prefetch POSTs) + ns spent in them
 	traceGetN, traceGetNs int64 // store object reads (presigned GET, or the direct-S3 path) + ns spent
 	traceKdfN, traceKdfNs int64 // Argon2 computations (deriveKey cache MISSES only) + ns spent
 )

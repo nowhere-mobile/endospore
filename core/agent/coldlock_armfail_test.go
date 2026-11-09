@@ -152,19 +152,6 @@ func TestColdLockArmFailFido2NeverMovedRepliesHandOff(t *testing.T) {
 	}
 }
 
-// The stated residual, narrowed by h56 #2 (NWP-20261126-01): a timed-out rekey whose instance still runs at
-// coldLockAwaitLateRekey's bound may have landed, and unwinding it is Check B's job, so the lock still commits.
-func TestColdLockArmFailFido2TimeoutAtTheBoundStillCommits(t *testing.T) {
-	so := cafInstall(t)
-	dest, rec, _ := clwSetup(t)
-	clrSetup(t, clrRekey(), 20*time.Millisecond, func(int32) string { return "running" })
-	cafRun(t, dest, rec, "ERR-TIMEOUT", true)
-	if !clwExists(dest, ".coldlock") {
-		t.Error("a rekey still unknown at the bound no longer commits -- the residual changed")
-	}
-	cafSignedOut(t, so, 0)
-}
-
 func TestColdLockArmFailLandedTable(t *testing.T) {
 	for _, c := range []struct {
 		needKey, arm, fwd string

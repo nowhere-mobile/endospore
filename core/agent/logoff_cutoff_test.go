@@ -45,6 +45,7 @@ func cutoffWorker(t *testing.T, dest string, answers map[string]string, hold map
 // non-empty line, so a beat never reaches the logoff bar.
 func cutoffWorkerGated(t *testing.T, dest string, answers map[string]string, hold map[string]time.Duration, gate map[string]chan struct{}, beatUntil string) (ops func() []string) {
 	t.Helper()
+	tr := sharedGoSafeTracker(t)        // NWP-20261128-35: joined in the cleanup below
 	var answerGoroutines sync.WaitGroup // every answer goroutine this stand-in started
 	openGates := func() {
 		for _, g := range gate {
@@ -131,7 +132,16 @@ func cutoffWorkerGated(t *testing.T, dest string, answers map[string]string, hol
 		}
 	}()
 	// After <-finished no answer goroutine can be added; open any gate still shut, then join them (NWP-20261024-13).
-	t.Cleanup(func() { close(done); <-finished; openGates(); answerGoroutines.Wait() })
+	// NWP-20261128-35: first it answers until this test's sign-outs have finished. An op handed over after it stops
+	// would hold the process-wide RW lane for its whole 150 s stall budget, and every later test's logoff behind it.
+	t.Cleanup(func() {
+		openGates()
+		tr.joinSignOuts(t, rearmHang)
+		close(done)
+		<-finished
+		openGates()
+		answerGoroutines.Wait()
+	})
 	return func() []string {
 		mu.Lock()
 		defer mu.Unlock()
@@ -142,6 +152,7 @@ func cutoffWorkerGated(t *testing.T, dest string, answers map[string]string, hol
 // cutoffSession seats a STORED session (not a throwaway) for uid and resets the logoff's global state around the test.
 func cutoffSession(t *testing.T, uid string) string {
 	t.Helper()
+	rwLaneFree(t) // NWP-20261128-35
 	ropReapReset(t)
 	// The 2 s onStop window is a plain sleep before the cutoff; nothing here observes it, so it is shortened (round 7).
 	fw := logoffFlushWait

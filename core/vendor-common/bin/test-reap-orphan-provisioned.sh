@@ -2,8 +2,9 @@
 # test-reap-orphan-provisioned.sh [<nowhere_roamd.sh>] [--mutate] -- roamd's cross-profile reap at roam-in,
 # reap_orphan_provisioned, and the #647 guard that keeps it off another profile's apps (NWP-20261011-07).
 #
-# WHY THIS IS COMMITTED. reap_orphan_provisioned runs `pm uninstall` with no --user -- USER_ALL -- at every roam-in,
-# on every `installer=com.nowhere.chooser` package outside this profile's keep-set. A FRESH profile's keep-set is
+# WHY THIS IS COMMITTED. reap_orphan_provisioned runs at every roam-in, on every `installer=com.nowhere.chooser`
+# package outside this profile's keep-set, and its reap with no other user is `pm uninstall` with no --user --
+# USER_ALL. A FRESH profile's keep-set is
 # empty by construction (no manifest, no nowhere-apps.list, no nowhere-appkeep), and `pm list packages -a -i` also
 # lists packages that are installed only for ANOTHER user. On lynx, 2026-08-11 (DIA-20260811-07), a fresh profile's
 # sign-in therefore uninstalled another profile's Play Store and YouTube device-wide, with nothing left to restore
@@ -12,7 +13,9 @@
 # device "the guard held" and "there was nothing to reap" look the same (docs/backlog.md #98 / #99). This suite runs
 # the real function against stubbed pm/dumpsys and asserts the exact uninstall set and the log line of every branch:
 # the three keep-set sources, the whole-line keep match, the malformed-name skip, the /data/app codePath gate, the
-# user-0 / roaming-user / no-user arms of the reap verdict, the guard, and the installer filter.
+# user-0 / roaming-user / no-user arms of the reap verdict, the guard, and the installer filter. Since NWP-20261129-11
+# (decided 2026-11-05, h59 #12) it also pins the mixed case: a package installed for user 0 or the roaming user AND
+# for another user is uninstalled --user 0 and --user <ruid> only, so that the other user's copy and data stay.
 #
 # The function is extracted from nowhere_roamd.sh BY ANCHOR, never copied, and the extraction is asserted (exit 2 if
 # it is empty or truncated), so a stale copy cannot keep passing after the real code moves. pm, dumpsys and timeout
@@ -60,13 +63,15 @@ done
 SHELLS="${SHELLS# }"
 
 # --- the stubs, POSIX only (they run under dash) ----------------------------------------------------------------
-# pm: `list packages -a -i` answers $D/pmlist; `uninstall <pkg>` appends `uninstall <pkg>` to $D/calls (roamd sends
-# pm's stdout to /dev/null, so the record goes to a file). dumpsys: `package <pkg>` answers $D/dumpsys/<pkg> with
+# pm: `list packages -a -i` answers $D/pmlist; `uninstall <pkg>` and `uninstall --user <n> <pkg>` append exactly that
+# line to $D/calls (roamd sends pm's stdout to /dev/null, so the record goes to a file) and read their stdin to the
+# end, as a call with no </dev/null would eat the rest of the function's package list. dumpsys: `package <pkg>` answers $D/dumpsys/<pkg> with
 # `/` mapped to `_`; absent -> nothing. timeout: drops `-k 5 30`. Any other argv is recorded in $D/unexpected.
 STUBS=$(cat <<'EOS'
 pm() {
   if [ "$*" = "list packages -a -i" ]; then cat "$D/pmlist"
-  elif [ "$1" = uninstall ] && [ $# = 2 ]; then echo "uninstall $2" >> "$D/calls"
+  elif [ "$1" = uninstall ] && [ $# = 2 ]; then cat >/dev/null; echo "uninstall $2" >> "$D/calls"
+  elif [ "$1" = uninstall ] && [ "$2" = --user ] && [ $# = 4 ]; then cat >/dev/null; echo "uninstall --user $3 $4" >> "$D/calls"
   else echo "pm $*" >> "$D/unexpected"; return 1
   fi
 }
@@ -138,8 +143,8 @@ suite() {
   ctrl="uninstall $CTRL"
 
   for sh in $SHELLS; do
-    for c in a b c d e f g h i j k l; do
-      D=$(mktemp -d); mkdir -p "$D/dumpsys" "$D/$KEEPDIR"
+    for c in a b c d e f g h i j k l m n o; do
+      D=$(mktemp -d -p "$TMP"); mkdir -p "$D/dumpsys" "$D/$KEEPDIR"
       case "$c" in
         a) lbl="a [$sh] a package in the keep-installed manifest is kept"
            reapable com.example.kept; fx_manifest com.example.kept; fx_manifest com.example.other ;;
@@ -159,7 +164,7 @@ suite() {
            reapable com.example.mine 0:false 11:true ;;
         h) lbl="h [$sh] a dangling record (installed for nobody) is reaped"
            fx_pm com.example.dangling com.nowhere.chooser; fx_dump com.example.dangling "$(dapp com.example.dangling)" ;;
-        i) lbl="i [$sh] installed for user 0 AND another profile: the user-0 residue wins, reaped"
+        i) lbl="i [$sh] h59 #12: installed for user 0 AND another profile: only user 0's copy goes"
            reapable com.example.both 0:true 12:true ;;
         j) lbl="j [$sh] a package another installer put there is never touched"
            fx_pm com.example.store null; fx_dump com.example.store "$(dapp com.example.store)" 0:true ;;
@@ -167,6 +172,12 @@ suite() {
            reapable com.foo; reapable com.foo.bar; fx_apps_list com.foo.bar ;;
         l) lbl="l [$sh] a malformed package name is never passed to pm"
            reapable com.example/evil ;;
+        m) lbl="m [$sh] h59 #12: installed for the roaming user AND another profile: only the roaming user's copy goes"
+           reapable com.example.mine2 11:true 12:true ;;
+        n) lbl="n [$sh] h59 #12: user 0, the roaming user AND another profile: two per-user calls, user 0 first"
+           reapable com.example.all 0:true 11:true 12:true ;;
+        o) lbl="o [$sh] h59 #12: two other profiles: both kept, named on one log line"
+           reapable com.example.two 0:true 12:true 13:true ;;
       esac
       reapable "$CTRL"
       run "$sh" "$fn"
@@ -185,13 +196,19 @@ suite() {
              && logs "reap-orphan-provisioned com.example.mine (rc=0) installed=[$RUID]" && ok "$lbl" ;;
         h) expect "uninstall com.example.dangling"$'\n'"$ctrl" \
              && logs "reap-orphan-provisioned com.example.dangling (rc=0) installed=[none]" && ok "$lbl" ;;
-        # $inst is one line per user, so the log line spans two lines here: assert each half.
-        i) expect "uninstall com.example.both"$'\n'"$ctrl" \
-             && logs "reap-orphan-provisioned com.example.both (rc=0) installed=[0" && logs "12]" && ok "$lbl" ;;
+        i) expect "uninstall --user 0 com.example.both"$'\n'"$ctrl" \
+             && logs "reap-orphan-provisioned com.example.both --user 0 (rc=0) kept for user(s) 12 " && ok "$lbl" ;;
         j) expect "$ctrl" && nolog com.example.store && ok "$lbl" ;;
         k) expect "uninstall com.foo"$'\n'"$ctrl" \
              && logs "reap-orphan-provisioned com.foo (rc=0)" && nolog com.foo.bar && ok "$lbl" ;;
         l) expect "$ctrl" && nolog com.example/evil && ok "$lbl" ;;
+        m) expect "uninstall --user $RUID com.example.mine2"$'\n'"$ctrl" \
+             && logs "reap-orphan-provisioned com.example.mine2 --user $RUID (rc=0) kept for user(s) 12 " && ok "$lbl" ;;
+        n) expect "uninstall --user 0 com.example.all"$'\n'"uninstall --user $RUID com.example.all"$'\n'"$ctrl" \
+             && logs "reap-orphan-provisioned com.example.all --user 0 (rc=0) kept for user(s) 12 " \
+             && logs "reap-orphan-provisioned com.example.all --user $RUID (rc=0) kept for user(s) 12 " && ok "$lbl" ;;
+        o) expect "uninstall --user 0 com.example.two"$'\n'"$ctrl" \
+             && logs "reap-orphan-provisioned com.example.two --user 0 (rc=0) kept for user(s) 12 13 " && ok "$lbl" ;;
       esac
       command rm -rf "$D"
     done
@@ -214,12 +231,14 @@ if [ "$MUTATE" = yes ]; then
     for s in $SHELLS; do
       "$s" -n "$mf" 2>/dev/null || { printf '  ERR   %-62s mutant does not parse under %s\n' "$label" "$s"; MFAIL=1; return; }
     done
-    suite "$mf" quiet >/dev/null 2>&1; r=$?
-    case "$r" in
-      0) printf '  XX    %-62s SURVIVED\n' "$label"; MFAIL=1 ;;
-      1) printf '  ok    %-62s CONVICTED\n' "$label" ;;
-      *) printf '  ERR   %-62s harness error (rc=%s), not a conviction\n' "$label" "$r"; MFAIL=1 ;;
-    esac
+    for s in $SHELLS; do
+      ( SHELLS="$s"; suite "$mf" quiet >/dev/null 2>&1 ); r=$?
+      case "$r" in
+        0) printf '  XX    %-62s SURVIVED under %s\n' "$label" "$s"; MFAIL=1 ;;
+        1) printf '  ok    %-62s CONVICTED under %s\n' "$label" "$s" ;;
+        *) printf '  ERR   %-62s harness error under %s (rc=%s), not a conviction\n' "$label" "$s" "$r"; MFAIL=1 ;;
+      esac
+    done
   }
   # m1 deletes the four-line #647 guard (if / echo SKIP / continue / fi): the first `    fi` after its `if` is its own.
   mutate 'm1 the #647 guard is gone (DIA-20260811-07 again)'      '/^    if \[ "\$reap" != 1 \]; then$/,/^    fi$/d'
@@ -228,6 +247,13 @@ if [ "$MUTATE" = yes ]; then
   mutate 'm4 every codePath is reap-eligible'                      's@case "\$cp" in /data/app/\*) ;;@case "$cp" in *) ;;@'
   mutate 'm5 the keep-set match is a substring match'              's/grep -qxF/grep -qF/'
   mutate 'm6 malformed package names reach pm'                     's@case "\$p" in ""|\*/\*|\*" "\*) continue;; esac@case "$p" in "") continue;; esac@'
+  mutate 'm7 the mixed case is back to USER_ALL'                   's/^    if \[ -n "\$_others" \]; then$/    if false; then/'
+  mutate 'm8 the --user 0 call is dropped'                         '/pm uninstall --user 0 /d'
+  mutate 'm9 the --user "$ruid" call is dropped'                   '/pm uninstall --user "\$ruid" /d'
+  mutate 'm10 _others counts user 0 too (f becomes per-user)'      's/^      if \[ "\$u" = 0 \]; then _in0=1$/      if [ "$u" = 0 ]; then _in0=1; _others="${_others:+$_others }$u"/'
+  mutate 'm11 the two per-user calls swap order'                   '/^      if \[ "\$_in0" = 1 \]; then$/,/^      fi$/{H;d;};/^      if \[ "\$_inr" = 1 \]; then$/,/^      fi$/{/^      fi$/{G;s/\n\n/\n/;};}'
+  mutate 'm12 the --user 0 call loses its stdin redirect'          '/pm uninstall --user 0 /s@ </dev/null@@'
+  mutate 'm13 the --user "$ruid" call loses its stdin redirect'    '/pm uninstall --user "\$ruid" /s@ </dev/null@@'
   echo
   [ "${MFAIL:-0}" = 0 ] && echo "ALL MUTATIONS BEHAVED" || { echo "PROBLEM: a mutation did not behave"; FAILED=1; }
 fi

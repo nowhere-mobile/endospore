@@ -46,4 +46,9 @@ mut "W1 tr.wait returns at once" "$WAIT" '(func \(tr \*goSafeTracker\) wait\(t \
 mut "W2 defer done() dropped from goSafe" "$SAFE" 'fn = func\(\) \{ defer done\(\); runSafe\(job, inner\) \}' 'fn = func() { runSafe(job, inner) }' TestGoroutineWait_TracksAtStart TestGoroutineWait_PanickingJobEnds
 mut "W3 dirCameBack always nil" "$WAIT" '(func dirCameBack\(root string, settle time\.Duration\) \[\]string \{\n)' '\1\treturn nil\n' TestGoroutineWait_GuardSeesALateWriter/wait=false
 mut "W4 hook moved into runSafe" "$SAFE" '\tif track := goSafeTrack\.Load\(\); track != nil \{.*?\n\t\}\n\tgo runSafe\(job, fn\)\n(.*?func runSafe\(job string, fn func\(\)\) \(returned bool\) \{\n)' '\tgo runSafe(job, fn)\n\1\tif track := goSafeTrack.Load(); track != nil {\n\t\tif done := (*track)(job); done != nil {\n\t\t\tinner := fn\n\t\t\tfn = func() { defer done(); inner() }\n\t\t}\n\t}\n' TestGoroutineWait_HookBeforeGoStatement TestGoroutineWait_TracksAtStart
+mut "W5 joinSignOuts returns at once (RF-001, as on main)" "$WAIT" '(func \(tr \*goSafeTracker\) joinSignOuts\(t \*testing\.T, limit time\.Duration\) \{\n\tt\.Helper\(\)\n)' '\1\treturn\n' TestGoroutineWait_TheStandInJoinsARunningLogoff
+mut "W6 a logoff in its reap wait is not parked" "$WAIT" 'tr\.parked\[id\] = true' '_ = id' TestGoroutineWait_TheJoinDoesNotWaitOutTheReap
+mut "W7 rwLaneFree does not wait" "$WAIT" '(func rwLaneFree\(t \*testing\.T\) \{\n\tt\.Helper\(\)\n)' '\1\treturn\n' TestGoroutineWait_ASignOutTestWaitsForAHeldLane
+mut "W8 an ended logoff keeps its park (RF-001)" "$WAIT" '\t+delete\(tr\.parked, id\)\n' '\t\t\t\t_ = id\n' TestGoroutineWait_AnEndedParkDoesNotCoverALiveLogoff
+mut "W9 any job's reap wait parks" "$WAIT" ' && inHandleLogout\(\)' '' TestGoroutineWait_AnotherJobsReapWaitParksNoLogoff
 [ "$fails" -eq 0 ] && echo "== all mutations convicted" || { echo "== $fails mutation(s) not convicted"; exit 1; }

@@ -11,8 +11,9 @@ import (
 // deleted at that moment, for every owner the unassign drops (*"lets make the unbind at a sim level?"*). For that a
 // record has to say which SIM it came in on: its sealed payload holds the sub id, but the agent cannot open
 // another profile's blob, and a mailbox row carries no sub id at all. So every record is tagged at arrival with
-// simTag(its binding's ICCID) -- in the sealed blob's file name, in the per-SIM mailbox file's name, and for a
-// call row in its body slot, which the chooser echoes back verbatim on a RESTAGE (serializeTelIngest).
+// simTag(its binding's ICCID) -- in the sealed blob's file name, in the per-SIM mailbox file's name, for a call row
+// in its body slot, which the chooser echoes back verbatim on a RESTAGE, and since NWP-20261130-01 for an SMS or MMS
+// row in a "sim:<tag>" slot of its own, which the chooser maps to a subscription (serializeTelIngest, TelSub).
 
 // normICCID is the one comparison form of an ICCID, the same rule as the chooser's iccEq: trimmed, lower-case,
 // one trailing 'f' filler stripped. The same SIM shows up with and without the filler nibble (Chester, lynx

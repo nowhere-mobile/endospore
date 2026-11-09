@@ -48,7 +48,7 @@ mut "M3 the renewal runs after logoutWalletStep" main.go \
 mut "M4 the GATEWAY_URL guard removed" logout_renew.go \
   "$(one "r'\tif gw == \"\" \{\n\t\treturn // managed-store billing not configured on this device\n\t\}\n'" "''")"
 mut "M5 the periodic path takes the sign-out rule" billing.go \
-  "$(both "r'(\t\treturn signOutRenewalDue\(w, nowEpoch\)\n\t\}\n\treturn )renewalDue\(w, nowEpoch\)'" "lambda m: m.group(1) + 'signOutRenewalDue(w, nowEpoch)'" \
+  "$(both "r'(\t\treturn signOutRenewalDue\(w, nowEpoch\)\n\t\}\n\treturn )periodicRenewalDue\(w, nowEpoch\)'" "lambda m: m.group(1) + 'signOutRenewalDue(w, nowEpoch)'" \
           "r'(\t\treturn noWalletSignOutDue\(meterKey, nowEpoch\)\n\t\}\n\treturn )noWalletRenewalDue\(meterKey, nowEpoch\)'" "lambda m: m.group(1) + 'noWalletSignOutDue(meterKey, nowEpoch)'")"
 mut "M6 the free latch read bypasses its lock" billing.go \
   "$(one "r'freeRenewedEpoch\(meterKey\) >= q\.CurrentEpoch'" "'freeRenewedThrough[meterKey] >= q.CurrentEpoch'")"

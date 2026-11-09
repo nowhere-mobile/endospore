@@ -48,6 +48,14 @@
 # (K-W0). A `cp` stub in the extracted script does this: CPFAIL=<dest basename> fails that copy, CPSHORT=<dest basename>
 # writes its first byte only and returns 0. The recording AGENT keeps the real cp. Mutants W1-W5 have to be convicted.
 #
+# ASSERTED (NWP-20261128-40, #67): each "has no package mapping" line ends `(map rows=T ns_rows=R named=K)`, or
+# `(map absent)` / `(map unreadable)`, counts only: T = KS_MAP's lines, R = lines whose FIRST field equals the ns as a
+# string (any run of spaces or tabs; no prefix, substring or numeric match), K = those with a second field. ns_rows=0
+# says the map never listed the ns; ns_rows above 0 says the lookup missed a listed row. The bundle is still dropped
+# and counted as before. A tab row (K22), no row (K23), a row with no package (K24), no map (K25), a mode-000 map
+# (K25b, skipped as root), an import with a two-space row (K26) and a substring or numeric twin of the ns (K27); no
+# row's package reaches the log (K22, K26). Mutants N1-N6 have to be convicted.
+#
 #   bash test-keystore-push-merge.sh            # the behaviour cases
 #   bash test-keystore-push-merge.sh --mutate   # ... plus mutations that must each CONVICT the suite
 set -uo pipefail
@@ -283,6 +291,63 @@ suite() {  # suite <roamd.sh> [quiet] -> 0 all ok, 1 a case failed, 2 the harnes
     [ "$(cat "$d/in/10/com.b.keys" 2>/dev/null)" = carried ] || why="$why KS_IN bundle disturbed;"
     [ ! -e "$d/keystore-stage" ] || why="$why stage dir left behind;"
     fin "K9 unmapped drop and nothing fresh: no AGENT call, KS_IN untouched" "$d"
+
+    # K22-K27 (NWP-20261128-40): a "has no package mapping" line carries the map's counts for the ns, never a row's text
+    d=$(newcase); why=""
+    printf '1010001 com.a\n1010099\tcom.z\n' > "$d/map"; put "$d/exp" 1010001.keys fresh; put "$d/exp" 1010099.keys orphan
+    runcase "$fn" "$sh" "$d"
+    grep -qF 'keystore_push: ns 1010099 has no package mapping, dropped (map rows=2 ns_rows=1 named=1) ' "$d/log" || why="$why no counted drop line: $(cat "$d/log");"
+    [ "$(staged "$d")" = "com.a.keys" ] || why="$why staged '$(staged "$d")', want 'com.a.keys';"
+    grep -qF '#keys sealed (1 pkg, 1 fresh, 1 dropped)' "$d/log" || why="$why sealed line missing: $(cat "$d/log");"
+    ! grep -qF 'com.z' "$d/log" || why="$why the row's package reached the log;"
+    fin "K22 tab row '1010099<TAB>com.z': still dropped, line reads ns_rows=1 named=1, no com.z" "$d"
+
+    d=$(newcase); why=""
+    printf '1010001 com.a\n1010002 com.b\n' > "$d/map"; put "$d/exp" 1010001.keys fresh; put "$d/exp" 1010099.keys orphan
+    runcase "$fn" "$sh" "$d"
+    grep -qF 'ns 1010099 has no package mapping, dropped (map rows=2 ns_rows=0 named=0) ' "$d/log" || why="$why no counted drop line: $(cat "$d/log");"
+    grep -qF '#keys sealed (1 pkg, 1 fresh, 1 dropped)' "$d/log" || why="$why sealed line missing: $(cat "$d/log");"
+    fin "K23 no row for the ns in a 2-row map: map rows=2 ns_rows=0 named=0" "$d"
+
+    d=$(newcase); why=""
+    printf '1010001 com.a\n1010099 \n' > "$d/map"; put "$d/exp" 1010001.keys fresh; put "$d/exp" 1010099.keys orphan
+    runcase "$fn" "$sh" "$d"
+    grep -qF 'ns 1010099 has no package mapping, dropped (map rows=2 ns_rows=1 named=0) ' "$d/log" || why="$why no counted drop line: $(cat "$d/log");"
+    fin "K24 row '1010099 ' with no package: ns_rows=1 named=0" "$d"
+
+    d=$(newcase); why=""
+    command rm -f "$d/map"; put "$d/exp" 1010099.keys orphan; put "$d/in/10" com.b.keys carried
+    runcase "$fn" "$sh" "$d"
+    grep -qF 'ns 1010099 has no package mapping, dropped (map absent) ' "$d/log" || why="$why no map-absent drop line: $(cat "$d/log");"
+    [ "$(wc -l < "$d/log" | tr -d ' ')" = 1 ] || why="$why the log holds more than the one line: $(cat "$d/log");"
+    [ ! -s "$d/agent.calls" ] || why="$why AGENT was called: $(cat "$d/agent.calls");"
+    fin "K25 no map file: (map absent), no AGENT call" "$d"
+
+    if [ "$(id -u)" = 0 ]; then
+      printf '  SKIP  K25b unreadable map [%s] (root reads a mode-000 file)\n' "$sh"
+    else
+      d=$(newcase); why=""
+      echo '1010001 com.a' > "$d/map"; chmod 000 "$d/map"; put "$d/exp" 1010099.keys orphan
+      runcase "$fn" "$sh" "$d"
+      chmod 600 "$d/map"
+      grep -qF 'ns 1010099 has no package mapping, dropped (map unreadable) ' "$d/log" || why="$why no map-unreadable drop line: $(cat "$d/log");"
+      [ "$(wc -l < "$d/log" | tr -d ' ')" = 1 ] || why="$why the log holds more than the one line: $(cat "$d/log");"
+      fin "K25b mode-000 map: (map unreadable)" "$d"
+    fi
+
+    d=$(newcase); why=""
+    printf '1010001 com.a\n1010098  com.y\n' > "$d/map"; put "$d/exp" 1010001.keys fresh; put "$d/imp" 1010098.keys staged
+    runcase "$fn" "$sh" "$d"
+    grep -qF 'keystore_push: staged import ns 1010098 has no package mapping, dropped (map rows=2 ns_rows=1 named=1) ' "$d/log" || why="$why no counted import drop line: $(cat "$d/log");"
+    grep -qF '#keys sealed (1 pkg, 1 fresh, 1 dropped)' "$d/log" || why="$why sealed line missing: $(cat "$d/log");"
+    ! grep -qF 'com.y' "$d/log" || why="$why the row's package reached the log;"
+    fin "K26 import, two-space row '1010098  com.y': ns_rows=1 named=1, no com.y" "$d"
+
+    d=$(newcase); why=""
+    printf '1010001 com.a\n21010099 com.w\n01010099 com.v\n' > "$d/map"; put "$d/exp" 1010001.keys fresh; put "$d/exp" 1010099.keys orphan
+    runcase "$fn" "$sh" "$d"
+    grep -qF 'ns 1010099 has no package mapping, dropped (map rows=3 ns_rows=0 named=0) ' "$d/log" || why="$why no counted drop line: $(cat "$d/log");"
+    fin "K27 substring and numeric twins (21010099, 01010099): ns_rows=0" "$d"
 
     # K6: no creds on this op -> deferred, notsealed, dump kept
     for cred in "name" "pass"; do
@@ -528,7 +593,7 @@ if [ "$MUTATE" = yes ]; then
   mutate 'm5 the nothing-fresh early return is deleted' \
     '/^  if \[ "\$_kn" = 0 \] && \[ "\$_kdrop" = 0 \]; then rm -rf "\$KSTAGE"/d'
   mutate 'm6 the export-arm unmapped increment is deleted' \
-    '/has no package mapping, dropped \$(date)" >> "\$LOG"; _knomap=/{/staged import/!s/ _knomap=\$((_knomap + 1));//}'
+    '/has no package mapping, dropped \$_kmev \$(date)" >> "\$LOG"; _knomap=/{/staged import/!s/ _knomap=\$((_knomap + 1));//}'
   mutate 'm7 the import-arm unmapped increment is deleted' \
     '/staged import ns/s/ _knomap=\$((_knomap + 1));//'
   mutate 'm8 the sealed line reverts to $_kdrop dropped' \
@@ -580,6 +645,19 @@ if [ "$MUTATE" = yes ]; then
     '/^keystore_push() {$/,/^}$/{/then _kn=\$((_kn + 1)); else/s/; else rm -f "\$KSTAGE\/\$_pkg\.keys" 2>\/dev\/null; _kcf=\$((_kcf + 1)); fi$/; fi/;}'
   mutate 'W5 the refusal block no longer returns' \
     '/^keystore_push() {$/,/^}$/{/could not be staged whole/,/^  fi$/{/^    return 1$/d;};}'
+  # NWP-20261128-40: the "has no package mapping" lines carry the map's counts for the ns, counts only.
+  mutate 'N1 the export line loses the evidence' \
+    '/keystore_push: ns \$_ns has no/s/dropped \$_kmev \$(date)/dropped $(date)/'
+  mutate 'N2 the import line loses the evidence' \
+    '/staged import ns \$_ns has no/s/dropped \$_kmev \$(date)/dropped $(date)/'
+  mutate 'N3 ns_rows counts a substring match' \
+    '/^keystore_push() {$/,/^}$/s/(\$1 "") == (n "")/index($0, n)/g'
+  mutate 'N4 the matched row is printed in place of the counts' \
+    '/^keystore_push() {$/,/^}$/{s/{ r++; if (NF > 1) k++ }/{ r++; if (NF > 1) k++; m = $0 }/g;s/END { printf "(map rows=%d ns_rows=%d named=%d)", t, r, k }/END { printf "(map row %s)", m }/g;}'
+  mutate 'N5 the map-absent arm is removed' \
+    '/^keystore_push() {$/,/^}$/s/_kmev='"'"'(map absent)'"'"'; \[ ! -e "\$KS_MAP" \] || //g'
+  mutate 'N6 ns_rows compares the first field numerically' \
+    '/^keystore_push() {$/,/^}$/s/(\$1 "") == (n "")/$1 == n/g'
   echo
   [ "${MFAIL:-0}" = 0 ] && echo "ALL MUTATIONS BEHAVED" || { echo "PROBLEM: a mutation did not behave"; FAILED=1; }
   command rm -rf "$mtmp"

@@ -130,7 +130,7 @@ agent_sim() {
 pw() { printf '%s\n' "$ROOT/sim/pw"; }
 _ms() { echo 0; }
 sleep() { return 0; }
-for t in stop_mediad usb_host relabel_launcher remap_media_db remap_per_pkg _tlog acct_restore remap_tree reown_ext_appdata \
+for t in stop_mediad usb_host relabel_launcher remap_media_db insert_deferred_media remap_per_pkg _tlog _ssum acct_restore remap_tree reown_ext_appdata \
          hold_ondemand od_parked_report reap_stale_ondemand reap_orphan_provisioned restorecon \
          uiderrors_floor_take uiderrors_floor_commit tz_surface; do
   eval "$t() { :; }"

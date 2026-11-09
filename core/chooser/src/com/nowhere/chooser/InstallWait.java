@@ -1,8 +1,9 @@
 package com.nowhere.chooser;
 
-/** The wait-and-decide rule of a committed PackageInstaller session (NWP-20260831-03), once, for both full-session
- *  installs: {@code UnarchiveService.installApks} (an on-demand materialise) and {@code ChooserActivity.installApkSet}
- *  (the login materialise). Pure java.lang -- no android.* import -- so test-install-wait-java.sh runs it under javac.
+/** The wait-and-decide rule of a committed PackageInstaller session (NWP-20260831-03), once, for all three full-session
+ *  installs: {@code UnarchiveService.installApks} (an on-demand materialise), {@code ChooserActivity.installApkSet}
+ *  (the login materialise) and {@code StoreInstaller.installStaged} (a store Get or Update, NWP-20261129-21). Pure
+ *  java.lang -- no android.* import -- so test-install-wait-java.sh runs it under javac.
  *
  *  ⚠ A TIMEOUT IS NOT A VERDICT. The receiver's status defaults to FAILURE, and the old single 120s await reported a
  *  still-running install as failed: device-proven on lynx 2026-08-30, where a 243MB 12-apk gms set landed at ~4

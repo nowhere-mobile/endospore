@@ -544,6 +544,9 @@ var opaqueAllowed = map[string][]string{
 	"UnarchiveService.java#restoreOnlyListLocked": {"RESTORE-ODDATA"},
 	// First run's phone name: saveDeviceName sends DeviceName.request(label), "SET-DEVICE-LABEL\n<label>\n" (NWP-20261114-28).
 	"ChooserActivity.java#saveDeviceName": {"SET-DEVICE-LABEL"},
+	// The #119 skip notice's card: markShown sends SkipNoticeCopy.shownRequest(time), "SKIP-NOTICE-SHOWN\n<time>\n",
+	// once the card is on screen (NWP-20261128-08).
+	"SkipNoticeActivity.java#markShown": {"SKIP-NOTICE-SHOWN"},
 }
 
 // streamReplies are literals written to a socket whose request is already open: answers to the daemon's prompts, not
@@ -657,7 +660,7 @@ var senderFiles = map[string]bool{
 	"CredentialService.java": true, "DaemonSocket.java": true, "DiagReportJob.java": true, "DozeAppsMirror.java": true, "GateAlarmActivity.java": true, "GateTrace.java": true,
 	"IdleLogoffReceiver.java": true, "Ingest.java": true, "NfcFido2.java": true, "OtaUpdate.java": true,
 	"OtaTimeReceiver.java": true, "OtaWakeReceiver.java": true, "ProfileActivity.java": true, "ReloginReceiver.java": true,
-	"SmsDeliverReceiver.java": true, "StoreService.java": true, "TelArrival.java": true, "TelIngest.java": true,
+	"SkipNoticeActivity.java": true, "SmsDeliverReceiver.java": true, "StoreService.java": true, "TelArrival.java": true, "TelIngest.java": true,
 	"UnarchiveService.java": true, "WifiMirror.java": true,
 }
 

@@ -7,7 +7,8 @@
 # notices read two texts on Sim1 plus one on another line as "2 new messages" with no line named -- misleading when one
 # line is bound and the other is not (Chester, handset test 2026-09-27). The banner now names each line's notices under
 # its label, and the receiver carries a running nowhere_count so a second text counts. Each of those is one line a later
-# edit can change without breaking a build.
+# edit can change without breaking a build. NWP-20261128-18: a call answered at the gate is its own kind ("incoming"),
+# on its own notice id and marked by nowhere_call, so the banner never reads it as a missed call.
 #
 # It needs a JDK, and it FAILS when there is none. javac/java come from PATH, then the build VM's prebuilt JDK 21.
 # --mutate re-runs it against deliberately broken copies, each of which must fail a CASE (a copy that no longer
@@ -73,6 +74,12 @@ if [ "$MUTATE" = yes ] && [ "$rc" = 0 ]; then
   mutate "the receiver never stores the count"                $R '/nx.putInt("nowhere_count", count);/d'
   mutate "the receiver reads no previous count"               $R 's/if (old == null || old.getId() != nid || !TEL_CHANNEL.equals(old.getTag())) continue;/continue;/'
   mutate "the second arrival's title loses the label suffix"  $R 's/title + "  -  " + line)/title)/'
+  # NWP-20261128-18: an answered gate call is counted as incoming, on its own notice
+  mutate "M1 summarize counts an incoming call as missed"     $C 's/else if ("incoming".equals(n\[1\])) c\[3\] += k;/else if ("incoming".equals(n[1])) c[0] += k;/'
+  mutate "M3 the answered call shares the missed call's id"   $R 's/(isCall ? (callType == 1 ? "ci" : "c") : "m")/(isCall ? "c" : "m")/'
+  mutate "M4 the receiver does not put nowhere_call"          $R '/nx.putString("nowhere_call",/d'
+  mutate "M5 the incoming plural reads missed calls"          $C 's/c\[3\] + " incoming calls"/c[3] + " missed calls"/'
+  mutate "telNotices reduces every call to call again"        $C 's/notices.add(new String\[\]{noticeLabel(sbn), kind,/notices.add(new String[]{noticeLabel(sbn), "incoming".equals(kind) ? "call" : kind,/'
 fi
 
 echo

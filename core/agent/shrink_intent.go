@@ -88,6 +88,36 @@ func handleExpectShrinkInferred(conn net.Conn, r *bufio.Reader, dest string) {
 	fmt.Fprint(conn, "OK\n")
 }
 
+// handleExpectShrinkAndroid backs the EXPECT-SHRINK-ANDROID verb (NWP-20261129-04): the payload line names the
+// packages Android's own clear-data and uninstall events touched. Only names validPkgName accepts count, each once,
+// at most shrinkAndroidMaxPkgs of them. "OK" | "NONE" | "ERR". Like handleExpectShrink it WRITES state the seal path
+// reads, so it is not in concurrentSafeCmd.
+func handleExpectShrinkAndroid(conn net.Conn, r *bufio.Reader, dest string) {
+	pl, _ := r.ReadString('\n')
+	var pkgs []string
+	seen := map[string]bool{}
+	for _, p := range strings.Fields(strings.TrimRight(pl, "\r\n")) {
+		if len(pkgs) == shrinkAndroidMaxPkgs {
+			break
+		}
+		if validPkgName(p) && !seen[p] {
+			seen[p] = true
+			pkgs = append(pkgs, p)
+		}
+	}
+	nm, ps, _ := readRoamSession(dest)
+	if nm == "" || len(pkgs) == 0 {
+		fmt.Fprint(conn, "NONE\n")
+		return
+	}
+	if err := markProfileShrinkAndroid(nm, ps, pkgs); err != nil {
+		dlog("expect-shrink-android: marker not written for %d package(s)", len(pkgs))
+		fmt.Fprint(conn, "ERR\n")
+		return
+	}
+	fmt.Fprint(conn, "OK\n")
+}
+
 // shrinkTarget is one marker a call means to write.
 type shrinkTarget struct {
 	path string
@@ -543,7 +573,7 @@ func readShrinkIntent(ref string) shrinkIntent {
 	if err != nil {
 		return shrinkIntent{}
 	}
-	// Authority only to a body whose first line is exactly "deliberate" or "inferred" and which ends in a newline.
+	// Authority only to a body whose first line is exactly "deliberate", "inferred" or "android" and which ends in a newline.
 	// An empty, truncated or unrecognised body (a write that died half way, the consumed tombstone) authorizes
 	// nothing. This INVERTS the older "unrecognised reads as deliberate": the markers live on the RAM state tmpfs,
 	// so no body written before the strict reader survives a reboot, and a body cut short must never read as whole-scope
@@ -557,6 +587,13 @@ func readShrinkIntent(ref string) shrinkIntent {
 	case "deliberate":
 	case "inferred":
 		in.kind = "inferred"
+		for _, l := range lines[1:] {
+			if !strings.HasPrefix(l, genLine) {
+				in.declared = append(in.declared, l)
+			}
+		}
+	case "android":
+		in.kind = "android"
 		for _, l := range lines[1:] {
 			if !strings.HasPrefix(l, genLine) {
 				in.declared = append(in.declared, l)
@@ -692,6 +729,9 @@ func shrinkIntentProvenance(ref string) (string, []string) {
 // compare against. No index means no verification, and unverifiable is refused. The []string return
 // names the unexplained packages, for the refusal message.
 func shrinkIntentAllowed(kind string, declared []string, oldPkg, newPkg map[string]int64, newDeferredRels []string) (bool, []string) {
+	if kind == "android" {
+		return false, nil // shrinkAndroidExplains judges it: an android marker never reaches the outright path
+	}
 	if kind != "inferred" {
 		return true, nil
 	}
@@ -891,6 +931,83 @@ func deferredGrowth(oldDef, newDef map[string]deferredFile) int64 {
 func shrinkWalkExplains(sealDropped, defMigrated, lost int64) bool {
 	s := sealDropped + defMigrated
 	return s > 0 && s >= lost
+}
+
+// ---- Android's own clear-data and uninstall events (NWP-20261129-04) ------------------------------------
+//
+// docs/product-decisions.md, 2026-11-05, #5: a shrunken #de is armed from Android's own events, which the user made on
+// purpose, and sign-out gets no override. A clear in Android Settings arms nothing else, so without this every later
+// seal of a large app's scope is refused and the sign-out wedges.
+//
+// NOT THE DELIBERATE MARKER: that one allows a scope's shrink outright and only a seal that USED it retires it, so an
+// unshrunk scope or the walk-explained arm leaves it armed. Armed at every Android uninstall it would hold #media's
+// guard open for the rest of the session, and the guard is what stopped the backlog row's #media false positive
+// (73.5 MB -> 1.3 MB -> 73.5 MB in one session). So this marker speaks only for the packages Android named, by the
+// sealed bytes they lost.
+//
+// NOT #apps: the logoff prune owns an uninstall's #apps drop, and a clear-data leaves the code.
+
+// shrinkAndroidMaxPkgs bounds one EXPECT-SHRINK-ANDROID payload.
+const shrinkAndroidMaxPkgs = 64
+
+// markProfileShrinkAndroid arms the intent on the vault, #de and #media scopes, all or nothing (commitShrinkMarkers).
+// A deliberate marker stays untouched: a whole-scope user authority already stands and is never narrowed. An android
+// marker gets the sorted union of its names and pkgs. Lifetime, tmpfs residence and clear-on-commit are the siblings'.
+func markProfileShrinkAndroid(profile, pass string, pkgs []string) error {
+	if profile == "" || len(pkgs) == 0 {
+		return nil
+	}
+	var targets []shrinkTarget
+	for _, scope := range []string{profile, profile + "#de", profile + "#media"} {
+		ref := profileRefV2(scope, pass)
+		f := shrinkIntentFile(ref)
+		if f == "" {
+			continue
+		}
+		names := pkgs
+		switch in := readShrinkIntent(ref); {
+		case in.armed && in.kind == "deliberate":
+			continue
+		case in.armed && in.kind == "android":
+			set := map[string]bool{}
+			for _, p := range append(append([]string{}, in.declared...), pkgs...) {
+				set[p] = true
+			}
+			names = make([]string, 0, len(set))
+			for p := range set {
+				names = append(names, p)
+			}
+			sort.Strings(names)
+		}
+		body := "android\n"
+		for _, p := range names {
+			body += p + "\n"
+		}
+		targets = append(targets, shrinkTarget{f, withGen(body)})
+	}
+	return commitShrinkMarkers(targets)
+}
+
+// shrinkAndroidExplains is the guard verdict on an android marker, PURE so the table is testable. The declared
+// packages' sealed-byte shortfall, with the walk's dropped and deferred-migrated bytes, must account for at least four
+// fifths of what the head lost: the net's own one-fifth slack, so tail re-chunking and another app's cache trim do not
+// refuse a real clear, while an undeclared loss over a quarter of the explained bytes still does. A drop-listed name is
+// skipped because its bytes are already in sealDropped: no byte counts twice. An unmeasured seal (NOWHERE_SEAL_FULL) or
+// an index-less head vouches for nothing. The int64 is the declared shortfall, for the log line.
+func shrinkAndroidExplains(declared []string, oldPkg, newPkg map[string]int64, measured bool, drop map[string]bool, sealDropped, defMigrated, lost int64) (bool, int64) {
+	var short int64
+	seen := map[string]bool{}
+	for _, p := range declared {
+		if seen[p] || drop[p] {
+			continue
+		}
+		seen[p] = true
+		if d := oldPkg[p] - newPkg[p]; d > 0 {
+			short += d
+		}
+	}
+	s := sealDropped + defMigrated + short
+	return measured && len(oldPkg) > 0 && s > 0 && s*5 >= lost*4, short
 }
 
 // shrinkShortfallLog renders shrinkShortfall's result as the log lines pushProfile prints after a refusal: one

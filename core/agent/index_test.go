@@ -40,15 +40,19 @@ func withIndexKey(t *testing.T) (ed25519.PrivateKey, string, func()) {
 	dir := t.TempDir()
 	sk, ss, sd, sp := indexPubKey, indexSystemPath, indexDataPath, iconPackPath
 	sc, scd := catalogPubKey, catalogSystemPath
+	sq, sh := indexKeySeqPath, indexKeyHeldPath
 	indexPubKey = base64.StdEncoding.EncodeToString(pub)
 	indexSystemPath = filepath.Join(dir, "index.json")
 	indexDataPath = filepath.Join(dir, "index-data.json")
 	iconPackPath = filepath.Join(dir, "icons.pack")
 	catalogSystemPath = filepath.Join(dir, "catalog.json") // empty by default -> no curated entries
+	indexKeySeqPath = filepath.Join(dir, "index-key-seq")
+	indexKeyHeldPath = filepath.Join(dir, "index-key")
 	resetIndexCaches()
 	return pk, dir, func() {
 		indexPubKey, indexSystemPath, indexDataPath, iconPackPath = sk, ss, sd, sp
 		catalogPubKey, catalogSystemPath = sc, scd
+		indexKeySeqPath, indexKeyHeldPath = sq, sh
 		resetIndexCaches()
 	}
 }

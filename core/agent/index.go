@@ -36,10 +36,10 @@ var (
 )
 
 // indexDataPath is NOT wiped at power-off (/data is not; only /data/nowhere/state is tmpfs) and nothing removes it, by
-// design (NWP-20261017-34): it is the same public Nowhere-signed trimmed index for every device, verified against
-// indexPubKey on every read and ignored when older than the baked index (loadIndexBytes). Staleness (maxIndexStaleness)
-// is checked only when an index is FETCHED (refreshIndex): refusing a stale /data index on read would only fall back to
-// the baked one, which is older still. The shape of catalogDataPath. One honest residual:
+// design (NWP-20261017-34): it is the same public Nowhere-signed trimmed index for every device, verified against the
+// key currentIndexKey selects on every read and ignored when older than the baked index (loadIndexBytes). Staleness
+// (maxIndexStaleness) is checked only when an index is FETCHED (refreshIndex): refusing a stale /data index on read
+// would only fall back to the baked one, which is older still. The shape of catalogDataPath. One honest residual:
 // its mtime survives power-off and, since NWP-20261102-11, is the publisher's Last-Modified of the copy fetched (set
 // after the write; refreshIndex sends it back as If-Modified-Since), the same for every device that fetched that copy
 // -- not when a session refreshed. A copy written before that, or from a response with no valid Last-Modified, keeps
@@ -93,11 +93,22 @@ func indexGeneratedOf(b []byte) int64 {
 // replayed OLD signed index (stale URLs, a reverted removal) can't roll the device back. When a key is baked the
 // /system copy must ALSO carry a matching .sig (defense in depth); no key => the read-only baked copy rides
 // verified boot. Called on a getIndex cache MISS only, so the extra parse of `generated` is not a per-search cost.
+// The /data copy is checked with the key currentIndexKey selects (NWP-20261129-18, #8); see loadIndexBytesWith.
 func loadIndexBytes() []byte {
+	return loadIndexBytesWith(currentIndexKey(time.Now().Unix()))
+}
+
+// loadIndexBytesWith is loadIndexBytes with the /data key already selected, so one refresh judges with one key. dataKey
+// checks ONLY the /data copy, and "" means "no /data refresh is accepted", never "unsigned". The baked /system copy
+// rides verified boot and is signed by the baked key, so every other branch here keeps reading indexPubKey: a revoked
+// key still serves the baked copy, and a phone with no key baked still trusts it unsigned.
+func loadIndexBytesWith(dataKey string) []byte {
 	baked, _ := os.ReadFile(indexSystemPath)
 	if indexPubKey != "" {
-		if d, err := os.ReadFile(indexDataPath); err == nil {
-			if sig, e := os.ReadFile(indexDataPath + ".sig"); e == nil && verifyIndexSig(d, sig) {
+		if dataKey == "" {
+			fmt.Fprintln(os.Stderr, "[index] no /data refresh key is selected -- ignoring any /data refresh")
+		} else if d, err := os.ReadFile(indexDataPath); err == nil {
+			if sig, e := os.ReadFile(indexDataPath + ".sig"); e == nil && verifyEd25519(dataKey, d, sig) {
 				if indexGeneratedOf(d) >= indexGeneratedOf(baked) {
 					return d
 				}
@@ -125,7 +136,7 @@ func loadIndexBytes() []byte {
 
 type indexCacheT struct {
 	mu      sync.RWMutex
-	key     string         // indexCacheKey() of the four files when entries was parsed
+	key     string         // indexCacheKey() of the files it stats when entries was parsed
 	entries []catalogEntry // resident parsed index
 	gen     int64          // parsed `generated` of the resident index (for the search reply's staleness hint)
 }
@@ -133,20 +144,24 @@ type indexCacheT struct {
 var indexCache indexCacheT
 
 // indexCacheKey is a CHEAP key from a stat of EVERY file loadIndexBytes reads to choose what it serves: the baked
-// index, its .sig, the /data refresh and its .sig (NO read/verify) -- so a cache HIT costs four os.Stat calls, not a
-// re-read + full ed25519 verify of the ~3 MB index on every search keystroke. A refresh (new /data pair) or an OTA
-// (new /system pair) changes a stat -> the key changes -> getIndex re-parses via loadIndexBytes (which does the read +
-// sig-verify + /data-vs-/system choice). The .sig files are in the key because refreshIndex installs the index and
-// its signature in TWO renames, index first: a getIndex between them (or after a crash between them) sees the new
-// index beside the old signature and falls back to the baked index, and the .sig rename that follows must change
-// the key, or that fallback stays resident until index.json changes again (refreshIndex re-stamps its mtime only
-// when the publisher sent a Last-Modified and the Chtimes worked). Each file has its own prefix letter, so a missing
-// file and a present one never render the same key. If none of the four files is present the key is "" (no cache).
+// index, its .sig, the /data refresh, its .sig and the held index-key pair (NO read/verify) -- so a cache HIT costs six
+// os.Stat calls, not a re-read + full ed25519 verify of the ~3 MB index on every search keystroke. A refresh (new /data
+// pair) or an OTA (new /system pair) changes a stat -> the key changes -> getIndex re-parses via loadIndexBytes (which
+// does the read + sig-verify + /data-vs-/system choice). The .sig files are in the key because refreshIndex installs
+// the index and its signature in TWO renames, index first: a getIndex between them (or after a crash between them) sees
+// the new index beside the old signature and falls back to the baked index, and the .sig rename that follows must
+// change the key, or that fallback stays resident until index.json changes again (refreshIndex re-stamps its mtime only
+// when the publisher sent a Last-Modified and the Chtimes worked). The floor and the held envelope are in the key
+// because they choose the key that checks the /data copy (NWP-20261129-18): a held object that arrives, changes or goes
+// must drop a parse the old key accepted. acceptIndexKey writes them in two renames, so a parse between the two (no
+// /data key) is dropped by the second. Each file has its own prefix letter, so a missing file and a present one never
+// render the same key. If none of the six files is present the key is "" (no cache).
 func indexCacheKey() string {
 	k := ""
 	for _, f := range []struct{ tag, path string }{
 		{"s", indexSystemPath}, {"S", indexSystemPath + ".sig"},
 		{"d", indexDataPath}, {"D", indexDataPath + ".sig"},
+		{"q", indexKeySeqPath}, {"h", indexKeyHeldPath},
 	} {
 		if fi, err := os.Stat(f.path); err == nil {
 			k += fmt.Sprintf("%s%d:%d;", f.tag, fi.ModTime().UnixNano(), fi.Size())
@@ -364,7 +379,7 @@ func indexRefreshURL() string {
 }
 
 // indexHTTPGet: like catalogHTTPGet but a generous 32 MiB cap (a trimmed index is ~3 MB now but headroom for
-// growth; still bounded so a hostile huge body fails closed after verifyIndexSig, not before). With a non-zero since
+// growth; still bounded so a hostile huge body fails closed after the sig check, not before). With a non-zero since
 // it asks If-Modified-Since and reports a 304 as notModified (NWP-20261102-11); lastMod is the response's parsed
 // Last-Modified, zero when absent or invalid.
 func indexHTTPGet(url string, since time.Time) (body []byte, lastMod time.Time, notModified bool, err error) {
@@ -394,12 +409,18 @@ func indexHTTPGet(url string, since time.Time) (body []byte, lastMod time.Time, 
 }
 
 // servedIndexDataMtime is the /data index's mtime, but only when loadIndexBytes would select that copy: a key is
-// baked, the /data signature verifies and /data is not older than the baked index. Zero (so no If-Modified-Since)
-// otherwise -- only the baked copy, a missing or bad /data signature, or a rollback-guarded /data. The next fetch
-// must then be a full 200, never a 304 against a copy that is not in use. The selection is validated here, not
-// inferred from byte equality with loadIndexBytes: a rejected /data copy can match the baked bytes.
+// baked, the /data signature verifies under the selected key and /data is not older than the baked index. Zero (so no
+// If-Modified-Since) otherwise -- only the baked copy, no selected key, a missing or bad /data signature, or a
+// rollback-guarded /data. The next fetch must then be a full 200, never a 304 against a copy that is not in use. The
+// selection is validated here, not inferred from byte equality with loadIndexBytes: a rejected /data copy can match
+// the baked bytes.
 func servedIndexDataMtime() time.Time {
-	if indexPubKey == "" {
+	return servedIndexDataMtimeWith(currentIndexKey(time.Now().Unix()))
+}
+
+// servedIndexDataMtimeWith is servedIndexDataMtime with the /data key already selected, as in loadIndexBytesWith.
+func servedIndexDataMtimeWith(dataKey string) time.Time {
+	if indexPubKey == "" || dataKey == "" {
 		return time.Time{}
 	}
 	fi, err := os.Stat(indexDataPath)
@@ -411,7 +432,7 @@ func servedIndexDataMtime() time.Time {
 		return time.Time{}
 	}
 	sig, err := os.ReadFile(indexDataPath + ".sig")
-	if err != nil || !verifyIndexSig(d, sig) {
+	if err != nil || !verifyEd25519(dataKey, d, sig) {
 		return time.Time{}
 	}
 	baked, _ := os.ReadFile(indexSystemPath)
@@ -433,7 +454,13 @@ func refreshIndex() error {
 	if url == "" {
 		return fmt.Errorf("index refresh: no source (set INDEX_URL or GATEWAY_URL): %w", errRefreshOff)
 	}
-	body, lastMod, notModified, err := indexHTTPGet(url, servedIndexDataMtime())
+	// The key the object selects (NWP-20261129-18, decision #8), read once: one refresh judges with one key. "" means the
+	// phone accepts no /data refresh, so nothing is asked of the network. Not errRefreshOff: REFRESH-INDEX answers ERR.
+	k := currentIndexKey(time.Now().Unix())
+	if k == "" {
+		return errors.New("index refresh: no /data refresh key is selected -- refusing")
+	}
+	body, lastMod, notModified, err := indexHTTPGet(url, servedIndexDataMtimeWith(k))
 	if err != nil {
 		return err
 	}
@@ -444,7 +471,7 @@ func refreshIndex() error {
 	if err != nil {
 		return err
 	}
-	if !verifyIndexSig(body, sig) {
+	if !verifyEd25519(k, body, sig) {
 		return fmt.Errorf("index refresh: fetched index signature invalid -- refusing")
 	}
 	var c catalog
@@ -464,7 +491,7 @@ func refreshIndex() error {
 	if c.Generated < now-maxIndexStaleness {
 		return fmt.Errorf("index refresh: too stale (generated=%d, older than %dd) -- refusing", c.Generated, maxIndexStaleness/86400)
 	}
-	if c.Generated <= indexGeneratedOf(loadIndexBytes()) {
+	if c.Generated <= indexGeneratedOf(loadIndexBytesWith(k)) {
 		return nil // already current or older -> no-op (not an error)
 	}
 	os.MkdirAll(filepath.Dir(indexDataPath), 0o700)

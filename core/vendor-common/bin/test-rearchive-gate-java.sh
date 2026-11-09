@@ -10,6 +10,9 @@
 # foreground-service times to archive's max. Pins s8-s11: the sweep reads every job source once, archives nothing
 # when one cannot be read, and passes holdsJob and the four times to archive. Mutants G6-G10, R10 and R11 are new;
 # G1 and G5 are re-pointed at the four-time max.
+# NWP-20261129-14 (h59 #8) adds ReArchiveGate.playNeeded and holdsJob's playNeeded argument (a Play stack member an app
+# with code on the phone needs is kept), pin s12 (sweep and freeNow read it once, after readJobs and before their
+# failure check; the reader refuses an unknown nowhere-playdeps and maps only packages with code) and mutants P1-P6.
 #
 # It needs a JDK, and it FAILS when there is none: a Java suite that skips without one would read green on a runner
 # that never ran it. javac/java come from PATH, then the build VM's prebuilt JDK 21. The pins need python3.
@@ -124,4 +127,24 @@ mut "R10 sweep passes false for holdsJob" ReArchiveReceiver.java \
 mut "R11 the read-failure path removed" ReArchiveReceiver.java \
   's/\n[ \t]*if \(failed != null\) \{.*?return;\n[ \t]*\}//s' \
   "s10 a failed job read returns before the loop" || fails=$((fails+1))
+S8="s8 sweep passes holdsJob for each package to ReArchiveGate.archive before archive(ctx, pkg)"
+S12="s12 sweep and freeNow read playNeeded once, and the reader refuses unknown and maps only code"
+mut "P1 holdsJob ignores playNeeded" ReArchiveGate.java \
+  's/\s*\|\| \(playNeeded != null && playNeeded\.contains\(pkg\)\)//' \
+  "a needed stack member is kept past idle" || fails=$((fails+1))
+mut "P2 playNeeded keeps a non-stack dep" ReArchiveGate.java \
+  's/if \(PLAY_STACK\.contains\(dep\)\) out\.add\(dep\);/out.add(dep);/' \
+  "a non-stack dep is not needed" || fails=$((fails+1))
+mut "P3 the readPlayDepsStrict check removed" ReArchiveReceiver.java \
+  's/\n[ \t]*if \(playDeps == null\) return "nowhere-playdeps";//' \
+  "$S12" || fails=$((fails+1))
+mut "P4 sweep passes an empty set" ReArchiveReceiver.java \
+  's/(boolean job = ReArchiveGate\.holdsJob\(pkg, jobs\[0\], jobs\[1\], jobs\[2\], jobs\[3\], roles, )needed\)/$1Collections.emptySet())/' \
+  "$S8" || fails=$((fails+1))
+mut "P5 freeNow skips the read" ReArchiveReceiver.java \
+  's/(static String freeNow.*?)\n[ \t]*if \(failed == null\) failed = readPlayNeeded\(ctx, needed\);/$1/s' \
+  "$S12" || fails=$((fails+1))
+mut "P6 the code check removed" ReArchiveReceiver.java \
+  's/(String readPlayNeeded.*?)pm\.getApplicationInfo\(pkg, 0\);/$1/s' \
+  "$S12" || fails=$((fails+1))
 [ "$fails" -eq 0 ] && echo "== all mutations convicted" || { echo "== $fails mutation(s) not convicted"; exit 1; }

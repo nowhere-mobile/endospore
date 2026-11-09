@@ -165,6 +165,7 @@ public class ChooserActivity extends Activity {
     // free -- line label only) and clears when the owner logs in (cancelTelNotices, task_c65700f5).
     private TextView noticeBanner;
     private android.app.AlertDialog noticePopup; // NWP-20261105-06: the one per-notice popup (showNoticePopup); refreshNoticeBanner and onDestroy close it
+    private android.app.AlertDialog syncPicker; // NWP-20261130-14: the one Backup cadence picker (showSyncIntervalPicker); onPause closes it. UI thread only.
     private TextView otaBanner; // #194: in-gate "software update available" banner (kiosk shade is disabled, so the gate draws its own)
     private OtaUpdate.Status otaStatus = OtaUpdate.NONE; // NWP-20261011-05: the last OTA-STATUS checkForOta read (UI thread)
     private boolean otaAuto; // NWP-20261011-05: the install-while-charging setting, read with otaStatus (UI thread)
@@ -291,8 +292,8 @@ public class ChooserActivity extends Activity {
     // log; set on a successful owner verify and cleared on leaving owner mode (Back to gate, and the re-arm paths).
     private volatile String ownerSessionPass;
     // NWP-20261124-11 (#13): the owner verified for this visit of the Settings screen, so its device-wide controls
-    // (Backup cadence, automatic install, install time) are live. UI thread only. The setContentView override and
-    // onPause clear it, so leaving Settings, a rebuild of it, a screen-off or a task switch asks for the verify again.
+    // (automatic install, install time; Backup left for Owner settings, NWP-20261130-14) are live. UI thread only.
+    // The setContentView override and onPause clear it, so leaving Settings, a rebuild of it, a screen-off or a task switch asks for the verify again.
     private boolean deviceSettingsVerified;
     // NWP-20261124-11: the number of this visit; endDeviceVisit() raises it. A DEST_DEVICE verify records it at submit,
     // and its success lands only while it is unchanged, so a Cancel or a screen-off before the answer revokes it.
@@ -1468,6 +1469,9 @@ public class ChooserActivity extends Activity {
             if (gateView != null) setContentView(gateView);
         }
         endDeviceVisit(); // NWP-20261124-11: a screen-off or task switch ends the Settings verify; the painted screen asks again at the next tap
+        // NWP-20261130-14: the picker is a window of its own, so the swap to the gate above leaves it up. Close it, or
+        // the next person to wake the phone could pick a cadence with no verify.
+        if (syncPicker != null) { syncPicker.dismiss(); syncPicker = null; }
         disarmGateNfc(); // #81 item 5: reader mode is tied to the foreground gate; release it when we leave
         // Chester: never leave the passphrase revealed once the gate loses the foreground (screen off / task
         // switch). Re-mask so a revealed credential can't linger on-screen for the next person to glance at.
@@ -1744,12 +1748,14 @@ public class ChooserActivity extends Activity {
     }
 
     /** Dialog to pick how often the live session's data is sealed to the store (DIA-20260619-11). Presets
-     *  only; the agent clamps anything odd to [15s, 1 day]. */
+     *  only; the agent clamps anything odd to [15s, 1 day]. One at a time, so the one syncPicker holds is the only one
+     *  up when onPause closes it (NWP-20261130-14). */
     private void showSyncIntervalPicker(Runnable onChanged) {
+        if (syncPicker != null && syncPicker.isShowing()) return;
         final int[] secs = {30, 60, 120, 300, 600};
         final String[] labels = {"Every 30 seconds", "Every minute", "Every 2 minutes (default)",
                 "Every 5 minutes", "Every 10 minutes"};
-        new android.app.AlertDialog.Builder(this)
+        syncPicker = new android.app.AlertDialog.Builder(this)
                 .setTitle("Back up my data")
                 .setItems(labels, (d, w) ->
                         new Thread(() -> {
@@ -1763,6 +1769,9 @@ public class ChooserActivity extends Activity {
                 .setNegativeButton("Cancel", null)
                 .show();
     }
+
+    // NWP-20261128-35: GateBarsTrace ran in this activity instance (once per gate start).
+    private boolean barsTraced;
 
     /** Kiosk reliability: Lock Task can only be started from the FOREGROUND task, so if the gate lost the
      *  boot foreground race (e.g. SetupWizard came up over it), the onResume/onCreate lockGate(true) fails
@@ -1785,6 +1794,19 @@ public class ChooserActivity extends Activity {
         // it WORSE (the tap fired no assert at all -- the reader ended up disarmed), so it was removed. NFC at
         // resume remains a known-flaky Android NFC-lifecycle issue vs the keyguard wake; USB-resume works. The
         // gate NFC arming stays in onResume; do NOT re-arm on focus without a proven on-device fix.
+        // NWP-20261128-35: in light mode, put the gate window's dark-icon bits into gate.log once per gate start, so
+        // a light-mode report says whether the window lost applyGateBars' request or SystemUI ignored it. After the
+        // LockTask re-arm above, never before it. The flag is set before the read, so a throwing read never retries.
+        if (hasFocus) {
+            try {
+                if (GateBarsTrace.shouldTrace(GatePalette.active().lightBars, barsTraced, android.os.Build.VERSION.SDK_INT)) {
+                    barsTraced = true;
+                    int a = getWindow().getInsetsController().getSystemBarsAppearance();
+                    GateTrace.ev("bars-light", "fields", GateBarsTrace.value(a));
+                }
+            } catch (Throwable ignore) {
+            }
+        }
     }
 
     /** During a no-reboot logoff the gate is switched to the foreground (phase 1) while the seal+remove are
@@ -3328,7 +3350,7 @@ public class ChooserActivity extends Activity {
     }
 
     /** The Settings screen behind the gate's gear (DIA-20260618-04): device-config that used to clutter the
-     *  gate footer — Store settings, Wi-Fi, and Software update. An in-app setContentView swap (like the
+     *  gate footer — Wi-Fi, Airplane mode, Software update and About. An in-app setContentView swap (like the
      *  Store/Wi-Fi/Recover screens), so it stays inside Lock-Task — no new activity, no kiosk escape. */
     private View buildSettingsScreen() {
         wifiBackTo = wifiNextTo = storeBackTo = storeOnSaved = null; // Settings is never part of first-run
@@ -3408,30 +3430,6 @@ public class ChooserActivity extends Activity {
             };
             apSw.setOnCheckedChangeListener(apSelf[0]);
         }
-
-        // Backup frequency (DIA-20260619-11): how often the live session's data is sealed to the store. Lower
-        // = less lost on an unclean power-off (crash / dead battery); convergent dedup keeps frequent cycles
-        // cheap. Read/written via the daemon's GET/SET-SYNC-INTERVAL; syncLoop applies the change live.
-        // NWP-20261124-11 (#13): a device-wide setting, so a change waits for the owner verify (deviceControlsOpen).
-        TextView bkHdr = new TextView(this);
-        bkHdr.setText("Backup");
-        bkHdr.setTextColor(INK);
-        bkHdr.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16);
-        LinearLayout.LayoutParams bhp = new LinearLayout.LayoutParams(MATCH, WRAP);
-        bhp.topMargin = dp(22);
-        ll.addView(bkHdr, bhp);
-
-        final TextView bkRow = new TextView(this);
-        bkRow.setTextColor(ACCENT);
-        bkRow.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
-        bkRow.setPadding(dp(2), dp(8), dp(2), dp(8));
-        ll.addView(bkRow, new LinearLayout.LayoutParams(MATCH, WRAP));
-        final Runnable refreshBkRow = () -> new Thread(() -> {
-            final String line = ReplyCopy.backupRow(daemonCmd("GET-SYNC-INTERVAL"));
-            runOnUiThread(() -> bkRow.setText(line));
-        }).start();
-        refreshBkRow.run();
-        bkRow.setOnClickListener(v -> { if (deviceControlsOpen()) showSyncIntervalPicker(refreshBkRow); else openDeviceVerify(); });
 
         // Messages & calls (#146) LIVED HERE until DIA-20260813-21. This screen needs no authentication, so
         // the caller's-number opt-in was flippable by anyone holding the locked phone; it now lives in the
@@ -5549,10 +5547,12 @@ public class ChooserActivity extends Activity {
                 // our reliable path -- SMS_DELIVER no longer reaches the gate's SmsDeliverReceiver, so nothing
                 // seals or delivers. Instead: the SIM stays on user 0, the gate chooser (default SMS app there)
                 // intercepts SMS_DELIVER, SEAL-TEL seals to the bound owner and -- if that owner is logged in
-                // RIGHT NOW -- returns LIVE <uid>, which kicks TelIngest to INSERT the row (sub_id=-1) into the
-                // roamed user's OWN per-user provider. Messaging DISPLAYS an injected sub_id=-1 row fine (proven);
-                // sub_id=-1 sidesteps the self-participant requirement that kills native delivery. cede still runs
-                // so Messaging is the roamed user's SMS default (it must own+read the provider to show our rows).
+                // RIGHT NOW -- returns LIVE <uid>, which kicks TelIngest to INSERT the row into the roamed user's OWN
+                // per-user provider, filed under its SIM's subscription (NWP-20261130-01). ~~Messaging DISPLAYS an
+                // injected sub_id=-1 row fine (proven); sub_id=-1 sidesteps the self-participant requirement that kills
+                // native delivery.~~ (Superseded by the 2026-11-06 decision: GrapheneOS 2026110200 shows a sub_id=-1 row
+                // only to user 0. A row under a real subscription showing in Messaging waits for the lynx check.) cede
+                // still runs so Messaging is the roamed user's SMS default (it must own+read the provider to show our rows).
                 android.util.Log.i("NowhereChooser", "#149 live-intercept-mode: SIM stays on gate, no associate");
                 cedeSmsToMessagingInRoamedUser(fuid);
                 disableRoamedDialerComponents(fuid); // NWP-20261012-07: the missed-call receiver works only in user 0
@@ -6535,7 +6535,7 @@ public class ChooserActivity extends Activity {
         ll.addView(t);
         TextView sub = new TextView(this);
         sub.setText(dest == StoreGate.DEST_STORE ? "Enter your device passphrase to change where this phone saves data."
-                : dest == StoreGate.DEST_DEVICE ? "Enter your device passphrase to change backup and update settings."
+                : dest == StoreGate.DEST_DEVICE ? "Enter your device passphrase to change update settings."
                 : "Enter your device passphrase to open Owner settings.");
         sub.setTextColor(MUTED); sub.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13); sub.setGravity(Gravity.CENTER);
         LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(MATCH, WRAP); slp.topMargin = dp(10); slp.bottomMargin = dp(24);
@@ -6556,19 +6556,21 @@ public class ChooserActivity extends Activity {
             final String p = pf.getText().toString();
             if (p.isEmpty()) { msg.setTextColor(MUTED); StatusLine.error(msg, "enter your device passphrase"); return; }
             go.setEnabled(false); msg.setTextColor(ACCENT); StatusLine.busy(msg, "checking…");
-            final int visit = deviceVisit; // NWP-20261124-11: the Settings visit this verify belongs to
+            final int visit = deviceVisit; // NWP-20261124-11, NWP-20261129-09: the visit this verify belongs to, for every destination
             new Thread(() -> {
                 final int r;
                 OWNER_AUTH_LOCK.lock(); // not while a passphrase change is mid-transaction (see OWNER_AUTH_LOCK)
                 try { r = verifyOwner(p); } finally { OWNER_AUTH_LOCK.unlock(); }
                 runOnUiThread(() -> {
+                    // NWP-20261129-09: a Cancel, a screen-off or another screen before the answer ends the visit, for
+                    // every destination (NWP-20261124-11's rule covered DEST_DEVICE alone). The field holds the passphrase
+                    // that just verified, so it is emptied: the verify screen survives a screen-off, because onPause
+                    // returns the gate only once ownerSessionPass is set.
+                    if ((r == 0 || r == -7) && !StoreGate.deviceVerifyLands(visit, deviceVisit)) { pf.setText(""); go.setEnabled(true); msg.setText(""); return; }
                     if (r == 0) {
                         if (StoreGate.keepsOwnerPass(dest)) ownerSessionPass = p; // Slice D: hold the pass for the Inbox verbs
                         if (dest == StoreGate.DEST_STORE) setContentView(buildStoreScreen());
-                        else if (dest == StoreGate.DEST_DEVICE) {
-                            if (StoreGate.deviceVerifyLands(visit, deviceVisit)) { setContentView(buildSettingsScreen()); deviceSettingsVerified = true; } // after: setContentView clears it
-                            else { go.setEnabled(true); msg.setText(""); } // a Cancel, screen-off or other screen came first: no verify
-                        }
+                        else if (dest == StoreGate.DEST_DEVICE) { setContentView(buildSettingsScreen()); deviceSettingsVerified = true; } // after: setContentView clears it
                         else if (dest == StoreGate.DEST_INBOX) setContentView(buildOwnerInboxScreen());
                         else setContentView(buildOwnerMenu());
                     }
@@ -6632,6 +6634,10 @@ public class ChooserActivity extends Activity {
         ll.addView(settingsRow("Store settings", "Where your encrypted data is saved", v -> {
             storeBackTo = () -> setContentView(buildOwnerMenu()); storeOnSaved = storeBackTo; setContentView(buildStoreScreen());
         }), new LinearLayout.LayoutParams(MATCH, WRAP));
+        // NWP-20261130-14 (docs/product-decisions.md, 2026-11-06): Backup lives here too, behind this menu's own verify,
+        // so neither this row nor its screen asks a second time. deviceControlsOpen() would: setContentView clears it.
+        ll.addView(settingsRow("Backup", "How often your data is saved",
+                v -> setContentView(buildOwnerBackupScreen())), new LinearLayout.LayoutParams(MATCH, WRAP));
         ll.addView(settingsRow("System settings",
                 "USB debugging, eSIM and more. What you change here stays on this phone, for every profile and after every sign-out.",
                 v -> standDownForOwner()), new LinearLayout.LayoutParams(MATCH, WRAP));
@@ -6645,6 +6651,27 @@ public class ChooserActivity extends Activity {
                 v -> setContentView(buildReportScreen())), new LinearLayout.LayoutParams(MATCH, WRAP));
         ll.addView(settingsRow("Leave Nowhere", "Go back to the stock Android this phone shipped with", v -> setContentView(buildLeaveScreen())), new LinearLayout.LayoutParams(MATCH, WRAP));
         ll.addView(ownerBack("Back to gate", v -> { ownerSessionPass = null; setContentView(gateView); }), new LinearLayout.LayoutParams(MATCH, WRAP));
+        return ownerScroll(ll);
+    }
+
+    /** NWP-20261130-14: Owner settings › Backup. Backup frequency (DIA-20260619-11): how often the live session's data
+     *  is sealed to the store. Lower = less lost on an unclean power-off (crash / dead battery); convergent dedup keeps
+     *  frequent cycles cheap. Read/written via the daemon's GET/SET-SYNC-INTERVAL; syncLoop applies the change live. */
+    private View buildOwnerBackupScreen() {
+        LinearLayout ll = ownerColumn("Backup");
+        final TextView bkRow = new TextView(this);
+        bkRow.setTextColor(ACCENT);
+        bkRow.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        bkRow.setPadding(dp(2), dp(8), dp(2), dp(8));
+        LinearLayout.LayoutParams top = new LinearLayout.LayoutParams(MATCH, WRAP); top.topMargin = dp(24);
+        ll.addView(bkRow, top);
+        final Runnable refreshBkRow = () -> new Thread(() -> {
+            final String line = ReplyCopy.backupRow(daemonCmd("GET-SYNC-INTERVAL"));
+            runOnUiThread(() -> bkRow.setText(line));
+        }).start();
+        refreshBkRow.run();
+        bkRow.setOnClickListener(v -> showSyncIntervalPicker(refreshBkRow));
+        ll.addView(ownerBack("Back", v -> setContentView(buildOwnerMenu())), new LinearLayout.LayoutParams(MATCH, WRAP));
         return ownerScroll(ll);
     }
 
@@ -7211,11 +7238,15 @@ public class ChooserActivity extends Activity {
                 final boolean[] armed = { false };
                 clear.setOnClickListener(v -> {
                     if (!armed[0]) { armed[0] = true; clear.setText("Clear all — tap again to confirm"); return; }
+                    final boolean owned = ownerSessionPass != null;
                     clear.setEnabled(false); clear.setText("Clearing…");
                     new Thread(() -> {
                         daemonCmd("CLEAR-OWNER-INBOX");
                         cancelTelNotices(java.util.Collections.singleton(SmsDeliverReceiver.UNBOUND_LINE));
-                        runOnUiThread(() -> setContentView(buildOwnerInboxScreen()));
+                        runOnUiThread(() -> {
+                            if (!OwnerLanding.lands(owned, ownerSessionPass != null)) return; // NWP-20261129-12: owner mode ended before the answer: open nothing over the gate
+                            setContentView(buildOwnerInboxScreen());
+                        });
                     }).start();
                 });
                 LinearLayout.LayoutParams cp = new LinearLayout.LayoutParams(MATCH, WRAP); cp.topMargin = dp(8);
@@ -7261,10 +7292,14 @@ public class ChooserActivity extends Activity {
         del.setText("Delete"); del.setTextColor(ACCENT); del.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
         del.setPadding(dp(8), dp(8), dp(8), dp(8));
         del.setOnClickListener(v -> {
+            final boolean owned = ownerSessionPass != null;
             del.setEnabled(false); del.setText("Deleting…");
             new Thread(() -> {
                 daemonCmd("DELETE-OWNER-ITEM\n" + id);
-                runOnUiThread(() -> setContentView(buildOwnerInboxScreen()));
+                runOnUiThread(() -> {
+                    if (!OwnerLanding.lands(owned, ownerSessionPass != null)) return; // NWP-20261129-12: owner mode ended before the answer: open nothing over the gate
+                    setContentView(buildOwnerInboxScreen());
+                });
             }).start();
         });
         LinearLayout.LayoutParams dlp = new LinearLayout.LayoutParams(MATCH, WRAP); dlp.topMargin = dp(16); ll.addView(del, dlp);
@@ -8441,16 +8476,19 @@ public class ChooserActivity extends Activity {
      *  verdict, since the repair may have dropped lines, and reloads the SIM lines; a failure stays on the status line,
      *  and ERR io points at a reset. */
     private void confirmRepairBindings(TextView status) {
+        final boolean owned = ownerSessionPass != null;
         new android.app.AlertDialog.Builder(this)
                 .setTitle(BindingsRepair.TITLE)
                 .setMessage(BindingsRepair.CONFIRM)
                 .setPositiveButton("Repair", (d, w) -> {
+                    if (!OwnerLanding.lands(owned, ownerSessionPass != null)) return; // NWP-20261129-12: owner mode ended while the dialog was open: do nothing
                     StatusLine.busy(status, "Repairing…");
                     new Thread(() -> {
                         final String r = sendDaemon("REPAIR-BINDINGS\n");
                         final String line = BindingsRepair.outcome(r);
                         if (BindingsRepair.ok(r)) reapplyLiveTelVerdict(); // NWP-20261005-12: the repair changed the owner set; a session signed in now takes the new verdict
                         runOnUiThread(() -> {
+                            if (!OwnerLanding.lands(owned, ownerSessionPass != null)) return; // NWP-20261129-12: owner mode ended before the answer: open nothing over the gate
                             if (BindingsRepair.ok(r)) {
                                 setContentView(buildBindingScreen());
                                 android.widget.Toast.makeText(this, line, android.widget.Toast.LENGTH_LONG).show();
@@ -8573,30 +8611,35 @@ public class ChooserActivity extends Activity {
         View unbind = settingsRow("Unbind all", "Remove every profile from this line", v -> {
             final String iccid = iccidF.getText().toString().trim();
             if (iccid.isEmpty()) { msg.setTextColor(MUTED); StatusLine.error(msg, "enter the SIM's ICCID first"); return; }
+            final boolean owned = ownerSessionPass != null;
             new android.app.AlertDialog.Builder(this)
                     .setTitle("Unbind this line?")
                     .setMessage("Every profile is removed from this SIM, and any texts or calls for it that have not "
                             + "reached a profile yet are deleted.")
-                    .setPositiveButton("Unbind", (d, w) -> new Thread(() -> {
-                        final String r = sendDaemon("DELETE-BINDING\n" + iccid + "\n\n");
-                        // NWP-20260924-08 (Chester, 2026-09-24: "unbind all should clear it"): the line's gate notices go
-                        // with its records. A notice names its line only by LABEL, so another line with the same label
-                        // (every unlabelled line shares one) loses its hint too; its record is untouched.
-                        final boolean ok = r != null && r.startsWith("OK");
-                        final java.util.Set<String> labels = ok ? unboundLabels(r) : null;
-                        if (ok) cancelTelNotices(labels);
-                        if (ok) reapplyLiveTelVerdict(); // NWP-20261005-12: a former owner signed in now loses the line
-                        runOnUiThread(() -> {
-                            if (ok) { setContentView(buildBindingScreen()); return; }
-                            msg.setTextColor(MUTED);
-                            if ("BUSY".equals(r)) StatusLine.error(msg, "the phone is busy saving — try again in a moment");
-                            else if ("NOTFOUND".equals(r)) StatusLine.error(msg, "this SIM isn't bound to anyone");
-                            else StatusLine.error(msg, r != null && r.startsWith("ERR damaged") ? TelArrival.BINDINGS_DAMAGED : "couldn't unbind — try again");
-                        });
-                        // A text sealed just BEFORE the unbind gets its notice posted just AFTER it: this chooser posts
-                        // once SEAL-TEL has replied and released the lock the unbind then took. Sweep once more.
-                        if (ok) { try { Thread.sleep(2000); } catch (InterruptedException ignore) {} cancelTelNotices(labels); }
-                    }).start())
+                    .setPositiveButton("Unbind", (d, w) -> {
+                        if (!OwnerLanding.lands(owned, ownerSessionPass != null)) return; // NWP-20261129-12: owner mode ended while the dialog was open: do nothing
+                        new Thread(() -> {
+                            final String r = sendDaemon("DELETE-BINDING\n" + iccid + "\n\n");
+                            // NWP-20260924-08 (Chester, 2026-09-24: "unbind all should clear it"): the line's gate notices go
+                            // with its records. A notice names its line only by LABEL, so another line with the same label
+                            // (every unlabelled line shares one) loses its hint too; its record is untouched.
+                            final boolean ok = r != null && r.startsWith("OK");
+                            final java.util.Set<String> labels = ok ? unboundLabels(r) : null;
+                            if (ok) cancelTelNotices(labels);
+                            if (ok) reapplyLiveTelVerdict(); // NWP-20261005-12: a former owner signed in now loses the line
+                            runOnUiThread(() -> {
+                                if (!OwnerLanding.lands(owned, ownerSessionPass != null)) return; // NWP-20261129-12: owner mode ended before the answer: open nothing over the gate
+                                if (ok) { setContentView(buildBindingScreen()); return; }
+                                msg.setTextColor(MUTED);
+                                if ("BUSY".equals(r)) StatusLine.error(msg, "the phone is busy saving — try again in a moment");
+                                else if ("NOTFOUND".equals(r)) StatusLine.error(msg, "this SIM isn't bound to anyone");
+                                else StatusLine.error(msg, r != null && r.startsWith("ERR damaged") ? TelArrival.BINDINGS_DAMAGED : "couldn't unbind — try again");
+                            });
+                            // A text sealed just BEFORE the unbind gets its notice posted just AFTER it: this chooser posts
+                            // once SEAL-TEL has replied and released the lock the unbind then took. Sweep once more.
+                            if (ok) { try { Thread.sleep(2000); } catch (InterruptedException ignore) {} cancelTelNotices(labels); }
+                        }).start();
+                    })
                     .setNegativeButton("Cancel", null)
                     .show();
         });
@@ -8630,12 +8673,14 @@ public class ChooserActivity extends Activity {
             final boolean markIt = !sim.mine;
             View mineRow = settingsRow(sim.mine ? BindingMarks.UNMARK_ROW : BindingMarks.MARK_ROW,
                     sim.mine ? BindingMarks.UNMARK_SUMMARY : BindingMarks.MARK_SUMMARY, v -> {
+                final boolean owned = ownerSessionPass != null;
                 msg.setTextColor(ACCENT); StatusLine.busy(msg, "saving…");
                 new Thread(() -> {
                     final String r = sendDaemon("SET-SIM-MINE\n" + sim.iccid + "\n" + (markIt ? "1" : "0") + "\n");
                     final String out = BindingMarks.mineOutcome(r);
                     final String line = BindingMarks.DAMAGED.equals(out) ? TelArrival.BINDINGS_DAMAGED : out;
                     runOnUiThread(() -> {
+                        if (!OwnerLanding.lands(owned, ownerSessionPass != null)) return; // NWP-20261129-12: owner mode ended before the answer: open nothing over the gate
                         if (BindingMarks.mineBack(r)) {
                             setContentView(buildBindingScreen());
                             android.widget.Toast.makeText(this, line, android.widget.Toast.LENGTH_LONG).show();
@@ -8663,8 +8708,9 @@ public class ChooserActivity extends Activity {
         else setContentView(buildStoreScreen());
     }
 
-    /** NWP-20261124-11 (#13, docs/product-decisions.md 2026-11-02): the Settings screen's device-wide controls (Backup
-     *  cadence, automatic install, install time) change a setting only after the owner verify of this visit, or with
+    /** NWP-20261124-11 (#13, docs/product-decisions.md 2026-11-02): the Settings screen's device-wide controls
+     *  (automatic install, install time; Backup moved to Owner settings, NWP-20261130-14) change a setting only after
+     *  the owner verify of this visit, or with
      *  no device passphrase (first run). Read at the tap, so every clear of deviceSettingsVerified acts at once. */
     private boolean deviceControlsOpen() { return StoreGate.devicePickersOpen(ownerSecretSet(), deviceSettingsVerified); }
     /** NWP-20261124-11: a tap on a closed device-wide control opens the owner verify; it sends no SET-*. */
@@ -8829,12 +8875,14 @@ public class ChooserActivity extends Activity {
                 StatusLine.error(msg, "fill in URL, bucket, access key, and secret key");
                 return;
             }
+            final boolean owned = ownerSessionPass != null;
             save.setEnabled(false);
             msg.setTextColor(ACCENT);
             StatusLine.busy(msg, "saving…");
             new Thread(() -> {
                 String r = sendDaemon("SET-STORE\n" + ep + "\n" + rg + "\n" + bk + "\n" + ak + "\n" + sk + "\n");
                 runOnUiThread(() -> {
+                    if (!OwnerLanding.lands(owned, ownerSessionPass != null)) return; // NWP-20261129-12: owner mode ended before the answer: open nothing over the gate
                     if (r.startsWith("OK")) {
                         // #27: don't park "store saved" on the gate's SHARED result view -- it lingered onto the
                         // gate after Settings -> Store -> back. Clear any stale result + show a transient toast.
@@ -13827,6 +13875,17 @@ public class ChooserActivity extends Activity {
         java.io.File dir = new java.io.File(getFilesDir(), ".appcode");
         java.io.File man = new java.io.File(dir, "manifest.tsv");
         if (!man.isFile()) return od; // nothing opted in / nothing restored
+        // NWP-20261129-13 (h55 #4): the packages this sign-in could not park, which reap_stale_ondemand wrote beside the
+        // manifest. Absent = nothing listed. Unreadable = one warning, then raise as today. The open is the test:
+        // File.exists() would read a wrong label as "absent", with no warning, and the warning is the diagnostic.
+        java.util.Set<String> unparked = java.util.Collections.emptySet();
+        try {
+            unparked = OdUnparked.parse(new String(java.nio.file.Files.readAllBytes(
+                    new java.io.File(dir, "od-unparked").toPath()), java.nio.charset.StandardCharsets.UTF_8));
+        } catch (java.nio.file.NoSuchFileException absent) {
+        } catch (Throwable t) {
+            android.util.Log.w("NowhereChooser", "od-unparked unreadable, raising every deferred row", t);
+        }
         int ok = 0, tot = 0;
         // NWP-20261127-08: one outcome per deferred row, sent to login.log after the loop as counts only, so a
         // report tells a missing _meta from a refused install (logcat, which carries the package, a report does not).
@@ -13847,6 +13906,14 @@ public class ChooserActivity extends Activity {
                         // ArchivedPackageInfo metadata (restored into .appcode/<pkg>/_meta) -- no APK here; it's
                         // fetched on the tap (on-demand) or by the post-login sweep (auto).
                         od.add(pkg); // DIA-20260727-01: caller must NOT install-existing this pkg (would clobber the placeholder)
+                        // NWP-20261129-13 (h55 #4): this app's restored data is still in its canonical dir. A raise would
+                        // re-create the package record, and installd can wipe the root-owned data it finds (#204). So no
+                        // placeholder this session, and od (above) keeps it out of the GET-APPS pass, which would do the
+                        // same. Not in the tally: roam.log's `reap-stale-ondemand <pkg> SKIPPED` line counts it.
+                        if (unparked.contains(pkg)) {
+                            android.util.Log.i("NowhereChooser", "not raising " + pkg + ": its data was not parked this sign-in");
+                            continue;
+                        }
                         java.io.File metaDir = new java.io.File(new java.io.File(dir, pkg), "_meta");
                         if (!metaDir.isDirectory()) {
                             // NWP-20261127-08: the restore staged no _meta for this row. installArchivedPlaceholder
@@ -14512,8 +14579,9 @@ public class ChooserActivity extends Activity {
      *  titles are already content-free (line label per the visibility dial). A SINGLE notice shows its title
      *  (+ the opted-in "From <number>" line, #146). SEVERAL show a TYPED one-line summary grouped by LINE --
      *  "Sim1 — Missed call · New message" -- with each kind counted by events (summarize; NWP-20261013-41). Each
-     *  notice carries a "nowhere_kind" extra (call|message) and a running "nowhere_count"; older notices fall back
-     *  to their leading title word and a count of 1. Each entry's sixth field is "true" for the unassigned line's
+     *  notice carries a "nowhere_kind" extra (call|message), a call a "nowhere_call" extra (incoming|missed,
+     *  NWP-20261128-18), and a running "nowhere_count"; older notices fall back to their title (TelNoticeClear.kindOf)
+     *  and a count of 1. Each entry's sixth field is "true" for the unassigned line's
      *  notice, marked by the nowhere_line extra since NWP-20261006-04 and, for a notice posted before it, recognised
      *  by its line label (NWP-20261105-06). Null when there is nothing to list.
      *  Leaves out the notices whose StatusBarNotification key is in skip: a cancel is applied asynchronously, so
@@ -14533,15 +14601,13 @@ public class ChooserActivity extends Activity {
                 if (ex == null) continue;
                 CharSequence title = ex.getCharSequence(android.app.Notification.EXTRA_TITLE);
                 if (title == null || title.length() == 0) continue;
-                String kind = ex.getString("nowhere_kind", "");
-                boolean isCall = "call".equals(kind)
-                        || (kind.isEmpty() && (title.toString().startsWith("Missed call")
-                                            || title.toString().startsWith("Incoming call")));
+                // "call" (missed) | "incoming" (answered at the gate) | "message" (NWP-20261128-18)
+                String kind = TelNoticeClear.kindOf(ex.getString("nowhere_kind", ""), ex.getString("nowhere_call", ""), title.toString());
                 boolean isLoss = !ex.getString("nowhere_class", "").isEmpty(); // "may not have been saved" (NWP-20260930-05)
                 boolean unbound = "unbound".equals(ex.getString("nowhere_line", ""))
                         || title.toString().endsWith(SmsDeliverReceiver.UNBOUND_LINE); // the unassigned line's (NWP-20261006-04)
                 CharSequence text = ex.getCharSequence(android.app.Notification.EXTRA_TEXT); // opted-in "From <number>"
-                notices.add(new String[]{noticeLabel(sbn), isCall ? "call" : "message",
+                notices.add(new String[]{noticeLabel(sbn), kind,
                         String.valueOf(Math.max(1, ex.getInt("nowhere_count", 1))), String.valueOf(isLoss),
                         (text != null && text.length() > 0) ? title + "  ·  " + text : title.toString(),
                         String.valueOf(unbound)});
@@ -14558,8 +14624,8 @@ public class ChooserActivity extends Activity {
         return n == null ? null : summarize(n);
     }
 
-    /** NWP-20261013-41: the banner text for the gate's telephony notices; pure. Each entry is {line label, "call" |
-     *  "message", count (the notice's running nowhere_count), "true" for a loss notice, the single-notice text,
+    /** NWP-20261013-41: the banner text for the gate's telephony notices; pure. Each entry is {line label, "call" (a
+     *  missed call) | "incoming" (a call answered at the gate, NWP-20261128-18) | "message", count (the notice's running nowhere_count), "true" for a loss notice, the single-notice text,
      *  "true" for the unassigned line's notice (not read here)}.
      *  Exactly ONE notice that stands for ONE event shows its own rich text (title + opted-in "From"). Anything else
      *  is grouped by line, in first-seen order: "<label> — <kinds>", kinds counted by EVENTS and joined by " · ",
@@ -14568,12 +14634,12 @@ public class ChooserActivity extends Activity {
     static String summarize(java.util.List<String[]> notices) {
         if (notices == null || notices.isEmpty()) return null;
         if (notices.size() == 1 && "1".equals(notices.get(0)[2])) return "✉   " + notices.get(0)[4];
-        java.util.LinkedHashMap<String, int[]> byLine = new java.util.LinkedHashMap<>(); // label -> {calls, msgs, lost}
+        java.util.LinkedHashMap<String, int[]> byLine = new java.util.LinkedHashMap<>(); // label -> {missed calls, msgs, lost, incoming calls}
         for (String[] n : notices) {
             int[] c = byLine.get(n[0]);
-            if (c == null) { c = new int[3]; byLine.put(n[0], c); }
+            if (c == null) { c = new int[4]; byLine.put(n[0], c); }
             int k = Integer.parseInt(n[2]);
-            if ("true".equals(n[3])) c[2] += k; else if ("call".equals(n[1])) c[0] += k; else c[1] += k;
+            if ("true".equals(n[3])) c[2] += k; else if ("call".equals(n[1])) c[0] += k; else if ("incoming".equals(n[1])) c[3] += k; else c[1] += k;
         }
         StringBuilder sb = new StringBuilder("✉   ");
         boolean firstLine = true;
@@ -14581,6 +14647,7 @@ public class ChooserActivity extends Activity {
             int[] c = e.getValue();
             java.util.ArrayList<String> parts = new java.util.ArrayList<>();
             if (c[0] > 0) parts.add(c[0] == 1 ? "Missed call" : c[0] + " missed calls");
+            if (c[3] > 0) parts.add(c[3] == 1 ? "Incoming call" : c[3] + " incoming calls");
             if (c[1] > 0) parts.add(c[1] == 1 ? "New message" : c[1] + " new messages");
             if (c[2] > 0) parts.add(c[2] == 1 ? "1 may not have been saved" : c[2] + " may not have been saved");
             if (!firstLine) sb.append(" · ");

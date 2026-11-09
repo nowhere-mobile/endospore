@@ -5,7 +5,7 @@
 # comes to the front and dtrelease restores at its release (docs/product-decisions.md, 2026-10-20, Q072).
 # GateAirplane.java decides the bound and the words and is pure Java, so it is compiled here and run against
 # GateAirplaneCases; the screen glue in ChooserActivity.java (which javac cannot compile off the build host) is pinned
-# by anchor: the switch once in buildSettingsScreen between the Wi-Fi row and the Backup header, the single
+# by anchor: the switch once in buildSettingsScreen between the Wi-Fi row and the Software update header, the single
 # setAirplaneMode write reached only from inside a Thread, the bounded re-read, the switch set from the READ value,
 # the verdict on the switch's own line (apMsg, never swMsg), and no settings-key write of airplane_mode_on anywhere
 # in the chooser.
@@ -74,16 +74,16 @@ suite() {
   setter=$(body "$ca" 'private Boolean setGateAirplane\(boolean want\)')
   [ -n "$settings" ] || { echo "  PIN   buildSettingsScreen not found" >&2; return 2; }
 
-  # P1: the switch, once, in buildSettingsScreen, after the Wi-Fi row and before the Backup header.
+  # P1: the switch, once, in buildSettingsScreen, after the Wi-Fi row and before the Software update header.
   n=$(count "$settings" 'apSw.setText(GateAirplane.ROW);')
   [ "$n" = 1 ] || { echo "  PIN   buildSettingsScreen has the Airplane mode switch $n times, not once" >&2; return 1; }
   n=$(grep -cF 'setText(GateAirplane.ROW)' "$ca" || true)
   [ "$n" = 1 ] || { echo "  PIN   ChooserActivity has the Airplane mode switch $n times, not once" >&2; return 1; }
   lw=$(line "$settings" 'settingsRow("Wi-Fi"')
   lr=$(line "$settings" 'apSw.setText(GateAirplane.ROW);')
-  lb=$(line "$settings" 'TextView bkHdr = ')
+  lb=$(line "$settings" 'TextView swHdr = ')
   { [ "$lw" -gt 0 ] && [ "$lr" -gt "$lw" ] && [ "$lb" -gt "$lr" ]; } \
-    || { echo "  PIN   the switch is not between the Wi-Fi row ($lw) and the Backup header ($lb): line $lr" >&2; return 1; }
+    || { echo "  PIN   the switch is not between the Wi-Fi row ($lw) and the Software update header ($lb): line $lr" >&2; return 1; }
   block=$(printf '%s\n' "$settings" | sed -n "$((lw + 2)),$((lb - 1))p")
   case "$block" in *"new android.widget.Switch(this)"*) ;; *) echo "  PIN   the block has no android.widget.Switch" >&2; return 1 ;; esac
   case "$block" in *"apSub.setText(GateAirplane.SUB);"*) ;; *) echo "  PIN   the subtitle is not under the switch" >&2; return 1 ;; esac
@@ -180,7 +180,7 @@ mut "M1 settled ignores the time bound" ga 's/ \|\| elapsedMs >= READBACK_MS//' 
 mut "M2 the toast confirms without the read-back" ga 's/if \(seen != null && seen == want\) return want/if (true) return want/' || fails=$((fails+1))
 mut "M3 the switch set from the tapped value" ca 's/apSw\.setChecked\(seen != null && seen\);/apSw.setChecked(want);/' || fails=$((fails+1))
 mut "M4 the write moved onto the UI thread" ca 's/new Thread\(\(\) -> \{\n(\s*)final Boolean seen = setGateAirplane\(want\);/final Boolean seen = setGateAirplane(want);\n$1new Thread(() -> {/' || fails=$((fails+1))
-mut "M5 the block removed from buildSettingsScreen" ca 's/\n        \/\/ Airplane mode beside Wi-Fi \(NWP-20261109-21.*?\n(\n        \/\/ Backup frequency)/\n$1/s' || fails=$((fails+1))
+mut "M5 the block removed from buildSettingsScreen" ca 's/\n        \/\/ Airplane mode beside Wi-Fi \(NWP-20261109-21.*?\n(\n        \/\/ Messages & calls \(#146\))/\n$1/s' || fails=$((fails+1))
 mut "M6 a Settings.Global.putInt write added" ca 's/(\n(\s*)final Boolean seen = setGateAirplane\(want\);)/\n$2android.provider.Settings.Global.putInt(getContentResolver(),\n$2        android.provider.Settings.Global.AIRPLANE_MODE_ON, want ? 1 : 0);$1/' || fails=$((fails+1))
 mut "M7 the verdict written to swMsg instead of apMsg" ca 's/apMsg\.setText\(GateAirplane\.toast/swMsg.setText(GateAirplane.toast/' || fails=$((fails+1))
 [ "$fails" = 0 ] || { echo "FAILED: $fails mutant(s) not convicted"; exit 1; }

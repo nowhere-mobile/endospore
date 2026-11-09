@@ -20,6 +20,9 @@ Identical to stallion's delta apart from `os-ref`; the two devices share a grid 
 
 1. `vendor/adevtool/bin/run generate-all -d <device>` — generates `vendor/google_devices/<device>`, without
    which there is no product to lunch. Needs Node 24.
-2. `script/generate-keys <device>` then `script/encrypt-keys keys/<device>`.
+2. ~~`script/generate-keys <device>` then `script/encrypt-keys keys/<device>`.~~ *(superseded 2026-11-05,
+   `NWP-20261105-19`: a device's keys are made in the keys home, not in a tree: `editions/endospore/build/gen-keys.sh
+   <device>` makes them there on a host that has one, then `script/encrypt-keys` on the keys home's `<device>`;
+   `docs/release-runbook.md` §1b)*
 3. This directory.
 4. A catalog entry + `Available: true` in `nowhere-cloud/internal/installer` (and `DisplayOrder`).

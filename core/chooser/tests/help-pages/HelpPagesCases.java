@@ -35,10 +35,11 @@ public final class HelpPagesCases {
                     + "settings.";
 
     /** NWP-20261126-03 (decision 2026-11-03): Store settings moved from Gate settings to Owner settings, so its
-     *  sentence is part of Owner settings' Lock screen clock step (page 2 keeps 6 steps). */
+     *  sentence is part of Owner settings' Lock screen clock step (page 2 keeps 6 steps). NWP-20261130-14 (decision
+     *  2026-11-06): Backup moved the same way, into the same step. */
     static final String WANT_OWNER_STORE =
             "Lock screen clock: show a dim clock while the phone is resting. Store settings: choose where profiles "
-                    + "are saved.";
+                    + "are saved. Backup: choose how often.";
 
     /** B4: a body says what a feature does and how to use it, never what it protects. Titles are exempt. */
     static final String[] B4_WORDS = {
@@ -99,6 +100,9 @@ public final class HelpPagesCases {
                 "GateHelpPages.body(1) has no step \"" + WANT_GATE_LOOK + "\"");
         // NWP-20261126-03 (decision 2026-11-03): Store settings is named under Owner settings, not Gate settings.
         check(!GateHelpPages.body(1).contains("Store settings"), "GateHelpPages.body(1) still names Store settings");
+        // NWP-20261130-14 (decision 2026-11-06): so is Backup, in the same step.
+        check(!GateHelpPages.body(1).contains("Backup") && GateHelpPages.body(2).contains("Backup"),
+                "GateHelpPages does not name Backup under Owner settings only");
         check(Arrays.asList(GateHelpPages.body(2).split("\n\n")).contains(WANT_OWNER_STORE),
                 "GateHelpPages.body(2) has no step \"" + WANT_OWNER_STORE + "\"");
         pages("HelpPages", HelpPages.TITLES, HelpPages::body);

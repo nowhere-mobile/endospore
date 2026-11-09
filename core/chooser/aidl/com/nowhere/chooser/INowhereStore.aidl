@@ -45,8 +45,8 @@ interface INowhereStore {
      *  Replies: "OK <pkg>" (installed + kept, AUTO mode) | "OK-SESSION-ONLY <pkg>" (installed, keep refused
      *  by the #136 over-plan gate -- SAY SO) | "OK-UNSAVED <pkg>" (installed, but its keep line could not be
      *  written -- it will not come back; SAY SO) | "ERR-BUSY" (this pkg is already installing) | "ERR-PENDING"
-     *  (commit outcome unknown after 180 s -- re-check, do not retry blindly) | "ERR-INSTALL" | "ERR-CALLER"
-     *  | the daemon's own verdict (ERR-NOENTRY / ERR-OVERPLAN ... / NONE).
+     *  (still installing at InstallWait's 10-minute bound -- re-check, do not retry blindly) | "ERR-INSTALL"
+     *  | "ERR-CALLER" | the daemon's own verdict (ERR-NOENTRY / ERR-OVERPLAN ... / NONE).
      *
      *  NWP-20260921-12: `label` is the catalog's display name, carried purely so the install NOTIFICATION
      *  can say "Adding NotePad" instead of "Adding com.example.notepad". The notice is posted BEFORE the

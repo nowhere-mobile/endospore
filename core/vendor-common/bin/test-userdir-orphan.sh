@@ -306,7 +306,8 @@ suite() {  # suite <roamd.sh> [quiet] -> 0 all ok, 1 a case failed, 2 the harnes
       }
       pw() { printf '%s\n' "$ROOT/sim/pw"; }
       _ms() { echo 0; }
-      for t in stop_mediad usb_host relabel_launcher remap_media_db remap_per_pkg _tlog acct_restore remap_tree reown_ext_appdata \
+      _sum0=0; _sumt=0   # set above the `in` arm in the script (NWP-20261130-08); this harness runs the arm alone under set -u
+      for t in stop_mediad usb_host relabel_launcher remap_media_db insert_deferred_media remap_per_pkg _tlog _ssum acct_restore remap_tree reown_ext_appdata \
                keystore_push keystore_restore ks_signin_reset hold_ondemand od_parked_report reap_stale_ondemand reap_orphan_provisioned restorecon \n               uiderrors_floor_take uiderrors_floor_commit tz_surface; do  # NWP-20261010-06: the report's sign-in floor
         eval "$t() { :; }"
       done
@@ -1264,7 +1265,7 @@ suite() {  # suite <roamd.sh> [quiet] -> 0 all ok, 1 a case failed, 2 the harnes
   chk new "P1 nothing in roamd creates users/<n> (no mkdir -p of a users/ path)" eqv "$(grep -c 'mkdir -p "/data/system/users/' "$f")" 0
   chk new "P2 the cleanstorage op itself never rm's users/\$uid (only the anchored take does)" \
       eqv "$(printf '%s\n' "$CLEAN" | grep -v '^[[:space:]]*#' | grep -c 'rm .*"/data/system/users/\$uid"')$(printf '%s\n' "$CLEAN" | grep -c '^  reap_userdir_settle "\$uid"$')" 01
-  ln_bt=$(printf '%s\n' "$CLEAN" | grep -n '^  if bt_reset ""; then' | head -1 | cut -d: -f1)
+  ln_bt=$(printf '%s\n' "$CLEAN" | grep -n '^  bt_reset "" reap "\$uid"; ' | head -1 | cut -d: -f1)
   ln_set=$(printf '%s\n' "$CLEAN" | grep -n '^  reap_userdir_settle "\$uid"$' | head -1 | cut -d: -f1)
   ln_loop=$(printf '%s\n' "$CLEAN" | grep -n '^  _reapleft=""; _reapi=0' | head -1 | cut -d: -f1)
   chk new "P3 the settle runs after bt_reset and before the survivor loop" test "${ln_bt:-0}" -gt 0 -a "${ln_set:-0}" -gt "${ln_bt:-0}" -a "${ln_loop:-0}" -gt "${ln_set:-0}"
@@ -1459,7 +1460,7 @@ if [ "$MUTATE" = yes ] && [ "$BASE" = no ]; then
   # The quotes must be ESCAPED to reach the log: a bare "..." inside the already double-quoted echo just closes
   # and reopens the shell string, so the line would be byte-identical and the mutant inert in effect.
   mutate 'R1: the userdir field is quoted (log_scrub eats it)' \
-    's@ userdir=\$_udf \$\(date\)@ userdir=\\"$_udf\\" $(date)@' 'the REAL log_scrub'
+    's@ userdir=\$_udf loop=@ userdir=\\"$_udf\\" loop=@' 'the REAL log_scrub'
   mutate 'R1: the settle is an undefined command at its call site (the forward-reference trap)' \
     's@^  reap_userdir_settle "\$uid"$@  reap_userdir_setle "$uid"@' 'H no run hit an undefined command'
   # R4, the reap and a link at users/<uid>

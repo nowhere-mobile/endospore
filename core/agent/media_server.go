@@ -574,7 +574,10 @@ func loadTombstones(cacheDir string) map[string]bool {
 		return out
 	}
 	for _, ln := range strings.Split(string(b), "\n") {
-		if ln = strings.TrimSpace(ln); ln != "" {
+		// NWP-20261129-46: keep the line as written. appendTombstone writes rel+"\n" exactly, and a file name may
+		// begin or end in whitespace, so a trimmed key can name another file: the restart lists the deleted stub
+		// again and hides that file's stub. Same defect class as NWP-20261016-43.
+		if ln != "" {
 			out[ln] = true
 		}
 	}

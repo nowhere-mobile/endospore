@@ -2,7 +2,8 @@
 # test-sign-release.sh [--mutate] -- one signing sitting signs N devices with one prompt (NWP-20261122-01).
 #
 # Runs COPIES of sign-release.sh and sitting-guard.sh in a scratch world: a git repo holding them beside copies of the
-# real verified-commit-guard.sh, ring-for-build.sh, ring-record.tsv, assert-baked-ring.sh and rings/*.conf, plus recording
+# real verified-commit-guard.sh, ring-for-build.sh, ring-record.tsv, assert-baked-ring.sh, keys-home.sh and rings/*.conf
+# (NOWHERE_KEYS_HOME is the world's own keyshome/, never the host's), plus recording
 # stubs of make-web-package.sh, ota-field-guard.sh and check-patch-markers.py; and a tree holding stub build/envsetup.sh,
 # script/finalize.sh, script/decrypt-keys, script/generate-release.sh, fixture keys and target-files zips (python3
 # zipfile). Stub openssl, tmux and ps come first on PATH. The ps stub prints ONLY a fabricated table: its own row, its
@@ -188,7 +189,7 @@ world() {
   RB="$X/repo/editions/endospore/build"
   mkdir -p "$RB" "$X/repo/core/vendor-common/etc/rings"
   cp "$S" "$RB/sign-release.sh"; cp "$G" "$RB/sitting-guard.sh"
-  for d in verified-commit-guard.sh ring-for-build.sh ring-record.tsv assert-baked-ring.sh support-guard.sh; do cp "$HERE/$d" "$RB/$d"; done
+  for d in verified-commit-guard.sh ring-for-build.sh ring-record.tsv assert-baked-ring.sh support-guard.sh keys-home.sh; do cp "$HERE/$d" "$RB/$d"; done
   # NWP-20261124-19: the guard's directory, with only its README (never the committed markers: a real one for
   # lynx would refuse every case here).
   mkdir -p "$X/repo/editions/endospore/support-ended"; cp "$HERE/../support-ended/README" "$X/repo/editions/endospore/support-ended/"
@@ -211,7 +212,7 @@ run() {
   env -u TMUX -u NOWHERE_RING -u NOWHERE_RING_OVERRIDE -u BUILD_DATETIME -u BUILD_NUMBER -u OUT_DIR -u password \
     PATH="$X/bin:$PATH" ENDOSPORE_TREE="$X/tree" ENDOSPORE_REPO="$X/repo" SIGN_SHM_DIR="$X/shm" TMPDIR="$TMPDIR" \
     SIGN_MIN_TMP_GIB=0 NOWHERE_OTA_STORE_CONF="$X/conf" NOWHERE_AGENT="$X/agent" FX_LOG="$X/log" FX_PWFILE="$X/pwref" \
-    FX_PS_PLANT="$X/plant" "${XENV[@]}" \
+    FX_PS_PLANT="$X/plant" NOWHERE_KEYS_HOME="$X/keyshome" "${XENV[@]}" \
     bash "$X/repo/editions/endospore/build/sign-release.sh" "$@" < "$IN" > "$X/out" 2> "$X/err"
   RC=$?
 }
@@ -319,6 +320,8 @@ su_F1() { mkdir -p "$1/shm/release_keys.stale1"; }
 su_G1() { printf '#!/bin/bash\nread -rsp "Enter key passphrase: " password\n' > "$1/tree/script/decrypt-keys"; }
 su_G2() { sed -i 's#/dev/shm/release_keys\.#/run/keys.#' "$1/tree/script/generate-release.sh"; }
 su_V1() { printf '900003 1 claude\n' > "$1/plant"; }
+su_KH2() { rm -rf "$1/tree/keys"; }
+su_KH3() { mkdir -p "$1/keyshome"; cp -a "$1/tree/keys/husky" "$1/keyshome/"; printf 'another-root\n' > "$1/keyshome/husky/avb_pkmd.bin"; }
 case_R() {       # <S> <G> <id>
   local id="$3"
   case "$id" in
@@ -337,8 +340,22 @@ case_R() {       # <S> <G> <id>
     G1) refusal "$1" "$2" "an upstream sync changed the password gate or the key dir" su_G1 ;;
     G2) refusal "$1" "$2" "an upstream sync changed the password gate or the key dir" su_G2 ;;
     V1) refusal "$1" "$2" "pid 900003 claude" su_V1 ;;
+    KH2) refusal "$1" "$2" "husky: no usable keys/husky (keys-home.sh, above)" su_KH2 ;;
+    KH3) refusal "$1" "$2" "keys/husky/avb_pkmd.bin differs from the keys home's" su_KH3 ;;
   esac
   XENV=()
+}
+case_KH1() {     # NWP-20261105-19: a tree with no keys/ and a keys home holding both devices: linked, and both sign
+  local X
+  X=$(world "$1" "$2" husky frankel) || { WHY="world"; return; }; CX="$X"
+  mv "$X/tree/keys" "$X/keyshome"
+  run "$X" "$X/pw" "$BN" "$(head7 "$X")" husky frankel
+  chk test "$RC" = 0
+  chk test -L "$X/tree/keys"
+  chk test "$(readlink "$X/tree/keys")" = "$X/keyshome"
+  chk has "$X/err" "linked $X/tree/keys -> $X/keyshome"
+  chk has "$X/log" "gen husky $BN password-set=yes password-ok=yes"
+  chk has "$X/log" "gen frankel $BN password-set=yes password-ok=yes"
 }
 case_K2() {      # a missing id_ed25519 warns and still signs
   local X
@@ -383,6 +400,7 @@ case_H1() {      # TERM to the wrapper while generate-release holds: child gone,
       PATH="$X/bin:$PATH" ENDOSPORE_TREE="$X/tree" ENDOSPORE_REPO="$X/repo" SIGN_SHM_DIR="$X/shm" TMPDIR="$TMPDIR" \
       SIGN_MIN_TMP_GIB=0 NOWHERE_OTA_STORE_CONF="$X/conf" NOWHERE_AGENT="$X/agent" FX_LOG="$X/log" FX_PWFILE="$X/pwref" \
       FX_PS_PLANT="$X/plant" FX_GEN_HOLD=husky FX_READY="$X/ready" FX_HOLD_PID="$X/hold.pid" FX_SLEEP_PID="$X/sleep.pid" \
+      NOWHERE_KEYS_HOME="$X/keyshome" \
       bash "$X/repo/editions/endospore/build/sign-release.sh" "$BN" "$(head7 "$X")" husky frankel \
       < "$X/pw" > "$X/out" 2> "$X/err" ) &
   WPID=$!
@@ -466,10 +484,11 @@ plain() {
   WHY=""; case_S2 "$SIGN" "$GUARD"; report "S2 an explicit out dir is the one signed"
   WHY=""; case_P1 "$SIGN" "$GUARD"; report "P1 a wrong passphrase on the second device's key: nothing signed, the key named"
   WHY=""; case_P2 "$SIGN" "$GUARD"; report "P2 an empty passphrase is refused before any key is tried"
-  for c in R1 R2 R3 R4 R5 R6 R7 K1 O1 O2 T1 F1 G1 G2 V1; do
+  for c in R1 R2 R3 R4 R5 R6 R7 K1 KH2 KH3 O1 O2 T1 F1 G1 G2 V1; do
     WHY=""; case_R "$SIGN" "$GUARD" "$c"; report "$c preflight refusal, named, no prompt"
   done
   WHY=""; case_K2 "$SIGN" "$GUARD"; report "K2 a missing id_ed25519 warns and still signs"
+  WHY=""; case_KH1 "$SIGN" "$GUARD"; report "KH1 a tree with no keys/ is linked to the keys home and both devices sign"
   WHY=""; case_X1 "$SIGN" "$GUARD"; report "X1 a failing device: the other signs after its key dir is swept; exit 1"
   WHY=""; case_X2 "$SIGN" "$GUARD"; report "X2 envsetup pinning another BN fails that device before generate-release"
   WHY=""; case_H1 "$SIGN" "$GUARD"; report "H1 TERM mid-signing: child gone, key dirs swept, the TERM line"
@@ -509,6 +528,8 @@ convict() {      # <id> <sign-src> <guard-src>: runs the signature case and sets
         if [ -z "$WHY" ]; then VERDICT=SURVIVED
         elif has "$CX/err" "$PROMPT" || grep -q '^gen husky' "$CX/log"; then VERDICT=CONVICTED; else VERDICT=BROKEN; fi ;;
     M6) case_H1 "$S" "$G"; if [ -z "$WHY" ]; then VERDICT=SURVIVED; elif lacks "$CX/err" "$TERMLINE"; then VERDICT=CONVICTED; else VERDICT=BROKEN; fi ;;
+    M13) case_KH1 "$S" "$G"; if [ -z "$WHY" ]; then VERDICT=SURVIVED; elif has "$CX/err" "keys/husky/*.pk8 is MISSING"; then VERDICT=CONVICTED; else VERDICT=BROKEN; fi ;;
+    M14) case_R "$S" "$G" KH3; if [ -z "$WHY" ]; then VERDICT=SURVIVED; elif has "$CX/err" "$PROMPT" || grep -q '^gen husky' "$CX/log"; then VERDICT=CONVICTED; else VERDICT=BROKEN; fi ;;
     M5|M11)
         VERDICT=CONVICTED
         for sh in $SHELLS; do
@@ -555,6 +576,9 @@ mutants() {
   # inside the awk program: an EMPTY line, a valid awk no-op (a bare ':' is an awk syntax error)
   mutant M11 guard 'if (!(p in par)) par[p] = pp' ''
   mutant M12 sign 'unset PW password' ':'
+  # NWP-20261105-19: the keys home
+  mutant M13 sign 'if ! sh "$B/keys-home.sh" "$TREE" "$DEV" >&2; then' 'if false; then'
+  mutant M14 sign 'refuse "$DEV: no usable keys/$DEV (keys-home.sh, above)"' ':'
 }
 
 echo "test-sign-release.sh (shells:$SHELLS)"

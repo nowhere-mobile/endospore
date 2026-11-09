@@ -15,7 +15,7 @@ package main
 // verifyEd25519 decodes, so a selected key checks an index unchanged. Keys are compared by their DECODED bytes, never as
 // strings: the decoder trims spaces and ignores the spare bits of the last character, so two spellings can name one key.
 //
-// Everything here is pure: no I/O, no clock, no state. Nothing calls it yet (see activeIndexKey for the next slice).
+// Everything here is pure: no I/O, no clock, no state. index_key_fetch.go calls it (activeIndexKey says what is left).
 
 import (
 	"bytes"
@@ -185,13 +185,16 @@ func verifyIndexKeyObject(pubB64 string, env []byte, now, floor int64) (*indexKe
 //
 // NWP-20261126-14 built the fetch (as Q098's build_warning_fetch.go followed build_warning.go): index_key_fetch.go's
 // fetchIndexKey reads ref/ota/index-key, acceptIndexKey keeps the accepted envelope and its durable seq floor
-// (/data/nowhere/index-key, index-key-seq), and currentIndexKey selects the refresh key or none. Not called yet. The
-// later slices build:
-//   - the operator's put command, which publishes the object only above the published seq;
-//   - the call in index.go. The selected key replaces indexPubKey ONLY for the /data refresh (loadIndexBytes's /data
-//     branch) and refreshIndex's checks. The baked /system copy is signed by the baked key and rides verified boot, so
-//     it keeps verifyIndexSig's baked key. The `indexPubKey == ""` branches trust the baked copy unsigned, so they must
-//     keep reading the BAKED key: an "" from here must never reach them.
+// (/data/nowhere/index-key, index-key-seq), and currentIndexKey selects the refresh key or none.
+//
+// NWP-20261129-18 built the calls: refreshOtaCache calls fetchIndexKey after each completed OTA check, and index.go
+// calls currentIndexKey. The selected key replaces indexPubKey ONLY for the /data refresh (loadIndexBytesWith's /data branch)
+// and refreshIndex's checks. The baked /system copy is signed by the baked key and rides verified boot, so it keeps
+// verifyIndexSig's baked key. The `indexPubKey == ""` branches trust the baked copy unsigned, so they keep reading the
+// BAKED key: an "" from here must never reach them.
+//
+// NWP-20261129-24 built the operator's put command (index_key_put.go), which publishes the object only above the
+// published seq.
 func activeIndexKey(baked string, obj *indexKeyObject) string {
 	if obj == nil {
 		return baked

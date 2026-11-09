@@ -196,18 +196,18 @@ func TestSignOutRenewal_ThePeriodicRuleIsUnchanged(t *testing.T) {
 		t.Fatalf("payRentGen sent %d /lease requests for a footprint renewed three epochs ago, want 0", n)
 	}
 	for _, c := range []struct {
-		why               string
-		w                 Wallet
-		periodic, signOut bool
+		why                        string
+		w                          Wallet
+		renewal, periodic, signOut bool
 	}{
-		{"renewed 3 epochs ago, term live", Wallet{PaidThrough: 92, RenewedEpoch: 39}, false, true},
-		{"renewed this epoch, term live", Wallet{PaidThrough: 92, RenewedEpoch: 42}, false, false},
-		{"rent due", Wallet{PaidThrough: 42, RenewedEpoch: 42}, true, true},
-		{"footprint stale", Wallet{PaidThrough: 92, RenewedEpoch: 42 - renewEveryEpochs}, true, true},
+		{"renewed 3 epochs ago, term live", Wallet{PaidThrough: 92, RenewedEpoch: 39}, false, false, true},
+		{"renewed this epoch, term live", Wallet{PaidThrough: 92, RenewedEpoch: 42}, false, false, false},
+		{"rent due, renewed this epoch", Wallet{PaidThrough: 42, RenewedEpoch: 42}, true, false, true},
+		{"footprint stale", Wallet{PaidThrough: 92, RenewedEpoch: 42 - renewEveryEpochs}, true, true, true},
 	} {
 		w := c.w
-		if got := renewalDue(&w, 42); got != c.periodic {
-			t.Errorf("%s: renewalDue = %v, want %v", c.why, got, c.periodic)
+		if got := renewalDue(&w, 42); got != c.renewal {
+			t.Errorf("%s: renewalDue = %v, want %v", c.why, got, c.renewal)
 		}
 		if got := dueBy(renewPeriodic, &w, 42); got != c.periodic {
 			t.Errorf("%s: the periodic rule = %v, want %v", c.why, got, c.periodic)

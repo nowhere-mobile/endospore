@@ -382,6 +382,16 @@ allow nowhere_chooser clipboard_service:service_manager find;
 # service=location_service scontext=u:r:nowhere_chooser:s0`. The service is in system_server, so as above the find
 # is the whole delta. NOT device-proven: the check is the Wi-Fi screen on an enforcing handset (a system_ext flash).
 allow nowhere_chooser location_service:service_manager find;
+# NWP-20261129-53: a lookup at boot, its caller not named yet. SEEN on lynx 2026110402 on GrapheneOS 2026110100
+# (enforcing, a sign-in on 2026-11-04): three denials, the first two seconds after boot, `avc: denied { find } ...
+# name=legacy_permission scontext=u:r:nowhere_chooser:s0 tcontext=u:object_r:legacy_permission_service:s0`. Nothing
+# visible failed. The caller runs in the chooser's process and none of the chooser's own code asks for the service
+# (no LegacyPermissionManager in core/chooser), so it is a framework class, not named yet. Granted under the 2026-11-04
+# rule (docs/product-decisions.md, harvest 58 #2): a find is a lookup, and the service checks its own permissions on
+# every call. legacy_permission_service is the AOSP service type the denial's tcontext names; the build host's policy
+# compile proves both editions' trees define it. NOT device-proven: the check is an enforcing handset's boot with no
+# such denial (a system_ext flash).
+allow nowhere_chooser legacy_permission_service:service_manager find;
 # #151 gate alarm: GateAlarmActivity plays the alarm sound ITSELF (RingtoneManager -> MediaPlayer). Unlike the
 # incoming-call ring -- where telecom's system ringer makes the sound -- this is the first chooser-owned audio
 # playback, and MediaPlayer needs the media stack: audio_flinger/audio_policy (audioserver_service),

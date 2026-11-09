@@ -8,7 +8,8 @@ package main
 // -- or in an error the line prints, since an *fs.PathError repeats its path unquoted -- therefore outlives its
 // profile and reaches the next profile's report. Q001 (e) (docs/product-decisions.md, 2026-10-20) decided this is a
 // leak past the scrub; NWP-20261102-03 fixed it for the seal walk (sealUnreadableKeepLine). This is the same
-// invariant for the four media files.
+// invariant for the five media files. NWP-20261129-37 adds media_seal.go: the seal's UNRESOLVED overlay line printed
+// its mountpoint bare, and a push's stderr reaches roam.log.
 
 import (
 	"errors"
@@ -21,10 +22,10 @@ import (
 	"testing"
 )
 
-var mlpFiles = []string{"mediafs.go", "media_server.go", "media_defer_sync.go", "media_span.go"}
+var mlpFiles = []string{"mediafs.go", "media_server.go", "media_defer_sync.go", "media_span.go", "media_seal.go"}
 
 // mlpPathIdents are the names a session path travels under in these files; mlpPathSels the selector forms.
-var mlpPathIdents = map[string]bool{"rel": true, "target": true, "hidden": true, "dir": true, "pp": true, "cur": true}
+var mlpPathIdents = map[string]bool{"rel": true, "target": true, "hidden": true, "dir": true, "pp": true, "cur": true, "mp": true}
 var mlpPathSels = map[string]bool{"f.rel": true, "f.path": true, "mt.target": true, "hdr.Name": true}
 
 // mlpKnownGood is a line that already quoted before this slice: the scan must have seen it, or it saw nothing.
@@ -215,5 +216,45 @@ func TestMediaSyncSkippedLineIsScrubbed(t *testing.T) {
 	}
 	if n != 1 {
 		t.Fatalf("want 1 SKIPPED line, got %d in %q", n, out)
+	}
+}
+
+// TestSealUnresolvedOverlayLineIsScrubbed feeds the real parser an overlay with no published map entry and no .under
+// bind. The skip mapping stays as it was, and the folder name goes whole under the issue report's name rules.
+func TestSealUnresolvedOverlayLineIsScrubbed(t *testing.T) {
+	const src = "/data/media/77"
+	const rel = "Pictures/Trip with Alice"
+	mp := src + "/" + rel
+	table := `nowhere_media /data/media/77/Pictures/Trip\040with\040Alice fuse.nowheremedia rw 0 0` + "\n"
+	var got map[string]string
+	var err error
+	out := captureStderr(t, func() {
+		got, err = parseMediaOverlayUndersPub(strings.NewReader(table), src, nil)
+	})
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	want := src + "/" + mediaCacheRel + "/.under/" + underLeaf(rel)
+	if got[mp] != want {
+		t.Errorf("the overlay maps to %q, want %q", got[mp], want)
+	}
+	n := 0
+	for _, line := range strings.Split(out, "\n") {
+		if !strings.Contains(line, "UNRESOLVED") {
+			continue
+		}
+		n++
+		if !strings.Contains(line, strconv.Quote(mp)) {
+			t.Errorf("the mountpoint is not quoted: %q", line)
+		}
+		scrubbed := applyIssueNameRules(line)
+		for _, w := range []string{"Trip", "Alice", "Pictures"} {
+			if strings.Contains(scrubbed, w) {
+				t.Errorf("%q survives the issue report's name rules: %q", w, scrubbed)
+			}
+		}
+	}
+	if n != 1 {
+		t.Fatalf("want 1 UNRESOLVED line, got %d in %q", n, out)
 	}
 }

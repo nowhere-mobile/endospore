@@ -30,6 +30,7 @@ func TestConcurrentSafeCmd(t *testing.T) {
 		// a progress poll during a login or materialise froze the very bar it was feeding.
 		"SEAL-STATUS", "GET-SYNC-STATUS", "GET-SWEEP", "AUTO-SWEEP", "AUTO-SWEEP-APP",
 		"PLACEHOLDER-OUTCOMES", // NWP-20261127-08: a sign-in sends it while it holds sessionMu
+		"TELINGEST-SEEN",       // NWP-20261129-02: a session whose seals hold sessionMu for minutes sends it
 		// NWP-20261117-27: one atomic read; a materialise or a sign-in holds sessionMu for minutes.
 		"GET-SEAL-LANDED",
 		"COLD-LOCK-STATUS",     // NWP-20261005-09: explains a lock queued behind a seal, which holds sessionMu

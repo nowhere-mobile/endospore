@@ -7,7 +7,8 @@ import (
 
 // NWP-20261017-13: the cold-lock teardown keeps the forward rekey's reply. After a DEFINITIVE refusal
 // (ERR-REKEY / ERR-ARGS / ERR-REQ) the keyguard never moved, so a revoke has nothing to unwind; after OK, or after
-// any reply that leaves it open (ERR-TIMEOUT), the unwind runs and a failed unwind declines the revoke.
+// any reply that leaves it open (an ERR-TIMEOUT whose late reply was read), the unwind runs and a failed unwind
+// declines the revoke.
 
 // clwRekeyRun drives a 2FA lock whose forward rekey answers fwd and whose unwind (the second rekey, if it is made)
 // answers unwind, with an authenticated unlock landing during the wait. It returns once the teardown has left the
@@ -102,8 +103,49 @@ func TestColdLockForwardRekeyOKFailedUnwindDeclinesTheRevoke(t *testing.T) {
 	clwRekeyDeclined(t, dest, rec, hold)
 }
 
-// (d) A timed-out forward rekey may have landed after the stall: it still unwinds, and a failed unwind declines.
+// (d) A timed-out forward rekey whose late reply is read as OK (h56 #2, coldLockAwaitLateRekey) landed after the
+// stall: it still unwinds, and a failed unwind declines. A reply still unknown at the bound never gets here: it signs
+// out above the wait (NWP-20261128-06, coldlock_late_rekey_test.go).
 func TestColdLockForwardRekeyTimeoutStillUnwinds(t *testing.T) {
-	dest, rec, hold := clwRekeyRun(t, "ERR-TIMEOUT", "ERR-REKEY")
+	clwRekeyLateDeclined(t, "OK")
+}
+
+// clwRekeyLateDeclined drives a timed-out forward rekey whose late reply is late, then a failed unwind that declines.
+func clwRekeyLateDeclined(t *testing.T, late string) {
+	t.Helper()
+	dest, rec, hold := clwSetup(t)
+	clrSetup(t, clrRekey(), time.Minute, clrStopsAfterTwo)
+	clrRes(t, dest, late)
+	clwFido2(t, dest)
+	rec.ret = func(op string, nth int) string {
+		if op != "rekey" {
+			return ""
+		}
+		if nth == 1 {
+			return "ERR-TIMEOUT"
+		}
+		return "ERR-REKEY"
+	}
+	hold.take()
+	p := coldLockParks.Load()
+	clwLock(t, dest, 1000)
+	if !clwWaitFor(2*time.Second, func() bool { return len(rec.ops()) >= 1 }) {
+		t.Fatal("the forward rekey never ran")
+	}
+	clwParked(t, p)
+	if armed, _ := armColdLockAbort(dest, "10", 2000); !armed {
+		t.Fatal("the unlock was rejected")
+	}
 	clwRekeyDeclined(t, dest, rec, hold)
+}
+
+// (e) A reply outside the definitive set does not prove the keyguard stayed put, so it keeps the unwind, and a failed
+// unwind declines the revoke. It arrives as the forward reply itself or as the late reply of a timed-out rekey.
+func TestColdLockForwardRekeyUnlistedReplyStillUnwinds(t *testing.T) {
+	const unlisted = "ERR-UNLISTED"
+	t.Run("forward", func(t *testing.T) {
+		dest, rec, hold := clwRekeyRun(t, unlisted, "ERR-REKEY")
+		clwRekeyDeclined(t, dest, rec, hold)
+	})
+	t.Run("late", func(t *testing.T) { clwRekeyLateDeclined(t, unlisted) })
 }

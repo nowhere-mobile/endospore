@@ -38,6 +38,7 @@
             // id keyed on the arrival-ms so a re-verify pass or re-login updates rather than stacks duplicates,
             // while two different MMS still get distinct notifications.
             nm.notify(tag, (int) (when ^ (when >>> 32)), b.build());
+            traceNoticeReadBack(ctx, tag, (int) (when ^ (when >>> 32)), false, named.getString(SmsDeliverReceiver.EXTRA_SUBST_APP_NAME)); // NWP-20261128-33
             syncMessageSummary(ctx); // NWP-20261118-16: the group's own summary, so Android never posts its own
         } catch (Throwable t) {
             android.util.Log.w("NowhereChooser", "roamed message notice", t);

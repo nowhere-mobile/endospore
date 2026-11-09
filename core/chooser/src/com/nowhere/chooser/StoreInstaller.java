@@ -24,9 +24,10 @@ import java.io.OutputStream;
  *    A present-but-malformed cert REFUSES (fail-closed), and so does no verdict at all (a null pin,
  *    which StoreSignerPin yields for any reply but "OK <pkg> <64 hex|->"). EVERY install is pinned: a
  *    daemon-declared "-" (the catalog omits the cert) refuses too, with NOSIGNER (decided 2026-10-20).
- *  - PackageInstaller session lifecycle: abandoned on every pre-commit failure; a post-commit latch
- *    timeout is "outcome unknown", so we re-check PackageManager rather than declare failure — the
- *    commit can land after 180 s, and calling that ERR-INSTALL left an installed app with no keep line.
+ *  - PackageInstaller session lifecycle: abandoned on every pre-commit failure; after the commit the wait is
+ *    InstallWait's (NWP-20261129-21). A big set's commit can outlive any single latch, and a Get that answered
+ *    PENDING and landed later had no keep line. PENDING means "still installing at InstallWait's 10-minute
+ *    bound"; an installed old version proves nothing about an Update's commit, so isInstalled has no say.
  *  - ALL nowhere-appkeep writes serialize on {@link #APPKEEP_LOCK} and land via temp+rename —
  *    StoreService's binder threads made the file's read-modify-write concurrent for the first time,
  *    and a lost update silently drops an app from the roam.
@@ -62,7 +63,7 @@ final class StoreInstaller {
      *  (NOSIGNER for "", FAIL for null). */
     static String installStaged(Context ctx, String pkg, String signerHex) {
         File dir = new File(new File(ctx.getFilesDir(), ".appcode"), pkg);
-        int sid = -1;
+        int abandonSid = -1; // the one the outer catch abandons: sid below stays final for InstallWait's session adapter
         boolean committed = false;
         android.content.pm.PackageInstaller pi = ctx.getPackageManager().getPackageInstaller();
         try {
@@ -90,7 +91,8 @@ final class StoreInstaller {
             try { p.setInstallReason(android.content.pm.PackageManager.INSTALL_REASON_USER); } catch (Throwable ignore) {}
             try { p.setRequestUpdateOwnership(true); } catch (Throwable ignore) {}
             pinInternalStorage(p); // deliberate -- see the helper
-            sid = pi.createSession(p);
+            final int sid = pi.createSession(p);
+            abandonSid = sid;
             android.content.pm.PackageInstaller.Session ses = pi.openSession(sid);
             try {
                 for (File a : apks) {
@@ -103,39 +105,58 @@ final class StoreInstaller {
                 }
                 final java.util.concurrent.CountDownLatch latch = new java.util.concurrent.CountDownLatch(1);
                 final int[] st = { android.content.pm.PackageInstaller.STATUS_FAILURE };
+                final String[] stMsg = { null };
                 String action = ctx.getPackageName() + ".STORE_INSTALL." + sid;
                 android.content.BroadcastReceiver rcv = new android.content.BroadcastReceiver() {
                     @Override public void onReceive(Context c, Intent i) {
                         st[0] = i.getIntExtra(android.content.pm.PackageInstaller.EXTRA_STATUS,
                                 android.content.pm.PackageInstaller.STATUS_FAILURE);
+                        stMsg[0] = i.getStringExtra(android.content.pm.PackageInstaller.EXTRA_STATUS_MESSAGE);
                         latch.countDown();
                     }
                 };
+                // NWP-20261129-21: the codePath BEFORE commit. Every applied session mints a new one, so a change is
+                // proof this commit landed; an installed old version proves nothing (an Update).
+                String pathBefore = null;
+                try {
+                    pathBefore = ctx.getPackageManager().getApplicationInfo(pkg, 0).sourceDir;
+                } catch (Throwable notInstalled) { }
                 ctx.registerReceiver(rcv, new android.content.IntentFilter(action), Context.RECEIVER_NOT_EXPORTED);
-                boolean replied;
+                InstallWait.Outcome outcome;
                 try {
                     android.app.PendingIntent pend = android.app.PendingIntent.getBroadcast(ctx, sid,
                             new Intent(action).setPackage(ctx.getPackageName()),
                             android.app.PendingIntent.FLAG_UPDATE_CURRENT | android.app.PendingIntent.FLAG_MUTABLE);
                     ses.commit(pend.getIntentSender());
                     committed = true; // past this point the session cannot be abandoned; the outcome is the PM's
-                    replied = latch.await(180, java.util.concurrent.TimeUnit.SECONDS);
+                    // NWP-20261129-21: a timeout is not a verdict -- the wait-and-decide rule lives once, in InstallWait.
+                    outcome = InstallWait.await(
+                            ms -> latch.await(ms, java.util.concurrent.TimeUnit.MILLISECONDS),
+                            () -> { try { return pi.getSessionInfo(sid) != null; } catch (Throwable gone) { return false; } },
+                            () -> { try { return ctx.getPackageManager().getApplicationInfo(pkg, 0).sourceDir; }
+                                    catch (Throwable notInstalled) { return null; } },
+                            pathBefore,
+                            android.os.SystemClock::elapsedRealtime,
+                            () -> Log.i("NowhereChooser", "store install " + pkg
+                                    + " still running (session alive) -- waiting on (NWP-20261129-21)"));
+                    if (outcome == InstallWait.Outcome.LANDED) st[0] = android.content.pm.PackageInstaller.STATUS_SUCCESS;
+                    if (outcome != InstallWait.Outcome.BROADCAST) stMsg[0] = InstallWait.message(outcome);
                 } finally {
                     try { ctx.unregisterReceiver(rcv); } catch (Throwable ignore) {}
                 }
-                if (replied) {
-                    return st[0] == android.content.pm.PackageInstaller.STATUS_SUCCESS ? OK : FAIL;
-                }
-                // Latch timeout AFTER commit: outcome unknown, not failure. The commit can still land -- and
-                // declaring FAIL here left an installed app with no keep line (review finding). Re-check.
-                return isInstalled(ctx, pkg) ? OK : PENDING;
+                Log.i("NowhereChooser", "StoreInstaller " + pkg + " status=" + st[0]
+                        + (stMsg[0] != null ? " (" + stMsg[0] + ")" : ""));
+                // Still installing at the bound: outcome unknown. An installed old version is no proof, so isInstalled
+                // has no say here (an Update), and GONE_UNCHANGED is a failure.
+                if (outcome == InstallWait.Outcome.HARD_BOUND) return PENDING;
+                return st[0] == android.content.pm.PackageInstaller.STATUS_SUCCESS ? OK : FAIL;
             } finally {
                 try { ses.close(); } catch (Throwable ignore) {}
             }
         } catch (Throwable t) {
             Log.w("NowhereChooser", "StoreInstaller " + pkg, t);
-            if (sid >= 0 && !committed) {
-                try { pi.abandonSession(sid); } catch (Throwable ignore) {}
+            if (abandonSid >= 0 && !committed) {
+                try { pi.abandonSession(abandonSid); } catch (Throwable ignore) {}
             }
             return FAIL;
         } finally {

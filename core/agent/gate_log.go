@@ -84,6 +84,8 @@ var gateLogVerbs = map[string]bool{
 	"ui-silence-refused": true,
 	// NWP-20261116-12: the gate alarm rang 10 minutes unattended and snoozed itself / was dismissed
 	"ui-auto-snooze": true, "ui-auto-dismiss": true,
+	// NWP-20261128-35: the gate window's two light-bar appearance bits at first focus, in light mode (0, 8, 16 or 24)
+	"bars-light": true,
 	// the record of a rejection -- never the rejected text itself
 	"trace-unknown": true,
 }
@@ -97,6 +99,7 @@ var gateLogVerbs = map[string]bool{
 //	       the alarm was set, roughly how far out, and whether it was ALREADY PAST.
 //	ms     milliseconds a UI surface lived, an INTEGER. A two-digit value IS the flash-and-vanish report.
 //	fields how many tab-separated fields a wire line carried (0-3), an INTEGER. Shape, not content.
+//	       For bars-light: the gate window's two light-bar bits (0, 8, 16 or 24), a property of the gate.
 //
 // `d`, `m` and `s` are not caller keys: gateLog writes them on every line, as gateGapBucket tokens.
 var gateLogKeys = map[string]bool{"in": true, "ms": true, "fields": true}

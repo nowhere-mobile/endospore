@@ -79,8 +79,9 @@ public final class WapPushDeliverReceiver extends BroadcastReceiver {
             // kept, so leave the loss notice, the same as an unresolved text or call (docs/product-decisions.md
             // 2026-09-30, answer 2). No txn is claimed, so a later push that DOES name a SIM is not skipped.
             final String t0 = txnId(nInd);
+            final String aid = TelArrival.mmsId(subId, t0, loc, when); // NWP-20260930-05: a re-push has the same id
             if (subId == SubscriptionManager.INVALID_SUBSCRIPTION_ID) {
-                SmsDeliverReceiver.postLossNotice(app, "mms", 0, TelArrival.mmsId(subId, t0, loc, when));
+                SmsDeliverReceiver.postLossNotice(app, "mms", 0, aid);
                 return;
             }
 
@@ -110,7 +111,7 @@ public final class WapPushDeliverReceiver extends BroadcastReceiver {
                     .putExtra(MmsDownloadedReceiver.EXTRA_WHEN, when)
                     .putExtra(MmsDownloadedReceiver.EXTRA_FROM, from)
                     .putExtra(MmsDownloadedReceiver.EXTRA_TXN, txn).putExtra(MmsDownloadedReceiver.EXTRA_MONO, mono)
-                    .putExtra(MmsDownloadedReceiver.EXTRA_AID, TelArrival.mmsId(subId, t0, loc, when)); // NWP-20260930-05
+                    .putExtra(MmsDownloadedReceiver.EXTRA_AID, aid); // NWP-20260930-05
             PendingIntent pi = PendingIntent.getBroadcast(app, name.hashCode(), done,
                     PendingIntent.FLAG_ONE_SHOT | PendingIntent.FLAG_MUTABLE);
 
@@ -132,10 +133,11 @@ public final class WapPushDeliverReceiver extends BroadcastReceiver {
             } catch (Throwable kick) {
                 finishDownload(app, fName, fUri, subId); // undo the grant + PDN ref + token on a failed kick
                 releaseTxn(txn);                         // and free the txn so the next re-push retries
+                SmsDeliverReceiver.postDownloadLoss(app, subId, aid); // docs/product-decisions.md 2026-11-05, #14
                 throw kick;
             }
             android.util.Log.i("NowhereChooser", "#150 download kicked (uri=" + contentUri + ")");
-            armDownloadTimeout(app, fName, fUri, subId, txn);
+            armDownloadTimeout(app, fName, fUri, subId, txn, aid);
         } catch (Throwable t) {
             android.util.Log.w("NowhereChooser", "#150 notification handling failed", t);
         }
@@ -236,13 +238,14 @@ public final class WapPushDeliverReceiver extends BroadcastReceiver {
     }
 
     /** If the download-complete callback never fires (MMS PDN never comes up -> the documented silent timeout),
-     *  clean up anyway so the cleartext staging body never lingers on user 0's disk. */
-    private static void armDownloadTimeout(Context app, String name, String uriStr, int subId, String txn) {
+     *  clean up anyway so the cleartext staging body never lingers on user 0's disk, and leave the loss notice. */
+    private static void armDownloadTimeout(Context app, String name, String uriStr, int subId, String txn, String aid) {
         new Thread(() -> {
             try { Thread.sleep(DOWNLOAD_TIMEOUT_MS); } catch (InterruptedException ignore) { return; }
             if (finishDownload(app, name, uriStr, subId)) {
                 android.util.Log.w("NowhereChooser", "#150 MMS download timed out (no callback); sweeping staging");
                 releaseTxn(txn); // a timeout is a failure -> free the txn so the next re-push retries
+                SmsDeliverReceiver.postDownloadLoss(app, subId, aid); // only here: a callback that finished it posts nothing more
             }
         }).start();
     }

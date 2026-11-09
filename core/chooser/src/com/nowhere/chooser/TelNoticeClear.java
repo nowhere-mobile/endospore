@@ -4,7 +4,9 @@ package com.nowhere.chooser;
  * NWP-20261110-22: the two parsers behind "Unbind all" and "Clear notices", lifted out of ChooserActivity so a javac
  * suite runs them. Pure, java.* only. Two producers feed them: SmsDeliverReceiver.postMessageNotice composes a gate
  * notice's title as {@code title + "  -  " + line}, and core/agent/main.go's DELETE-BINDING reply names the unbound
- * lines as {@code " L" + base64.StdEncoding(label)} (a bare {@code L} is a blank label).
+ * lines as {@code " L" + base64.StdEncoding(label)} (a bare {@code L} is a blank label). NWP-20261128-18: kindOf reads
+ * the nowhere_kind and nowhere_call extras that postMessageNotice writes, and the title of a notice posted before them,
+ * for the gate banner.
  */
 final class TelNoticeClear {
     private TelNoticeClear() {}
@@ -16,6 +18,22 @@ final class TelNoticeClear {
         String s = title.toString();
         int i = s.indexOf("  -  ");
         return i >= 0 ? s.substring(i + 5) : "";
+    }
+
+    /** NWP-20261128-18: the kind of event a gate notice stands for, as telNotices hands it to summarize: "call" (a
+     *  missed call), "incoming" (a call answered at the gate) or "message". postMessageNotice marks a call with
+     *  nowhere_call; a notice posted before that is read by its title, before the "  -  <label>" suffix only. */
+    static String kindOf(String nowhereKind, String nowhereCall, String title) {
+        String k = nowhereKind == null ? "" : nowhereKind, c = nowhereCall == null ? "" : nowhereCall;
+        if (!k.isEmpty() && !"call".equals(k)) return "message";
+        if ("call".equals(k) && "incoming".equals(c)) return "incoming";
+        if ("call".equals(k) && "missed".equals(c)) return "call";
+        String t = title == null ? "" : title;
+        int i = t.indexOf("  -  ");
+        String head = i >= 0 ? t.substring(0, i) : t;
+        if (head.startsWith("Incoming call") || head.contains(" incoming calls")) return "incoming";
+        if (head.startsWith("Missed call") || head.contains(" missed calls")) return "call";
+        return "call".equals(k) ? "call" : "message";
     }
 
     /**

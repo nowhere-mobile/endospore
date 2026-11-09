@@ -16,7 +16,7 @@
 # hold_ondemand's /data/ are rewritten to a temp root, and each runs with stubbed $AGENT/stat/chown/restorecon and
 # sentinels around the paths a bad name would reach. Every bad name below is the ONLY one some rule refuses, and every
 # good name is one an over-tightened rule would refuse, so --mutate convicts each rule separately.
-# The odrestore arm's own guard is NOT covered: the Go guard blocks the only door to it (see docs/backlog.md).
+# The odrestore arm calls the same pkgname_ok since NWP-20261128-42; test-odrestore-ext-reown.sh covers it.
 #
 # Each case writes its extracted text, variables and stubs into a run file and executes that file in a CHILD of each
 # shell found among bash, sh, dash and mksh (the device's /system/bin/sh): pkgname_ok's `${#p}`, its bracket classes and
@@ -119,6 +119,8 @@ write_hold() {
     printf 'ROOT=%s\n' "$(sq "$root")"
     cat <<'STUB'
 LOG="$ROOT/log"; restorecon() { :; }
+pm() { case "$*" in "list packages -s -u") echo package:android ;; esac; return 0; }
+timeout() { while [ "${1:-}" = -k ]; do shift 2; done; shift; "$@"; }
 STUB
     printf '%s\n' "$odl" "$helper" "$fn" 'hold_ondemand 12'
   } > "$f"

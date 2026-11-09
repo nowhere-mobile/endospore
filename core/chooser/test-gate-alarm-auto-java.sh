@@ -7,6 +7,7 @@
 # on, until its battery died. dn-1023 #12 and #64 (dn-1110 #2) decided: unanswered for 10 minutes it snoozes itself, three
 # times, and the next unattended ring is dismissed. The cases pin the timer's value and the count; the pins pin where the
 # timer is posted and cancelled, and that the count rides alarm -> receiver -> activity. No check waits 10 minutes.
+# NWP-20261128-34: the pins also hold that a volume press, after it silences the ring, releases the screen-on hold.
 # What it does NOT prove: a device ring, or that the full chooser compiles (the build host does that).
 #
 # ⚠ IT FAILS WHEN THERE IS NO JAVAC, IT NEVER SKIPS (exit 2), like the other javac suites.
@@ -92,4 +93,10 @@ mut "A7 the receiver drops the extra" rcv \
 mut "A8 gateAlarmPi drops the extra" act \
   's/\n\s*\.putExtra\(GateAlarmAuto\.EXTRA, GateAlarmAuto\.sane\(autoSnoozes\)\);/;/' || fails=$((fails+1))
 mut "A9 ui-auto-dismiss removed from gate_log.go" go 's/ "ui-auto-dismiss": true,//' || fails=$((fails+1))
+mut "A10 a volume press keeps the screen-on hold" gat \
+  's/(stopRinging\(\); \/\/ a volume press[^\n]*(?:\n\s*\/\/[^\n]*)*)\n\s*try \{ getWindow\(\)\.clearFlags\(WindowManager\.LayoutParams\.FLAG_KEEP_SCREEN_ON\); \} catch \(Throwable ignore\) \{\}/$1/' || fails=$((fails+1))
+mut "A11 the volume branch releases the hold before it silences the ring" gat \
+  's/(stopRinging\(\); \/\/ a volume press[^\n]*)((?:\n\s*\/\/[^\n]*)*\n\s*)(try \{ getWindow\(\)\.clearFlags\(WindowManager\.LayoutParams\.FLAG_KEEP_SCREEN_ON\); \} catch \(Throwable ignore\) \{\})/$3$2$1/' || fails=$((fails+1))
+mut "A12 onCreate no longer holds the screen on" gat \
+  's/\n\s*getWindow\(\)\.addFlags\(WindowManager\.LayoutParams\.FLAG_KEEP_SCREEN_ON\);//' || fails=$((fails+1))
 [ "$fails" -eq 0 ] && echo "== all mutations convicted" || { echo "== $fails mutation(s) not convicted"; exit 1; }

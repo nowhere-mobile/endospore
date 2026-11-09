@@ -772,8 +772,8 @@ func resetResolverState(t *testing.T) {
 	dnsServers, netIface, netAt, dnsGoodAt, dnsFromVPN, dotHost, dotAddrs = nil, "", time.Time{}, time.Time{}, false, "", nil
 	sVpnEg, sVpnLogged := vpnEg, vpnStateLogged
 	vpnEg, vpnStateLogged = vpnEgress{}, ""
-	sEmpty, sSeed := dnsEmptySince, dnsSeedIface
-	dnsEmptySince, dnsSeedIface = time.Time{}, ""
+	sEmpty, sSeed, sRun := dnsEmptySince, dnsSeedIface, dnsKeepRun
+	dnsEmptySince, dnsSeedIface, dnsKeepRun = time.Time{}, "", ""
 	netMu.Unlock()
 	sUsable, sBind := vpnIfaceUsable, bindToIface
 	dotMu.Lock()
@@ -785,7 +785,7 @@ func resetResolverState(t *testing.T) {
 		netMu.Lock()
 		dnsServers, netIface, netAt, dnsGoodAt, dnsFromVPN, dotHost, dotAddrs = sDNS, sIface, sAt, sGood, sVPN, sHost, sAddrs
 		vpnEg, vpnStateLogged = sVpnEg, sVpnLogged
-		dnsEmptySince, dnsSeedIface = sEmpty, sSeed
+		dnsEmptySince, dnsSeedIface, dnsKeepRun = sEmpty, sSeed, sRun
 		netMu.Unlock()
 		vpnIfaceUsable, bindToIface = sUsable, sBind
 		dotMu.Lock()

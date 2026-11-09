@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# test-gen-keys.sh [--mutate] [<gen-keys.sh>] -- exercise NWP-20261104-15's AVB-root guard in gen-keys.sh.
+# test-gen-keys.sh [--mutate] [<gen-keys.sh>] -- exercise NWP-20261104-15's AVB-root guard in gen-keys.sh, and where it
+# makes the keys when the host has a keys home (NWP-20261105-19).
 #
 # WHY THIS IS COMMITTED. gen-keys.sh mints a NEW AVB root whenever avb.pem is missing. Beside a device's
 # existing keys that is the one mistake a relocked fleet cannot recover from: every handset rejects every later
@@ -8,10 +9,11 @@
 #
 # Each case builds a synthetic tree (stub make_key / avbtool / openssl / ssh-keygen, each logging its name to
 # $W/calls) and runs the script from the tree root. make_key exits 1 like the real one, so outputs, not exit
-# codes, are what the script checks.
+# codes, are what the script checks. Every run sets NOWHERE_KEYS_HOME, never to the host's own home: to a path that does
+# not exist for g1-g14 (a tree-local keys/, as on a host with no keys home), and to the case's own home for g15-g25.
 #
-#   bash test-gen-keys.sh              # the behaviour cases g1-g14
-#   bash test-gen-keys.sh --mutate     # ... plus mutants G1-G11 that must each CONVICT a named case
+#   bash test-gen-keys.sh              # the behaviour cases g1-g25 (g24 is skipped under root, with a line saying so)
+#   bash test-gen-keys.sh --mutate     # ... plus mutants G1-G19 that must each CONVICT a named case (G18 skipped under root)
 # A self-check runs first in both modes: it prints whether printf | grep -q under pipefail can die of SIGPIPE
 # on this host, and asserts has() (the suite's substring test) finds a needle and rejects a missing one.
 #
@@ -83,11 +85,20 @@ seed() {
 # snap <tree> -> names and sha256 of every file under keys/
 snap() { (cd "$1" && find keys -type f 2>/dev/null | LC_ALL=C sort | xargs -r sha256sum); }
 
+# snapd <dir> -> every file under <dir> with its sha256, and every link with its target (a keys/ link included)
+snapd() {
+  (cd "$1" && find . \( -type f -o -type l \) 2>/dev/null | LC_ALL=C sort | while IFS= read -r f; do
+    if [ -L "$f" ]; then printf 'L %s -> %s\n' "$f" "$(readlink "$f")"; else printf 'F %s %s\n' "$f" "$(sha256sum < "$f" | cut -d' ' -f1)"; fi
+  done)
+}
+
+# KHOME: the keys home a case gives the script; empty = a path that does not exist (no keys home)
+KHOME=""
 # run <tree> <args...> -> sets OUT, ERR, RC, CALLS_N (the calls file's lines, newline-joined)
 run() {
   local t="$1"; shift
   : > "$W/calls"
-  OUT=$(cd "$t" && CALLS="$W/calls" PATH="$t/bin:$PATH" bash "$SUT" "$@" 2>"$W/err"); RC=$?
+  OUT=$(cd "$t" && CALLS="$W/calls" PATH="$t/bin:$PATH" NOWHERE_KEYS_HOME="${KHOME:-$W/no-keys-home}" bash "$SUT" "$@" 2>"$W/err"); RC=$?
   ERR=$(cat "$W/err")
   CALLS_N=$(cat "$W/calls")
 }
@@ -114,11 +125,12 @@ selfcheck() {
   else echo "  ok    self-check has() rejects a missing needle"; fi
 }
 
-all_made() {
-  local t="$1" k
-  for k in $PAIRS; do [ -f "$t/keys/dev/$k.pk8" ] && [ -f "$t/keys/dev/$k.x509.pem" ] || return 1; done
-  [ -f "$t/keys/dev/avb.pem" ] && [ -f "$t/keys/dev/avb_pkmd.bin" ] && [ -f "$t/keys/dev/id_ed25519" ] && [ -f "$t/keys/dev/id_ed25519.pub" ]
+all_made_at() {   # <keys dir>: every key gen-keys.sh makes is there
+  local d="$1" k
+  for k in $PAIRS; do [ -f "$d/$k.pk8" ] && [ -f "$d/$k.x509.pem" ] || return 1; done
+  [ -f "$d/avb.pem" ] && [ -f "$d/avb_pkmd.bin" ] && [ -f "$d/id_ed25519" ] && [ -f "$d/id_ed25519.pub" ]
 }
+all_made() { all_made_at "$1/keys/dev"; }
 
 # cases <quiet> -> prints "FAIL gN" per failing case (and ok lines unless quiet); returns 0 if all pass
 cases() {
@@ -208,6 +220,70 @@ cases() {
   chk "g11 exit 3" '[ "$RC" = 3 ]'
   chk "g11 nothing changed" '[ "$(snap "$t")" = "$b" ] && [ -z "$CALLS_N" ]'
 
+  # ---- a keys home (NWP-20261105-19): each case below names its own home in KHOME
+  # g15 an empty home and a tree with no keys/: everything is made IN THE HOME, and the tree is left without keys/
+  t=$(mktree g15); KHOME="$W/home15"; mkdir -p "$KHOME"; run "$t" dev
+  chk "g15 exit 0" '[ "$RC" = 0 ]'
+  chk "g15 made in the home" 'all_made_at "$KHOME/dev"'
+  chk "g15 the tree still has no keys/" '[ ! -e "$t/keys" ] && [ ! -L "$t/keys" ]'
+  chk "g15 calls" '[ "$(count make_key)" = 9 ] && [ "$(count openssl)" = 1 ] && [ "$(count avbtool)" = 1 ] && [ "$(count ssh-keygen)" = 1 ]'
+  # g22 a re-run of g15: nothing runs and the home is byte-identical
+  b=$(snapd "$KHOME"); run "$t" dev
+  chk "g22 re-run: exit 0, no tool run, the home unchanged" '[ "$RC" = 0 ] && [ -z "$CALLS_N" ] && [ "$(snapd "$KHOME")" = "$b" ]'
+
+  # g16 keys/ is a link to the home, which holds dev's avb.pem only: the rest is made in the home, by the tree's own
+  # tools reached from the tree root (from the home's dev, ../.. is not the tree)
+  t=$(mktree g16); KHOME="$W/home16"; mkdir -p "$KHOME/dev"; echo old-root > "$KHOME/dev/avb.pem"; ln -s "$KHOME" "$t/keys"; run "$t" dev
+  chk "g16 exit 0" '[ "$RC" = 0 ]'
+  chk "g16 made in the home, avb.pem kept" 'all_made_at "$KHOME/dev" && [ "$(cat "$KHOME/dev/avb.pem")" = old-root ]'
+  chk "g16 make_key and avbtool ran, openssl did not" '[ "$(count make_key)" = 9 ] && [ "$(count avbtool)" = 1 ] && [ "$(count openssl)" = 0 ]'
+  chk "g16 keys/ is still the link" '[ -L "$t/keys" ] && [ "$(readlink "$t/keys")" = "$KHOME" ]'
+
+  # g17 a home, and a tree with its own keys/ directory: refused, nothing created anywhere, no tool run
+  t=$(mktree g17); KHOME="$W/home17"; mkdir -p "$KHOME"; seed "$t" pairs pkmd ed pem; b=$(snapd "$t"); hb=$(snapd "$KHOME"); run "$t" dev
+  chk "g17 exit 3" '[ "$RC" = 3 ]'
+  chk "g17 says keys are made only in the home" 'has "$ERR" "and keys are made only there"'
+  chk "g17 nothing changed, no tool run" '[ "$(snapd "$t")" = "$b" ] && [ "$(snapd "$KHOME")" = "$hb" ] && [ -z "$CALLS_N" ]'
+
+  # g18 a home, and a tree whose keys/ links elsewhere: refused, nothing created, no tool run
+  t=$(mktree g18); KHOME="$W/home18"; mkdir -p "$KHOME" "$W/elsewhere18"; ln -s "$W/elsewhere18" "$t/keys"
+  b=$(snapd "$t"); hb=$(snapd "$KHOME"); run "$t" dev
+  chk "g18 exit 3, nothing created, no tool run" '[ "$RC" = 3 ] && [ "$(snapd "$t")" = "$b" ] && [ "$(snapd "$KHOME")" = "$hb" ] && [ -z "$(ls -A "$W/elsewhere18")" ] && [ -z "$CALLS_N" ]'
+
+  # g19 the home holds dev's other keys but no avb.pem: the missing-root refusal, against the home
+  t=$(mktree g19); KHOME="$W/home19"; mkdir -p "$KHOME/dev"
+  for k in $PAIRS; do echo "old-key-$k" > "$KHOME/dev/$k.pk8"; echo "old-cert-$k" > "$KHOME/dev/$k.x509.pem"; done
+  hb=$(snapd "$KHOME"); run "$t" dev
+  chk "g19 exit 3, the restore line" '[ "$RC" = 3 ] && has "$ERR" "Restore avb.pem from the offline backup"'
+  chk "g19 no avb.pem, nothing changed, no tool run" '[ ! -e "$KHOME/dev/avb.pem" ] && [ "$(snapd "$KHOME")" = "$hb" ] && [ -z "$CALLS_N" ] && [ ! -e "$t/keys" ]'
+
+  # g20 a relative NOWHERE_KEYS_HOME, even one that exists from the tree root: usage, nothing created
+  t=$(mktree g20); KHOME="rel-home"; mkdir -p "$t/rel-home"; run "$t" dev
+  chk "g20 exit 2, nothing created" '[ "$RC" = 2 ] && [ ! -e "$t/keys" ] && [ -z "$(ls -A "$t/rel-home")" ] && [ -z "$CALLS_N" ]'
+
+  # g21 the home path is a file: refused, nothing created
+  t=$(mktree g21); KHOME="$W/home21"; echo not-a-dir > "$KHOME"; run "$t" dev
+  chk "g21 exit 3, nothing created" '[ "$RC" = 3 ] && [ ! -e "$t/keys" ] && [ "$(cat "$KHOME")" = not-a-dir ] && [ -z "$CALLS_N" ]'
+
+  # g23 the home's dev is a FILE, so the keys dir cannot be made or entered: exit 1, and no key is made in the tree root
+  t=$(mktree g23); KHOME="$W/home23"; mkdir -p "$KHOME"; echo a-file > "$KHOME/dev"; b=$(snapd "$t"); run "$t" dev
+  chk "g23 exit 1, the tree root untouched, no tool run" '[ "$RC" = 1 ] && [ "$(snapd "$t")" = "$b" ] && [ -z "$CALLS_N" ]'
+
+  # g24 the home's dev EXISTS but cannot be entered (mode 000): mkdir -p succeeds and cd fails, so only the cd guard
+  # keeps every key out of the tree root. Root ignores the mode, so the case is skipped there, and says so.
+  if [ "$(id -u)" = 0 ]; then
+    printf '  info  g24 skipped: root ignores the directory mode the case relies on\n'
+  else
+    t=$(mktree g24); KHOME="$W/home24"; mkdir -p "$KHOME/dev"; chmod 000 "$KHOME/dev"; b=$(snapd "$t"); run "$t" dev
+    chmod 700 "$KHOME/dev"
+    chk "g24 the dir cannot be entered: exit 1, the tree root untouched, no tool run" '[ "$RC" = 1 ] && [ "$(snapd "$t")" = "$b" ] && [ -z "$CALLS_N" ]'
+  fi
+
+  # g25 the home path is a dangling link: refused as not a directory, nothing created
+  t=$(mktree g25); KHOME="$W/home25"; ln -s "$W/gone25" "$KHOME"; run "$t" dev
+  chk "g25 a dangling-link home: exit 3, nothing created" '[ "$RC" = 3 ] && [ ! -e "$t/keys" ] && [ -z "$CALLS_N" ]'
+  KHOME=""
+
   [ "$x" = 0 ]
 }
 
@@ -249,5 +325,18 @@ mutant G8 "g11 g13" '/avb_pkmd.bin.old" \]; then$/,/fi$/{/exit 3/d}'
 mutant G9 "g14"    's/ || { echo "gen-keys.sh: could not move.*$//'
 mutant G10 "g12"   's/^DEV="\$1"$/DEV="${1:-}"/;s/^case "\$DEV" in ""|-\*)/case "$DEV" in "")/'
 mutant G11 "g3 g4 g5" '/^ *echo "  Restore avb.pem from the offline backup/s/Restore avb.pem from the offline backup/Fetch avb.pem from the offline copy/'
+# NWP-20261105-19, the keys home
+mutant G12 "g15"   's/^if \[ -e "\$KH" \] || \[ -L "\$KH" \]; then$/if false; then/'
+mutant G13 "g17"   's/^    if \[ "\$(readlink -f keys 2>\/dev\/null)" != "\$(readlink -f "\$KH")" \]; then$/    if false; then/'
+mutant G14 "g15"   '/^  KD="\$KH\/\$DEV"$/d'
+mutant G15 "g20"   '/^case "\$KH" in /d'
+mutant G16 "g21"   's/^  if \[ ! -d "\$KH" \]; then$/  if false; then/'
+mutant G17 "g23"   's/^mkdir -p "\$KD" || .*$/mkdir -p "$KD"/;s/^cd "\$KD" || .*$/cd "$KD"/'
+if [ "$(id -u)" = 0 ]; then
+  echo "  info  G18 skipped: its case g24 does not run under root"
+else
+  mutant G18 "g24" 's/^cd "\$KD" || .*$/cd "$KD"/'
+fi
+mutant G19 "g25"   's/^if \[ -e "\$KH" \] || \[ -L "\$KH" \]; then$/if [ -e "$KH" ]; then/'
 
 if [ "$FAILS" = 0 ]; then echo "PASS (all mutants convicted)"; else echo "FAILED ($FAILS)"; exit 1; fi

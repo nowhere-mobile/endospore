@@ -90,7 +90,7 @@ source_check() {
     || { echo "  FAIL  S1 sealDownloaded does not pass MmsText.toUtf8(ct, p.getCharset(), d) to the part" >&2; bad=1; }
 
   code=$(strip_comments "$ti") || { echo "  FAIL  could not strip comments from $ti" >&2; return 1; }
-  body=$(method "$code" 'private static void insertMmsPart(Context ctx, long mid, int seq, String ct, String name, byte[] data) {')
+  body=$(method "$code" 'private static boolean insertMmsPart(Context ctx, long mid, int seq, String ct, String name, byte[] data) {')
   if [ -z "$body" ]; then echo "  FAIL  S2 insertMmsPart not found in $ti" >&2; return 1; fi
   x='v.put("chset", 106);'
   grep -qF -e "$x" <<<"$body" || { echo "  FAIL  S2 control: insertMmsPart no longer writes $x" >&2; bad=1; }

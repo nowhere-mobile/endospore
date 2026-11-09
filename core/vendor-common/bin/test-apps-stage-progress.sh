@@ -140,7 +140,8 @@ textpins() {  # textpins <roamd.sh> [quiet] -> 0 all ok, 1 a pin failed, 2 appco
     && ok "W4 the keep-set call follows the group/comment skip" || no "W4 the keep-set call is misplaced"
   grep -qxF '  local _stg_t0 _stg_i _stg_n _stg_a _stg_k' <<<"$body" \
     && ok "W5 the counters are local (a roamd helper that leaks a global has lost a roam before)" || no "W5 the counters are not declared local"
-  grep -qF '[roamd] #apps staged $staged pkg(s), $(du -sk "$STAGE" 2>/dev/null | cut -f1) KiB, in $(( $(_ms) - _stg_t0 ))ms (copy ${_acw_cms}ms, $_acw_tf mtime kept-failed, $_acw_ru reused) (NWP-20261005-04, NWP-20261123-02, NWP-20261128-09)' <<<"$body" \
+  grep -qxF '  _stg_kib=$(du -sk "$STAGE" 2>/dev/null | cut -f1)' <<<"$body" && grep -qxF '  _stg_ms=$(( $(_ms) - _stg_t0 ))' <<<"$body" \
+    && grep -qF '[roamd] #apps staged $staged pkg(s), $_stg_kib KiB, in ${_stg_ms}ms (copy ${_acw_cms}ms, $_acw_tf mtime kept-failed, $_acw_ru reused) (NWP-20261005-04, NWP-20261123-02, NWP-20261128-09) (lookups ${_acw_lms}ms/$_acw_lct, carry ${_acw_kms}ms, lists ${_acw_sms}ms, other ${_stg_oth}ms)' <<<"$body" \
     && ok "W6 staging is timed and sized, with no profile or package name" || no "W6 the timing line is missing or changed"
   # The timing line must come AFTER both loops, or it times nothing.
   printf '%s\n' "$body" | awk '/done < "\$AK"/{d=1} /#apps staged/{if(d) ok=1} END{exit ok?0:1}' \

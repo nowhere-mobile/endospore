@@ -184,7 +184,7 @@ agent_stub() {
 }
 AGENT=agent_stub
 timeout() { shift 3; "$@"; }
-keystore_register_all() { :; }; _ms() { echo 0; }; _apps_stage_prog() { :; }
+keystore_register_all() { :; }; appcode_pm_snapshot() { :; }; _ms() { echo 0; }; _apps_stage_prog() { :; }
 STUBS
     printf '%s\n' "$fns"
     printf 'appcode_seal; echo "res=$?" >> "$T/calls"\n'

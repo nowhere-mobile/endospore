@@ -304,6 +304,7 @@ func TestErrLineSourcePins(t *testing.T) {
 		{"main.go", `case "restore-app":`, `re:"restore-app: %[sv]\\n"`, "logSafeErrText("},
 		{"main.go", `case "ota-notes-get":`, `re:"ota-notes-get: %[sv]\\n"`, "logSafeErrText("},
 		{"main.go", `case "build-warning-check", "build-warning-put":`, `"%s: %s: %`, "logSafeErrText("},
+		{"main.go", `case "index-key-check", "index-key-put":`, `"%s: %s: %`, "logSafeErrText("},
 		{"main.go", `case "export-manifest":`, `"export-manifest: profile %s -- %`, "logSafeErrText("},
 		{"main.go", `case "wallet-push":`, `"wallet-push: refused -- %`, "logSafeErrText("},
 		{"main.go", "retryPlanCarryGuarded", `plan carry retry: skipped (`, "logSafeErrText("},

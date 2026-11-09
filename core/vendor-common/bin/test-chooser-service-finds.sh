@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
-# test-chooser-service-finds.sh [--mutate] -- the gate may look up the clipboard and location services
-# (NWP-20261127-14).
+# test-chooser-service-finds.sh [--mutate] -- the gate may look up the clipboard, location and legacy_permission
+# services (NWP-20261127-14, NWP-20261129-53).
 #
 # WHY COMMITTED. nowhere_chooser is built with app_domain() alone, which grants no service_manager find, so every
-# system service the chooser touches is granted by hand in core/vendor-common/sepolicy/nowhere.te. Two of them:
+# system service the chooser touches is granted by hand in core/vendor-common/sepolicy/nowhere.te. Three of them:
 #   - clipboard_service (Q041, decided 2026-10-20): without it getSystemService(ClipboardManager.class) is null,
 #     so SafeEdit.withPaste never offers paste and a buyer cannot paste a claim code into the claim box.
 #   - location_service: without it ChooserActivity.scanWifi gets a null LocationManager, sleeps all ten 300 ms
 #     ticks (3 s more on every scan) and words every empty list "can't scan for networks yet".
+#   - legacy_permission_service (NWP-20261129-53): three denials at boot on lynx 2026110402, from a caller not named
+#     yet. Nothing visible failed, but they crowd the denial ring that the issue report's avc section reads.
 # Nothing breaks at build time when a line goes, so this pins each one as text:
 #   1. the exact allow line appears exactly once, uncommented, in nowhere.te;
 #   2. no neverallow in core/ or editions/ sepolicy names nowhere_chooser with that service;
@@ -32,7 +34,7 @@ for d in $POLICY_DIRS; do [ -d "$d" ] || { echo "no such dir: $d" >&2; exit 2; }
 W=$(mktemp -d) || exit 2
 trap 'rm -rf "$W"' EXIT
 
-SERVICES='clipboard_service location_service'
+SERVICES='clipboard_service location_service legacy_permission_service'
 CONTROL='allow nowhere_chooser deviceidle_service:service_manager find;'
 PASS=0; FAIL=0
 ok(){ PASS=$((PASS+1)); printf '  ok    %s\n' "$1"; }

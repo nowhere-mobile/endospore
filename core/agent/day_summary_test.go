@@ -276,9 +276,9 @@ func TestDaySummaryOnBeta(t *testing.T) {
 	dest := dsSetup(t, "dstest08", "48", 48*100000+10123)
 	t.Setenv("GATEWAY_URL", dsBeta)
 	sig := filepath.Join(loginStateDir(), signinSummaryPrefix+"48")
-	if err := os.WriteFile(sig, []byte("v=1 scope=vault ms=1500 chunks=3 cached=1 fetched=2\n"+
-		"v=1 scope=media ms=2500 chunks=3 cached=1 fetched=2 indexed=0\n"+
-		"v=1 scope=sys ms=40 chunks=1 cached=1 fetched=0\n"), 0o600); err != nil {
+	if err := os.WriteFile(sig, []byte("v=1 scope=vault ms=1500 chunks=3 cached=1 fetched=2 heal_ms=0 store_reads=3 cap_calls=1\n"+
+		"v=1 scope=media ms=2500 chunks=3 cached=1 fetched=2 heal_ms=0 store_reads=3 cap_calls=1 indexed=0\n"+
+		"v=1 scope=sys ms=40 chunks=1 cached=1 fetched=0 heal_ms=0 store_reads=1 cap_calls=1\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if got := dsVerb(t, dest, "DIAG-SUMMARY", "on"); got != "OK\n" {

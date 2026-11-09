@@ -17,6 +17,7 @@ import "strings"
 // NWP-20261116-14: pushdoze-roam gains tries=<n>, the number of login apply attempts (DozeApplyRetry).
 // NWP-20261120-02: the idle cold lock's audio wait: `defer audio held=<n>`, `audio stopped`, `audio cap reached`.
 // NWP-20261124-04: `abort committed`, the gate's trace when COLD-LOCK-ABORT answers COMMITTED (ColdLockAbortReply).
+// NWP-20261128-33: `smsnotice sum= subst= pub= icon=`, a session text notice read back about 1 s after posting (MsgNoticeTrace).
 
 const idleTraceMaxBytes = 120
 
@@ -24,6 +25,7 @@ var idleTraceVerbs = map[string]bool{
 	"screen": true, "arm": true, "cancel": true, "probe": true, "abort": true, "armreg": true, "defer": true,
 	"fire": true, "installs": true, "pushdoze": true, "pushdoze-roam": true, "pushdoze-capture": true,
 	"pushdoze-sweep": true, "pushdoze-relay": true, "permsrelay": true, "audio": true,
+	"smsnotice": true,
 }
 
 var idleTraceWords = map[string]bool{
@@ -37,7 +39,7 @@ var idleTraceKeys = map[string]bool{
 	"ms": true, "u": true, "explicit": true, "ctx": true, "secure": true, "probe": true, "match": true,
 	"appid": true, "ok": true, "applied": true, "dropped": true, "live": true, "n": true, "user": true,
 	"removed": true, "kept": true, "late": true, "screenon": true, "locked": true, "s": true, "held": true,
-	"tries": true,
+	"tries": true, "sum": true, "subst": true, "pub": true, "icon": true,
 }
 
 // idleTraceFilter is the charset rule: one line, cut to idleTraceMaxBytes, everything outside [a-z0-9 =_-] dropped.

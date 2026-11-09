@@ -2,8 +2,9 @@
 """pins.py <repo-root> -- NWP-20261102-15 / NWP-20261120-12: source checks that the chooser's ReArchiveReceiver,
 CredentialService and UnarchiveService reach ReArchiveGate and keep the idle-reclaim sweep armed. NWP-20261122-10
 adds s8-s11: the sweep reads every job source once, archives nothing when one cannot be read, and passes holdsJob and
-the visible and foreground-service times to ReArchiveGate.archive. It reads the
-sources with comments dropped (string literals kept) and whitespace collapsed, prints one 'ok   <pin>' or
+the visible and foreground-service times to ReArchiveGate.archive. NWP-20261129-14 adds s12: sweep and freeNow read
+the needed Play stack once, the reader refuses an unknown nowhere-playdeps and maps only packages with code. It reads
+the sources with comments dropped (string literals kept) and whitespace collapsed, prints one 'ok   <pin>' or
 'FAIL <pin> ...' line per pin, and exits 1 when any pin fails. It reads the files and never writes."""
 import re
 import sys
@@ -121,12 +122,12 @@ def main():
 
     loop = block(sweep, "for (String pkg : od)")
     rj = block(rcv, "private static String readJobs(")
-    hj = loop.find("boolean job = ReArchiveGate.holdsJob(pkg, jobs[0], jobs[1], jobs[2], jobs[3], roles);")
+    hj = loop.find("boolean job = ReArchiveGate.holdsJob(pkg, jobs[0], jobs[1], jobs[2], jobs[3], roles, needed);")
     av = loop.find("ReArchiveGate.archive(now, idle, lastUsed, lastVisible, lastFgs, lastUpdate, job)")
     ac = loop.find("archive(ctx, pkg);")
     pin("s8 sweep passes holdsJob for each package to ReArchiveGate.archive before archive(ctx, pkg)",
         0 <= hj < av < ac,
-        "the loop must compute job = ReArchiveGate.holdsJob(pkg, jobs[0..3], roles), pass it to "
+        "the loop must compute job = ReArchiveGate.holdsJob(pkg, jobs[0..3], roles, needed), pass it to "
         "ReArchiveGate.archive(now, idle, lastUsed, lastVisible, lastFgs, lastUpdate, job), then archive(ctx, pkg)")
 
     keys = re.search(r"JOB_KEYS = \{ ([^}]*)\}", rcv)
@@ -159,6 +160,26 @@ def main():
         all(0 <= r < av for r in reads),
         "the loop must read getLastTimeUsed, getLastTimeVisible and getLastTimeForegroundServiceUsed into "
         "lastUsed, lastVisible and lastFgs before ReArchiveGate.archive")
+
+    call = "if (failed == null) failed = readPlayNeeded(ctx, needed);"
+    fn = block(rcv, "static String freeNow(Context ctx, String pkg)")
+    rpn = block(rcv, "private static String readPlayNeeded(")
+    each = block(rpn, "for (String pkg : ProfileActivity.keepSetAll(ctx))")
+    code = each.find("pm.getApplicationInfo(pkg, 0);")
+    skip = each.find("catch (PackageManager.NameNotFoundException e) { continue;")
+    put = each.find("deps.put(pkg, AppDeps.appDeps(pkg, groups, ProfileActivity.DEFAULT_GROUPS, deferred, playDeps,")
+    pin("s12 sweep and freeNow read playNeeded once, and the reader refuses unknown and maps only code",
+        sweep.count("readPlayNeeded(") == 1 and 0 <= ro < sweep.find(call) < fo
+        and fn.count("readPlayNeeded(") == 1 and ", roles, needed)" in fn
+        and 0 <= fn.find("readJobs(ctx, jobs, roles);") < fn.find(call) < fn.find("FreeOnPhone.verdict(failed,")
+        and "Set<String> playDeps = ProfileActivity.readPlayDepsStrict(ctx); "
+            'if (playDeps == null) return "nowhere-playdeps";' in rpn
+        and 0 <= code < skip < put and 'return "packages";' in each
+        and each != "" and rpn.find("out.addAll(ReArchiveGate.playNeeded(deps));") > rpn.find(each)
+        and not re.search(r"ProfileActivity\.(appDeps|readPlayDeps|readAppGroups|deferredKeepSet)\b", each),
+        "sweep and freeNow must each call readPlayNeeded once, after readJobs and before their failure check; the "
+        "reader must return a failure on a null readPlayDepsStrict, read its inputs outside the loop, and map only "
+        "packages whose getApplicationInfo(pkg, 0) answered")
     return bad
 
 

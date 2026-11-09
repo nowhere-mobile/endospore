@@ -103,6 +103,7 @@ ProfileActivity:showStorage -> REPAIR-WALLET # WalletRepairCopy.CHECK_REQUEST / 
 ProfileActivity:probeSession -> GET-SESSION-TYPE,GET-OFFLINE,GET-SESSION-NAME,OTA-AFTER-LOGOFF # the Sender ProfileProbe.run asks (the verb comes from ProfileProbe), one-line replies; OTA-STATUS stays a literal roundTripLines
 TelArrival:untilAnswered -> SEAL-TEL,SEAL-MMS # telRequest / mmsRequest from SmsDeliverReceiver
 UnarchiveService:sweepAuto -> AUTO-SWEEP-APP # SweepOutcome.request, a one-line OK / ERR-ARG reply
+SkipNoticeActivity:markShown -> SKIP-NOTICE-SHOWN # SkipNoticeCopy.shownRequest, a one-line OK / ERR reply
 GateTrace:ev -> GATE-TRACE # both ev overloads pass a token to send
 UnarchiveService:restoreOnlyListLocked -> RESTORE-ODDATA # OdRestoreList.request, a list of 2..CHUNK names, read with roundTripLines: one "<pkg> <reply>" line per app, then END <n> (NWP-20261128-16)'
 # VERB File:method COUNT # why the one-line read is correct. COUNT = one-line calls of VERB in that method.

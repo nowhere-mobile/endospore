@@ -201,6 +201,14 @@ public final class SmsDeliverReceiver extends BroadcastReceiver {
         } catch (Throwable ignore) {}
     }
 
+    /** A gate MMS whose download failed, timed out or whose kick failed (docs/product-decisions.md 2026-11-05, #14): the
+     *  loss notice, under the Private rule settle's failure case applies. A later successful re-push also posts the
+     *  line's ordinary notice, as decided. The log line carries no number and no id. */
+    static void postDownloadLoss(Context ctx, int subId, String aid) {
+        android.util.Log.w("NowhereChooser", "#150 gate MMS download failed: loss notice unless the line is known Private");
+        if (!TelArrival.knownPrivate(safe(iccidForSub(ctx, subId)))) postLossNotice(ctx, "mms", 0, aid);
+    }
+
     /** #150 P2: one downloaded MMS part (content-type + name + raw bytes) for the SEAL-MMS wire. */
     static final class MmsPart {
         final String contentType, name;
@@ -318,7 +326,10 @@ public final class SmsDeliverReceiver extends BroadcastReceiver {
             String title = isCall ? (callType == 1 ? "Incoming call" : "Missed call") : "New message";
             // Distinct id per (line, KIND): a call and a message on the SAME line must NOT replace each other
             // (keying on the line alone collapsed them to whichever arrived last -- the "only the latest" bug).
-            final int nid = Math.abs(("t" + line + "|" + (isCall ? "c" : "m")).hashCode());
+            // NWP-20261128-18: an answered call ("ci") and a missed call ("c") are apart too: on one id the last call
+            // re-titled the whole running count, so an answered call then a missed one read "2 missed calls". A missed
+            // call keeps "c", so a missed-call notice posted before this build is still found and counted.
+            final int nid = Math.abs(("t" + line + "|" + (isCall ? (callType == 1 ? "ci" : "c") : "m")).hashCode());
             // NWP-20261013-41: a second arrival replaces the first in place, so the running count rides on the notice
             // (nowhere_count) -- 1 for a notice posted before this build, 0 when there is none -- and the title says so.
             int count = 1;
@@ -339,6 +350,7 @@ public final class SmsDeliverReceiver extends BroadcastReceiver {
             // BOTH a missed call AND a new message on one line ("Missed call · New message"), not just the latest.
             android.os.Bundle nx = new android.os.Bundle();
             nx.putString("nowhere_kind", isCall ? "call" : "message");
+            if (isCall) nx.putString("nowhere_call", callType == 1 ? "incoming" : "missed"); // NWP-20261128-18: which call, for the banner (TelNoticeClear.kindOf)
             nx.putInt("nowhere_count", count);
             // NWP-20261006-04: mark the unassigned line's notice, so the gate banner knows a tap may lead to the owner inbox.
             if (UNBOUND_LINE.equals(line)) nx.putString("nowhere_line", "unbound");

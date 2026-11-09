@@ -37,6 +37,23 @@ LOG=/data/nowhere/roam.log            # status only -- never creds
 # _tlog writes one "[roamd] TIMING <phase> <ms>ms" line. Log-only; no behaviour change. Grep TIMING to read.
 _ms() { local _t; _t=$(date +%s%3N 2>/dev/null); case "$_t" in ''|*[!0-9]*) echo 0;; *) echo "$_t";; esac; }
 _tlog() { echo "[roamd] TIMING $1 $(( $(_ms) - ${2:-0} ))ms (user ${uid:-?}) $(date)" >> "$LOG"; }
+# _ssum WORD START (NWP-20261130-08): one `v=1 phase=WORD ms=<n>` line in this sign-in's summary (core/agent/signin_summary.go).
+# A bad clock writes no line. The guards on a raw time are `case`, never a numeric test: mksh arithmetic is 32-bit, a
+# 13-digit time wraps, and only the difference stays correct.
+_ssum() {
+  [ -n "${NOWHERE_SIGNIN_SUMMARY:-}" ] || return 0
+  case "${2:-}" in ''|0|*[!0-9]*) return 0 ;; esac
+  local _n _d
+  _n=$(_ms)
+  case "$_n" in 0) return 0 ;; esac
+  _d=$(( _n - $2 ))
+  [ "$_d" -ge 0 ] || return 0
+  echo "v=1 phase=$1 ms=$_d" 2>/dev/null >> "$NOWHERE_SIGNIN_SUMMARY"
+  return 0
+}
+# signin_in_ms starts here, at this run's start, so it holds the synchronous work before the `in` arm. _sumt holds each
+# bracket's start (_ssum), never the _tt that restore_media_tail overwrites.
+_sum0=$(_ms)
 AGENT=/system/bin/nowhere_agent
 
 # usb_host on|off -- portable USB host-mode (OTG) flip for the FIDO2 CTAPHID path (#142). A plugged security
@@ -502,8 +519,9 @@ REMAP_CACHE_EOF
 # (core/agent/pkgname.go) checks, ^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)+$, at most 255 bytes. Every caller
 # joins the name into a path and recursively copies or deletes it, so "." and ".." (which a bare slash/space test
 # passes) must not get through. STRICTER than the _smsapp check in grant_perms_for, which accepts `1a.b` and `a._b`:
-# this one also refuses a segment that starts with a digit or an underscore. Callers: hold_ondemand, materializeapp
-# and stageapp (test-appcode-pkg-guard.sh covers all three).
+# this one also refuses a segment that starts with a digit or an underscore. Callers: hold_ondemand, od_parked_report,
+# ks_stage_drop, appcode_seal, materializeapp, stageapp and odrestore. test-appcode-pkg-guard.sh covers materializeapp,
+# stageapp and hold_ondemand; test-odrestore-ext-reown.sh covers odrestore (NWP-20261128-42).
 pkgname_ok() {
   local p="$1"
   case "$p" in *.*) ;; *) return 1;; esac      # no dot (and so the empty string): one segment is not a package
@@ -558,6 +576,15 @@ PLP_EOF
 # authoritative -- DROP the empty/placeholder canonical and KEEP the hold; only move when there's no hold yet.
 # Idempotent for a dormant app (canonical absent -> skip). Keep-set mode column: `pkg\tondemand` (installed/off
 # rows untouched). Amnesia-safe: the hold lives in the ephemeral user's FBE CE/DE volumes -> sealed by out, reaped.
+# NWP-20261129-27: the data of an app the IMAGE SHIPS is never parked. A keep line can name one, because a release can
+# bundle an app a profile already keeps (NWP-20260827-22 bundled Etar). remap_per_pkg has already re-owned that data (a
+# system package is in packages.list) and install-existing keeps an app-owned dir, so it stays where the restore put
+# it, as every bundled app's data does. A hold here would strand it: Endospore lets no store install land over a system
+# app (docs/product-decisions.md Q156), so RESTORE-ODDATA is never sent; AppInstallReceiver.heal skips a bundled app;
+# at sign-out captureAppCode prunes the bundled keep line with no drop record, so the hold seals into every later head
+# and nothing reads it again. "Ships" means ONE read per call: the exact line `package:<pkg>` is in the system listing
+# and not in the third-party listing. A listing that cannot be read, or a package both listings name, parks as before.
+# Residual: a hold an earlier image stranded is not handed back. test-hold-shipped.sh covers it.
 # DIA-20260816-19: one definition of the hold dir name, shared by the CE/DE and EXTERNAL holds and matching
 # odHoldDirName in the agent (incremental_seal.go). It is part of a SEALED PATH SHAPE -- the seal's drop and
 # attribution rules match on it literally -- so it cannot drift between the two languages.
@@ -565,9 +592,19 @@ ODHOLD=".nowhere-odhold"
 
 hold_ondemand() {
   # every assigned name is local -- see [[roam-data-loss-saga]]; the ext loop below reuses vol/holddir/src/dst.
-  local uid="$1" ak pkg mode rest vol holddir src dst _ce _cn _cl
+  local uid="$1" ak pkg mode rest vol holddir src dst _ce _cn _cl _nl _sl _tl _src _trc _use=0 _nk=0
   ak="/data/user/$uid/com.nowhere.chooser/files/nowhere-appkeep"
   [ -f "$ak" ] || return 0
+  # NWP-20261129-27: see the header. -u lists a package uninstalled for user 0 too. Each status is read on its own line.
+  _nl='
+'
+  _sl=$(timeout -k 2 20 pm list packages -s -u </dev/null 2>/dev/null); _src=$?
+  _tl=$(timeout -k 2 20 pm list packages -3 -u </dev/null 2>/dev/null); _trc=$?
+  if [ "$_src" = 0 ] && [ -n "$_sl" ] && [ "$_trc" = 0 ]; then
+    _use=1; _sl="$_nl$_sl$_nl"; _tl="$_nl$_tl$_nl"
+  else
+    echo "[roamd] hold: the system package list could not be read -- every kept app parked as before (NWP-20261129-27) $(date)" >> "$LOG"
+  fi
   while IFS="$(printf '\t')" read -r pkg mode rest; do
     # DIA-20260801: hold BOTH on-demand rows AND installed sealed-code rows (mode empty == installed). A kept
     # INSTALLED app is user-installed (captureAppCode prunes bundled apps from the keep-set) whose APK the logoff
@@ -594,6 +631,13 @@ hold_ondemand() {
     # copy pulled /data/user (other users' CE dirs included) into the ROAMED chooser dir until cp hit its own
     # destination and failed, which is all that kept the `rm -rf /data/user` behind it from running.
     pkgname_ok "$pkg" || continue
+    # NWP-20261129-27: the image ships it, so its data stays where the restore put it (no move, no hold dir).
+    if [ "$_use" = 1 ]; then
+      case "$_sl" in
+        *"${_nl}package:$pkg$_nl"*)
+          case "$_tl" in *"${_nl}package:$pkg$_nl"*) ;; *) _nk=$((_nk + 1)); continue ;; esac ;;
+      esac
+    fi
     for vol in "/data/user/$uid" "/data/user_de/$uid"; do
       src="$vol/$pkg"                                    # canonical per-app data dir
       [ -d "$src" ] || continue                          # dormant (data already held) -> nothing to move
@@ -696,6 +740,10 @@ hold_ondemand() {
       restorecon -R "$holddir" 2>>"$LOG"
     done
   done < "$ak"
+  if [ "$_nk" -gt 0 ]; then
+    echo "[roamd] hold: $_nk kept app(s) the image ships left in place, not parked (NWP-20261129-27) $(date)" >> "$LOG"
+  fi
+  return 0
 }
 
 # od_parked_report UID (NWP-20261119-17): one roam.log line saying how much of this sign-in's restored CE and DE data
@@ -773,7 +821,16 @@ ODPR_EOF
 # file means nothing was skipped. It is written FRESH (temp + rename, mode 600) at every call with a valid uid, also
 # when the manifest is absent, so it is rewritten at each sign-in of that uid, as $STATE/.declined.<uid> is cleared.
 # $STATE is the tmpfs. A failed write is logged and changes nothing else: the safety is the missing pm call, not the
-# file. Reader: the chooser (a later slice), to leave those apps out of this session's placeholders.
+# file.
+# NWP-20261129-13: the reader is the gate's chooser, which leaves those apps out of this session's placeholders. The
+# decision puts the list in roamd's state dir, but that chooser is an app uid in user 0 and cannot read $STATE. So the
+# same list is ALSO written beside the manifest it qualifies, as <manifest dir>/od-unparked (the chooser's .appcode):
+# an inference from the decision, not its words. rmTree removes it with .appcode. The in op's chown and restorecon of
+# .appcode ran before this call and do not cover it, so this block does both, on the temp file before the rename, so
+# the chooser never sees a copy it cannot read. Temp + rename, mode 600, owned by the dir's owner. A manifest whose dir
+# is absent writes no copy. A failed write logs one WARN naming no package and changes nothing else: the chooser then
+# raises as it did before this list, and the safety is still the missing pm call. A failed restorecon alone keeps the
+# copy, as the in op's own restorecon of this dir ignores its rc: the new file already inherits the dir's label.
 # test-reap-stale-ondemand.sh covers it.
 reap_stale_ondemand() {
   local man="$1" uid="$2" rline rpkg rmode _vol _skipped="" _out _tmp
@@ -806,6 +863,16 @@ reap_stale_ondemand() {
     rm -f "$_tmp" 2>/dev/null
     echo "[roamd] WARN reap-stale-ondemand: could not write the unparked list for user $uid (NWP-20261125-01) $(date)" >> "$LOG"
   fi
+  local _dir _own _copy _ctmp
+  _dir="${man%/*}"
+  if [ -d "$_dir" ]; then
+    _copy="$_dir/od-unparked"; _ctmp="$_copy.tmp"
+    if { _own=$(stat -c %u "$_dir") && [ -n "$_own" ] && ( : > "$_ctmp" ) && printf '%s' "$_skipped" >> "$_ctmp" && chmod 600 "$_ctmp" && chown "$_own:$_own" "$_ctmp" && { restorecon -D "$_ctmp" || :; } && mv -f "$_ctmp" "$_copy"; } 2>>"$LOG"; then :
+    else
+      rm -f "$_ctmp" 2>/dev/null
+      echo "[roamd] WARN reap-stale-ondemand: could not write the unparked list beside the manifest for user $uid (NWP-20261129-13) $(date)" >> "$LOG"
+    fi
+  fi
   return 0
 }
 
@@ -821,7 +888,7 @@ reap_stale_ondemand() {
 # by timeout so it cannot wedge the login. (installApkSet is also now roamed-user-scoped, so leak A stops at the source;
 # this is the belt-and-suspenders that also cleans historical + dangling records.)
 reap_orphan_provisioned() {
-  local man="$1" ruid="$2" keep p cp inst u reap
+  local man="$1" ruid="$2" keep p cp inst u reap _others _in0 _inr
   # keep-set = this profile's FULL provisioned set (nowhere-apps.list, restored with the CE) UNION the keep-installed
   # raise manifest -- NOT the manifest alone. The manifest lists ONLY keep-installed/on-demand apps; a package the
   # profile provisions another way -- e.g. the #159 WireGuard always-on VPN, in nowhere-apps.list but never in the
@@ -863,6 +930,10 @@ reap_orphan_provisioned() {
     # What stops is destroying code that belongs to a live profile which simply is not signed in right now. That
     # is not a leak: installApkSet has been roamed-user-scoped since DIA-20260730-06 (createContextAsUser), so a
     # per-user install is already invisible to this profile without uninstalling anything.
+    # A package installed for user 0 or the roaming user AND for another user is the mixed case (decided 2026-11-05,
+    # h59 #12, docs/product-decisions.md, "seventeen answers to harvest 59 ..."): USER_ALL would delete a cold-locked
+    # session's copy and its data, so only the copies of user 0 and the roaming user go. USER_ALL stays for every
+    # other reap: a record installed for nobody, or only for user 0 and/or the roaming user.
     inst=$(dumpsys package "$p" 2>/dev/null | sed -n 's/^ *User \([0-9][0-9]*\): .*installed=true.*/\1/p')
     reap=1
     if [ -n "$inst" ]; then
@@ -875,6 +946,24 @@ reap_orphan_provisioned() {
     fi
     if [ "$reap" != 1 ]; then
       echo "[roamd] reap-orphan-provisioned SKIP $p -- installed for user(s) $inst, none of them user 0 or $ruid; another profile's app, not a leak $(date)" >> "$LOG"
+      continue
+    fi
+    _others=""; _in0=0; _inr=0
+    for u in $inst; do
+      if [ "$u" = 0 ]; then _in0=1
+      elif [ "$u" = "$ruid" ]; then _inr=1
+      else _others="${_others:+$_others }$u"
+      fi
+    done
+    if [ -n "$_others" ]; then
+      if [ "$_in0" = 1 ]; then
+        timeout -k 5 30 pm uninstall --user 0 "$p" </dev/null >/dev/null 2>&1
+        echo "[roamd] reap-orphan-provisioned $p --user 0 (rc=$?) kept for user(s) $_others $(date)" >> "$LOG"
+      fi
+      if [ "$_inr" = 1 ]; then
+        timeout -k 5 30 pm uninstall --user "$ruid" "$p" </dev/null >/dev/null 2>&1
+        echo "[roamd] reap-orphan-provisioned $p --user $ruid (rc=$?) kept for user(s) $_others $(date)" >> "$LOG"
+      fi
       continue
     fi
     timeout -k 5 30 pm uninstall "$p" </dev/null >/dev/null 2>&1
@@ -1233,8 +1322,13 @@ grant_perms_for() {
 # "fuse.nowheremedia" (go-fuse mounts "fuse."+Name). Both services run in init's (global) mount namespace, so a
 # `umount -l` there detaches the app-visible mount. NEVER touch /sys/fs/fuse/connections -- aborting it kills
 # Android's own emulated-storage FUSE for the live user (spike).
+# $1 = reap, $2 = the reaped uid (NWP-20261129-06): only the cleanstorage op passes them. See reap_live_other.
 stop_mediad() {
-  local i mnt _dev _rest left a j _mt _mtrc _unread _pre _prerc _n _bound
+  local i mnt _dev _rest left a j _mt _mtrc _unread _pre _prerc _n _bound _rlo
+  if [ "${1:-}" = reap ] && _rlo=$(reap_live_other "$2") && ! reap_media_mounted "$2"; then
+    echo "[roamd] reap of user $2: a live session (user $_rlo) holds the media daemon and no media mount lies in the removed user's dirs -- mediad left running (NWP-20261129-06) $(date)" >> "$LOG"
+    return 0
+  fi
   setprop ctl.stop nowhere_mediad
   i=0
   while [ $i -lt 30 ] && [ "$(getprop init.svc.nowhere_mediad)" = "running" ]; do i=$((i+1)); sleep 0.1; done
@@ -1426,7 +1520,7 @@ relabel_launcher() {
 # remap_per_pkg/restorecon, like relabel_launcher, so any -wal/-shm/-journal the rewrite creates as root is re-owned
 # and relabelled with the rest. Never fatal: a failed rewrite leaves the database as restored, which is today's state.
 remap_media_db() {
-  local db out rc nrem ndrop
+  local db out rc nrem ndrop mrest nown ngen
   for db in "$2/com.android.providers.media.module/databases/external.db" \
             "$2/com.google.android.providers.media.module/databases/external.db"; do
     [ -f "$db" ] || continue
@@ -1437,12 +1531,56 @@ remap_media_db() {
     fi
     out=$(/system/bin/nowhere_db_fix media-remap "$db" "$1" </dev/null 2>> "$LOG"); rc=$?
     if [ "$rc" = 0 ]; then
-      nrem=${out%% *}; ndrop=${out##* }
-      echo "[roamd] media-remap user $1: $nrem row(s) repointed, $ndrop stale duplicate(s) dropped (NWP-20261124-01)" >> "$LOG"
+      nrem=${out%% *}; mrest=${out#* }; ndrop=${mrest%% *}; mrest=${mrest#* }; nown=${mrest%% *}; ngen=${mrest##* }
+      if [ "$ngen" = "-" ]; then ngen="generation unchanged"; else ngen="generation $ngen"; fi
+      echo "[roamd] media-remap user $1: $nrem row(s) repointed, $ndrop stale duplicate(s) dropped, $nown row(s) given user $1, $ngen (NWP-20261129-01)" >> "$LOG"
     else
       echo "[roamd] media-remap user $1: FAILED rc=$rc -- left as restored (NWP-20261124-01)" >> "$LOG"
     fi
   done
+  return 0
+}
+
+# insert_deferred_media UID USERDIR DEDIR (NWP-20261130-02; docs/product-decisions.md, 2026-11-06): on the default tier
+# MediaStore never learns that a file not yet downloaded exists, so the Gallery is empty. The #media restore leaves
+# $STATE/media.rows (core/agent/media_rows.go), and nowhere_db_fix media-insert writes one row per file straight into
+# MediaProvider's database, every column computed there. It runs after the #media restore because the mount scan ran
+# before it. The user is already running, so MediaProvider may hold the database open: this is too late for
+# remap_per_pkg/restorecon to fix a -wal/-shm/-journal the tool creates as root, so this does. Same four candidate paths
+# as remap_media_db's two calls. Never fatal: a failed insert leaves the database as restored. Counts only in the log.
+insert_deferred_media() {
+  local db out rc ni np ns ng mrest own sf found=no list="$STATE/media.rows"
+  if [ ! -s "$list" ]; then
+    echo "[roamd] media-insert user $1: no media waiting (NWP-20261130-02)" >> "$LOG"
+    return 0
+  fi
+  # Loud guard, not command -v (relabel_launcher's rule).
+  if [ ! -x /system/bin/nowhere_db_fix ]; then
+    echo "[roamd] media-insert SKIPPED: /system/bin/nowhere_db_fix missing on this build (user $1) (NWP-20261130-02)" >> "$LOG"
+    return 0
+  fi
+  for db in "$2/com.android.providers.media.module/databases/external.db" \
+            "$2/com.google.android.providers.media.module/databases/external.db" \
+            "$3/com.android.providers.media.module/databases/external.db" \
+            "$3/com.google.android.providers.media.module/databases/external.db"; do
+    [ -f "$db" ] || continue
+    found=yes
+    out=$(/system/bin/nowhere_db_fix media-insert "$db" "$1" "$list" </dev/null 2>> "$LOG"); rc=$?
+    if [ "$rc" = 0 ]; then
+      ni=${out%% *}; mrest=${out#* }; np=${mrest%% *}; mrest=${mrest#* }; ns=${mrest%% *}; ng=${mrest##* }
+      if [ "$ng" = "-" ]; then ng="generation unchanged"; else ng="generation $ng"; fi
+      echo "[roamd] media-insert user $1: $ni row(s) for media not yet downloaded, $np already listed, $ns skipped, $ng (NWP-20261130-02)" >> "$LOG"
+    else
+      echo "[roamd] media-insert user $1: FAILED rc=$rc -- left as restored (NWP-20261130-02)" >> "$LOG"
+    fi
+    own=$(stat -c '%u:%g' "$db" 2>/dev/null)
+    for sf in "$db-wal" "$db-shm" "$db-journal"; do
+      [ -e "$sf" ] || continue
+      case "$own" in ''|*[!0-9:]*) ;; *) chown "$own" "$sf" 2>> "$LOG" ;; esac
+      restorecon "$sf" 2>> "$LOG"
+    done
+  done
+  [ "$found" = yes ] || echo "[roamd] media-insert user $1: no MediaProvider database yet -- rows not written (NWP-20261130-02)" >> "$LOG"
   return 0
 }
 
@@ -1993,7 +2131,7 @@ keystore_push() {
     ks_ns_mine "$f" || { _kskip=$((_kskip + 1)); continue; }
     _ns=$(basename "$f" .keys)
     _pkg=$(grep -m1 "^$_ns " "$KS_MAP" 2>/dev/null | cut -d' ' -f2)
-    [ -n "$_pkg" ] || { echo "[roamd] keystore_push: staged import ns $_ns has no package mapping, dropped $(date)" >> "$LOG"; _knomap=$((_knomap + 1)); _knomapi=$((_knomapi + 1)); continue; }
+    [ -n "$_pkg" ] || { _kmev='(map absent)'; [ ! -e "$KS_MAP" ] || _kmev=$(awk -v n="$_ns" '{ t++ } ($1 "") == (n "") { r++; if (NF > 1) k++ } END { printf "(map rows=%d ns_rows=%d named=%d)", t, r, k }' "$KS_MAP" 2>/dev/null) || _kmev='(map unreadable)'; echo "[roamd] keystore_push: staged import ns $_ns has no package mapping, dropped $_kmev $(date)" >> "$LOG"; _knomap=$((_knomap + 1)); _knomapi=$((_knomapi + 1)); continue; }
     if cp "$f" "$KSTAGE/$_pkg.keys" 2>>"$LOG" && cmp -s "$f" "$KSTAGE/$_pkg.keys"; then _kc=$((_kc + 1)); else rm -f "$KSTAGE/$_pkg.keys" 2>/dev/null; _kcf=$((_kcf + 1)); fi
   done
   for f in "$KS_EXPORT"/*.keys; do
@@ -2007,7 +2145,7 @@ keystore_push() {
     ks_ns_mine "$f" || { _kskip=$((_kskip + 1)); continue; }
     _ns=$(basename "$f" .keys)
     _pkg=$(grep -m1 "^$_ns " "$KS_MAP" 2>/dev/null | cut -d' ' -f2)
-    [ -n "$_pkg" ] || { echo "[roamd] keystore_push: ns $_ns has no package mapping, dropped $(date)" >> "$LOG"; _knomap=$((_knomap + 1)); continue; }
+    [ -n "$_pkg" ] || { _kmev='(map absent)'; [ ! -e "$KS_MAP" ] || _kmev=$(awk -v n="$_ns" '{ t++ } ($1 "") == (n "") { r++; if (NF > 1) k++ } END { printf "(map rows=%d ns_rows=%d named=%d)", t, r, k }' "$KS_MAP" 2>/dev/null) || _kmev='(map unreadable)'; echo "[roamd] keystore_push: ns $_ns has no package mapping, dropped $_kmev $(date)" >> "$LOG"; _knomap=$((_knomap + 1)); continue; }
     if cp "$f" "$KSTAGE/$_pkg.keys" 2>>"$LOG" && cmp -s "$f" "$KSTAGE/$_pkg.keys"; then _kn=$((_kn + 1)); else rm -f "$KSTAGE/$_pkg.keys" 2>/dev/null; _kcf=$((_kcf + 1)); fi
   done
   # NWP-20261119-06: A STAGE THAT IS NOT WHOLE IS NEVER PUSHED. The push seals $KSTAGE as the WHOLE #keys scope (the
@@ -5122,8 +5260,16 @@ bt_seal_capture() {
 # $2 = resume (NWP-20261116-19, #57 / dn-1109 #5): only the btresume op passes it. When the adapter never reaches
 # OFF, a resume turns the radio back on before it returns 1 -- the device then holds only this session's bonds.
 # Every other caller keeps the radio off on that exit (option b, "everywhere", was not chosen).
+# $2 = reap, $3 = the reaped uid (NWP-20261129-06): only the cleanstorage op passes them. With a live session other than
+# that uid (reap_live_other) nothing is cleared and the return is 2, neither "verified clear" nor a failed clear.
 bt_reset() {
   local _bd=""; local _s; local _f; local _left; local _rc=0; local _n=0
+  local _brl
+  if [ "${2:-}" = reap ] && _brl=$(reap_live_other "$3"); then
+    echo "[roamd] bt: a live session (user $_brl) holds the device -- its Bluetooth state left in place at the reap of user $3 (NWP-20261129-06) $(date)" >> "$LOG"
+    BT_RESTORED=0
+    return 2
+  fi
   BT_RESTORED=0
   [ -n "$1" ] && _bd="$1/com.nowhere.chooser/files"
 
@@ -5830,6 +5976,40 @@ reap_retry_run() {
   return 0
 }
 
+# reap_live_other <uid> (NWP-20261129-06): print the uid of a live session other than <uid> and return 0, else return 1.
+# A reap's Bluetooth clear and media-daemon stop are device-wide, and they are safe only with no other session in
+# front. $STATE/.roamsession names the live session (core/agent/roamsession_marker.go), and every session end removes it
+# before its reap, so a marker that names <uid> is the reaped session's own. Any other marker is a live session, a
+# damaged one too (roamSessionExists counts it): `?` stands for a line 3 that is not a uid. ONLY line 3 is read: lines
+# 1-2 are the profile name and the passphrase, and they never reach a variable or a log.
+reap_live_other() {
+  local _rlou
+  [ -s "$STATE/.roamsession" ] || return 1
+  _rlou=$(sed -n 3p "$STATE/.roamsession" 2>/dev/null)
+  [ "$_rlou" = "$1" ] && return 1
+  case "$_rlou" in ''|*[!0-9]*|0?*) _rlou='?' ;; esac
+  echo "$_rlou"
+  return 0
+}
+
+# reap_media_mounted <uid> (NWP-20261129-06): 0 when a mount point lies at or under user <uid>'s own dirs, the mounts
+# that would block the reap's rm, and also when the table cannot be read or reads empty (stop_mediad's rule: an unread
+# table is never "no mount"). Else 1. `<dir>` and `<dir>/*`, so user 11 never matches user 110; these paths hold no
+# escaped character, so field 2 is compared raw. One read, through a here-document, never a printf argument (E2BIG).
+reap_media_mounted() {
+  local _rmt _rmrc _rmd _rmp _rmr
+  _rmt=$(cat /proc/mounts 2>>"$LOG"); _rmrc=$?
+  { [ "$_rmrc" -eq 0 ] && [ -n "$_rmt" ]; } || return 0
+  while read -r _rmd _rmp _rmr; do
+    case "$_rmp" in
+      "/data/user/$1"|"/data/user/$1"/*|"/data/user_de/$1"|"/data/user_de/$1"/*|"/data/media/$1"|"/data/media/$1"/*) return 0 ;;
+    esac
+  done <<EOF_RMM
+$_rmt
+EOF_RMM
+  return 1
+}
+
 # Orphan per-user storage cleanup (P4, DIA-20260625-13): removeUser leaves /data/system_ce/<uid> (+ misc_ce) on
 # this FBE build, so a REUSED user-id inherits the stale, key-mismatched CE and crashes system_server on unlock
 # (AccountManagerService accounts_ce.db, code 14 SQLITE_CANTOPEN). The chooser calls this AFTER removeUser -- the
@@ -5857,12 +6037,15 @@ if [ "$op" = "cleanstorage" ]; then
   dt_release "$uid" reap   # NWP-20261027-05: the reap's backstop for the device toggles; another owner is left alone
   dr_release "$uid" reap   # NWP-20261028-07: the reap's backstop for data roaming; another owner is left alone
   hs_release "$uid" reap   # NWP-20261028-10: the reap's backstop for the hotspot; another session's is left alone by the gate
-  stop_mediad   # #84 P3d: a defunct overlay inside the removed user's dirs would block the rm below
+  stop_mediad reap "$uid"   # #84 P3d: a defunct overlay inside the removed user's dirs would block the rm below (NWP-20261129-06: left running when a live session holds it and no such mount exists)
   for d in system_ce system_de misc_ce misc_de user user_de media vendor_ce vendor_de; do
     rm -rf "/data/$d/$uid" 2>> "$LOG"
   done
   rm -rf "$DE_PARK_ROOT/$uid" 2>> "$LOG"   # NWP-20261005-23: a reaped session's parked account file goes with it
   rm -f "$STATE/.cutoff.$uid" "$STATE/.cutoff.$uid".* 2>/dev/null   # NWP-20261011-04: the reaped session's cutoff record and its .new/.tmp scratch (package names) go with it
+  # NWP-20261128-36: the departed session's other per-uid package records go with it, for the same reason as its
+  # cutoff record; its next sign-in clears them too. The odbatch3 glob keeps the dot, so uid 10 never takes uid 100's.
+  [ -n "${STATE:-}" ] && rm -f "$STATE/.declined.$uid" "$STATE/.granted.$uid" "$STATE/.a11ydone.$uid" "$STATE/.autofilldone.$uid" "$STATE/od-unparked.$uid" "$STATE/od-unparked.$uid.tmp" "$STATE/.odbatch3.$uid".* 2>/dev/null   # NWP-20261128-36
   # DIA-20260816-03: and the paths outside the /data/<tree>/<uid> shape (see extra_user_paths above).
   for _xp in $(extra_user_paths "$uid"); do
     rm -rf "$_xp" 2>> "$LOG"
@@ -6002,6 +6185,7 @@ if [ "$op" = "cleanstorage" ]; then
   # of another uid costs that session one cache miss.
   rm -rf /data/nowhere/appcode-reuse 2>>"$LOG"
   rm -rf /data/nowhere/appcode-dormant 2>>"$LOG"   # NWP-20261128-01: package names and _meta of the last #apps seal
+  [ -z "${STATE:-}" ] || rm -f "$STATE/appcode-pm-snapshot" 2>>"$LOG"   # NWP-20261130-16: every installed package's name, left by a killed seal
   # DIA-20260807-03: #154's clear was wired to ONE exit verb -- the logoff seal, via a marker that only
   # `sweepmedia` wrote and only handleLogout's non-LOCAL branch reached. Every other way a session can end left
   # the bonds sitting on the device: a throwaway/LOCAL logoff, the 12h coldWipe, delete-my-profile, a rollback,
@@ -6010,8 +6194,15 @@ if [ "$op" = "cleanstorage" ]; then
   # sweep) and BootReceiver calls it for each leftover user at boot. So the clear belongs HERE, as the net under
   # all of them, rather than bolted onto each verb in turn where the next teardown path added would simply not
   # have it. Credless by definition (the chooser passes name="x"), so this is a pure wipe: no profile to restore.
-  if bt_reset ""; then echo "[roamd] bt: device cleared at reap (user $uid) $(date)" >> "$LOG"
-  else echo "[roamd] bt ERR: device NOT cleared at reap (user $uid) $(date)" >> "$LOG"; fi
+  # NWP-20261129-06: not while another session is live. ChooserActivity.reapSupersededColdLock runs this op after the
+  # new session's `in` laid its pairings down (bt_reset "$USERDIR") and its GRANT-PERMS started its mediad, and the reaped
+  # user's own state is off the device already (its cold lock ran btpark and coldsweep). A clear here empties the new
+  # session's pairings and name, and its next bt_seal_capture then removes them from the seal as well. Status 2 is that
+  # refusal. Residual: when the cold lock's clear and the new sign-in's clear both failed, the departed pairings stay
+  # until the live session's own reap.
+  bt_reset "" reap "$uid"; _rbrc=$?
+  if [ "$_rbrc" = 0 ]; then echo "[roamd] bt: device cleared at reap (user $uid) $(date)" >> "$LOG"
+  elif [ "$_rbrc" != 2 ]; then echo "[roamd] bt ERR: device NOT cleared at reap (user $uid) $(date)" >> "$LOG"; fi
   # NWP-20261003-01: users/<uid> is removed HERE, once the framework has finished removing the user (see
   # reap_userdir_settle), not at the top of this op, where the rm ran before the framework had deleted anything.
   # Placed after the keystore wait and the Bluetooth clear so the time those already spend counts toward the
@@ -6169,7 +6360,8 @@ if [ "$op" = "cleanstorage" ]; then
   case "$_ud_anchor" in timeout|blind) userdir_pending_add "$uid" ;; esac   # NWP-20261104-14 (Q037): re-checked at the next read-write-lane op
   _udc=none; [ "$_ud_took" != 0 ] && _udc="files:$_ud_files other=$_ud_other"
   [ -n "$_ud_left" ] && { if [ -L "/data/system/users/$uid" ]; then _udc="$_udc remains:link"; else _udc="$_udc remains:$(userdir_census "/data/system/users/$uid")"; fi; }
-  echo "[roamd] cleanstorage user $uid class=$_reapclass keys=$_ksv userdir=$_udf $(date)" >> "$LOG"
+  # NWP-20261128-39 (Q039's measurement): the reap's added RW-lane wait is (polls + loop) x 0.25 s, settle plus tail.
+  echo "[roamd] cleanstorage user $uid class=$_reapclass keys=$_ksv userdir=$_udf loop=$_reapi cap=$_reapcap $(date)" >> "$LOG"
   # A DURABLE record, because none of the above survives. $RES is on the RAM tmpfs and is deleted by its
   # reader; roam.log is truncated to a tail by log_scrub on the very next line. The ledger is plain /data, is
   # not in NOWHERE_LOGS so the scrub never touches it, and carries NO profile name -- only uid, class and
@@ -6205,17 +6397,27 @@ fi
 # link keys for as long as it stays there. Handled here, before the name/uid arg guard, because it needs no
 # credentials and no session -- like `armcred` above.
 if [ "$op" = "btwipe" ]; then
-  if bt_reset ""; then echo "[roamd] bt: device cleared (btwipe) $(date)" >> "$LOG"; echo "OK" > "$RES"
-  else echo "[roamd] bt ERR: device NOT cleared (btwipe) $(date)" >> "$LOG"; echo "ERR-BT" > "$RES"; fi
+  if bt_reset ""; then echo "[roamd] bt: device cleared (btwipe) $(date)" >> "$LOG"; _btw=OK
+  else echo "[roamd] bt ERR: device NOT cleared (btwipe) $(date)" >> "$LOG"; _btw=ERR-BT; fi
   # DIA-20260807-12: BootReceiver calls btwipe unconditionally at every boot (DIA-20260807-09), which makes
   # this the one place the log scrub runs even when no leftover user exists -- the battery-death case, where
   # the reap below never fires and the departed name would otherwise sit on disk until the next clean logoff.
+  _btw_t0=$(_ms)
   log_scrub
   # NWP-20261107-10 (Q143): the reap ledger is trimmed at boot with the logs -- the last 20 rows, none 30 days old.
   # handleRoamInOffline also runs btwipe at an offline sign-in, which only trims more often. A wrong early-boot clock
   # can only keep rows (now behind them) or drop them early (now ahead), never keep more than 20. The per-reap writes
   # (cleanstorage, bootsweep) are unchanged.
   reap_ledger_trim /data/nowhere/reap-ledger "$(date +%s)"
+  _btw_t1=$(_ms)
+  echo "[roamd] btwipe: log scrub and ledger trim took $(( ${_btw_t1:-0} - ${_btw_t0:-0} ))ms (NWP-20261129-20) $(date)" >> "$LOG"
+  # NWP-20261129-20: the reply is LAST. runWorkerHeld returns at the first byte of $RES, and init ignores a ctl.start for
+  # a oneshot that still runs, so an earlier reply let the next RW-lane op wait for the #83 lost-start recovery. That
+  # op's appends would also land inside log_scrub's in-place rewrite. Residual: the daemon's other goroutines and
+  # nowhere_provision.sh still append during the rewrite. Cost: BT-WIPE's callers now wait for the scrub too.
+  # BootReceiver's thread: a later verb queues on the lane and does not race init. The offline sign-in:
+  # handleRoamInOffline waits for this op.
+  echo "$_btw" > "$RES"
   chmod 600 "$RES"; exit 0
 fi
 
@@ -6965,6 +7167,76 @@ USERDIR="/data/user/$uid"
 # for P2 restore. Needs the worker to read apk_data_file (fine on this su:s0 build; a USER/enforcing build may
 # need an explicit read grant -- verify on-device).
 
+# NWP-20261130-16 (backlog: a periodic seal's #apps stage spends about 85-124 s besides copying): the stage's ONE
+# PackageManager read. Every lookup used to run its own `dumpsys package <pkg>`, once per package at every seal. The one
+# call is `dumpsys package packages`: for each package it prints the same block as the per-package dump, so it carries
+# codePath, flags and versionCode together. `pm list packages -f --show-versioncode` has no flags, and
+# `dumpsys package --checkin` has no codePath.
+# The dump is streamed into awk, never held as a shell value (the E2BIG note below). The file is root-only, under the RAM
+# $STATE, one line per package: <pkg> TAB <codePath> TAB <SYSTEM 0|1> TAB <versionCode>. appcode_seal removes it before
+# its "#apps staged" line; the next snapshot and the reap remove the file of a killed op.
+# A BLOCK WITH A MISSING FIELD MAKES NO ROW: dumpsys stops a service that overruns its timeout, so a dump can end inside a
+# block, and a block cut before its flags line must never read as "not SYSTEM". A flags line must close with its ].
+# A DUMP THAT FAILS MAKES NO SNAPSHOT, WHATEVER ROWS IT PRINTED FIRST. A pipeline's status is awk's, and dash has no pipefail,
+# so dumpsys's status follows the dump as the stream's last line, on a line of its own. awk exits 3 unless that line says 0.
+# The first block of a name decides (the same first match as the per-package dump): an updated system app's hidden second
+# block has a /system path. A package with no row falls back to its own dump, so a failed or empty snapshot is never read
+# as "not installed". Sets PM_SNAP to the file, or to empty when there is no snapshot.
+appcode_pm_snapshot() {
+  local aps_f aps_t0 aps_n aps_why aps_rc
+  PM_SNAP=""
+  aps_t0=$(_ms)
+  aps_f="$STATE/appcode-pm-snapshot"
+  rm -f "$aps_f" 2>/dev/null
+  aps_why=""
+  aps_rc=0
+  ( umask 077; { dumpsys package packages 2>/dev/null; printf '\nnowhere-dump-rc=%s\n' "$?"; } | awk '
+    function emit() {
+      if (n != "" && c != "" && f ~ /flags=\[.*\]/ && v != "") printf "%s\t%s\t%d\t%s\n", n, c, (index(f, " SYSTEM ") > 0), v
+      n = ""
+    }
+    { l = $0 }
+    /^[ \t]*Package \[/ {
+      emit()
+      m = $0; sub(/^[ \t]*Package \[/, "", m); sub(/\].*/, "", m)
+      p = 0; q = 0; r = 0; c = ""; f = ""; v = ""
+      if (!(m in seen)) { seen[m] = 1; n = m }
+      next
+    }
+    n == "" { next }
+    !p && /codePath=/ { p = 1; c = $0; sub(/.*codePath=/, "", c) }
+    !q && /flags=\[/ { q = 1; f = $0 }
+    !r && /(^|[ \t])versionCode=/ { r = 1; v = $0; sub(/.*versionCode=/, "", v); sub(/[^0-9].*/, "", v) }
+    END { emit(); if (l != "nowhere-dump-rc=0") exit 3 }' > "$aps_f" ) 2>/dev/null || aps_rc=$?
+  case "$aps_rc" in 0) ;; 3) aps_why="dump failed" ;; *) aps_why="cannot write" ;; esac
+  if [ -z "$aps_why" ] && { [ ! -f "$aps_f" ] || [ -L "$aps_f" ]; }; then aps_why="cannot write"; fi
+  if [ -z "$aps_why" ] && [ ! -s "$aps_f" ]; then aps_why="empty dump"; fi
+  if [ -n "$aps_why" ]; then
+    rm -f "$aps_f" 2>/dev/null
+    echo "[roamd] #apps pm snapshot: none, $aps_why -- per-package lookups, $(( $(_ms) - aps_t0 ))ms (NWP-20261130-16) $(date)" >> "$LOG"
+    return 0
+  fi
+  aps_n=$(grep -c . "$aps_f" 2>/dev/null)
+  PM_SNAP=$aps_f
+  echo "[roamd] #apps pm snapshot: ${aps_n:-0} package(s) in $(( $(_ms) - aps_t0 ))ms (NWP-20261130-16) $(date)" >> "$LOG"
+  return 0
+}
+
+# NWP-20261130-16: the snapshot's row for package $1, in the caller's _pms_dir, _pms_sys and _pms_vc. Status 0: the row
+# answers. Status 1: the caller reads the package's own dump. A row whose dir is gone falls back too: a package updated
+# during the stage has a new dir, and only the live dump names it. The sealable rules stay in the callers, one copy each.
+appcode_pm_row() {
+  local apr_r apr_nl
+  apr_nl='
+'
+  apr_r=$(awk -F'\t' -v p="$1" '$1 == p { print $2; print $3; print $4; exit }' "$PM_SNAP" 2>/dev/null)
+  _pms_dir=${apr_r%%"$apr_nl"*}; apr_r=${apr_r#*"$apr_nl"}
+  _pms_sys=${apr_r%%"$apr_nl"*}; _pms_vc=${apr_r#*"$apr_nl"}
+  case "$_pms_sys" in 0|1) ;; *) return 1 ;; esac
+  case "$_pms_vc" in ''|*[!0-9]*) return 1 ;; esac
+  [ -n "$_pms_dir" ] && [ -d "$_pms_dir" ]
+}
+
 # DIA-20260805-09: a package's CURRENT code dir, from live PackageManager state. The dumpsys capture works in
 # this domain (the reap above already relies on it, see reap_orphan_provisioned). Only /data/app counts: a
 # system app's codePath is /system/... and must never be sealed -- captureAppCode skips FLAG_SYSTEM for the
@@ -6972,16 +7244,21 @@ USERDIR="/data/user/$uid"
 # NWP-20261113-01: the dump is streamed into awk, which keeps the first codePath and the first flags=[ line: it
 # is never a shell value passed to printf, since mksh's printf is /system/bin/printf and the kernel refuses an
 # argument over 128 KiB (E2BIG) -- VLC's 365,826-byte dump was refused, so its code was never re-sealed.
+# NWP-20261130-16: during an #apps stage the raw values come from the stage's snapshot; the rules below are unchanged.
 live_code_dir() {
-  local lcd lflags lout lnl
+  local lcd lflags lout lnl _pms_dir _pms_sys _pms_vc
   lnl='
 '
-  lout=$(dumpsys package "$1" 2>/dev/null | awk '
-    !p && /codePath=/ { p = 1; c = $0; sub(/.*codePath=/, "", c) }
-    !q && /flags=\[/ { q = 1; f = $0 }
-    END { print c; print f }')
-  lcd=${lout%%"$lnl"*}
-  case "$lout" in *"$lnl"*) lflags=${lout#*"$lnl"} ;; *) lflags="" ;; esac
+  if [ -n "${PM_SNAP:-}" ] && appcode_pm_row "$1"; then
+    lcd=$_pms_dir; lflags=""; [ "$_pms_sys" = 0 ] || lflags=" SYSTEM "
+  else
+    lout=$(dumpsys package "$1" 2>/dev/null | awk '
+      !p && /codePath=/ { p = 1; c = $0; sub(/.*codePath=/, "", c) }
+      !q && /flags=\[/ { q = 1; f = $0 }
+      END { print c; print f }')
+    lcd=${lout%%"$lnl"*}
+    case "$lout" in *"$lnl"*) lflags=${lout#*"$lnl"} ;; *) lflags="" ;; esac
+  fi
   case "$lcd" in /data/app/*) ;; *) return 0 ;; esac
   [ -d "$lcd" ] || return 0
   # Mirror captureAppCode's FLAG_SYSTEM / FLAG_UPDATED_SYSTEM_APP skip. /data/app alone is NOT enough: an
@@ -6998,19 +7275,24 @@ live_code_dir() {
 # on-demand/auto package whose listed paths are all stale. Same three rules as live_code_dir; the dump is streamed
 # into awk for the same E2BIG reason. Sets the caller's _lcv_dir (empty = not installed / not sealable) and _lcv_vc
 # (the digits of the first versionCode=, or empty). live_code_dir itself is left as test-live-code-dir.sh pins it.
+# NWP-20261130-16: as in live_code_dir, the stage's snapshot answers when it holds a usable row.
 live_code_ver() {
-  local lcv_out lcv_nl lcv_f
+  local lcv_out lcv_nl lcv_f _pms_dir _pms_sys _pms_vc
   lcv_nl='
 '
   _lcv_dir=""; _lcv_vc=""
-  lcv_out=$(dumpsys package "$1" 2>/dev/null | awk '
-    !p && /codePath=/ { p = 1; c = $0; sub(/.*codePath=/, "", c) }
-    !q && /flags=\[/ { q = 1; f = $0 }
-    !r && /(^|[ \t])versionCode=/ { r = 1; v = $0; sub(/.*versionCode=/, "", v); sub(/[^0-9].*/, "", v) }
-    END { print c; print f; print v; print "." }')
-  _lcv_dir=${lcv_out%%"$lcv_nl"*}; lcv_out=${lcv_out#*"$lcv_nl"}
-  lcv_f=${lcv_out%%"$lcv_nl"*}; lcv_out=${lcv_out#*"$lcv_nl"}
-  _lcv_vc=${lcv_out%%"$lcv_nl"*}
+  if [ -n "${PM_SNAP:-}" ] && appcode_pm_row "$1"; then
+    _lcv_dir=$_pms_dir; _lcv_vc=$_pms_vc; lcv_f=""; [ "$_pms_sys" = 0 ] || lcv_f=" SYSTEM "
+  else
+    lcv_out=$(dumpsys package "$1" 2>/dev/null | awk '
+      !p && /codePath=/ { p = 1; c = $0; sub(/.*codePath=/, "", c) }
+      !q && /flags=\[/ { q = 1; f = $0 }
+      !r && /(^|[ \t])versionCode=/ { r = 1; v = $0; sub(/.*versionCode=/, "", v); sub(/[^0-9].*/, "", v) }
+      END { print c; print f; print v; print "." }')
+    _lcv_dir=${lcv_out%%"$lcv_nl"*}; lcv_out=${lcv_out#*"$lcv_nl"}
+    lcv_f=${lcv_out%%"$lcv_nl"*}; lcv_out=${lcv_out#*"$lcv_nl"}
+    _lcv_vc=${lcv_out%%"$lcv_nl"*}
+  fi
   case "$_lcv_vc" in *[!0-9]*) _lcv_vc="" ;; esac
   case "$_lcv_dir" in /data/app/*) ;; *) _lcv_dir=""; return 0 ;; esac
   [ -d "$_lcv_dir" ] || { _lcv_dir=""; return 0; }
@@ -7115,7 +7397,9 @@ appcode_stage_play_dormant() {
       [ -s "$apd_f" ] && grep -qxF "$apd_pkg" "$apd_f" 2>/dev/null && apd_hit=1
     done
     [ "$apd_hit" = 1 ] || continue
-    apd_dir=$(live_code_dir "$apd_pkg"); [ -n "$apd_dir" ] || continue
+    apd_t0=$(_ms); apd_dir=$(live_code_dir "$apd_pkg"); apd_t1=$(_ms)   # NWP-20261130-16: the caller's "lookups" part
+    _acw_lms=$(( ${_acw_lms:-0} + ${apd_t1:-0} - ${apd_t0:-0} )); _acw_lct=$(( ${_acw_lct:-0} + 1 ))
+    [ -n "$apd_dir" ] || continue
     apd_kd="$STAGE/$apd_pkg"; mkdir -p "$apd_kd" 2>>"$LOG" || continue
     apd_t0=$(_ms)
     apd_names=$(stage_live_apks "$apd_dir" "$apd_kd")
@@ -7124,7 +7408,9 @@ appcode_stage_play_dormant() {
     if [ -n "$apd_names" ]; then touch -r "$apd_dir" "$apd_kd" 2>>"$LOG" || _acw_tf=$(( ${_acw_tf:-0} + 1 )); fi
     apd_t1=$(_ms); _acw_cms=$(( ${_acw_cms:-0} + ${apd_t1:-0} - ${apd_t0:-0} ))
     [ -n "$apd_names" ] || { rmdir "$apd_kd" 2>/dev/null; continue; }
+    apd_t0=$(_ms)
     for apd_bn in $apd_names; do printf '%s/%s\n' "$apd_pkg" "$apd_bn" >> "$DEFER"; done
+    apd_t1=$(_ms); _acw_sms=$(( ${_acw_sms:-0} + ${apd_t1:-0} - ${apd_t0:-0} ))
     apd_k=$((apd_k+1))
   done
   [ "$apd_k" -gt 0 ] || return 0
@@ -7218,6 +7504,12 @@ appcode_seal() {
   POOL=/data/nowhere/appcode-reuse
   [ -s "$AL" ] || [ -s "$AK" ] || [ -f "$AK" ] || { rm -rf "$POOL" 2>/dev/null; return 0; }
   [ -s "$AL" ] || AL=/dev/null   # keep-set-only recovery: the staging loop below must still have a readable input
+  # NWP-20261005-04: time the step. NWP-20261130-16: the clock starts here, so the drop lists below count in the "lists"
+  # part. _acw_lms and _acw_lct: the lookups' ms and count. _acw_kms: the carry branch. _acw_sms: the list writes. Each span
+  # closes before another opens, so no ms counts twice; _acw_t0, _acw_k0 and _acw_s0 start one span each.
+  local _stg_t0 _stg_i _stg_n _stg_a _stg_k
+  local _acw_lms _acw_lct _acw_kms _acw_sms _acw_t0 _acw_k0 _acw_s0 _stg_ms _stg_oth _stg_kib
+  _stg_t0=$(_ms); _acw_lms=0; _acw_lct=0; _acw_kms=0; _acw_sms=0
   META_SRC="$USERDIR/com.nowhere.chooser/files/nowhere-appmeta"  # #204: per-pkg archived-placeholder snapshots
   STAGE=/data/nowhere/appcode-stage
   DEFER=/data/nowhere/appcode-defer   # #204: rel-prefixes the #apps seal must DEFER (on-demand APK bytes). Kept
@@ -7338,6 +7630,7 @@ appcode_seal() {
   # this seal's uid; any other pool is another profile's or not ours, and is removed before anything reads it.
   local _acw_pu
   _acw_pu=""
+  _acw_sms=$(( $(_ms) - _stg_t0 ))   # NWP-20261130-16: the drop lists above
   case "$uid" in ''|*[!0-9]*) rm -rf "$POOL" 2>/dev/null ;; esac
   [ -d "$POOL" ] && [ ! -L "$POOL" ] && [ -f "$POOL/.uid" ] && [ ! -L "$POOL/.uid" ] \
     && { IFS= read -r _acw_pu < "$POOL/.uid"; } 2>/dev/null \
@@ -7359,9 +7652,8 @@ appcode_seal() {
   n=0
   staged=0   # DIA-20260805-09: packages for which at least one real APK landed in the stage
   seen=" "   # packages the code list already covered, so the keep-set sweep below doesn't double-stage
-  # NWP-20261005-04: keep the daemon's stall watchdog fed while staging (_apps_stage_prog),
-  # and time the step. The total is both lists' line counts, an upper bound; it grows if a count runs past it.
-  local _stg_t0 _stg_i _stg_n _stg_a _stg_k
+  # NWP-20261005-04: keep the daemon's stall watchdog fed while staging (_apps_stage_prog).
+  # The total is both lists' line counts, an upper bound; it grows if a count runs past it.
   local _acw_n _acw_w _acw_cut _acw_bn _acw_left
   # NWP-20261119-02: the parse (_pl_*), the stale-path class (_acw_gone, _acw_stale, _acw_why), its counts (_st_*),
   # live_code_ver's answer (_lcv_*) and the meta's own vc (_mvc, _ml).
@@ -7371,10 +7663,12 @@ appcode_seal() {
   # ms spent copying (cp, size check, touch), _acw_c0 starts one span, _acw_src is the source of the package dir's mtime.
   # NWP-20261128-09: _acw_ru counts the APKs stage_apk_copy reused from the pool.
   local _acw_tf _acw_cms _acw_c0 _acw_src _acw_l _acw_ru
-  _stg_t0=$(_ms); _stg_i=0; _acw_left=0; _st_s=0; _st_c=0; _st_k=0; _acw_tf=0; _acw_cms=0; _acw_ru=0
+  _stg_i=0; _acw_left=0; _st_s=0; _st_c=0; _st_k=0; _acw_tf=0; _acw_cms=0; _acw_ru=0
   _acw_tab=$(printf '\t')
   _stg_a=$(grep -c . "$AL" 2>/dev/null); _stg_k=$(grep -c . "$AK" 2>/dev/null)
   _stg_n=$(( ${_stg_a:-0} + ${_stg_k:-0} ))
+  # NWP-20261130-16: one PackageManager read for the whole stage. Its time counts in the "lookups" ms, not in the count.
+  _acw_t0=$(_ms); appcode_pm_snapshot; _acw_lms=$((_acw_lms + $(_ms) - _acw_t0))
   while IFS= read -r line; do
     [ -n "$line" ] || continue
     # NWP-20261119-02: ONE builtin pass per line. Each field used to be `$(printf '%s' "$line" | cut -fN)`, and on the
@@ -7454,7 +7748,7 @@ appcode_seal() {
     if [ "$_acw_w" -eq "$_acw_n" ]; then
       # On-demand/auto (#130): the APK bytes ride the seal (a tap or the auto sweep materialises them) but are
       # DEFERRED -- excluded from the login restore. Installed apps stay essential (restored whole at login, #200).
-      case "$mode" in ondemand|auto) for _acw_bn in $names; do printf '%s/%s\n' "$pkg" "$_acw_bn" >> "$DEFER"; done;; esac
+      case "$mode" in ondemand|auto) _acw_s0=$(_ms); for _acw_bn in $names; do printf '%s/%s\n' "$pkg" "$_acw_bn" >> "$DEFER"; done; _acw_sms=$((_acw_sms + $(_ms) - _acw_s0));; esac
     else
       rm -f "$d"/*.apk
       names=""; _acw_src=""
@@ -7472,7 +7766,7 @@ appcode_seal() {
     # bytes beside a fresh _meta sealed a pair whose versions differ. It is re-resolved in the branch below. A CUT
     # on-demand/auto copy is still exempt.)
     if [ -z "$names" ] && [ "$mode" != ondemand ] && [ "$mode" != auto ]; then   # #130: deferred bytes cover auto too
-      cdir=$(live_code_dir "$pkg")
+      _acw_t0=$(_ms); cdir=$(live_code_dir "$pkg"); _acw_lms=$((_acw_lms + $(_ms) - _acw_t0)); _acw_lct=$((_acw_lct+1))
       if [ -n "$cdir" ]; then
         _acw_c0=$(_ms)
         names=$(stage_live_apks "$cdir" "$d") || _acw_cut=1
@@ -7491,7 +7785,8 @@ appcode_seal() {
     # s (staged), c (carried: no live dir, or a version unknown on either side), k (carried: the versions differ)
     # or x (the live copy cut: counted as not whole, then carried).
     if [ "$_acw_stale" = 1 ] && { [ "$mode" = ondemand ] || [ "$mode" = auto ]; }; then
-      live_code_ver "$pkg"
+      _acw_t0=$(_ms); live_code_ver "$pkg"; _acw_lms=$((_acw_lms + $(_ms) - _acw_t0)); _acw_lct=$((_acw_lct+1))
+      _acw_k0=$(_ms)   # NWP-20261130-16: the "carry" part: this branch, less its lookup, copy and list writes
       _mvc=""
       if [ -f "$META_SRC/$pkg/meta" ]; then
         while IFS= read -r _ml; do case "$_ml" in "vc$_acw_tab"*) _mvc=${_ml#"vc$_acw_tab"}; break ;; esac; done < "$META_SRC/$pkg/meta"
@@ -7502,18 +7797,22 @@ appcode_seal() {
         if [ "$_mvc" = "$_lcv_vc" ]; then _acw_why=s; else _acw_why=k; fi
       fi
       if [ "$_acw_why" = s ]; then
+        _acw_kms=$((_acw_kms + $(_ms) - _acw_k0))
         _acw_c0=$(_ms)
         names=$(stage_live_apks "$_lcv_dir" "$d") || _acw_cut=1
         _acw_cms=$((_acw_cms + $(_ms) - _acw_c0))
         if [ -n "$names" ]; then
           _acw_src=$_lcv_dir
+          _acw_s0=$(_ms)
           for _acw_bn in $names; do printf '%s/%s\n' "$pkg" "$_acw_bn" >> "$DEFER"; done
+          _acw_sms=$((_acw_sms + $(_ms) - _acw_s0))
           _st_s=$((_st_s+1))
         elif [ "$_acw_cut" = 1 ]; then
           _acw_left=$((_acw_left+1)); _acw_why=x
         else
           _acw_why=c
         fi
+        _acw_k0=$(_ms)
       fi
       case "$_acw_why" in c) _st_c=$((_st_c+1)) ;; k) _st_k=$((_st_k+1)) ;; esac
       if [ "$_acw_why" != s ]; then
@@ -7530,13 +7829,17 @@ appcode_seal() {
             fi
             if [ -n "$_acw_src" ]; then touch -r "$_acw_src" "$DORMANT/$pkg" 2>>"$LOG" || _acw_tf=$((_acw_tf+1)); fi
             [ -n "$_acw_src" ] || TZ=UTC0 touch -t 200001010000.00 "$DORMANT/$pkg" 2>>"$LOG" || _acw_tf=$((_acw_tf+1))
+            _acw_kms=$((_acw_kms + $(_ms) - _acw_k0)); _acw_s0=$(_ms)
             printf '%s%s\n' "$meta" "${grp:+$_acw_tab$grp}" >> "$DORMANT/manifest.tsv"
+            _acw_sms=$((_acw_sms + $(_ms) - _acw_s0)); _acw_k0=$(_ms)
           fi
           rm -f "${d:?}"/*.apk; rmdir "$d" 2>/dev/null
+          _acw_kms=$((_acw_kms + $(_ms) - _acw_k0))
           continue
         fi
         _acw_cut=0   # the flag is off: the dormant shape below, its _meta and a line naming no APK
       fi
+      _acw_kms=$((_acw_kms + $(_ms) - _acw_k0))
     fi
     if [ -z "$names" ] && [ "$_acw_cut" = 1 ]; then _acw_left=$((_acw_left+1)); fi
     [ -n "$names" ] && staged=$((staged+1))
@@ -7560,7 +7863,9 @@ appcode_seal() {
     if [ -n "$_acw_src" ]; then touch -r "$_acw_src" "$d" 2>>"$LOG" || _acw_tf=$((_acw_tf+1)); fi
     [ -n "$_acw_src" ] || TZ=UTC0 touch -t 200001010000.00 "$d" 2>>"$LOG" || _acw_tf=$((_acw_tf+1))
     _acw_cms=$((_acw_cms + $(_ms) - _acw_c0))
+    _acw_s0=$(_ms)
     printf '%s%s%s\n' "$meta" "$names" "${grp:+$_acw_tab$grp}" >> "$MAN"
+    _acw_sms=$((_acw_sms + $(_ms) - _acw_s0))
     n=$((n+1))
   done < "$AL"
   # DIA-20260805-09: sweep the KEEP-SET for installed-mode apps the code list does not mention at all. This is
@@ -7578,6 +7883,8 @@ appcode_seal() {
       kpkg=$(printf '%s' "$kline" | cut -f1); [ -n "$kpkg" ] || continue
       case "$kpkg" in group:*|\#*) continue ;; esac
       _stg_i=$((_stg_i+1)); [ "$_stg_i" -le "$_stg_n" ] || _stg_n=$_stg_i; _apps_stage_prog "$_stg_i" "$_stg_n"
+      # NWP-20261128-38: before kmode and want_installed++, so a line that is not a package never counts as a wanted installed app.
+      pkgname_ok "$kpkg" || { echo "[roamd] appcode: keep-set line skipped -- not a package name $(date)" >> "$LOG"; continue; }
       kmode=$(printf '%s' "$kline" | cut -f2)
       [ "$kmode" = "$kpkg" ] && kmode=installed   # no tab in the line -> cut echoes it whole; mode defaults to installed
       [ -n "$kmode" ] || kmode=installed
@@ -7601,7 +7908,7 @@ appcode_seal() {
       case "$kmode" in
         ondemand|auto)
           case "$seen" in *" $kpkg "*) continue ;; esac   # the code list already covered it
-          kdir=$(live_code_dir "$kpkg")
+          _acw_t0=$(_ms); kdir=$(live_code_dir "$kpkg"); _acw_lms=$((_acw_lms + $(_ms) - _acw_t0)); _acw_lct=$((_acw_lct+1))
           [ -n "$kdir" ] || continue                      # dormant placeholder -> carry-forward, exactly as before
           kd="$STAGE/$kpkg"; mkdir -p "$kd" 2>>"$LOG" || continue
           _acw_c0=$(_ms)
@@ -7630,7 +7937,9 @@ appcode_seal() {
             [ ! -d "$kd/_meta" ] || stage_keep_mtimes "$META_SRC/$kpkg" "$kd/_meta"
             kmode_out="$kmode"
             # knames is a TAB-prefixed list of basenames; word-splitting it is safe.
+            _acw_cms=$((_acw_cms + $(_ms) - _acw_c0)); _acw_s0=$(_ms)
             for kbn in $knames; do printf '%s/%s\n' "$kpkg" "$kbn" >> "$DEFER"; done
+            _acw_sms=$((_acw_sms + $(_ms) - _acw_s0)); _acw_c0=$(_ms)
           else
             kmode_out=installed
             echo "[roamd] appcode $kpkg ($kmode) has no placeholder metadata yet -> sealing ESSENTIAL as installed so it restores WHOLE (#124) $(date)" >> "$LOG"
@@ -7638,7 +7947,9 @@ appcode_seal() {
           # NWP-20261123-02: the LAST write into $kd: its live code dir's mtime (see the code-list loop's dir touch).
           touch -r "$kdir" "$kd" 2>>"$LOG" || _acw_tf=$((_acw_tf+1))
           _acw_cms=$((_acw_cms + $(_ms) - _acw_c0))
+          _acw_s0=$(_ms)
           printf '%s\t0\t0\t%s%s\n' "$kpkg" "$kmode_out" "$knames" >> "$MAN"
+          _acw_sms=$((_acw_sms + $(_ms) - _acw_s0))
           n=$((n+1)); staged=$((staged+1)); seen="$seen$kpkg "
           echo "[roamd] appcode recovered $kpkg ($kmode -> sealed $kmode_out) from the keep-set -> $kdir (installed this session, absent from the code list) $(date)" >> "$LOG"
           continue
@@ -7646,7 +7957,8 @@ appcode_seal() {
       esac
       want_installed=$((want_installed+1))
       case "$seen" in *" $kpkg "*) continue ;; esac
-      kdir=$(live_code_dir "$kpkg"); [ -n "$kdir" ] || continue
+      _acw_t0=$(_ms); kdir=$(live_code_dir "$kpkg"); _acw_lms=$((_acw_lms + $(_ms) - _acw_t0)); _acw_lct=$((_acw_lct+1))
+      [ -n "$kdir" ] || continue
       kd="$STAGE/$kpkg"; mkdir -p "$kd" 2>>"$LOG" || continue
       _acw_c0=$(_ms)
       knames=$(stage_live_apks "$kdir" "$kd") || _acw_left=$((_acw_left+1))
@@ -7656,7 +7968,9 @@ appcode_seal() {
       _acw_cms=$((_acw_cms + $(_ms) - _acw_c0))
       # cols 2/3 (versionCode, sideloaded) are not read by the restore side -- it consumes pkg, mode and the
       # apk basenames -- so 0/0 is safe for a synthesized line.
+      _acw_s0=$(_ms)
       printf '%s\t0\t0\tinstalled%s\n' "$kpkg" "$knames" >> "$MAN"
+      _acw_sms=$((_acw_sms + $(_ms) - _acw_s0))
       n=$((n+1)); staged=$((staged+1)); seen="$seen$kpkg "
       echo "[roamd] appcode recovered $kpkg from the keep-set -> $kdir (absent from the code list) $(date)" >> "$LOG"
     done < "$AK"
@@ -7679,10 +7993,18 @@ appcode_seal() {
   SAC_RF=""
   # NWP-20261005-04: what staging cost. Before this line nothing measured it, which is why a logoff that timed
   # out here could only be inferred, not shown. Counts and sizes only: no profile name, no package name.
-  # NWP-20261123-02: "copy <c>ms" is the part spent copying (cp, size check, touch); the rest is the list parse and
-  # the dumpsys lookups. "<f> mtime kept-failed" counts the touches that failed (each one costs a cache miss only).
+  # NWP-20261123-02: "copy <c>ms" is the part spent copying (cp, size check, touch). "<f> mtime kept-failed" counts the
+  # touches that failed (each one costs a cache miss only).
   # NWP-20261128-09: "<r> reused" counts the APKs moved from the previous seal's stage instead of copied (a count only).
-  echo "[roamd] #apps staged $staged pkg(s), $(du -sk "$STAGE" 2>/dev/null | cut -f1) KiB, in $(( $(_ms) - _stg_t0 ))ms (copy ${_acw_cms}ms, $_acw_tf mtime kept-failed, $_acw_ru reused) (NWP-20261005-04, NWP-20261123-02, NWP-20261128-09) $(date)" >> "$LOG"
+  # NWP-20261130-16: the rest of the total, named: "lookups <ms>ms/<n>" (the snapshot and <n> live_code_dir/live_code_ver
+  # calls), "carry" (the stale-path branch less its lookup, copy and list writes), "lists" (the drop, manifest, defer and
+  # dormant list writes), "other" (the remainder: the parse, progress lines, du), so copy + the four parts = the total.
+  # Every return below this point comes after the snapshot's removal, and no return comes between it and its creation.
+  [ -z "${PM_SNAP:-}" ] || rm -f "$PM_SNAP"; PM_SNAP=""
+  _stg_kib=$(du -sk "$STAGE" 2>/dev/null | cut -f1)
+  _stg_ms=$(( $(_ms) - _stg_t0 ))
+  _stg_oth=$(( _stg_ms - _acw_cms - _acw_lms - _acw_kms - _acw_sms ))
+  echo "[roamd] #apps staged $staged pkg(s), $_stg_kib KiB, in ${_stg_ms}ms (copy ${_acw_cms}ms, $_acw_tf mtime kept-failed, $_acw_ru reused) (NWP-20261005-04, NWP-20261123-02, NWP-20261128-09) (lookups ${_acw_lms}ms/$_acw_lct, carry ${_acw_kms}ms, lists ${_acw_sms}ms, other ${_stg_oth}ms) $(date)" >> "$LOG"
   # NWP-20261123-10: on a full /data a zero-byte create succeeds and every append to the manifest fails (ENOSPC),
   # unchecked. A stage that staged packages but holds an empty manifest would seal APKs no sign-in installs: the
   # same refusal as above, with the staged-0 refusal's cleanup (the defer list holds package names by now). The
@@ -8904,27 +9226,37 @@ cutoff_run() {
   cutoff_prog "$1"
 }
 
-# bootwake_list <uid> (NWP-20261114-01): every package of the user that declares a receiver for
+# bootwake_list <uid> [<form file>] (NWP-20261114-01): every package of the user that declares a receiver for
 # LOCKED_BOOT_COMPLETED or BOOT_COMPLETED, once each, one per line, in first-seen order. Two bounded reads, one per
 # action. ⚠ The `--components` output form (one "<pkg>/<component>" per line, maybe indented) is read from
 # PackageManagerShellCommand, not yet from a device. The parse is lenient: leading blanks are stripped, any other line
 # is dropped, and a name that is not a plain package name is dropped, so an unknown form gives an empty list and the
 # bootwake op sends nothing.
+# NWP-20261128-37: with a <form file>, it also writes `<parsed> <none> <other>` there, the counts of the non-empty
+# lines of both listings: parsed = a component line that passed the checks (counted before the dedup), none = exactly
+# "No receivers found" (AOSP's runQueryIntentReceivers prints it for an empty result; read from AOSP source, not from
+# a device), other = every other line, so the unknown form above is counted. A failed write is silent and changes
+# nothing else: the counts are evidence, the list is the wake.
 bootwake_list() {
-  local _a _l _p _v _o=" "
+  local _a _l _p _v _o=" " _np=0 _nn=0 _no=0
   for _a in android.intent.action.LOCKED_BOOT_COMPLETED android.intent.action.BOOT_COMPLETED; do
     _v=$(timeout -k 2 20 pm query-receivers --user "$1" --components --include-stopped-packages -a "$_a" </dev/null 2>/dev/null)
     # Not a pipe into the loop: a pipe runs the loop in a subshell, and the dedup set _o would be lost.
     while read -r _l; do   # the default IFS: read strips the leading and the trailing blanks
-      case "$_l" in *" "*|*"	"*) continue ;; ?*/?*) ;; *) continue ;; esac
+      [ -n "$_l" ] || continue
+      if [ "$_l" = "No receivers found" ]; then _nn=$((_nn + 1)); continue; fi
+      case "$_l" in *" "*|*"	"*) _no=$((_no + 1)); continue ;; ?*/?*) ;; *) _no=$((_no + 1)); continue ;; esac
       _p=${_l%%/*}
-      cutoff_pkgok "$_p" || continue
+      cutoff_pkgok "$_p" || { _no=$((_no + 1)); continue; }
+      _np=$((_np + 1))
       case "$_o" in *" $_p "*) continue ;; esac
       _o="$_o$_p "; echo "$_p"
     done <<EOT
 $_v
 EOT
   done
+  if [ -n "${2:-}" ]; then echo "$_np $_nn $_no" 2>/dev/null > "$2"; fi
+  return 0
 }
 
 # NWP-20261113-15: the scope tokens of the `in` arm's landing line, one per best-effort restore (#de, then #media):
@@ -8969,6 +9301,7 @@ seal_wl_end() {
 # NWP-20261104-14 (Q037): queued users/<n> of earlier timeout/blind reaps, re-checked before any read-write-lane op.
 # NWP-20261114-15 (#67): and, first, the queued FBE-tree and extra paths of earlier residue or husk reaps (reap_retry_run).
 # The guard is load-bearing on both lines: the read-only lane's ops are arms of this same case (see userdir_recheck).
+_sumt=$(_ms)   # NWP-20261130-08: the `in` arm writes these two steps' time as its first reap line
 [ "$LANE" = rw ] && reap_retry_run
 [ "$LANE" = rw ] && userdir_recheck
 case "$op" in
@@ -8998,6 +9331,7 @@ case "$op" in
     # never touches a live or parked session's record. The rm drops a recycled uid's leftover.
     case "$uid" in ''|*[!0-9]*) ;; *) rm -f "$STATE/signin-summary.$uid" 2>/dev/null
       export NOWHERE_SIGNIN_SUMMARY="$STATE/signin-summary.$uid" ;; esac
+    _ssum reap "$_sumt"   # NWP-20261130-08: reap_retry_run and userdir_recheck, which ran before this file existed
     # #84 P3d: a predecessor's media daemon is stopped at the head of the landing branch, after the scope verdict
     # (NWP-20261117-16, NWP-20261124-05).
     # #81: a FIDO2-enrolled profile needs a security key at login (2FA). The check is a cheap head read (no
@@ -9073,14 +9407,21 @@ case "$op" in
       # and shared by every login, so a sign-in that never lands (a straggler over a live session, a fresh one over a
       # COLD-LOCKED session the owner can still resume) would otherwise have destroyed the state of a session that
       # still exists: pushProfile refuses every seal of a non-empty head that has no restore receipt. A park left by
-      # a killed run is discarded here, never restored. When THIS run cannot make the park, the else DELETES the six
-      # entries instead, as before NWP-20261020-01, so the moves below find nothing to move and a sign-in that does
-      # not land puts nothing back. The plain mkdir fails when this tmpfs is out of INODES, not bytes (on tmpfs a
+      # a killed run is discarded here, and this op never restores it. When THIS run cannot make the park, the else
+      # DELETES the six entries instead, as before NWP-20261020-01, so the moves below find nothing to move and a
+      # sign-in that does not land puts nothing back. The plain mkdir fails when this tmpfs is out of INODES, not bytes (on tmpfs a
       # mkdir costs an inode and no data pages, and nowhere.rc mounts $STATE size=256m with no nr_inodes, so a $STATE
       # full by bytes still gets its park), on a kernel ENOMEM, or when a stale park rm could not clear is still there.
       # Moving into a missing park would fail for a file, keeping the previous profile's .fido2hmac, and would RENAME
       # restore-receipts to the park path, where nothing puts it back and the next commit's rm discards it; moving
       # into a stale one would mix the session's entries with a killed run's.
+      # NWP-20261129-17 (h59 #2): after OK this op leaves the park. The daemon drops it once the session marker is
+      # written, and puts it back on ERR-UNRECORDED, on BLANK NET after the restore and when the next op on the lane
+      # finds an abandoned `in` (core/agent/in_park.go). Two residuals: (a) a daemon that dies between its marker and
+      # dropInPark leaves the park, which the next commit discards here; (b) a daemon that dies between this op's OK
+      # and its marker also leaves the park, and nothing restores it (the restarted daemon records "(daemon start)",
+      # not "in", and cannot tell (a) from (b)), so a cold-locked session resumed after that keeps the attempt's
+      # receipts, as before this slice, until the next commit discards the park.
       rm -rf "$PARK" 2>> "$LOG"
       if mkdir "$PARK" 2>> "$LOG"; then
         _parked=1
@@ -9168,6 +9509,7 @@ case "$op" in
       echo "NEEDKEY" > "$RES"
     elif NOWHERE_PHASE=apps NOWHERE_CLAIMS_SEED="$STATE/claims.seed" "$AGENT" restore s3 "$name" "$(pw "$pass")" "$USERDIR" >> "$LOG" 2>&1; then
       _ceok=1
+      _sumt=$(_ms)
       relabel_launcher "$uid" "$USERDIR"   # rewrite home-layout serial so the launcher keeps it (see above)
       remap_media_db "$uid" "$USERDIR"   # NWP-20261124-01: repoint the roamed MediaStore index; before remap_per_pkg/restorecon, which re-own and relabel any -wal/-shm it creates
       _tt=$(_ms); remap_per_pkg "$USERDIR"; _tlog reown-ce "$_tt"
@@ -9201,6 +9543,7 @@ case "$op" in
 # The libselinux bug is fixed separately (editions/endospore/build/patches/libselinux-pkgdir-uid-aliasing.sh),
 # so -D would be safe again. It is still not re-enabled here: nothing needs it.
       _tt=$(_ms); restorecon -R "$USERDIR" 2>> "$LOG"; _tlog restorecon-ce "$_tt"
+      _ssum reown "$_sumt"
       # Roam completeness: also restore device-encrypted per-user app data and the shared media tree
       # (photos, downloads, files), each on its own store ref (name#de / name#media) so a fresh profile
       # simply has none yet and the restore is a harmless no-op. Best-effort: a failure here other than exit 5 does
@@ -9211,14 +9554,18 @@ case "$op" in
       _derc=skip
       [ -d "$DEDIR" ] && { NOWHERE_PHASE=secure "$AGENT" restore s3 "${name}#de" "$(pw "$pass")" "$DEDIR" >> "$LOG" 2>&1; _derc=$?; }
       if [ "$_derc" = 0 ]; then
+        _sumt=$(_ms)
         remap_media_db "$uid" "$DEDIR"   # NWP-20261124-01: MediaProvider is directBootAware; same order rule as the CE call
         _tt=$(_ms); remap_per_pkg "$DEDIR"; _tlog reown-de "$_tt"; _tt=$(_ms); restorecon -R "$DEDIR" 2>> "$LOG"; _tlog restorecon-de "$_tt"
+        _ssum reown "$_sumt"
       fi
       # NWP-20261124-05: a #de restore that could not reach the store ends the sign-in (the verdict below). The
       # account, MMS and #media steps would spend minutes failing on the same dead network, so none of them runs.
       if [ "$_derc" = 5 ]; then _innet=de; fi
       if [ -z "$_innet" ]; then
+        _sumt=$(_ms)
         acct_restore "$uid"   # #DIA-20260802-02: restore the AccountManager account rows (name#sys) BEFORE provisionRoamedApps installs the authenticator
+        _ssum acct "$_sumt"
         # #148: the MMS `part._data` column stores an ABSOLUTE /data/user_de/<sealing-uid>/ path with the user
         # id baked in. The CE mmssms.db (restored with the apps phase) and the DE app_parts files (restored just
         # above) both roam to THIS user, but the paths INSIDE the db still name the OLD user -> MmsProvider.openFile
@@ -9250,8 +9597,12 @@ case "$op" in
         _mdrc=skip
         [ -d "$MEDIADIR" ] && { NOWHERE_PHASE=media "$AGENT" restore s3 "${name}#media" "$(pw "$pass")" "$MEDIADIR" >> "$LOG" 2>&1; _mdrc=$?; }
         if [ "$_mdrc" = 0 ]; then
+          _sumt=$(_ms)
           restore_media_tail "$MEDIADIR"
+          _ssum reown "$_sumt"
+          insert_deferred_media "$uid" "$USERDIR" "$DEDIR"   # NWP-20261130-02: the Gallery's rows for media not yet downloaded
         fi
+        rm -f "$STATE/media.rows" 2>> "$LOG"   # NWP-20261130-02: the session's file names, gone on every path
         if [ "$_mdrc" = 5 ]; then _innet=media; fi
       fi
     else
@@ -9507,12 +9858,14 @@ case "$op" in
       # from the restored .appcode manifest (the exact set about to be raised). Idempotent + self-healing; replaces the
       # fragile logoff-time reap. Must follow hold_ondemand (data already parked) and precede the chooser's raise.
       # NWP-20261125-01: with the uid it CHECKS that park and skips (and lists) an app whose data was left in place.
+      _sumt=$(_ms)
       reap_stale_ondemand "$CHOOSER0/.appcode/manifest.tsv" "$uid"
       # DIA-20260730-06 amnesia backstop: reap ANY chooser-provisioned pkg not in THIS profile's manifest (a leak
       # from a different profile / a retained record / a residual user-0 install), so it can't ghost across profiles.
       # DIA-20260811-07: pass the roaming uid explicitly rather than leaning on the global -- roamd helpers reading
       # globals they did not declare is what caused the roam data-loss saga.
       reap_orphan_provisioned "$CHOOSER0/.appcode/manifest.tsv" "$uid"
+      _ssum reap "$_sumt"
       # NWP-20261113-15: the scopes are the restores' real outcomes, no longer the fixed literal `(+de +media)`. On
       # lynx 2026102201 (NWP-20261024-18) Wi-Fi was cut during the #media chunk download: roam.log read
       # `ERR: fetch chunk 80 ...` and then `IN "<profile>" -> user 18 (+de +media)`, a sign-in called restored although
@@ -9521,15 +9874,17 @@ case "$op" in
       # #media restore that could not reach the store (exit 5) ends as BLANK NET at the verdict above, before this
       # line. Any other failure (1: damage, a missing chunk) still lands and is named here as `!<scope>(rc=<n>)`.
       print -r -- "[roamd] IN $(qn "$name") -> user $uid ($(in_scope_tokens "$_derc" "$_mdrc")) $(date)" >> "$LOG"
+      _ssum in "$_sum0"
       uiderrors_floor_commit "$_uefloor"   # NWP-20261010-06: this session's lines in uiderrors.txt start here
       echo "OK $uid" > "$RES"; _inres=OK
-      [ "$_parked" = 1 ] && rm -rf "$PARK" 2>> "$LOG"
+      # NWP-20261129-17 (h59 #2): the park stays. The daemon drops or restores it once it knows the OK is recorded
+      # (core/agent/in_park.go).
     fi
     # NWP-20261020-01: the commit arm moved the session's per-login entries into the park and this sign-in
     # did not land, so put each name back as it was: first remove whatever THIS attempt left there (the restore
     # writes restore-receipts/roster.<ref> before it fails; the commit arm wrote the fresh .fido2hmac and the
     # promoted .fido2slots), then move the parked one back. A name absent before is absent after. Only a park
-    # this run created is ever restored, and a landed sign-in (OK) already removed its own.
+    # this run created is ever restored here, and a landed sign-in (OK) leaves its own to the daemon.
     if [ "$_parked" = 1 ] && [ "$_inres" != OK ]; then
       _pbn=0
       for _pn in restore-receipts media.restore-ok .btlogoff .had_account .fido2hmac .fido2slots; do
@@ -10463,7 +10818,8 @@ EOF_MT
         case "$_odbi.$_odbn" in *[!0-9.]*|0*|*.0*|.*|*.|*.*.*) ;; *) odbatch="$skind" ;; esac ;;
     esac
     odlast=0; [ -n "$odbatch" ] && [ "$_odbi" = "$_odbn" ] && odlast=1
-    case "$pkg" in ""|*/*|*" "*) echo "[roamd] odrestore bad pkg $(date)" >> "$LOG"; echo "ERR-PKG" > "$RES"; chmod 600 "$RES"; exit 0;; esac
+    # NWP-20261128-42: the Android package grammar (pkgname_ok, the same check as validPkgName in pkgname.go).
+    pkgname_ok "$pkg" || { echo "[roamd] odrestore bad pkg $(date)" >> "$LOG"; echo "ERR-PKG" > "$RES"; chmod 600 "$RES"; exit 0; }
     # DIA-20260803: the app is very likely ALREADY RUNNING by the time we get here, against the EMPTY data dir
     # installApks just created -- gmscompat binds a Play-Services client's GmsCompatClientService the moment the
     # install completes ("Start proc ... for bound-service {PKG/GmsCompatClientService}"), which is a minute
@@ -10999,7 +11355,7 @@ EOF_MT
     # leftover at the reap.
     umask 077
     _bf="$STATE/.cutoff.$uid.bootwake"
-    rm -f "$_bf" "$_bf.u"
+    rm -f "$_bf" "$_bf.u" "$_bf.form"
     if [ -n "$srcunit" ] && ! cutoff_pkgok "$srcunit"; then
       echo "ERR-PKG" > "$RES"
       echo "[roamd] bootwake user $uid: bad package argument -- nothing sent (NWP-20261114-01) $(date)" >> "$LOG"
@@ -11010,7 +11366,16 @@ EOF_MT
           # cutoff_keep's fixed entries, as a literal: cutoff_keep itself also adds the settings-read keeps (above).
           _bfixed=" com.nowhere.chooser android com.android.systemui com.android.bluetooth com.android.providers.media.module com.google.android.providers.media.module "
           _bst=" $(printf '%s\n' "$_call" | cutoff_filter " " " " true | tr '\n' ' ')"
-          _blist=$(bootwake_list "$uid")
+          _blist=$(bootwake_list "$uid" "$_bf.form")
+          # NWP-20261128-37: how pm's receiver listing parsed, for the log line. other > 0: the listing has a form the
+          # parse does not know, so those apps were sent nothing. All three 0: pm printed nothing (a capture denial, an
+          # error or the 20 s timeout). none = 2 with the rest 0: no app of the session declares a receiver. The
+          # no-receivers form is from AOSP source, not from a device. An unreadable count logs as ?.
+          _bfp=""; _bfn=""; _bfo=""; _bfx=""
+          { read -r _bfp _bfn _bfo _bfx < "$_bf.form"; } 2>/dev/null
+          case "$_bfp" in ""|*[!0-9]*) _bfp="?" ;; esac
+          case "$_bfn" in ""|*[!0-9]*) _bfn="?" ;; esac
+          case "$_bfo" in ""|*[!0-9]*) _bfo="?" ;; esac
           _bdecl=0; _bheld=0
           # The split is unquoted: every name passed cutoff_pkgok, so it holds no blank and no glob character.
           { for _p in $_blist; do
@@ -11028,11 +11393,11 @@ EOF_MT
           while IFS= read -r _p; do case "$_bst" in *" $_p "*) echo "$_p" ;; esac; done < "$_bf" > "$_bf.u"
           cutoff_run unstop "$uid" "$_bf.u" "$(( $(date +%s) + CUTOFF_BUDGET ))"; _bun=${CUTOFF_RAN:-0}
           cutoff_run boot "$uid" "$_bf" "$(( $(date +%s) + CUTOFF_BUDGET ))"; _bsent=${CUTOFF_RAN:-0}
-          rm -f "$_bf" "$_bf.u"   # the scratch goes at the end too
+          rm -f "$_bf" "$_bf.u" "$_bf.form"   # the scratch goes at the end too
           echo "BOOTWAKE $_bsent $_bdecl" > "$RES"
           if [ -n "$srcunit" ]; then _bwho="one package: boot broadcasts sent to $_bsent of $_bcand"
           else _bwho="boot broadcasts sent to $_bsent of $_bcand package(s)"; fi
-          echo "[roamd] bootwake user $uid: $_bwho ($_bun unstopped first, $_bheld skipped with parked data, $_bdecl declare a boot receiver) (NWP-20261114-01) $(date)" >> "$LOG"
+          echo "[roamd] bootwake user $uid: $_bwho ($_bun unstopped first, $_bheld skipped with parked data, $_bdecl declare a boot receiver) (NWP-20261114-01); pm listed $_bfp component line(s), $_bfn no-receivers line(s), $_bfo other line(s) (NWP-20261128-37) $(date)" >> "$LOG"
           ;;
         *)
           echo "ERR-LIST" > "$RES"
@@ -11040,7 +11405,7 @@ EOF_MT
           ;;
       esac
     fi
-    unset _bf _call _bfixed _bst _blist _bdecl _bheld _bh _bv _p _bcand _bun _bsent _bwho
+    unset _bf _call _bfixed _bst _blist _bdecl _bheld _bh _bv _p _bcand _bun _bsent _bwho _bfp _bfn _bfo _bfx
     ;;
   *) echo "ERR-OP" > "$RES" ;;
 esac
