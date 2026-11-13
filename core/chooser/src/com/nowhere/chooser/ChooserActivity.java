@@ -79,6 +79,8 @@ public class ChooserActivity extends Activity {
     private TextView passStrength, genLink;            // #79: create-form strength hint + "Generate" link
     private android.widget.Switch playAtCreateSw;      // NWP-20261124-09: the create form's Google Play question
     private boolean gateGosStore;                      // NWP-20261124-09: the GrapheneOS App Store is installed (Endospore)
+    private android.widget.CheckBox createAckBox;      // NWP-20261202-23: the create form's lost-passphrase acknowledgement
+    private volatile String createAckReply;            // NWP-20261202-23: the gate's reply; null = not read yet
     private android.os.Handler strengthHandler;        // #79: debounce the CHECK-PASSPHRASE round-trip
     private Runnable strengthCheck;
     private TextView result;
@@ -572,6 +574,19 @@ public class ChooserActivity extends Activity {
         LinearLayout.LayoutParams playLp = new LinearLayout.LayoutParams(MATCH, WRAP);
         playLp.bottomMargin = dp(20);
         ll.addView(playAtCreateSw, playLp);
+        // NWP-20261202-23 (docs/product-decisions.md, 2026-11-10, item 2): Create asks for the first-boot screen's
+        // lost-passphrase acknowledgement, every time, behind the same one gate (OsAgreement.createStep). Unticked and
+        // hidden here; setCreateMode shows it through OsAgreement.createAckShown. Nothing records the tick.
+        createAckBox = new android.widget.CheckBox(this);
+        createAckBox.setText(OsAgreement.createAckText());
+        createAckBox.setTextColor(MUTED);
+        createAckBox.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        createAckBox.setChecked(false);
+        createAckBox.setVisibility(View.GONE);
+        LinearLayout.LayoutParams ackLp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        ackLp.bottomMargin = dp(20);
+        ll.addView(createAckBox, ackLp);
+        readCreateAckGate();
         strengthHandler = new android.os.Handler(android.os.Looper.getMainLooper());
         strengthCheck = () -> { // fired ~350ms after typing stops; off-main socket, back to the UI thread
             final String nm = profileField.getText().toString().trim();
@@ -988,6 +1003,15 @@ public class ChooserActivity extends Activity {
                 if (p.isEmpty()) { result.setTextColor(MUTED); result.setText("enter a passphrase"); return; }
                 if (!p.equals(confirmField.getText().toString())) {
                     result.setTextColor(MUTED); result.setText("passphrases don't match"); return;
+                }
+                // NWP-20261202-23: the lost-passphrase acknowledgement, behind the OS agreement gate (OsAgreement.createStep)
+                final int ackStep = OsAgreement.createStep(createAckReply, createAckBox != null && createAckBox.isChecked());
+                if (ackStep == OsAgreement.CREATE_WAIT) {
+                    result.setTextColor(MUTED); result.setText(OsAgreement.CREATE_WAIT_TEXT); readCreateAckGate(); return;
+                }
+                if (ackStep == OsAgreement.CREATE_ASK) {
+                    createAckBox.setVisibility(View.VISIBLE);
+                    result.setTextColor(MUTED); result.setText(OsAgreement.CREATE_ACK_NEED); return;
                 }
                 create(n, p);
             } else {
@@ -1752,13 +1776,13 @@ public class ChooserActivity extends Activity {
     }
 
     /** Dialog to pick how often the live session's data is sealed to the store (DIA-20260619-11). Presets
-     *  only; the agent clamps anything odd to [15s, 1 day]. One at a time, so the one syncPicker holds is the only one
-     *  up when onPause closes it (NWP-20261130-14). */
+     *  only, 2 to 30 minutes with 15 the default (DECIDED 2026-11-10, SyncChoices, NWP-20261202-25). A stored value
+     *  that is no longer offered still applies: the agent clamps anything odd to [15s, 1 day]. One at a time, so the
+     *  one syncPicker holds is the only one up when onPause closes it (NWP-20261130-14). */
     private void showSyncIntervalPicker(Runnable onChanged) {
         if (syncPicker != null && syncPicker.isShowing()) return;
-        final int[] secs = {30, 60, 120, 300, 600};
-        final String[] labels = {"Every 30 seconds", "Every minute", "Every 2 minutes (default)",
-                "Every 5 minutes", "Every 10 minutes"};
+        final int[] secs = SyncChoices.SECS;
+        final String[] labels = SyncChoices.LABELS;
         syncPicker = new android.app.AlertDialog.Builder(this)
                 .setTitle("Back up my data")
                 .setItems(labels, (d, w) ->
@@ -3991,6 +4015,20 @@ public class ChooserActivity extends Activity {
         android.util.Log.w("NowhereChooser", "no launcher to hand off to (" + ris.size() + " home candidates)");
     }
 
+    /** NWP-20261202-23: read the OS agreement gate for the create form off the UI thread, then show or hide the box.
+     *  Any failure stores "" (hides the box, as on the first-boot screen); the reply is never set back to null. */
+    private void readCreateAckGate() {
+        new Thread(() -> {
+            String r;
+            try { r = DaemonSocket.roundTrip("GET-OS-AGREEMENT\n", 5000); } catch (Throwable t) { r = ""; }
+            createAckReply = r == null ? "" : r;
+            runOnUiThread(() -> {
+                if (createAckBox != null)
+                    createAckBox.setVisibility(OsAgreement.createAckShown(createAckReply, createMode) ? View.VISIBLE : View.GONE);
+            });
+        }, "nowhere-createack").start();
+    }
+
     /** The create-profile / sign-in mode switch (the toggle under the form). Clears what was typed. */
     // Pinned byte for byte by core/chooser/tests/create-coldlock (NWP-20261010-16): update the pin with an edit.
     private void setCreateMode(boolean on) {
@@ -4001,6 +4039,9 @@ public class ChooserActivity extends Activity {
         genLink.setVisibility(createMode ? View.VISIBLE : View.GONE);       // #79
         playAtCreateSw.setVisibility(PlayAtCreate.offered(gateGosStore, createMode) ? View.VISIBLE : View.GONE); // NWP-20261124-09
         playAtCreateSw.setChecked(false);                                   // NWP-20261124-09: off by default, every time
+        createAckBox.setVisibility(OsAgreement.createAckShown(createAckReply, createMode) ? View.VISIBLE : View.GONE); // NWP-20261202-23
+        createAckBox.setChecked(false); // NWP-20261202-23: unticked every time
+        if (createMode) readCreateAckGate(); // NWP-20261202-23: re-read at every entry
         passStrength.setVisibility(View.GONE);                              // #79: reappears once they type
         setPassRevealed(false);                                            // re-mask (+ reset toggle) on mode switch
         unlockBtn.setText(createMode ? "Create profile" : "Unlock");
@@ -5769,7 +5810,7 @@ public class ChooserActivity extends Activity {
         // lookGlyph = the gate's sun/moon (NWP-20261117-25): a tap mid-login would recreate() the gate under it.
         View[] vs = {unlockBtn, profileField, passField, confirmField, toggle, gear, forgotLink,
                 gateCodeField, gateScanLink, genLink, resumeAlt, helpIcon, lookGlyph, restoreDeviceLink, ownerGlyph,
-                addPhoneLink, playAtCreateSw};
+                addPhoneLink, playAtCreateSw, createAckBox};
         // #81: the reveal toggles are SIBLINGS of the fields inside their wrapper, so disabling the EditText
         // would leave the one control that puts a credential on screen live behind a locked form.
         PassReveal.setToggleEnabled(passField, !lock, a);
@@ -5928,6 +5969,7 @@ public class ChooserActivity extends Activity {
         if (confirmField != null) confirmField.setText("");
         if (gateCodeField != null) gateCodeField.setText("");
         if (playAtCreateSw != null) playAtCreateSw.setChecked(false); // NWP-20261124-09: the Play question back to off
+        if (createAckBox != null) createAckBox.setChecked(false); // NWP-20261202-23
         setPassRevealed(false);
         if (held) android.util.Log.i("NowhereChooser", "screen off: sign-in fields cleared (NWP-20261117-09)");
     }
@@ -6676,8 +6718,9 @@ public class ChooserActivity extends Activity {
     }
 
     /** NWP-20261130-14: Owner settings › Backup. Backup frequency (DIA-20260619-11): how often the live session's data
-     *  is sealed to the store. Lower = less lost on an unclean power-off (crash / dead battery); convergent dedup keeps
-     *  frequent cycles cheap. Read/written via the daemon's GET/SET-SYNC-INTERVAL; syncLoop applies the change live. */
+     *  is sealed to the store. Lower = less lost on an unclean power-off (crash / dead battery); dedup keeps the
+     *  upload cheap, not the save's local work, so the default is 15 minutes (2026-11-10). Read/written via the
+     *  daemon's GET/SET-SYNC-INTERVAL; syncLoop applies the change live. */
     private View buildOwnerBackupScreen() {
         LinearLayout ll = ownerColumn("Backup");
         final TextView bkRow = new TextView(this);
@@ -11337,12 +11380,24 @@ public class ChooserActivity extends Activity {
     // NWP-20261201-10: a health check's notice, posted into the live session (HealthNotice decides what it offers).
     private static final String NOTIF_HEALTH_CHANNEL = "nowhere.health";
     private static final int NOTIF_HEALTH_ID = 0x0D26; // PrivateDnsWatch holds 0x0D25
+    private static final int NOTIF_MEDIA_HEALTH_ID = MediaFixReceiver.NOTIF_ID; // NWP-20261202-26: the media-health notice
     // NWP-20261118-08: the plan check's state, shared by the watcher and the check's own thread, so all of it is atomics.
     private static final java.util.concurrent.atomic.AtomicInteger planSchedUid = new java.util.concurrent.atomic.AtomicInteger(-1);
     private static final java.util.concurrent.atomic.AtomicLong planDueMs = new java.util.concurrent.atomic.AtomicLong(Long.MAX_VALUE);
     private static final java.util.concurrent.atomic.AtomicBoolean planBusy = new java.util.concurrent.atomic.AtomicBoolean(false);
     private static final java.util.concurrent.atomic.AtomicInteger planShownUid = new java.util.concurrent.atomic.AtomicInteger(-1);
     private static final java.util.concurrent.atomic.AtomicInteger planShownStage = new java.util.concurrent.atomic.AtomicInteger(PlanExpiry.NONE);
+    // NWP-20261202-26: the media-health check's schedule and state, shared by the watcher and its check thread. The
+    // session side's outstanding probe thread gets a fresh reference on a uid change, so a thread stuck on a previous
+    // user's provider never blocks the next user's probe; user 0 keeps one reference for the life of the process.
+    private static final java.util.concurrent.atomic.AtomicInteger mediaHealthSchedUid = new java.util.concurrent.atomic.AtomicInteger(-1);
+    private static final java.util.concurrent.atomic.AtomicLong mediaHealthDueMs = new java.util.concurrent.atomic.AtomicLong(Long.MAX_VALUE);
+    private static final java.util.concurrent.atomic.AtomicBoolean mediaHealthBusy = new java.util.concurrent.atomic.AtomicBoolean(false);
+    private static final java.util.concurrent.atomic.AtomicInteger mediaHealthShownUid = new java.util.concurrent.atomic.AtomicInteger(-1);
+    private static final java.util.concurrent.atomic.AtomicInteger mediaHealthMisses = new java.util.concurrent.atomic.AtomicInteger(0);
+    private static final java.util.concurrent.atomic.AtomicBoolean mediaHealthFiring = new java.util.concurrent.atomic.AtomicBoolean(false);
+    private static final java.util.concurrent.atomic.AtomicReference<Thread> mediaHealthOwnerStuck = new java.util.concurrent.atomic.AtomicReference<>();
+    private static volatile java.util.concurrent.atomic.AtomicReference<Thread> mediaHealthSessionStuck = new java.util.concurrent.atomic.AtomicReference<>();
     // NWP-20261011-05: a MANDATORY update has two more channels (OtaUpdate.CH_REQUIRED, HIGH, and CH_REQUIRED_QUIET,
     // LOW): a channel's importance is fixed once created, and Notification.Builder.setSilent is hidden API.
     // The watcher ticks fast so the media bar tracks a live fetch; the backup/storage/offline checks (unchanged
@@ -11413,6 +11468,7 @@ public class ChooserActivity extends Activity {
                     // post-once latch has nothing to re-post against.
                     if (updShownForUid >= 0) { cancelUpdateNotice(app, updShownForUid); updShownForUid = -1; }
                     if (planShownUid.get() >= 0) cancelPlanNotice(app, planShownUid.get()); planShownUid.set(-1); planShownStage.set(PlanExpiry.NONE); planSchedUid.set(-1); // NWP-20261118-08
+                    if (mediaHealthShownUid.get() >= 0) cancelMediaHealthNotice(app, mediaHealthShownUid.get()); mediaHealthShownUid.set(-1); mediaHealthSchedUid.set(-1); mediaHealthMisses.set(0); mediaHealthFiring.set(false); // NWP-20261202-26
                     backNow.reset();
                     offTicks = 0; // NWP-20260822-24: no session -> the debounce starts over with the next one
                     // #129 P4b: no live session -> disarm Tier-2 prefetch so a stale arm flag can't make the NEXT
@@ -11440,14 +11496,16 @@ public class ChooserActivity extends Activity {
                     repairSmsRoleLater(uid, "watcher");
                 }
                 // Media-loading progress (#90): fast cadence (every tick) so the bar tracks a live on-access
-                // fetch. NWP-20261117-15: the reply is MULTI-LINE. mediad's writeProg writes up to three lines --
+                // fetch. NWP-20261117-15: the reply is MULTI-LINE. mediad's writeProg writes up to four lines --
                 // "LOADING <done> <total> <nfiles> <name>" while a fetch runs, "DAMAGED <nfiles> <name>" once a chunk
-                // is proven corrupt (#110), "INCOMPLETE <napps> <app>" after a short #media restore -- and the
-                // daemon relays the file whole, or IDLE. So read every line and let MediaStatus.route give each
-                // kind its own line: postMediaNotice and postDamagedNotice take the name as the tail field.
+                // is proven corrupt (#110), "INCOMPLETE <napps> <app>" after a short #media restore, and
+                // "RESTORING <done B> <total B> <files left>" while the after-gate #media restore has files left
+                // (NWP-20261201-14) -- and the daemon relays the file whole, or IDLE. So read every line and let
+                // MediaStatus.route give each kind its own line: postMediaNotice and postDamagedNotice take the name
+                // as the tail field.
                 java.util.List<String> msl = DaemonSocket.roundTripLines("GET-MEDIA-STATUS\n", 5000);
                 String[] mr = MediaStatus.route(msl);
-                String loadLine = mr[0], dmgLine = mr[1], incLine = mr[2];
+                String loadLine = mr[0], dmgLine = mr[1], incLine = mr[2], restLine = mr[3];
                 // #129 P6: per-app Tier-2 prefetch progress -- drives the launcher icon ring (below) AND, since
                 // DIA-20260709, the media notice, so a background PREFETCH that draws rings also posts the "some
                 // apps may take longer" heads-up (before, only an on-access LOADING did -> ring with no notice).
@@ -11474,8 +11532,14 @@ public class ChooserActivity extends Activity {
                     prefetchActive = true;
                     break;
                 }
+                // NWP-20261202-28 (S6a): an on-access LOADING still wins (the user waits on it); else the after-gate
+                // #media restore shows "Restoring photos and files" with a byte bar. mediad drops the RESTORING line
+                // when the set is empty, so the notice clears below when nothing else is active.
                 if (loadLine != null) {              // on-access (T3) fetch -> byte-progress notice
                     postMediaNotice(app, uid, loadLine);
+                    mediaShownForUid = uid;
+                } else if (MediaStatus.restoring(restLine) != null) { // after-gate #media restore -> byte bar
+                    postMediaNotice(app, uid, restLine);
                     mediaShownForUid = uid;
                 } else if (prefetchActive) {          // background (T2) prefetch -> generic indeterminate notice
                     postMediaNotice(app, uid, "PREFETCH");
@@ -11653,6 +11717,22 @@ public class ChooserActivity extends Activity {
                 }
                 if (android.os.SystemClock.elapsedRealtime() >= planDueMs.get() && planBusy.compareAndSet(false, true)) {
                     startPlanCheck(app, uid);
+                }
+                // NWP-20261202-26: the media-health rule. Every CHECK_EVERY_MS (the first one CHECK_EVERY_MS after the
+                // sign-in) startMediaHealthCheck probes one MediaStore row for the session user and for user 0, on its
+                // own thread, so a hung provider never stalls this watcher. One check in flight; it posts only into the
+                // same live uid, once per firing episode, and it never repairs: the user's Fix tap does.
+                if (uid != mediaHealthSchedUid.get()) {
+                    int shown = mediaHealthShownUid.get();
+                    if (shown >= 0 && shown != uid) { cancelMediaHealthNotice(app, shown); mediaHealthShownUid.set(-1); }
+                    mediaHealthMisses.set(0);
+                    mediaHealthFiring.set(false);
+                    mediaHealthSessionStuck = new java.util.concurrent.atomic.AtomicReference<>();
+                    mediaHealthSchedUid.set(uid);
+                    mediaHealthDueMs.set(android.os.SystemClock.elapsedRealtime() + MediaHealth.CHECK_EVERY_MS);
+                }
+                if (android.os.SystemClock.elapsedRealtime() >= mediaHealthDueMs.get() && mediaHealthBusy.compareAndSet(false, true)) {
+                    startMediaHealthCheck(app, uid);
                 }
                 // NWP-20260901-06: tell the SIGNED-IN owner an OS update is waiting. Until now this existed
                 // only on the gate (the otaBanner and the Software-update screen), both device-owner surfaces
@@ -11867,6 +11947,74 @@ public class ChooserActivity extends Activity {
                 planBusy.set(false);
             }
         }, "nowhere-plan-check").start();
+    }
+
+    /** NWP-20261202-26: one media-health check for live uid <pu>, on its own "nowhere-media-health" thread. It probes
+     *  the session user's MediaStore, then user 0's, each bounded by MediaHealth.PROBE_LIMIT_MS; MediaHealth decides.
+     *  FIRE posts the notice into <pu>'s shade once per firing episode; CANCEL removes it. It sends no daemon verb:
+     *  the Fix is the user's tap (MediaFixReceiver). The caller holds mediaHealthBusy; the finally releases it and
+     *  sets the next check's due time. Logs one line per verdict change, outcomes and a count only. */
+    private static void startMediaHealthCheck(final Context app, final int pu) {
+        final java.util.concurrent.atomic.AtomicReference<Thread> sessionRef = mediaHealthSessionStuck;
+        new Thread(() -> {
+            try {
+                final Context uc = app.createContextAsUser(android.os.UserHandle.of(pu), 0);
+                final int session = MediaHealth.probe(mediaStoreQuery(uc.getContentResolver()),
+                        MediaHealth.PROBE_LIMIT_MS, sessionRef);
+                final int owner = MediaHealth.probe(mediaStoreQuery(app.getContentResolver()),
+                        MediaHealth.PROBE_LIMIT_MS, mediaHealthOwnerStuck);
+                if (mediaHealthSchedUid.get() != pu || !sessionLive
+                        || android.app.ActivityManager.getCurrentUser() != pu) return;
+                final int misses = MediaHealth.nextMisses(mediaHealthMisses.get(), session, owner);
+                mediaHealthMisses.set(misses);
+                final int offer = MediaHealth.offer(misses, session);
+                if (offer == MediaHealth.FIRE) {
+                    if (mediaHealthShownUid.get() != pu) {
+                        MediaFixReceiver.post(uc, true);
+                        mediaHealthShownUid.set(pu);
+                    }
+                    if (mediaHealthFiring.compareAndSet(false, true))
+                        android.util.Log.i("NowhereChooser", MediaHealth.logLine(true, session, owner, misses));
+                } else if (offer == MediaHealth.CANCEL) {
+                    if (mediaHealthShownUid.get() == pu) {
+                        cancelMediaHealthNotice(app, pu);
+                        mediaHealthShownUid.set(-1);
+                    }
+                    if (mediaHealthFiring.compareAndSet(true, false))
+                        android.util.Log.i("NowhereChooser", MediaHealth.logLine(false, session, owner, misses));
+                }
+            } catch (Throwable mediaErr) {
+                android.util.Log.w("NowhereChooser", "media health check", mediaErr);
+            } finally {
+                if (mediaHealthSchedUid.get() == pu) mediaHealthDueMs.set(android.os.SystemClock.elapsedRealtime()
+                        + MediaHealth.CHECK_EVERY_MS);
+                mediaHealthBusy.set(false);
+            }
+        }, "nowhere-media-health").start();
+    }
+
+    /** NWP-20261202-26: the media-health probe's query -- one _id row of the images collection, the cursor closed.
+     *  Shared with ProfileActivity.reportStatus. Any exception is an answer (MediaHealth.probe). */
+    static java.util.concurrent.Callable<Object> mediaStoreQuery(final android.content.ContentResolver cr) {
+        return () -> {
+            android.os.Bundle args = new android.os.Bundle();
+            args.putInt(android.content.ContentResolver.QUERY_ARG_LIMIT, 1);
+            try (android.database.Cursor c = cr.query(android.provider.MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                    new String[]{"_id"}, args, null)) {
+                return null;
+            }
+        };
+    }
+
+    /** NWP-20261202-26: clear the media-health notice from roamed user <uid>'s shade. */
+    private static void cancelMediaHealthNotice(Context app, int uid) {
+        try {
+            Context uc = app.createContextAsUser(android.os.UserHandle.of(uid), 0);
+            android.app.NotificationManager nm = uc.getSystemService(android.app.NotificationManager.class);
+            if (nm != null) nm.cancel(NOTIF_MEDIA_HEALTH_ID);
+        } catch (Throwable t) {
+            android.util.Log.w("NowhereChooser", "cancelMediaHealthNotice", t);
+        }
     }
 
     /** NWP-20261118-08: the plan-expiry notice (PlanExpiry's title and text) in roamed user <uid>'s shade. Not ongoing:
@@ -12355,9 +12503,16 @@ public class ChooserActivity extends Activity {
 
     /** Post/update the ongoing "Loading your media" progress notification in roamed user <uid>'s shade (#90).
      *  status is the daemon's "LOADING <done> <total> <nfiles> <name>" line (name last so it may contain
-     *  spaces). Determinate bar when the total is known; indeterminate otherwise. */
+     *  spaces). Determinate bar when the total is known; indeterminate otherwise. NWP-20261202-28: or mediad's
+     *  "RESTORING <done B> <total B> <files left>" line -> MediaStatus.RESTORING_TITLE with a byte bar, no advisory
+     *  and no file name; a RESTORING line MediaStatus.restoring refuses posts nothing. */
     private static void postMediaNotice(Context app, int uid, String status) {
         try {
+            long[] rest = null;
+            if (status.startsWith("RESTORING")) {
+                rest = MediaStatus.restoring(status);
+                if (rest == null) return; // an unparseable RESTORING line posts nothing
+            }
             boolean prefetch = status.startsWith("PREFETCH"); // #90/#129: a T2 background prefetch (not an on-access LOADING) -> generic title, no byte count
             String[] f = status.split(" ", 5); // LOADING, done, total, nfiles, name...
             long done = 0, total = 0;
@@ -12376,9 +12531,15 @@ public class ChooserActivity extends Activity {
                     NOTIF_MEDIA_CHANNEL, "Media", android.app.NotificationManager.IMPORTANCE_LOW);
             ch.setDescription("Shows when your photos or maps are loading from your store");
             nm.createNotificationChannel(ch);
-            String title = prefetch ? "Downloading offline media"
+            if (rest != null) { // the RESTORING numbers win over the LOADING parse above
+                done = rest[0];
+                total = rest[1];
+            }
+            String title = rest != null ? MediaStatus.RESTORING_TITLE
+                    : prefetch ? "Downloading offline media"
                     : (fname.isEmpty() ? "Loading your media" : "Loading " + prettyMediaName(fname));
-            String body = prefetch ? "Getting your maps & files ready to use offline"
+            String body = rest != null ? humanBytes(done) + " / " + humanBytes(total)
+                    : prefetch ? "Getting your maps & files ready to use offline"
                     : ((total > 0 ? humanBytes(done) + " / " + humanBytes(total) : humanBytes(done))
                        + (nfiles > 1 ? "  (+" + (nfiles - 1) + " more)" : ""));
             // #129: heads-up that a media fetch can slow or block the apps that read it -- an on-demand (T3) open
@@ -12390,10 +12551,13 @@ public class ChooserActivity extends Activity {
                     .setSmallIcon(R.drawable.ic_nowhere_notif) // #i: our mono spore-glyph (notification small icons are tinted single-color)
                     .setContentTitle(title)
                     .setContentText(body)
-                    .setStyle(new android.app.Notification.BigTextStyle().bigText(body + "\n\n" + advisory))
                     .setOngoing(true)
                     .setShowWhen(false);
-            if (!prefetch && total > 0 && done >= 0 && done <= total) {
+            if (rest == null) b.setStyle(new android.app.Notification.BigTextStyle().bigText(body + "\n\n" + advisory));
+            if (rest != null) {
+                // A parsed RESTORING line is always a known size, a total of 0 included: a determinate bar.
+                b.setProgress(1000, MediaStatus.restoringPermille(done, total), false);
+            } else if (!prefetch && total > 0 && done >= 0 && done <= total) {
                 // Scale to 0-1000 so multi-GB byte counts can't overflow the int progress fields.
                 b.setProgress(1000, (int) (done * 1000 / total), false);
             } else {

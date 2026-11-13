@@ -8,7 +8,7 @@
 # through the EXISTING agent verbs (ota-check to read a ring, ota-mark to write one) via the
 # NOWHERE_OTA_VERSION_REF override, so it needs no new device/agent build.
 #
-# Usage: e4-ota-promote.sh <store-conf> --device <dev> [agent_host] [--from <ring>] [--to <ring>] [--yes] [--force]
+# Usage: e4-ota-promote.sh <store-conf> --device <dev> [agent_host] [--from <ring>] [--to <ring>] [--yes] [--force] [--without-canary]
 #   <store-conf>   the S3_* creds file (R2; the same store the device + e4-ota-publish use)
 #   [agent_host]   native-linux agent (default /tmp/agent_host; the same binary e4-ota-publish uses)
 #   --from <ring>  source ring to promote FROM   (default beta   -> ota/<dev>/version-beta)
@@ -17,6 +17,9 @@
 #   --yes          skip the interactive confirmation (for CI/automation)
 #   --force        write even when target >= source (re-point / roll the general ring BACK to an older
 #                  staged build); normally refused as a no-op/downgrade
+#   --without-canary  NWP-20261202-12: promote a fleet device's version with no canary pass for it. Without it a
+#                  device that is not the canary (husky) is refused until editions/endospore/canary-pass/<version>
+#                  records the canary's passed smoke test (canary-guard.sh). Chester's call only; the guard logs it.
 #
 # Ring -> marker ref: "stable" is the bare ota/<dev>/version (what every device reads by default); any other
 # ring is ota/<dev>/version-<ring> (only devices opted into that ring read it). Promoting advances ONLY the
@@ -34,6 +37,7 @@ DEV=""
 TO=stable
 ASSUME_YES=0
 FORCE=0
+WITHOUT_CANARY=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --from)     FROM="${2:?--from needs a ring}"; shift ;;
@@ -44,16 +48,17 @@ while [ $# -gt 0 ]; do
     --device=*) DEV="${1#--device=}" ;;
     --yes|-y)   ASSUME_YES=1 ;;
     --force)    FORCE=1 ;;
+    --without-canary) WITHOUT_CANARY=1 ;;
     -*)         echo "unknown flag: $1"; exit 2 ;;
     *)          if [ -z "$CONF" ]; then CONF="$1"; else AGENT="$1"; fi ;;
   esac
   shift
 done
-: "${CONF:?usage: e4-ota-promote.sh <store-conf> --device <dev> [agent_host] [--from beta] [--to stable] [--yes] [--force]}"
+: "${CONF:?usage: e4-ota-promote.sh <store-conf> --device <dev> [agent_host] [--from beta] [--to stable] [--yes] [--force] [--without-canary]}"
 case "$DEV" in
   '' ) echo "refusing: --device is REQUIRED (e.g. --device frankel). Promoting the wrong device advances that"
        echo "          fleet's '$TO' ring to whatever sits on its '$FROM' ring."
-       echo "          usage: e4-ota-promote.sh <store-conf> --device <dev> [agent_host] [--from beta] [--to stable] [--yes] [--force]"
+       echo "          usage: e4-ota-promote.sh <store-conf> --device <dev> [agent_host] [--from beta] [--to stable] [--yes] [--force] [--without-canary]"
        exit 2 ;;
   *[!a-z0-9]* ) echo "bad --device '$DEV' -- use lowercase alphanumerics (e.g. frankel)"; exit 2 ;;
 esac
@@ -146,6 +151,10 @@ if SRC="$(read_ring "$FROM")"; then :; else
   esac
 fi
 [ -n "$SRC" ] || { echo "refusing: the '$FROM' ring marker is empty/unparseable"; exit 2; }
+# NWP-20261202-12 (docs/product-decisions.md, 2026-11-04 h57 #2): a fleet device gets $SRC only after husky's smoke
+# passed for it (editions/endospore/canary-pass/<version>, read from this checkout), or with --without-canary, logged.
+# Before the target read, the prompt and the ota-mark.
+sh "$(dirname "$0")/canary-guard.sh" "$DEV" "$SRC" ${WITHOUT_CANARY:+--without-canary} || exit 2
 # Absent target = first promote onto this ring. An UNREADABLE target is not that: it cannot be compared, so
 # it refuses, --force included (the read-back verify below could not be trusted either).
 if DST="$(read_ring "$TO")"; then :; else

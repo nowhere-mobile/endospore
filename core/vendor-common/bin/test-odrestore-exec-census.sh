@@ -162,6 +162,7 @@ suite() {  # suite <roamd.sh> <sh> [quiet] -> 0 all ok, 1 a case failed, 2 the h
                wait_acct_authenticator acct_reload sync_apply keystore_unit; do
         printf '%s() { echo "%s $*" >> "$C"; }\n' "$t" "$t"
       done
+      printf '%s\n' 'vpn_preconsent_off() { :; }'
       printf '%s\n' 'od_watched() { shift; "$@" 2>&1; }'
       printf '%s\n' 'od_fetch_data() { return 0; }; od_listed() { return 1; }; od_block_app() { return 0; }; od_unblock_app() { :; }; od_pending_clear() { :; }; od_block_installed() { :; }; od_shipped_prep() { return 0; }; od_park_var() { :; }; od_unf_path() { echo "$STATE/odfetch.$1/unfetched.$2"; }   # NWP-20261130-03'
       printf '%s\n' 'ks_in_dir() { echo "ks_in_dir" >> "$C"; printf "%s\n" "$KS_IN/$uid"; }'

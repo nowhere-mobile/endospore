@@ -39,7 +39,7 @@ want(){ case " $ONLY " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
 PRINT_SHIM='command -v print >/dev/null 2>&1 || print() { _pn=1; while [ $# -gt 0 ]; do case "$1" in -rn|-nr) _pn=0; shift ;; -r) shift ;; --) shift; break ;; *) break ;; esac; done; if [ "$_pn" = 1 ]; then printf "%s\n" "$*"; else printf "%s" "$*"; fi; }'
 
 FUNCS=""
-for fn in qn pw pkgname_ok live_code_dir live_code_ver stage_apk_copy stage_live_apks stage_keep_mtimes appcode_seal; do
+for fn in qn pw pkgname_ok live_code_dir live_code_ver stage_apk_copy stage_live_apks stage_keep_mtimes appcode_inputs_fp appcode_seal; do
   body=$(awk -v h="$fn() {" '$0 == h {f=1} f{print} f&&/^\}$/{exit}' "$ROAMD")
   case "$body" in
     "$fn() {"*'}') FUNCS="$FUNCS$body

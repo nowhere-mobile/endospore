@@ -276,7 +276,11 @@ func TestSealDeltaSEHandlersPassTheSessionSecret(t *testing.T) {
 	if !strings.Contains(body("handleSealDelta"), "storedAppsCached(name, pass, se)") {
 		t.Error("handleSealDelta does not pass the session's secret to storedAppsCached")
 	}
-	if !strings.Contains(body("handleSealDeltaWalk"), `scopeManifest(sealDeltaBase, name+suffix, pass, se)`) {
+	// NWP-20261202-10: the refresh is lifted into refreshSealDeltaIdx; the handler hands it the secret.
+	if !strings.Contains(body("handleSealDeltaWalk"), `refreshSealDeltaIdx(dest, name, pass, se,`) {
+		t.Error("handleSealDeltaWalk does not pass the session's secret to its index refresh")
+	}
+	if !strings.Contains(body("refreshSealDeltaIdx"), `scopeManifest(sealDeltaBase, name+suffix, pass, se)`) {
 		t.Error("handleSealDeltaWalk's refresh does not pass the session's secret to scopeManifest")
 	}
 }

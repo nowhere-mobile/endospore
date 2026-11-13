@@ -66,7 +66,7 @@ shellsuite() {
       printf "uid=%s; LOG='%s'; STATE='%s'; RES='%s'; KS_IN='%s'; MOVED='%s'\n" "$2" "$d/log" "$d/state" "$d/res" \
         "$d/data/nowhere/keystore-in" "$d/moved"
       printf '%s\n' "ACCT_AUTH_PKG=com.google.android.gms; PLAY_STORE_PKG=com.android.vending"
-      printf '%s\n' 'home_pin() { :; }; nav_apply() { :; }; aod_apply() { :; }; a11y_apply() { :; }; autofill_apply() { :; }'
+      printf '%s\n' 'home_pin() { :; }; nav_apply() { :; }; aod_apply() { :; }; a11y_apply() { :; }; autofill_apply() { :; }; shortcut_apply() { :; }'
       printf '%s\n' 'acct_reload() { :; }; sync_apply() { :; }; am() { :; }; pm() { :; }'
       printf 'grant_perms_for() { %s; }\n' "$3"
       printf '%s\n' 'keystore_register_all() { mkdir -p "$MOVED"; mv "$KS_IN/10"/*.keys "$MOVED/" 2>/dev/null; return 0; }'

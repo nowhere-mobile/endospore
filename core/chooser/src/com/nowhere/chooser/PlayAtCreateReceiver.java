@@ -16,6 +16,9 @@ import android.content.Intent;
  *
  * It marks no package: none is installed in a just-created user, and AppInstallReceiver keeps each Play package
  * On-demand when it lands while the flag is on (PlayChoice.keepModeOnInstall).
+ *
+ * NWP-20261202-22 (docs/product-decisions.md, 2026-11-10, item 1): after play.wanted it writes PlayFinishPrompt's
+ * pending marker, so the session's first switch-landing shows the one-time "Finish setting up Google Play" card.
  */
 public final class PlayAtCreateReceiver extends BroadcastReceiver {
 
@@ -23,6 +26,7 @@ public final class PlayAtCreateReceiver extends BroadcastReceiver {
         String v = intent.getStringExtra(PlayAtCreate.EXTRA);
         if (!PlayAtCreate.accepts(v)) return;
         ProfileActivity.cfgPutStatic(ctx, PlayChoice.CFG_KEY, v);
+        ProfileActivity.cfgPutStatic(ctx, PlayFinishPrompt.CFG_KEY, PlayFinishPrompt.PENDING);
         boolean landed = PlayChoice.parse(ProfileActivity.cfgStatic(ctx, PlayChoice.CFG_KEY)) == PlayChoice.State.ON;
         android.util.Log.i("NowhereChooser", "play-at-create user " + android.os.UserHandle.myUserId()
                 + ": play.wanted landed=" + landed + " (NWP-20261124-09)");

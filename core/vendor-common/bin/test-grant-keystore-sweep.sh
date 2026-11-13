@@ -93,7 +93,7 @@ suite() {
         "$d/data/nowhere/keystore-in" "$d/data/misc/keystore/nowhere-import" "$d/data/nowhere/keystore-map" \
         "$d/data/misc/keystore/nowhere-export"
       printf '%s\n' "ACCT_AUTH_PKG=com.google.android.gms; PLAY_STORE_PKG=com.android.vending"
-      printf '%s\n' 'home_pin() { :; }; nav_apply() { :; }; aod_apply() { :; }; a11y_apply() { :; }; autofill_apply() { :; }'
+      printf '%s\n' 'home_pin() { :; }; nav_apply() { :; }; aod_apply() { :; }; a11y_apply() { :; }; autofill_apply() { :; }; shortcut_apply() { :; }'
       printf '%s\n' 'grant_perms_for() { :; }; acct_reload() { :; }; sync_apply() { :; }; keystore_unit() { :; }; am() { :; }'
       printf '%s\n' 'chmod() { echo "$*" >> "$CMLOG"; }; chown() { echo "$*" >> "$COLOG"; }; restorecon() { echo "$*" >> "$RCLOG"; }'
       printf '%s\n' 'mv() { echo "$*" >> "$MVLOG"; command mv "$@"; }; basename() { echo "$*" >> "$BNLOG"; command basename "$@"; }'

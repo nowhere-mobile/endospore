@@ -3,8 +3,10 @@
 # beta profile has no way to send a diagnostic report on a schedule ...). While $STATE/day-summary-on.<uid> exists
 # (DIAG-SUMMARY on, only when GATEWAY_URL's host is the beta gateway), day_summary.go keeps a numbers-only summary in
 # $STATE/day-summary.<uid> (a signin line, a line per periodic or manual save from triggerRoamWorkerKind's deferred
-# writer, a line per DIAG-EVENT sweep; 24 h, 16 KiB), and an in-session report carries it whole as day_summary. Each
-# save line ends kib=<upload KiB> from that run's seal split, "-" when the run left none (NWP-20261128-29).
+# writer, a line per DIAG-EVENT sweep; 24 h; non-save lines 4 KiB; 16 KiB in total), and an in-session report carries it whole as day_summary. Each
+# save line ends kib=<upload KiB> from that run's seal split, "-" when the run left none (NWP-20261128-29). Every
+# REPORT-ISSUE sent at session scope adds a report line (the caller's report_kind, the reply's class, no ticket) after
+# its reply, so the next report shows it (NWP-20261202-11).
 #
 # Runs day_summary_test.go. --mutate breaks each guard in turn on a COPY of the package; each mutant must be
 # CONVICTED by a real `--- FAIL`. One that fails to apply or compile is a failure.
@@ -81,4 +83,24 @@ mut "M-kib2 the save kib reads an older run's split" day_summary.go \
   'if err != nil \|\| st\.ModTime\(\)\.Before\(t0\) \{' 'if err != nil || st.ModTime().IsZero() {'
 mut "M-kib3 the save kib counts a ?KiB entry as 0" push_stat.go \
   'if m == nil \|\| m\[3\] == "\?" \{\n\t\t\treturn 0, false\n\t\t\}' 'if m == nil {\n\t\t\treturn 0, false\n\t\t}\n\t\tif m[3] == "?" {\n\t\t\tcontinue\n\t\t}'
-[ "$fails" -eq 0 ] && echo "== all 16 mutations convicted" || { echo "== $fails mutation(s) not convicted"; exit 1; }
+mut "M-keep1 the size pass drops the oldest line of any kind" day_summary.go \
+  'i := daySummaryOldest\(keep, true\)' 'i := 0'
+mut "M-keep2 the kept-class budget pass disabled" day_summary.go \
+  'for kept > daySummaryKeptMaxBytes \{' 'for false && kept > daySummaryKeptMaxBytes {'
+mut "M-keep3 the kept-class pass drops the newest kept line" day_summary.go \
+  'i := daySummaryOldest\(keep, false\)' 'i := daySummaryOldest(keep, false)\n\t\tfor j := range keep {\n\t\t\tif !daySummaryIsSave(keep[j]) {\n\t\t\t\ti = j\n\t\t\t}\n\t\t}'
+mut "M-keep4 daySummaryIsSave always true" day_summary.go \
+  'func daySummaryIsSave\(l string\) bool \{ return daySummarySaveRe\.MatchString\(l\) \}' 'func daySummaryIsSave(l string) bool { return true }'
+mut "m14 the report shape dropped from the reader" day_summary.go \
+  'daySummarySweepRe, daySummaryReportRe\}' 'daySummarySweepRe}'
+mut "m15 the report kind always scheduled" day_summary.go \
+  '(func daySummaryReportKind\(v string\) string \{\n)' '\1\treturn "scheduled"\n'
+mut "m16 the send-path report record removed" report_issue.go \
+  '\n\tdaySummaryRecordReport\(uid, deviceScope, kind, daySummaryReportRC\(reply\)\)[^\n]*' ''
+mut "m17 the preview records a report line" report_issue.go \
+  '(\t\tfmt\.Fprint\(conn, "\\n"\)\n)(\t\treturn\n)' '\1\t\tdaySummaryRecordReport(uid, deviceScope, kind, "ok")\n\2'
+mut "m18 the report writer ignores device scope" day_summary.go \
+  '\tif deviceScope \{\n\t\treturn\n\t\}\n(\tdaySummaryAppend\(uid, fmt\.Sprintf\("v=1 t=%d ev=report)' '\1'
+mut "m19 the report rc keeps the ticket" day_summary.go \
+  '(case reply == "OK" \|\| strings\.HasPrefix\(reply, "OK "\):\n\t\treturn "ok")' '\1 + strings.TrimPrefix(reply, "OK")'
+[ "$fails" -eq 0 ] && echo "== all 26 mutations convicted" || { echo "== $fails mutation(s) not convicted"; exit 1; }

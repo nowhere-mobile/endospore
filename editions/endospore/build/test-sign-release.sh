@@ -22,7 +22,7 @@ ROOT="$(cd "$HERE/../../.." && pwd)"
 SIGN="$HERE/sign-release.sh"; GUARD="$HERE/sitting-guard.sh"
 for f in "$SIGN" "$GUARD"; do [ -s "$f" ] || { echo "FAIL: $f does not exist or is empty" >&2; exit 1; }; done
 
-PASS=0; FAIL=0
+PASS=0; FAIL=0; RC=0; PFRC=0
 ok(){ PASS=$((PASS+1)); printf '  ok    %s\n' "$1"; }
 no(){ FAIL=$((FAIL+1)); printf '  FAIL  %s\n' "$1"; }
 
@@ -421,6 +421,153 @@ case_H1() {      # TERM to the wrapper while generate-release holds: child gone,
   chk test "$(grep -c '^gen frankel' "$X/log")" = 0
 }
 
+# ---- --preflight-only (NWP-20261202-14): the PREFLIGHT line grammar the Release Desk reads ----------------------------
+PFIDS='commit|ota-conf|image|build-number|build-type|os-ref|source-commit|patch-markers|ring|keys|signer-key|support|ota-stamp|tmpdir|stale-keys|upstream-gate|session'
+PFDEV='image build-number build-type os-ref source-commit patch-markers ring keys signer-key support ota-stamp'
+PFONCE='commit ota-conf tmpdir stale-keys upstream-gate session'
+TAB=$'\t'
+pf_grammar() {   # <file>: every line a result line, OK text empty, FAIL/WARN text not, and only the last a verdict
+  python3 -I - "$1" "$PFIDS" <<'PY2'
+import re, sys
+lines = open(sys.argv[1]).read().split("\n")
+if not lines or lines[-1] != "":
+    sys.exit(1)
+lines = lines[:-1]
+row = re.compile(r"PREFLIGHT\t(OK|FAIL|WARN)\t(-|[a-z0-9]+)\t(%s)\t([^\t]*)" % sys.argv[2])
+if not lines or not re.fullmatch(r"PREFLIGHT\t(PASS|REFUSED\t[1-9][0-9]*)", lines[-1]):
+    sys.exit(1)
+for l in lines[:-1]:
+    m = row.fullmatch(l)
+    if not m or (m.group(1) == "OK") != (m.group(4) == ""):
+        sys.exit(1)
+PY2
+}
+pf_count() {     # <file> <status|*> <dev|-> <check>: how many such PREFLIGHT lines
+  awk -F'\t' -v s="$2" -v d="$3" -v c="$4" '$1=="PREFLIGHT" && (s=="*" || $2==s) && $3==d && $4==c' "$1" | wc -l | tr -d ' '
+}
+pf_has() { [ "$(pf_count "$@")" -ge 1 ]; }
+pf_text() { awk -F'\t' -v s="$2" -v d="$3" -v c="$4" '$1=="PREFLIGHT" && $2==s && $3==d && $4==c {print $5; exit}' "$1"; }
+pf_last() { tail -n 1 "$1"; }
+pf_allok() {     # <file> <dev>...: one OK line for every per-device id of each device
+  local f="$1" d c; shift
+  for d in "$@"; do for c in $PFDEV; do [ "$(pf_count "$f" OK "$d" "$c")" = 1 ] || return 1; done; done
+}
+nosign() { ! grep -qE '^(ossl|fin|gen|mwp) ' "$1/log" && shm_empty "$1" && [ ! -e "$1/tree/releases" ]; }
+case_PF1() {     # all pass: one OK line per check, PASS, exit 0, nothing but PREFLIGHT lines on stdout, nothing signed
+  local X c n
+  X=$(world "$1" "$2" husky frankel) || { WHY="world"; return; }; CX="$X"
+  run "$X" "$X/pw" --preflight-only "$BN" "$(head7 "$X")" husky frankel
+  chk test "$RC" = 0
+  chk pf_grammar "$X/out"
+  for c in $PFONCE; do chk test "$(pf_count "$X/out" OK - "$c")" = 1; done
+  chk pf_allok "$X/out" husky frankel
+  n=$(wc -l < "$X/out"); chk test "$n" = 29
+  chk test "$(pf_last "$X/out")" = "PREFLIGHT${TAB}PASS"
+  chk lacks "$X/err" "$PROMPT"
+  chk nosign "$X"
+  chk lacks "$X/out" "preflight passed"
+  chk lacks "$X/out" "verified commit"
+  chk has "$X/err" "sign-release: preflight passed for husky frankel"
+  chk has "$X/err" "verified commit"
+}
+case_PF2() {     # one device bakes a wrong build number: exactly one FAIL line, the other device all OK, REFUSED 1
+  local X
+  X=$(world "$1" "$2" husky frankel) || { WHY="world"; return; }; CX="$X"
+  mkzip "$X" husky bn=2026112202
+  run "$X" "$X/pw" --preflight-only "$BN" "$(head7 "$X")" husky frankel
+  chk test "$RC" = 1
+  chk pf_grammar "$X/out"
+  chk test "$(pf_count "$X/out" FAIL husky build-number)" = 1
+  chk test "$(grep -c "^PREFLIGHT${TAB}FAIL${TAB}" "$X/out")" = 1
+  chk test "$(pf_text "$X/out" FAIL husky build-number)" = "husky: image baked build number '2026112202', not $BN"
+  chk pf_allok "$X/out" frankel
+  chk test "$(pf_last "$X/out")" = "PREFLIGHT${TAB}REFUSED${TAB}1"
+  chk noprompt "$X"
+  chk nosign "$X"
+}
+case_PF3() {     # a wrong verified commit: FAIL - commit and the run goes on; normal mode still exits with the guard's code
+  local X
+  X=$(world "$1" "$2" husky frankel) || { WHY="world"; return; }; CX="$X"
+  run "$X" "$X/pw" --preflight-only "$BN" deadbee husky frankel
+  PFRC=$RC; cp "$X/out" "$X/pf.out"; cp "$X/log" "$X/pf.log"
+  chk test "$PFRC" = 1
+  chk pf_grammar "$X/pf.out"
+  chk pf_has "$X/pf.out" FAIL - commit
+  chk test "$(pf_count "$X/pf.out" OK - commit)" = 0
+  case "$(pf_text "$X/pf.out" FAIL - commit)" in *"unknown to"*) ;; *) chk false commit-text ;; esac
+  chk pf_has "$X/pf.out" FAIL husky source-commit
+  chk pf_has "$X/pf.out" FAIL frankel source-commit
+  chk pf_has "$X/pf.out" OK husky build-number
+  chk pf_has "$X/pf.out" OK frankel patch-markers
+  chk noprompt "$X"
+  run "$X" "$X/pw" "$BN" deadbee husky frankel
+  chk test "$RC" = 2
+  chk lacks "$X/out" PREFLIGHT
+  chk test "$(grep -c '^cpm ' "$X/log")" = 0
+  chk noprompt "$X"
+}
+case_PF4() {     # another process of the signing user: FAIL - session, the guard's names on stderr only
+  local X
+  X=$(world "$1" "$2" husky frankel) || { WHY="world"; return; }; CX="$X"
+  printf '900003 1 claude\n' > "$X/plant"
+  run "$X" "$X/pw" --preflight-only "$BN" "$(head7 "$X")" husky frankel
+  chk test "$RC" = 1
+  chk pf_grammar "$X/out"
+  chk pf_has "$X/out" FAIL - session
+  chk has "$X/err" "pid 900003 claude"
+  chk lacks "$X/out" "pid 900003"
+  chk test "$(pf_last "$X/out")" = "PREFLIGHT${TAB}REFUSED${TAB}1"
+  chk noprompt "$X"
+}
+case_PF7() {     # the guard cannot read the process table: FAIL - session carries the guard's own words
+  local X
+  X=$(world "$1" "$2" husky frankel) || { WHY="world"; return; }; CX="$X"
+  XENV=(FX_PS_FAIL=1)
+  run "$X" "$X/pw" --preflight-only "$BN" "$(head7 "$X")" husky frankel
+  XENV=()
+  chk test "$RC" = 1
+  chk pf_grammar "$X/out"
+  chk test "$(pf_text "$X/out" FAIL - session)" = "sitting-guard: ps -u $(id -u) failed -- refusing"
+  chk has "$X/err" "sitting-guard: ps -u $(id -u) failed -- refusing"
+  chk test "$(pf_last "$X/out")" = "PREFLIGHT${TAB}REFUSED${TAB}1"
+  chk noprompt "$X"
+}
+case_PF5() {     # keys refused: FAIL keys and no signer-key line; a missing id_ed25519 alone: WARN and still PASS
+  local X
+  X=$(world "$1" "$2" husky frankel) || { WHY="world"; return; }; CX="$X"
+  rm -rf "$X/tree/keys"
+  run "$X" "$X/pw" --preflight-only "$BN" "$(head7 "$X")" husky frankel
+  chk test "$RC" = 1
+  chk pf_grammar "$X/out"
+  chk pf_has "$X/out" FAIL husky keys
+  chk test "$(pf_count "$X/out" '*' husky signer-key)" = 0
+  [ -n "$WHY" ] && return
+  X=$(world "$1" "$2" husky) || { WHY="world"; return; }; CX="$X"
+  rm -f "$X/tree/keys/husky/id_ed25519"
+  run "$X" "$X/pw" --preflight-only "$BN" "$(head7 "$X")" husky
+  chk test "$RC" = 0
+  chk pf_grammar "$X/out"
+  chk test "$(pf_count "$X/out" WARN husky signer-key)" = 1
+  chk test "$(pf_count "$X/out" OK husky signer-key)" = 0
+  case "$(pf_text "$X/out" WARN husky signer-key)" in *"id_ed25519 is MISSING"*) ;; *) chk false warn-text ;; esac
+  chk test "$(pf_last "$X/out")" = "PREFLIGHT${TAB}PASS"
+}
+case_PF6() {     # normal mode prints no PREFLIGHT line, on a pass or a refusal
+  local X
+  X=$(world "$1" "$2" husky frankel) || { WHY="world"; return; }; CX="$X"
+  run "$X" "$X/pw" "$BN" "$(head7 "$X")" husky frankel
+  chk test "$RC" = 0
+  chk lacks "$X/out" PREFLIGHT
+  chk lacks "$X/err" PREFLIGHT
+  X=$(world "$1" "$2" husky frankel) || { WHY="world"; return; }; CX="$X"
+  su_R1 "$X"
+  run "$X" "$X/pw" "$BN" "$(head7 "$X")" husky frankel
+  chk test "$RC" = 1
+  chk lacks "$X/out" PREFLIGHT
+  chk lacks "$X/err" PREFLIGHT
+  chk has "$X/err" "REFUSING: husky: image baked build number"
+}
+
 # ---- the guard alone, under one shell -------------------------------------------------------------------------------
 GDBIN=""
 # gd <S> <G> <shell> <plant-rows> <clients|-> <TMUX value|-> [awk-broken]: GRC, and $X/gout, $X/gerr, $X/pslog.
@@ -492,6 +639,13 @@ plain() {
   WHY=""; case_X1 "$SIGN" "$GUARD"; report "X1 a failing device: the other signs after its key dir is swept; exit 1"
   WHY=""; case_X2 "$SIGN" "$GUARD"; report "X2 envsetup pinning another BN fails that device before generate-release"
   WHY=""; case_H1 "$SIGN" "$GUARD"; report "H1 TERM mid-signing: child gone, key dirs swept, the TERM line"
+  WHY=""; case_PF1 "$SIGN" "$GUARD"; report "PF1 --preflight-only, all pass: one OK line per check, PASS, exit 0, no prompt, nothing signed"
+  WHY=""; case_PF2 "$SIGN" "$GUARD"; report "PF2 --preflight-only, one wrong build number: one FAIL line, REFUSED 1, exit 1"
+  WHY=""; case_PF3 "$SIGN" "$GUARD"; report "PF3 --preflight-only, a wrong commit: FAIL - commit, the run goes on; normal mode exits 2 first"
+  WHY=""; case_PF4 "$SIGN" "$GUARD"; report "PF4 --preflight-only, another process of the user: FAIL - session, its name on stderr"
+  WHY=""; case_PF5 "$SIGN" "$GUARD"; report "PF5 --preflight-only: refused keys print no signer-key; a missing id_ed25519 is WARN and PASS"
+  WHY=""; case_PF6 "$SIGN" "$GUARD"; report "PF6 normal mode prints no PREFLIGHT line"
+  WHY=""; case_PF7 "$SIGN" "$GUARD"; report "PF7 --preflight-only, an unreadable process table: FAIL - session carries the guard's own words"
   for sh in $SHELLS; do
     for c in GD1 GD2 GD3 GD4 GD5 GD6 GD6b GD7 GD8; do
       WHY=""; case_GD "$SIGN" "$GUARD" "$c" "$sh"; report "$c sitting-guard under $sh"
@@ -529,6 +683,15 @@ convict() {      # <id> <sign-src> <guard-src>: runs the signature case and sets
         elif has "$CX/err" "$PROMPT" || grep -q '^gen husky' "$CX/log"; then VERDICT=CONVICTED; else VERDICT=BROKEN; fi ;;
     M6) case_H1 "$S" "$G"; if [ -z "$WHY" ]; then VERDICT=SURVIVED; elif lacks "$CX/err" "$TERMLINE"; then VERDICT=CONVICTED; else VERDICT=BROKEN; fi ;;
     M13) case_KH1 "$S" "$G"; if [ -z "$WHY" ]; then VERDICT=SURVIVED; elif has "$CX/err" "keys/husky/*.pk8 is MISSING"; then VERDICT=CONVICTED; else VERDICT=BROKEN; fi ;;
+    M15) case_PF1 "$S" "$G"; if [ -z "$WHY" ]; then VERDICT=SURVIVED; elif has "$CX/err" "$PROMPT" || grep -q '^ossl ' "$CX/log"; then VERDICT=CONVICTED; else VERDICT=BROKEN; fi ;;
+    M16) case_PF4 "$S" "$G"; if [ -z "$WHY" ]; then VERDICT=SURVIVED; elif [ "$RC" = 0 ] && pf_has "$CX/out" OK - session; then VERDICT=CONVICTED; else VERDICT=BROKEN; fi ;;
+    M21) case_PF7 "$S" "$G"; if [ -z "$WHY" ]; then VERDICT=SURVIVED
+         elif [ "$RC" = 1 ] && [ "$(pf_text "$CX/out" FAIL - session)" = "sitting-guard.sh refused (exit 2) and printed no reason" ]; then VERDICT=CONVICTED; else VERDICT=BROKEN; fi ;;
+    M17) case_PF3 "$S" "$G"; if [ -z "$WHY" ]; then VERDICT=SURVIVED; elif [ "$PFRC" = 2 ] && ! pf_has "$CX/pf.out" FAIL - commit && ! grep -q '^cpm ' "$CX/pf.log"; then VERDICT=CONVICTED; else VERDICT=BROKEN; fi ;;
+    M18) case_PF2 "$S" "$G"; if [ -z "$WHY" ]; then VERDICT=SURVIVED
+         elif [ -n "$(pf_text "$CX/out" OK husky build-number)" ] && ! grep -q "^PREFLIGHT${TAB}FAIL${TAB}" "$CX/out"; then VERDICT=CONVICTED; else VERDICT=BROKEN; fi ;;
+    M19) case_PF2 "$S" "$G"; if [ -z "$WHY" ]; then VERDICT=SURVIVED; elif [ "$RC" = 1 ] && [ "$(pf_last "$CX/out")" = "PREFLIGHT${TAB}PASS" ]; then VERDICT=CONVICTED; else VERDICT=BROKEN; fi ;;
+    M20) case_R "$S" "$G" R1; if [ -z "$WHY" ]; then VERDICT=SURVIVED; elif [ "$RC" = 1 ] && lacks "$CX/err" "REFUSING:"; then VERDICT=CONVICTED; else VERDICT=BROKEN; fi ;;
     M14) case_R "$S" "$G" KH3; if [ -z "$WHY" ]; then VERDICT=SURVIVED; elif has "$CX/err" "$PROMPT" || grep -q '^gen husky' "$CX/log"; then VERDICT=CONVICTED; else VERDICT=BROKEN; fi ;;
     M5|M11)
         VERDICT=CONVICTED
@@ -569,16 +732,30 @@ mutants() {
   mutant M4 sign 'check_stale_key_dirs' ':'
   mutant M5 guard 'set -u' 'set -u; exit 0'
   mutant M6 sign "trap 'sweep 143 TERM' TERM" ':'
-  mutant M7 sign '[ "$IMG_BN" = "$BN" ] || refuse "$DEV: image baked build number '"'"'$IMG_BN'"'"', not $BN"' ':'
-  mutant M8 sign 'python3 "$B/check-patch-markers.py" --table "$B/patch-markers.tsv" --zip "$TFI" >&2 || refuse "$DEV: a framework patch'"'"'s artifact literal is missing"' ':'
+  mutant M7 sign '[ "$IMG_BN" = "$BN" ] || refuse "$DEV" build-number "$DEV: image baked build number '"'"'$IMG_BN'"'"', not $BN"' ':'
+  mutant M8 sign 'python3 "$B/check-patch-markers.py" --table "$B/patch-markers.tsv" --zip "$TFI" >&2 || refuse "$DEV" patch-markers "$DEV: a framework patch'"'"'s artifact literal is missing"' ':'
   mutant M9 sign 'check_upstream_gate' ':'
-  mutant M10 sign '[ "$IMG_COMMIT" = "$FULL" ] || refuse "$DEV: image was staged from '"'"'$IMG_COMMIT'"'"', not the verified commit $FULL"' ':'
+  mutant M10 sign '[ -n "$FULL" ] && [ "$IMG_COMMIT" = "$FULL" ] || refuse "$DEV" source-commit "$DEV: image was staged from '"'"'$IMG_COMMIT'"'"', not the verified commit ${FULL:-<unresolved>}"' ':'
   # inside the awk program: an EMPTY line, a valid awk no-op (a bare ':' is an awk syntax error)
   mutant M11 guard 'if (!(p in par)) par[p] = pp' ''
   mutant M12 sign 'unset PW password' ':'
   # NWP-20261105-19: the keys home
   mutant M13 sign 'if ! sh "$B/keys-home.sh" "$TREE" "$DEV" >&2; then' 'if false; then'
-  mutant M14 sign 'refuse "$DEV: no usable keys/$DEV (keys-home.sh, above)"' ':'
+  mutant M14 sign 'refuse "$DEV" keys "$DEV: no usable keys/$DEV (keys-home.sh, above)"' ':'
+  # NWP-20261202-14: --preflight-only
+  mutant M15 sign 'exit "$(( NFAIL > 0 ))"' ':'
+  mutant M16 sign 'if sh "$B/sitting-guard.sh" "$$" 2> "$T/session.err"; then rc=0; else rc=$?; fi' 'rc=0; : > "$T/session.err"'
+  mutant M17 sign 'if [ -z "$PF" ]; then   # normal mode: a commit refusal ends the run here' 'if true; then'
+  mutant M18 sign 'pf_fail() { PFF["$1 $2"]=1; NFAIL=$((NFAIL+1)); pf_line FAIL "$1" "$2" "$3"; }' 'pf_fail() { PFF["$1 $2"]=1; NFAIL=$((NFAIL+1)); pf_line OK "$1" "$2" "$3"; }'
+  mutant M19 sign "$(cat <<'EOF'
+if [ "$NFAIL" = 0 ]; then printf 'PREFLIGHT\tPASS\n' >&3; else printf 'PREFLIGHT\tREFUSED\t%d\n' "$NFAIL" >&3; fi
+EOF
+)" "printf 'PREFLIGHT\\tPASS\\n' >&3"
+  mutant M20 sign 'refuse() { echo "REFUSING: $3" >&2; REFUSED=1; pf_fail "$1" "$2" "$3"; }   # <dev|-> <check> <text>' 'refuse() { REFUSED=1; pf_fail "$1" "$2" "$3"; }'
+  mutant M21 sign "$(cat <<'EOF'
+REFUSED=1; why=$(grep -v '^pid [0-9]' "$T/session.err" | tr '\n' ' ' | sed 's/ *$//')
+EOF
+)" 'REFUSED=1; why=""'
 }
 
 echo "test-sign-release.sh (shells:$SHELLS)"

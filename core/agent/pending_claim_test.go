@@ -211,8 +211,9 @@ func TestPendingClaim_PowerOffThenAnotherPhoneDrainsIt(t *testing.T) {
 	}
 }
 
-// T2: both phones restored the code; A drains it, then B's drain gets the proving 402, adds nothing and clears its
-// entry. The gateway issued the code's tokens once.
+// T2: both phones restored the code; A drains it, then B's drain gets the proving 402 and adds nothing. With nothing
+// landed, B's first empty answer keeps the code once and records its hash (h55 #1, NWP-20261202-01); B's next run clears
+// both. The gateway issued the code's tokens once.
 func TestPendingClaim_TwoPhonesDrainItOnce(t *testing.T) {
 	const code = "pcT2AAAAAAAAAAAAAAAAAAAA"
 	p := pcSetup(t, "pc-t2-twophones", code)
@@ -229,8 +230,18 @@ func TestPendingClaim_TwoPhonesDrainItOnce(t *testing.T) {
 	if err != nil || n != 0 {
 		t.Fatalf("phone B: drainPendingClaims = (%d, %v), want (0, nil)", n, err)
 	}
-	if bw := pcLoad(t, wb); pcHolds(bw, code) || bw.balance() != 0 {
-		t.Fatalf("phone B: holds the code %v, balance %d; want neither", pcHolds(bw, code), bw.balance())
+	if bw := pcLoad(t, wb); !pcHolds(bw, code) || bw.balance() != 0 ||
+		len(bw.PendingClaimMisses) != 1 || bw.PendingClaimMisses[0] != pendingClaimSeenKey(code) {
+		t.Fatalf("phone B, first empty answer: holds the code %v, balance %d, %d miss(es); want the code kept, 0, and "+
+			"exactly the code's hash", pcHolds(bw, code), bw.balance(), len(bw.PendingClaimMisses))
+	}
+	n, err = drainPendingClaims(gw.client(), wb)
+	if err != nil || n != 0 {
+		t.Fatalf("phone B, second run: drainPendingClaims = (%d, %v), want (0, nil)", n, err)
+	}
+	if bw := pcLoad(t, wb); pcHolds(bw, code) || bw.balance() != 0 || len(bw.PendingClaimMisses) != 0 {
+		t.Fatalf("phone B, second empty answer: holds the code %v, balance %d, %d miss(es); want none of them",
+			pcHolds(bw, code), bw.balance(), len(bw.PendingClaimMisses))
 	}
 	if got := gw.issuedFor(code); got != 10 {
 		t.Fatalf("the gateway issued %d tokens for the code, want 10 (once)", got)
@@ -250,10 +261,13 @@ func TestPendingClaim_AClearedCodeIsNeverResurrected(t *testing.T) {
 	if sw := p.stored(t); !pcHolds(sw, cp) || !pcHolds(sw, cq) {
 		t.Fatal("precondition: the stored wallet does not hold both codes")
 	}
-	// Phone A clears P (its drain got the proving 402) and publishes.
+	// Phone A clears P (its drain got the proving 402 twice: the first, with nothing landed, only marks it, h55 #1)
+	// and publishes.
 	gw := newPCGateway(t, nil)
-	if n, err := drainPendingClaims(gw.client(), p.wa); err != nil || n != 0 {
-		t.Fatalf("phone A: drainPendingClaims = (%d, %v), want (0, nil)", n, err)
+	for run := 1; run <= 2; run++ {
+		if n, err := drainPendingClaims(gw.client(), p.wa); err != nil || n != 0 {
+			t.Fatalf("phone A run %d: drainPendingClaims = (%d, %v), want (0, nil)", run, n, err)
+		}
 	}
 	if pcHolds(pcLoad(t, p.wa), cp) {
 		t.Fatal("precondition: phone A did not clear P")
@@ -265,6 +279,11 @@ func TestPendingClaim_AClearedCodeIsNeverResurrected(t *testing.T) {
 	}
 	if !pcHolds(sw, cq) {
 		t.Error("phone A's publish dropped Q, which it never held")
+	}
+	for _, k := range sw.PendingClaimMisses {
+		if k == pendingClaimSeenKey(cp) {
+			t.Error("phone A's publish carries a miss for P, which it cleared")
+		}
 	}
 	raw, err := os.ReadFile(p.wa + ".seen")
 	if err != nil {
@@ -312,6 +331,8 @@ func TestPendingClaim_KeptOnFailure(t *testing.T) {
 			t.Fatal("a busy wallet cleared the pending code")
 		}
 	})
+	// The two "at the clear" cases: the code is empty, so the run's first empty answer MARKS it (h55 #1), and the mark
+	// is the save the lock refuses: the code stays and no miss is recorded.
 	t.Run("busy at the clear", func(t *testing.T) {
 		const code = "pcT4cAAAAAAAAAAAAAAAAAAA"
 		p := pcSetup(t, "pc-t4-busyclear", code)
@@ -326,8 +347,9 @@ func TestPendingClaim_KeptOnFailure(t *testing.T) {
 		if !errors.Is(err, errWalletBusy) {
 			t.Fatalf("drainPendingClaims error = %v, want errWalletBusy", err)
 		}
-		if !pcHolds(pcLoad(t, p.wa), code) {
-			t.Fatal("a busy lock at the clear still cleared the pending code")
+		if w := pcLoad(t, p.wa); !pcHolds(w, code) || len(w.PendingClaimMisses) != 0 {
+			t.Fatalf("a busy lock at the clear: code kept %v, %d miss(es); want kept and none saved", pcHolds(w, code),
+				len(w.PendingClaimMisses))
 		}
 	})
 	t.Run("unavailable lock at the clear", func(t *testing.T) {
@@ -349,8 +371,9 @@ func TestPendingClaim_KeptOnFailure(t *testing.T) {
 		if !errors.Is(err, errPendingClaimLockUnavailable) {
 			t.Fatalf("drainPendingClaims error = %v, want errPendingClaimLockUnavailable", err)
 		}
-		if !pcHolds(pcLoad(t, p.wa), code) {
-			t.Fatal("an unavailable lock at the clear still cleared the pending code (an unlocked save)")
+		if w := pcLoad(t, p.wa); !pcHolds(w, code) || len(w.PendingClaimMisses) != 0 {
+			t.Fatalf("an unavailable lock at the clear: code kept %v, %d miss(es); want kept and none saved (an "+
+				"unlocked save)", pcHolds(w, code), len(w.PendingClaimMisses))
 		}
 	})
 }

@@ -21,18 +21,44 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public class DiagReportJob extends JobService {
     static final int JOB_ID = 0x4E444752; // "NDGR"; no other JobScheduler user in the chooser
 
-    /** The periodic job, unless it is already pending (a repeated arm must not push the period back). */
-    static void schedule(Context ctx) {
+    /** The periodic job, unless it is already pending (a repeated arm must not push the period back). Returns the
+     *  record's code (NWP-20261202-08): scheduled, pending, nojs, err-result (RESULT_FAILURE, which does not throw) or
+     *  DiagReports.throwCode's. */
+    static String schedule(Context ctx) {
         try {
             JobScheduler js = ctx.getSystemService(JobScheduler.class);
-            if (js == null || js.getPendingJob(JOB_ID) != null) return;
-            js.schedule(new JobInfo.Builder(JOB_ID, new ComponentName(ctx, DiagReportJob.class))
+            if (js == null) return "nojs";
+            if (js.getPendingJob(JOB_ID) != null) return "pending";
+            int r = js.schedule(new JobInfo.Builder(JOB_ID, new ComponentName(ctx, DiagReportJob.class))
                     .setPeriodic(3600_000L)
                     .setRequiredNetworkType(JobInfo.NETWORK_TYPE_ANY)
                     .setPersisted(false)
                     .build());
+            return r == JobScheduler.RESULT_SUCCESS ? "scheduled" : "err-result";
         } catch (Throwable t) {
             android.util.Log.w("NowhereChooser", "diag reports: schedule failed (NWP-20261126-02)", t);
+            return DiagReports.throwCode(t);
+        }
+    }
+
+    /** NWP-20261202-08: 1 when the job is pending now, 0 when not, err when JobScheduler could not say. */
+    static String pending(Context ctx) {
+        try {
+            JobScheduler js = ctx.getSystemService(JobScheduler.class);
+            if (js == null) return "err";
+            return js.getPendingJob(JOB_ID) != null ? "1" : "0";
+        } catch (Throwable t) {
+            return "err";
+        }
+    }
+
+    /** NWP-20261202-08: onStartJob / onStopJob's record, only with the opt-in on, so the stop a switchOff's cancel
+     *  causes records nothing. It takes RUNS_LOCK only, never LOCK: onStopJob runs on the main thread. */
+    static void noteJob(Context ctx, String ev) {
+        try {
+            if (DiagReports.optedIn(readFile(ctx, DiagReports.OPT_FILE))) DiagReports.record(new AndroidPort(ctx), ev, "ok");
+        } catch (Throwable ignore) {
+            // a record never stops the job
         }
     }
 
@@ -86,6 +112,7 @@ public class DiagReportJob extends JobService {
             finally { jobFinished(params, false); }
         }, "diag-reports");
         t.setDaemon(true);
+        noteJob(ctx, "start");
         t.start();
         return true;
     }
@@ -93,6 +120,7 @@ public class DiagReportJob extends JobService {
     @Override public boolean onStopJob(JobParameters params) {
         AtomicBoolean s = stop;
         if (s != null) s.set(true);
+        noteJob(getApplicationContext(), "stop");
         return false; // no reschedule: the next period runs it again
     }
 
@@ -107,7 +135,8 @@ public class DiagReportJob extends JobService {
         @Override public String on() { return onRequest(); }
         @Override public String off() { return offRequest(); }
         @Override public String report(Map<String, String> extra) { return sendScheduled(ctx, extra); }
-        @Override public void schedule() { DiagReportJob.schedule(ctx); }
+        @Override public String schedule() { return DiagReportJob.schedule(ctx); }
+        @Override public String pending() { return DiagReportJob.pending(ctx); }
         @Override public void cancel() { DiagReportJob.cancel(ctx); }
         @Override public boolean[] net() { return netState(ctx); }
         @Override public long now() { return System.currentTimeMillis(); }
@@ -140,6 +169,9 @@ public class DiagReportJob extends JobService {
             o.put("preview", false);
             org.json.JSONObject st = ProfileActivity.reportStatus(ctx);
             for (Map.Entry<String, String> e : extra.entrySet()) st.put(e.getKey(), e.getValue());
+            // NWP-20261202-08: the run record up to this run's send (its send line is written after the reply).
+            for (Map.Entry<String, String> e : DiagReports.jobStatus(readFile(ctx, DiagReports.RUNS_FILE),
+                    System.currentTimeMillis(), pending(ctx)).entrySet()) st.put(e.getKey(), e.getValue());
             o.put("status", st);
             reply = DaemonSocket.roundTrip("REPORT-ISSUE\n" + o.toString() + "\n", 120000);
         } catch (Throwable t) {

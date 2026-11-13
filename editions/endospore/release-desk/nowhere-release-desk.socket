@@ -1,0 +1,12 @@
+# The Release Desk's socket (docs/release-desk.md §4.2, NWP-20261202-24). A systemd USER unit of the signing user.
+# It listens on loopback only; `tailscale serve` proxies the tailnet name to it. The first connection starts
+# nowhere-release-desk.service, which exits when idle.
+[Unit]
+Description=Nowhere Release Desk socket, loopback only, for tailscale serve (NWP-20261202-24)
+
+[Socket]
+ListenStream=127.0.0.1:8770
+Accept=no
+
+[Install]
+WantedBy=sockets.target

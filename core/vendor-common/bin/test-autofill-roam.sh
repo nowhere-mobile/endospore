@@ -366,9 +366,11 @@ INVALID!"; do
   if [ "$n" = 1 ] && [ -n "$a" ] && [ -n "$b" ] && [ "$b" -gt "$a" ]; then ok "P2 grant calls autofill_apply once, after a11y_apply"; else no "P2 grant call missing, repeated or misplaced ($n)"; fi
   n=$(printf '%s\n' "$inarm" | grep -c '^    rm -f "\$STATE/.autofillapplied.\$uid" 2>/dev/null')
   if [ "$n" = 1 ]; then ok "P3 in clears .autofillapplied for its uid"; else no "P3 in's marker clear missing or repeated ($n)"; fi
-  # P4 the odrestore arm calls the pkg mode once, on the line right after a11y_apply's (NWP-20261112-12)
+  # P4 the odrestore arm calls the pkg mode once, on the line right after a11y_apply's (NWP-20261112-12), with only a
+  # time stamp line of the odrestore steps line between them (NWP-20261202-16): those are filtered out here.
   local odarm
-  odarm=$(awk '/^  odrestore\)$/{f=1;print;next} f&&/^  [a-z-]+\)$/{exit} f{print}' "$sut")
+  odarm=$(awk '/^  odrestore\)$/{f=1;print;next} f&&/^  [a-z-]+\)$/{exit} f{print}' "$sut" \
+    | grep -v '^      _odt[0-9]*=\$(_ms 2>/dev/null)$')
   n=$(printf '%s\n' "$odarm" | grep -c '^      autofill_apply "\$uid" "\$pkg"')
   a=$(printf '%s\n' "$odarm" | grep -n '^      a11y_apply "\$uid" "\$pkg"' | head -n 1 | cut -d: -f1)
   b=$(printf '%s\n' "$odarm" | grep -n '^      autofill_apply "\$uid" "\$pkg"' | head -n 1 | cut -d: -f1)

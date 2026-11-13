@@ -220,13 +220,16 @@ public class ProfileActivity extends Activity {
 
     /** NWP-20261126-05: the landing card's "+<n> more" row starts this screen with EXTRA_OPEN = OPEN_YOUR_APPS, and it
      *  opens Your apps. Once: the extra is removed when honoured. Only after a screen is drawn (shownView), so an intent
-     *  that arrives before the first menu waits for the probe's drawChecking. */
+     *  that arrives before the first menu waits for the probe's drawChecking. NWP-20261202-22: the "Finish setting up
+     *  Google Play" card sends OPEN_PLAY: the same Your apps, then the GrapheneOS App Store (openGosStore). */
     private void openYourAppsIfAsked() {
         Intent in = getIntent();
+        String open = in == null ? null : in.getStringExtra(LandingLine.EXTRA_OPEN);
         if (in == null || shownView == null
-                || !LandingLine.OPEN_YOUR_APPS.equals(in.getStringExtra(LandingLine.EXTRA_OPEN))) return;
+                || !(LandingLine.OPEN_YOUR_APPS.equals(open) || PlayFinishPrompt.OPEN_PLAY.equals(open))) return;
         in.removeExtra(LandingLine.EXTRA_OPEN);
         showYourApps();
+        if (PlayFinishPrompt.OPEN_PLAY.equals(open)) openGosStore();
     }
 
     /** The session probe: throwaway or stored, offline, the profile's name and the OS update offer. Re-run from the
@@ -1332,6 +1335,10 @@ public class ProfileActivity extends Activity {
         into.addView(box, blp);
     }
 
+    /** NWP-20261202-26: the report's own outstanding media probe thread (MediaHealth.probe), apart from the watcher's. */
+    private static final java.util.concurrent.atomic.AtomicReference<Thread> REPORT_MEDIA_STUCK =
+            new java.util.concurrent.atomic.AtomicReference<>();
+
     /** The device status keys of a session's report (NWP-20261126-02: shared with DiagReportJob's scheduled report). */
     static org.json.JSONObject reportStatus(android.content.Context ctx) throws org.json.JSONException {
         org.json.JSONObject st = new org.json.JSONObject();
@@ -1341,7 +1348,87 @@ public class ProfileActivity extends Activity {
         try {
             st.put("chooser_version", ctx.getPackageManager().getPackageInfo(ctx.getPackageName(), 0).versionName);
         } catch (Exception ignore) {}
+        // NWP-20261202-04: the session user's live always-on VPN state and the profile's captured choice, as codes only
+        // (VpnReportKeys: never a package name). Nothing here is logged; a gate report never calls reportStatus.
+        String vpnRec = vpnReportFile(ctx, "nowhere-vpn");
+        String vpnPick = vpnReportFile(ctx, "nowhere-vpn-pick");
+        boolean liveRead = false;
+        String liveApp = null, liveLock = null, livePend = null;
+        try {
+            android.content.ContentResolver cr = ctx.getContentResolver();
+            liveApp = android.provider.Settings.Secure.getString(cr, "always_on_vpn_app");
+            liveLock = android.provider.Settings.Secure.getString(cr, "always_on_vpn_lockdown");
+            livePend = android.provider.Settings.Secure.getString(cr, "nowhere_vpn_lockdown_pending");
+            liveRead = true;
+        } catch (Throwable ignore) {}
+        for (java.util.Map.Entry<String, String> e
+                : VpnReportKeys.keys(vpnRec, vpnPick, liveRead, liveApp, liveLock, livePend).entrySet()) {
+            st.put(e.getKey(), e.getValue());
+        }
+        // NWP-20261202-26: the media-health reading. ctx is the reporting user's (in a session, the session user's), so
+        // this is that user's MediaStore: "answered ms=<n>", "timeout ms=5000" or "error". Never fails the report.
+        try {
+            long t0 = android.os.SystemClock.elapsedRealtime();
+            int outcome = MediaHealth.probe(ChooserActivity.mediaStoreQuery(ctx.getContentResolver()),
+                    MediaHealth.PROBE_LIMIT_MS, REPORT_MEDIA_STUCK);
+            st.put("media_probe", MediaHealth.reportValue(outcome, android.os.SystemClock.elapsedRealtime() - t0));
+        } catch (Exception ignore) {}
+        // NWP-20261202-29: who holds each default-app role in this user, as a class word, never a package name.
+        st.put("default_roles", readDefaultRoles(ctx));
         return st;
+    }
+
+    /** NWP-20261202-04: the first 4096 bytes of a file in the chooser's files dir for reportStatus: null when there is
+     *  no file, VpnReportKeys.UNREADABLE when the read fails. Logs nothing. */
+    private static String vpnReportFile(android.content.Context ctx, String name) {
+        try {
+            java.io.File f = new java.io.File(ctx.getFilesDir(), name);
+            if (!f.exists()) return null;
+            byte[] buf = new byte[4096];
+            int n = 0;
+            try (java.io.FileInputStream in = new java.io.FileInputStream(f)) {
+                int r;
+                while (n < buf.length && (r = in.read(buf, n, buf.length - n)) > 0) n += r;
+            }
+            return new String(buf, 0, n, java.nio.charset.StandardCharsets.UTF_8);
+        } catch (Throwable t) {
+            return VpnReportKeys.UNREADABLE;
+        }
+    }
+
+    /** NWP-20261202-29: RoleReport.format over this user's roles. Same-user reads, as ReArchiveReceiver.readJobs. Each
+     *  read has its own try: a failed availability or holder read makes that role unreadable, a failed flags read
+     *  makes that holder unknown, and nothing drops the report. Binder reads only: no wait, no retry, no log line
+     *  (one could carry a package name). */
+    static String readDefaultRoles(android.content.Context ctx) {
+        java.util.Map<String, Boolean> available = new java.util.HashMap<>();
+        java.util.Map<String, java.util.List<String>> holders = new java.util.HashMap<>();
+        java.util.Map<String, Boolean> isSystem = new java.util.HashMap<>();
+        String self = null;
+        try {
+            self = ctx.getPackageName();
+            android.app.role.RoleManager rm = ctx.getSystemService(android.app.role.RoleManager.class);
+            android.content.pm.PackageManager pm = ctx.getPackageManager();
+            if (rm != null) {
+                for (String[] r : RoleReport.ROLES) {
+                    try {
+                        boolean av = rm.isRoleAvailable(r[0]);
+                        if (av) holders.put(r[0], rm.getRoleHolders(r[0]));
+                        available.put(r[0], av);
+                    } catch (Throwable ignore) {}
+                }
+            }
+            for (java.util.List<String> hs : holders.values()) {
+                if (hs == null) continue;
+                for (String pkg : hs) {
+                    if (pkg == null || isSystem.containsKey(pkg)) continue;
+                    try {
+                        isSystem.put(pkg, RoleReport.isBundled(pm.getApplicationInfo(pkg, 0).flags));
+                    } catch (Throwable ignore) {}
+                }
+            }
+        } catch (Throwable ignore) {}
+        return RoleReport.format(available, holders, self, isSystem);
     }
 
     /** Build the one-line JSON the daemon reads: note + device status (+ preview flag). org.json escapes newlines
@@ -1354,10 +1441,13 @@ public class ProfileActivity extends Activity {
             o.put("preview", preview);
             org.json.JSONObject st = reportStatus(this);
             // NWP-20261126-02: with "Send diagnostic reports" on, a by-hand report carries the same tag as the
-            // scheduled ones; with it off, neither key.
+            // scheduled ones; with it off, neither key. NWP-20261202-08: with it on, also the scheduled sender's run
+            // record (diag_job, diag_job_pending), so a by-hand report names the step where the sender stops.
             String tag = DiagReportJob.readFile(this, DiagReports.TAG_FILE).trim();
             if (DiagReports.optedIn(DiagReportJob.readFile(this, DiagReports.OPT_FILE)) && DiagReports.tagOk(tag)) {
                 for (java.util.Map.Entry<String, String> e : DiagReports.status(tag, false).entrySet()) st.put(e.getKey(), e.getValue());
+                for (java.util.Map.Entry<String, String> e : DiagReports.jobStatus(DiagReportJob.readFile(this, DiagReports.RUNS_FILE),
+                        System.currentTimeMillis(), DiagReportJob.pending(this)).entrySet()) st.put(e.getKey(), e.getValue());
             }
             o.put("status", st);
             // NWP-20261128-17 (Q121): this session's app crashes from DropBox, start-time and user filtered, and the
@@ -3779,6 +3869,11 @@ public class ProfileActivity extends Activity {
     private final java.util.concurrent.atomic.AtomicBoolean deltaLoading =
             new java.util.concurrent.atomic.AtomicBoolean();
     private volatile boolean paused;
+    // NWP-20261202-37: the run kind and start loadSealDelta last read ("" when no save runs), so the poll can repaint
+    // the running save's line from SEAL-STATUS. RUN_POLL_MS is the poll's tick while a save runs.
+    private volatile String liveRun = "";
+    private volatile long liveRunStart;
+    private static final long RUN_POLL_MS = 3_000L;
 
     /** Relative time for the headline: seconds granularity is noise, days are despair. */
     private static String fmtAgo(long unixSec) {
@@ -3850,10 +3945,10 @@ public class ProfileActivity extends Activity {
                 // the cadence is user-settable (GET/SET-SYNC-INTERVAL), so any hardcoded "10 minutes"
                 // would be wrong for whoever changed it. Same thread and the same round trip that was
                 // already being made a few lines down; nothing extra is spent.
-                int syncSec = 120;
+                int syncSec = SyncChoices.DEFAULT_SECS;
                 try { syncSec = Integer.parseInt(sendDaemon("GET-SYNC-INTERVAL\n").trim()); }
                 catch (Throwable ignore) { /* default cadence stands */ }
-                if (syncSec <= 0) syncSec = 120;
+                if (syncSec <= 0) syncSec = SyncChoices.DEFAULT_SECS;
                 if (lr == null || lr[1] == null || lr[1].isEmpty()) {
                     runOnUiThread(() -> { if (savedHeadTv != null) StatusLine.error(savedHeadTv,
                             "Can't check what's saved right now."); });
@@ -3869,6 +3964,10 @@ public class ProfileActivity extends Activity {
                     final String reason = o.optString("reason", "");
                     final long lastOK = o.optLong("lastOK", 0), lastStart = o.optLong("lastStart", 0);
                     final long deferrals = o.optLong("deferrals", 0);
+                    // NWP-20261202-37: the running save's start and first frame. A daemon without runStart falls back to
+                    // lastStart: markSealStarted sets it at every announce, so while run is set it is this run's start.
+                    final long runStart = o.has("runStart") ? o.optLong("runStart", 0) : lastStart;
+                    final String runProg = o.optString("runProg", "");
                     final boolean measured = o.optBoolean("storedMeasured", false);
                     org.json.JSONObject sa = o.optJSONObject("storedApps");
                     org.json.JSONArray blind = o.optJSONArray("blind");
@@ -3877,7 +3976,7 @@ public class ProfileActivity extends Activity {
                     if ("local".equals(o.optString("session"))) {
                         h = "Throwaway — lives only on this phone, never saved.";
                     } else if (!run.isEmpty()) {
-                        h = "manual".equals(run) ? "Saving now…" : "Saving automatically now…";
+                        h = saveRunHead(run, runProg, runStart, System.currentTimeMillis() / 1000);
                     } else if (lastOK > 0) {
                         h = "Last saved " + fmtAgo(lastOK) + ".";
                     } else if (lastStart > 0) {
@@ -3983,6 +4082,8 @@ public class ProfileActivity extends Activity {
                         a = al.text;
                         aWarn = al.warn;
                     }
+                    liveRun = (!"local".equals(o.optString("session")) && !run.isEmpty()) ? run : "";
+                    liveRunStart = runStart;
                     final String fh = h, fd = d.toString().trim(), fa = a;
                     final boolean faWarn = aWarn;
                     runOnUiThread(() -> {
@@ -4066,7 +4167,24 @@ public class ProfileActivity extends Activity {
                 new Thread(() -> {
                     long stamp = SaveLinesRefresh.parseLanded(sendDaemon("GET-SEAL-LANDED\n"));
                     if (savedHeadTv == mine && saveLines.due(stamp, deltaLoading.get() || paused)) loadSealDelta();
-                    h.postDelayed(next, SaveLinesRefresh.POLL_MS);
+                    else if (!liveRun.isEmpty() && savedHeadTv == mine && !paused && !deltaLoading.get()) {
+                        // NWP-20261202-37: a save is running, so repaint its line from SEAL-STATUS. It reads with
+                        // sealStatus(String[]), which writes no field: a tick that passed the checks above can still
+                        // run after the user left Your data and began a sign-out, and sealStatus() would overwrite
+                        // the sealStatusReason the sign-out loop reads after its FAILED reply.
+                        final String run = liveRun;
+                        final long start = liveRunStart;
+                        String s = sealStatus(new String[1]);
+                        if (s != null && s.startsWith("SEALING ")) {
+                            final String head = saveRunHead(run, s.substring(8), start, System.currentTimeMillis() / 1000);
+                            runOnUiThread(() -> { if (savedHeadTv == mine && head != null) mine.setText(head); });
+                        } else if (s != null) {
+                            // DONE or FAILED: the run ended. A failed save moves no GET-SEAL-LANDED stamp, so load again.
+                            liveRun = "";
+                            loadSealDelta();
+                        } // null: the status was unreadable; the line stays as it is
+                    }
+                    h.postDelayed(next, liveRun.isEmpty() ? SaveLinesRefresh.POLL_MS : RUN_POLL_MS);
                 }).start();
             }
         }, SaveLinesRefresh.POLL_MS);
@@ -4977,7 +5095,7 @@ public class ProfileActivity extends Activity {
             body.setText(sb.toString());
         } else if (ran) {
             // ⚠ NOT "until this device is offline for fifteen minutes". The held list has no time
-            // component -- nothing ages an entry out of it. The fifteen minutes expires the CLAIM in the
+            // component -- nothing ages an entry out of it. The hour (claimTTL) expires the CLAIM in the
             // store, so the app frees up only while this device is not saving, and is claimed again on the
             // next save. Saying otherwise promised a release that comes back.
             body.setText("Nothing is held from this device right now." + "\n\n"
@@ -5536,7 +5654,7 @@ public class ProfileActivity extends Activity {
         // Cost 1 is already solved (unpin before the switch, both directions). Do not re-derive either.
         new Thread(() -> {
             // NWP-20260912-06: let go of every app this handset holds, FIRST -- before the LOGOUT write below
-            // starts the logoff seal. Without it this handset publishes a fresh 15-minute claim on everything
+            // starts the logoff seal. Without it this handset publishes a fresh hour-long claim on everything
             // it used as its LAST act, and strands those apps on the other phone for the whole of claimTTL
             // after a CLEAN sign-out. ⚠ NOT clear(): a sign-out that is REFUSED (a shrink guard, a stale
             // base) leaves the session SIGNED IN, and clear() would move the floor too -- so the user would
@@ -6283,13 +6401,23 @@ public class ProfileActivity extends Activity {
     /**
      * NWP-20261017-16: the gateway's refusal text from the SEAL-STATUS call that last returned "FAILED NOCREDIT",
      * null when the daemon sent none (an older daemon, a 402 with no body, any other status). Written by
-     * sealStatus() on every call, so it always belongs to the reply sealStatus() just returned.
+     * sealStatus() on every call, so it always belongs to the reply sealStatus() just returned. Your data's poll
+     * reads with sealStatus(String[]) and never writes it (NWP-20261202-37).
      */
     private volatile String sealStatusReason;
 
     /** Ask the daemon for the background logoff seal's status: "SEALING <phase> <done> <total>" or "DONE". */
     private String sealStatus() {
-        sealStatusReason = null;
+        String[] reason = new String[1];
+        String line = sealStatus(reason);
+        sealStatusReason = reason[0];
+        return line;
+    }
+
+    /** NWP-20261202-37: the SEAL-STATUS reply line; a FAILED reply's REASON text goes to reason[0] (null when none).
+     *  It writes no field, so a reader beside the sign-out loop cannot change that loop's sealStatusReason. */
+    private static String sealStatus(String[] reason) {
+        reason[0] = null;
         try {
             LocalSocket s = DaemonSocket.connect(); // NWP-20261005-19: bounded connect
             if (s == null) throw new java.io.IOException("daemon connect timed out");
@@ -6301,7 +6429,7 @@ public class ProfileActivity extends Activity {
             // NWP-20261017-16: a FAILED verdict may carry a second line, "REASON <gateway text>". Bounded by the
             // socket timeout above; a daemon that sends nothing more yields null.
             if (line != null && line.startsWith("FAILED")) {
-                try { sealStatusReason = sealReasonOf(in.readLine()); } catch (Exception ignore) {}
+                try { reason[0] = sealReasonOf(in.readLine()); } catch (Exception ignore) {}
             }
             s.close();
             return line;
@@ -7215,6 +7343,37 @@ public class ProfileActivity extends Activity {
         if (dt == null || dt[1] <= 0) return 0;
         long pct = dt[0] * 100 / dt[1];
         return pct < 0 ? 0 : (pct > 100 ? 100 : (int) pct);
+    }
+
+    /** NWP-20261202-37: the Your data headline while a save runs. run is SEAL-DELTA's run kind ("" when none), prog a
+     *  SEAL-STATUS frame without its "SEALING " ("<phase> <done> <total>[ <scope>]", "" when none yet), runStart the
+     *  run's start in Unix seconds (0 when unknown). The text matches Back up now's line; null when no save runs. */
+    private static String saveRunHead(String run, String prog, long runStart, long nowSec) {
+        if (run == null || run.isEmpty()) return null;
+        String line = "SEALING " + (prog == null ? "" : prog.trim());
+        long[] dt = sealBytes(line);
+        String label = sealScopeLabel(sealScope(line));
+        boolean manual = "manual".equals(run);
+        String head;
+        if (dt != null && dt[1] > 0) {
+            String lead = (manual ? "Backing up " : "Saving automatically — ") + label + "…";
+            // the "sizes" phase counts chunks, not bytes, so it shows no figures (NWP-20260903-07)
+            head = "sizes".equals(sealPhase(line)) ? lead : lead + "  " + fmtBytes(dt[0]) + " of " + fmtBytes(dt[1]);
+        } else {
+            head = manual ? "Saving now…" : "Saving automatically now…";
+        }
+        if (runStart > 0) head += "\nStarted " + startedAgo(runStart, nowSec) + ".";
+        return head;
+    }
+
+    /** NWP-20261202-37: fmtAgo's wording and thresholds, measured to an explicit now (Unix seconds). */
+    private static String startedAgo(long startSec, long nowSec) {
+        long d = nowSec - startSec;
+        if (d < 0) d = 0;
+        if (d < 90) return "just now";
+        if (d < 90 * 60) return (d / 60) + " min ago";
+        if (d < 36 * 3600) return (d / 3600) + (d / 3600 == 1 ? " hour ago" : " hours ago");
+        return (d / 86400) + " days ago";
     }
 
     /** NWP-20261128-10: Back (the button or the swipe) on a sub-screen goes to its parent, the one its Back link names,
@@ -9811,10 +9970,10 @@ public class ProfileActivity extends Activity {
         // window of loginWindowCap=180s (main.go:9765, armed at main.go:10451) and ONLY a login can close
         // it early -- the sole GRANT-PERMS sender is provisionRoamedApps, inside roamLogin
         // (ChooserActivity.java:8912, called from :3794). The cold lock fires at 120s and removes
-        // .roamsession, which stops the sync (main.go:10267). With syncIntervalDefault=120 (main.go:8231),
-        // 180 > 120 means no instant exists at which a periodic seal is both permitted AND has a live
-        // session to seal. On a phone that wipes at power-off, that is lost work, so the option was not
-        // honest to offer.
+        // .roamsession, which stops the sync (main.go:10267). With syncIntervalDefault=120 (main.go:8231;
+        // syncIntervalDefault was 120 then; 900 since NWP-20261202-25's release), 180 > 120 means no
+        // instant exists at which a periodic seal is both permitted AND has a live session to seal. On a phone
+        // that wipes at power-off, that is lost work, so the option was not honest to offer.
         //
         // ⚠ 3 MINUTES WOULD BE THE WORST CHOICE AVAILABLE: 180s IS loginWindowCap exactly, so a 3-minute
         // idle leaves a ZERO-second seal-eligible window -- the same starvation, made intermittent. 5 min
@@ -14053,17 +14212,40 @@ public class ProfileActivity extends Activity {
         openGosStore();
     }
 
-    /** The GrapheneOS App Store, by its launch intent. No package-detail link of its own is known to exist (its
-     *  manifest is not in reach of this repo), so the user picks sandboxed Play from its list. */
+    /** NWP-20261202-21: the GrapheneOS App Store, opened at Play Store's entry (docs/product-decisions.md, 2026-11-10,
+     *  item 1). The store has a detail link: GrapheneOS/AppStore tag 37, app/src/main/AndroidManifest.xml:42-44 puts
+     *  a SHOW_APP_INFO filter on .ui.MainActivity, and ui/MainActivity.kt:73-79 opens the details of the package named
+     *  in EXTRA_PACKAGE_NAME. That filter has no DEFAULT category, so startActivity cannot resolve the package-only
+     *  link: it is resolved here with flags 0 and started at the resolved activity (as Settings' AppStoreUtil does).
+     *  setPackage keeps every other app from answering it. GosStoreLink.route picks; the store's list (its launch
+     *  intent, the behaviour before this slice) is only for a store build where the link does not resolve, and that
+     *  fallback is raised with Chester. The row, turnPlayOn and the "finish setting up Google Play" prompt all open
+     *  the store through here. The log line is one of GosStoreLink's three constants, never a package or profile. */
     private void openGosStore() {
-        android.content.Intent i = getPackageManager().getLaunchIntentForPackage(GOS_STORE_PKG);
-        if (i == null) {
-            android.widget.Toast.makeText(this, "Couldn't open the GrapheneOS App Store.", android.widget.Toast.LENGTH_SHORT).show();
-            return;
+        final android.content.Intent link = new android.content.Intent(GosStoreLink.ACTION)
+                .setPackage(GosStoreLink.STORE_PKG).putExtra(GosStoreLink.EXTRA, GosStoreLink.ENTRY_PKG);
+        final android.content.pm.ResolveInfo ri = getPackageManager().resolveActivity(link, 0);
+        final android.content.Intent launch = getPackageManager().getLaunchIntentForPackage(GOS_STORE_PKG);
+        final android.content.Intent start;
+        switch (GosStoreLink.route(ri != null && ri.activityInfo != null, launch != null)) {
+            case PLAY_ENTRY:
+                link.setClassName(ri.activityInfo.packageName, ri.activityInfo.name);
+                start = link;
+                android.util.Log.i("NowhereChooser", GosStoreLink.LOG_ENTRY);
+                break;
+            case STORE_LIST:
+                start = launch;
+                android.util.Log.i("NowhereChooser", GosStoreLink.LOG_LIST);
+                break;
+            case NONE:
+            default:
+                android.util.Log.i("NowhereChooser", GosStoreLink.LOG_NONE);
+                android.widget.Toast.makeText(this, "Couldn't open the GrapheneOS App Store.", android.widget.Toast.LENGTH_SHORT).show();
+                return;
         }
-        i.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK);
+        start.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK);
         try {
-            startActivity(i);
+            startActivity(start);
         } catch (Throwable t) {
             android.widget.Toast.makeText(this, "Couldn't open the GrapheneOS App Store.", android.widget.Toast.LENGTH_SHORT).show();
         }

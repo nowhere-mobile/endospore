@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # test-err-line-redact.sh [--mutate] -- runs err_line_redact_test.go and the tests that hold the lines it touches
 # (NWP-20261117-26, backlog row "A sign-in whose chunk fetch fails for good writes the whole presigned store URL,
-# credential and signature included, into roam.log"): main()'s ERR: line, untarFrom's copy skip line, restore-app's
-# error line, the other store-error lines and errCode / healErrText print through logSafeErrText, so no line carries
-# a presigned query or a head key, and the exit code still comes from the raw value. --mutate re-runs it against a
+# credential and signature included, into roam.log"): main()'s ERR: line, restore-app's error line, the other
+# store-error lines and errCode / healErrText print through logSafeErrText, and untarFrom's copy skip line prints
+# errCode (NWP-20261201-24), so no line carries a presigned query or a head key, and the exit code still comes from
+# the raw value. --mutate re-runs it against a
 # COPY of the package with each guard broken in turn; the tree is never touched. Each mutant must be CONVICTED by a
 # real `--- FAIL`; one that fails to apply or to compile is a failure.
 set -uo pipefail
@@ -40,7 +41,7 @@ mut "R1 main prints r raw" main.go \
 mut "R2 logSafeErrText skips the head-key rule" log_redact.go \
   $'\t}\n\treturn redactNameIn(s, "")\n}' $'\t}\n\treturn reURLQuery.ReplaceAllString(s, "${1}")\n}'
 mut "R3 untarFrom's copy line prints err raw" main.go \
-  'copy: %s\n", hdr.Name, logSafeErrText(err))' 'copy: %v\n", hdr.Name, err)'
+  'fmt.Fprint(os.Stderr, restoreSkipLine(dir, hdr.Name, "copy", err))' 'fmt.Fprintf(os.Stderr, "[restore] skip copy: %v\n", err)'
 mut "R4 restore-app's line prints err raw" main.go \
   '"restore-app: %s\n", logSafeErrText(err))' '"restore-app: %v\n", err)'
 mut "R5 ota-notes-get's line prints err raw" main.go \

@@ -51,7 +51,7 @@ final class HeldElsewhereCopy {
             sb.append("• ").append(labels.get(i)).append("\n");
         }
         sb.append("\nThese are in use on ").append(where(holder)).append(", so they won't open here. Each opens ")
-          .append("here once that device releases it, signs out or uninstalls it, or about fifteen minutes after ")
+          .append("here once that device releases it, signs out or uninstalls it, or about an hour after ")
           .append("that device is switched off.");
         return sb.toString();
     }

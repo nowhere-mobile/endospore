@@ -175,11 +175,19 @@ type Wallet struct {
 	// once the gateway proves the code empty; walletForPublish and mergeLateRestore carry it, and the seen-set keys it
 	// by its hash (pendingClaimSeenKey), so a code this session cleared is never brought back from a stored copy.
 	//
-	// keepPendingClaim (NWP-20261201-21) is the first writer: an Add-credits drain cut short keeps its code here. Slice 2's
-	// drain caller, which runs drainPendingClaims at a later session, is not built yet. ⚠ A build older than this field
-	// decodes the wallet non-strictly and drops pending_claims on its next write, so a writer must not ship before this
-	// reader is in the field (the reader is in release 0.5.54; h56 #1 in docs/product-decisions.md).
+	// keepPendingClaim (NWP-20261201-21) is the first writer: an Add-credits drain cut short keeps its code here.
+	// armPendingClaimDrain (NWP-20261202-01) runs drainPendingClaims at a random moment in each later session. ⚠ A build
+	// older than this field decodes the wallet non-strictly and drops pending_claims on its next write, so a writer must
+	// not ship before this reader is in the field (the reader is in release 0.5.54; h56 #1 in docs/product-decisions.md).
 	PendingClaims []string `json:"pending_claims,omitempty"`
+
+	// PendingClaimMisses holds pendingClaimSeenKey hashes, never a code (NWP-20261202-01; decided 2026-11-03, h55 #1:
+	// the webhook-lag edge). A hash marks a pending code whose drain once got the empty answer (402) with nothing
+	// landed: the code is kept once, because its payment webhook may not have reached the gateway yet, and the next
+	// session's empty answer clears it and its hash. A hash is kept only while its code is in PendingClaims
+	// (pendingClaimMissesFor). A build older than this field decodes the wallet non-strictly and drops it on its next
+	// write; that costs at most one extra retry (one more /issue round trip at a later session), never a token.
+	PendingClaimMisses []string `json:"pending_claim_misses,omitempty"`
 }
 
 func loadWallet(path string) (*Wallet, error) {
@@ -3204,7 +3212,8 @@ func sealWalletValuePublish(strict bool, base, name, pass string, dk []byte, wal
 //
 // The pending claim codes (Wallet.PendingClaims, NWP-20261125-05) follow the token rule and its seen semantics. The
 // cost is the same shape: a code the OTHER phone cleared but this one still holds is published again, and lasts until
-// this phone's next drain, where the gateway's 402 proves it empty and clears it (one /issue round trip).
+// this phone's next drain, where the gateway's 402 proves it empty and clears it (one /issue round trip). The miss hashes
+// (Wallet.PendingClaimMisses, NWP-20261202-01) are both sides' union, kept only for a code the published list holds.
 //
 // ⚠ AN IDLE PHONE PUBLISHES THE OTHER PHONE'S PURCHASE WHOLE (NWP-20261129-10; decided 2026-10-20, "a bigger plan
 // starts at once ...": a smaller purchase "is never stranded: the wallet activates each purchase at its own size and
@@ -3301,6 +3310,7 @@ func walletForPublish(stored, local *Wallet, seen map[string]bool) *Wallet {
 				out.PendingClaims = append(out.PendingClaims, c)
 			}
 		}
+		out.PendingClaimMisses = pendingClaimMissesFor(out.PendingClaims, local.PendingClaimMisses, stored.PendingClaimMisses)
 		// Every waiting purchase of the stored copy that this session never held (h60 #14). have holds this phone's plan
 		// id and queue ids (walletSeenKeys), and seen holds every id this session held, so a purchase that activated here
 		// stays out. taken is appended after this phone's, and the first becomes the head when this phone has none waiting.

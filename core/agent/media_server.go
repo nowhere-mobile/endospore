@@ -85,6 +85,35 @@ func isPlayDownloadPath(rel string) bool {
 	return rel == playDownloadRel || strings.HasPrefix(rel, playDownloadRel+"/")
 }
 
+// mediaProviderPkgs and mediaProviderDBNames name MediaProvider's own index databases. docs/product-decisions.md,
+// 2026-11-10, "DECIDED: MediaProvider's databases leave the seal and the restore; nothing in a sign-in writes
+// MediaProvider's database, and media not yet downloaded is announced through MediaStore": the new user's
+// MediaProvider is already running when the restore lands, and it holds no file lock on its database, so every
+// outside write lands under the live provider (lynx 2026111001: the CE restore truncated external.db and its
+// -wal/-shm in place -> SQLITE_IOERR_FSTAT and a corrupt index). MediaProvider builds its index by scanning, as for
+// a new user. Like playDownloadRel this is a by-name exclusion of another app's files, not a list to grow: a
+// rename of the module or the files makes the skip silent and the files roam again.
+var (
+	mediaProviderPkgs = map[string]bool{
+		"com.android.providers.media.module":        true,
+		"com.google.android.providers.media.module": true,
+	}
+	mediaProviderDBNames = map[string]bool{
+		"external.db": true, "external.db-wal": true, "external.db-shm": true, "external.db-journal": true,
+		"internal.db": true, "internal.db-wal": true, "internal.db-shm": true, "internal.db-journal": true,
+	}
+)
+
+// isMediaProviderDBRel reports whether rel (slash form, relative to a CE or #de scope root) is exactly
+// <pkg>/databases/<db><sfx> for a MediaProvider module, external.db or internal.db, and "", -wal, -shm or
+// -journal. Nothing else: not the databases dir, not another file in it, and not the same names deeper (so the
+// #media scope, whose rels start at Android/ or a user folder, never matches). NWP-20261202-02: every seal walker
+// skips these files (priced for the shrink guard, as Play's cache) and untarFrom never writes them.
+func isMediaProviderDBRel(rel string) bool {
+	parts := strings.Split(strings.TrimPrefix(rel, "/"), "/")
+	return len(parts) == 3 && mediaProviderPkgs[parts[0]] && parts[1] == "databases" && mediaProviderDBNames[parts[2]]
+}
+
 // isMediaCachePath reports whether rel lives inside a media-daemon DERIVED cache -- ANY path segment that starts
 // with mediaCacheDirName, i.e. `.nowhere-media` (CE) OR `.nowhere-media-ext` (external #media). Such a rel is
 // never legit user data: real media seals under a CLEAN app rel, and the caches are reconstructible from the
@@ -225,6 +254,7 @@ type mediaServer struct {
 	damaged     map[string]map[int]bool // #109: per-cache-key set of chunks PROVEN corrupt in the store (sticky)
 	deleted     map[string]bool         // #84: rel -> the app UNLINKED this deferred file (tombstoned; dropped at next seal)
 	tombMu      sync.Mutex              // NWP-20261127-06: one .deleted append at a time (the torn-line repair reads, then writes)
+	landMu      sync.Mutex              // NWP-20261202-17: the late heal's landing and a stub Unlink, one at a time
 
 	progMu      sync.Mutex           // #90: guards active + dmg + the progress file
 	scarLogged  map[string]bool      // NWP-20260822-05: apps whose recreated dir was judged a benign #92 scar (log once)

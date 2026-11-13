@@ -3,9 +3,11 @@
         final android.os.Handler h = clearHandler;
         if (h == null) return;
         h.post(() -> SmsRoleRoam.capture(this));
+        h.post(() -> { for (String r : DefaultRoles.ROLES) DefaultRoleRoam.capture(this, r); }); // NWP-20261202-05
         try {
             roleListener = (roleName, user) -> {
                 if (android.app.role.RoleManager.ROLE_SMS.equals(roleName)) h.post(() -> SmsRoleRoam.capture(this));
+                if (DefaultRoles.isRole(roleName)) h.post(() -> DefaultRoleRoam.capture(this, roleName));
             };
             getSystemService(android.app.role.RoleManager.class).addOnRoleHoldersChangedListenerAsUser(
                     h::post, roleListener, android.os.Process.myUserHandle());

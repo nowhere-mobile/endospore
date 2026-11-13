@@ -478,7 +478,7 @@ func TestGmsStateWorkerOpIsWired(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"|gmsstate) ;;", "  gmsstate)\n", `"$AGENT" gmsstate "$uid" > "$RES.part"`} {
+	for _, want := range []string{"|gmsstate|vpnstate) ;;", "  gmsstate)\n", `"$AGENT" gmsstate "$uid" > "$RES.part"`} {
 		if !strings.Contains(string(b), want) {
 			t.Errorf("nowhere_roamd.sh lost %q -- every report would say NOT collected", want)
 		}

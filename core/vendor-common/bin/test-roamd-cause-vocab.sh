@@ -155,7 +155,7 @@ echo "== the exit-code PATH: a push that exits 5 reaches the verdict as unreacha
 # emission are lifted by anchor and run on top of them. `timeout` is a stub that drops its three arguments
 # (`-k 5 <limit>`).
 SEALFUNCS=""
-for fn in pw pkgname_ok acct_seal stage_apk_copy appcode_seal; do
+for fn in pw pkgname_ok acct_seal stage_apk_copy appcode_inputs_fp appcode_seal; do
   body=$(awk -v h="$fn() {" '$0 == h {f=1} f{print} f&&/^\}$/{exit}' "$ROAMD")
   case "$body" in "$fn() {"*'}') SEALFUNCS="$SEALFUNCS$body
 " ;; *) echo "EXTRACTION FAILED: $fn -- not found by name" >&2; exit 2 ;; esac

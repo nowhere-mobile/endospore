@@ -403,6 +403,7 @@ func TestSignOutOfANeverRestoredSession(t *testing.T) {
 func (f *walletFailFixture) periodicCycle(t *testing.T, uid string) string {
 	t.Helper()
 	sessionState(t)
+	resetSealSignals() // NWP-20261202-10: no landed save, so the change test answers nobase and runs no probe
 	if err := markRoamSession(f.dest, walletFailName, walletFailPass, uid, ""); err != nil {
 		t.Fatal(err)
 	}

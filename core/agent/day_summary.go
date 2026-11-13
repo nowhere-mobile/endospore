@@ -19,13 +19,27 @@ package main
 //	v=1 t=<unix s> ev=signin ms=<vault>+<de>+<media>+<apps>+<sys>                     DIAG-SUMMARY on, from signin-summary.<uid>
 //	v=1 t=<unix s> ev=save ms=<n> rc=<ok|partial|refused|timeout|busy|err> kib=<n|->   triggerRoamWorkerKind, periodic + manual
 //	v=1 t=<unix s> ev=sweep apps=<n> ok=<n> fail=<n> ms=<n>                            DIAG-EVENT sweep (the chooser's Auto sweep)
+//	v=1 t=<unix s> ev=report kind=<scheduled|by_hand|none> rc=<ok|net|nogw|toobig|disabled|http>
+//	                                                                                   handleReportIssue, session scope
+//	v=1 t=<unix s> ev=vpnstate app=<1|0|-> lock=<1|0|-> pend=<1|0|-> net=<1|0|->       REPORT-ISSUE, a sent in-session report
+//
+// The report line (NWP-20261202-11) is written by handleReportIssue AFTER its reply, on the send path and on ERR-NOGW,
+// at session scope only: a preview, a gate report and a device-scope report write none. kind is the caller's
+// report_kind (scheduled or by_hand, else none) and rc is the reply's class; no ticket, no tag. The line is written
+// after this report was built, so it shows in the NEXT report: that report tells whether a scheduled report reached
+// the agent and how the gateway answered.
 //
 // The signin line's times exclude the heal since NWP-20261130-08 (signin_summary.go); this line carries no heal figure.
 //
 // A save line's kib (NWP-20261128-29) is that run's upload KiB, the sum of <dest>/seal-split (push_stat.go), or "-"
 // when the run left none. A save line without kib (written before NWP-20261128-29) still reads.
 //
-// Each append drops lines older than 24 h, then the oldest lines until the file is at most 16 KiB. An in-session
+// A vpnstate line (NWP-20261202-43) is the always-on VPN's live state, read by roamd's read-only vpnstate op when an
+// in-session report is sent: an app set, always_on_vpn_lockdown, a pending block for that app, and that app's
+// INTERNET grant, each 1, 0 or - (unread). It carries no package name. A preview appends nothing.
+//
+// Each append drops lines older than 24 h, then bounds every line that is not a save (sign-in, sweep) to 4 KiB,
+// oldest first, then drops the oldest save lines until the file is at most 16 KiB (NWP-20261202-09). An in-session
 // report reads its own uid's file whole into one key:
 //
 //	day_summary   the file's lines joined by ';', or "unreadable" when the file is over 16 KiB or ANY line is of
@@ -58,6 +72,10 @@ const daySummaryOnPrefix = "day-summary-on."
 // daySummaryMaxBytes bounds the file: the writer keeps it at most this long, and a longer file reads as unreadable.
 const daySummaryMaxBytes = 16 << 10
 
+// daySummaryKeptMaxBytes bounds every line that is NOT ev=save (signin, sweep, and any later non-save shape), so a
+// session's own DIAG-EVENT calls cannot fill the file and saves always have at least 12 KiB (NWP-20261202-09).
+const daySummaryKeptMaxBytes = 4 << 10
+
 // daySummaryMaxAge is how far back the summary reaches.
 const daySummaryMaxAge = 24 * time.Hour
 
@@ -75,17 +93,37 @@ var daySummaryMu sync.Mutex
 var daySummarySigninRe = regexp.MustCompile(`^v=1 t=([0-9]{1,12}) ev=signin ms=([0-9]{1,12}|-)\+([0-9]{1,12}|-)\+([0-9]{1,12}|-)\+([0-9]{1,12}|-)\+([0-9]{1,12}|-)$`)
 var daySummarySaveRe = regexp.MustCompile(`^v=1 t=([0-9]{1,12}) ev=save ms=([0-9]{1,12}) rc=(ok|partial|refused|timeout|busy|err)( kib=([0-9]{1,15}|-))?$`)
 var daySummarySweepRe = regexp.MustCompile(`^v=1 t=([0-9]{1,12}) ev=sweep apps=([0-9]{1,12}) ok=([0-9]{1,12}) fail=([0-9]{1,12}) ms=([0-9]{1,12})$`)
+var daySummaryReportRe = regexp.MustCompile(`^v=1 t=([0-9]{1,12}) ev=report kind=(scheduled|by_hand|none) rc=(ok|net|nogw|toobig|disabled|http)$`)
+var daySummaryVpnStateRe = regexp.MustCompile(`^v=1 t=([0-9]{1,12}) ev=vpnstate app=(1|0|-) lock=(1|0|-) pend=(1|0|-) net=(1|0|-)$`)
 var daySummaryEventRe = regexp.MustCompile(`^sweep ([0-9]{1,12}) ([0-9]{1,12}) ([0-9]{1,12}) ([0-9]{1,12})$`)
 
-// daySummaryLineT returns a line's t when the line has one of the three shapes.
+// daySummaryLineT returns a line's t when the line has one of the five shapes.
 func daySummaryLineT(l string) (int64, bool) {
-	for _, re := range []*regexp.Regexp{daySummarySigninRe, daySummarySaveRe, daySummarySweepRe} {
+	for _, re := range []*regexp.Regexp{daySummarySigninRe, daySummarySaveRe, daySummaryVpnStateRe, daySummarySweepRe, daySummaryReportRe} {
 		if m := re.FindStringSubmatch(l); m != nil {
 			t, err := strconv.ParseInt(m[1], 10, 64)
 			return t, err == nil
 		}
 	}
 	return 0, false
+}
+
+// daySummaryIsSave reports whether an accepted line is a save line; every other line is the kept class.
+func daySummaryIsSave(l string) bool { return daySummarySaveRe.MatchString(l) }
+
+// daySummaryOldest is the index of keep's oldest line of the class (save or not), or -1.
+func daySummaryOldest(keep []string, save bool) int {
+	for i, l := range keep {
+		if daySummaryIsSave(l) == save {
+			return i
+		}
+	}
+	return -1
+}
+
+// daySummaryVpnStateLine is the vpnstate line for v, the "app=.. lock=.. pend=.. net=.." value mergeVpnState rebuilt.
+func daySummaryVpnStateLine(t time.Time, v string) string {
+	return fmt.Sprintf("v=1 t=%d ev=vpnstate %s", t.Unix(), v)
 }
 
 // daySummaryUIDOK is mergeSigninSummary's uid check: non-empty, digits only.
@@ -123,7 +161,9 @@ func daySummaryAppend(uid, line string) {
 }
 
 // daySummaryAppendLocked is daySummaryAppend's body; the caller holds daySummaryMu. Read, drop the lines older than
-// 24 h (and any line of another shape), append, drop the oldest until at most 16 KiB, then temp + rename.
+// 24 h (and any line of another shape), append, drop the oldest non-save lines until they total at most 4 KiB,
+// then the oldest save lines (the oldest line of any kind once no save is left) until at most 16 KiB, then temp +
+// rename. The survivors keep their file order.
 func daySummaryAppendLocked(uid, line string) {
 	if !daySummaryOn(uid) {
 		return
@@ -141,13 +181,26 @@ func daySummaryAppendLocked(uid, line string) {
 		}
 	}
 	keep = append(keep, line)
-	size := 0
+	size, kept := 0, 0
 	for _, l := range keep {
 		size += len(l) + 1
+		if !daySummaryIsSave(l) {
+			kept += len(l) + 1
+		}
+	}
+	for kept > daySummaryKeptMaxBytes {
+		i := daySummaryOldest(keep, false)
+		kept -= len(keep[i]) + 1
+		size -= len(keep[i]) + 1
+		keep = append(keep[:i], keep[i+1:]...)
 	}
 	for size > daySummaryMaxBytes && len(keep) > 1 {
-		size -= len(keep[0]) + 1
-		keep = keep[1:]
+		i := daySummaryOldest(keep, true)
+		if i < 0 {
+			i = 0
+		}
+		size -= len(keep[i]) + 1
+		keep = append(keep[:i], keep[i+1:]...)
 	}
 	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, []byte(strings.Join(keep, "\n")+"\n"), 0o600); err != nil {
@@ -219,6 +272,41 @@ func daySummaryRecordSave(op, intent, uid, dest string, t0 time.Time, out *strin
 	}
 	daySummaryAppend(uid, fmt.Sprintf("v=1 t=%d ev=save ms=%d rc=%s kib=%s", daySummaryNow().Unix(),
 		time.Since(t0).Milliseconds(), daySummarySaveRC(*out), daySummarySaveKiB(dest, t0, *out)))
+}
+
+// daySummaryReportKind is the report line's kind: the caller's report_kind when it is scheduled or by_hand, else none.
+func daySummaryReportKind(v string) string {
+	if v == "scheduled" || v == "by_hand" {
+		return v
+	}
+	return "none"
+}
+
+// daySummaryReportRC is the CLOSED map from handleReportIssue's reply (without its newline) to the report line's rc
+// word. The ticket after "OK " is never read. The handler's only other reply is "ERR <code>", so the fallback is http.
+func daySummaryReportRC(reply string) string {
+	switch {
+	case reply == "OK" || strings.HasPrefix(reply, "OK "):
+		return "ok"
+	case reply == "ERR-NET":
+		return "net"
+	case reply == "ERR-NOGW":
+		return "nogw"
+	case reply == "ERR-TOOBIG":
+		return "toobig"
+	case reply == "ERR-DISABLED":
+		return "disabled"
+	}
+	return "http"
+}
+
+// daySummaryRecordReport is handleReportIssue's writer: one report line after the reply is written, at session scope
+// only. The marker check is in the append, so a session that has not opted in writes nothing.
+func daySummaryRecordReport(uid string, deviceScope bool, kind, rc string) {
+	if deviceScope {
+		return
+	}
+	daySummaryAppend(uid, fmt.Sprintf("v=1 t=%d ev=report kind=%s rc=%s", daySummaryNow().Unix(), kind, rc))
 }
 
 // daySummaryForget removes the uid's marker and summary: the completed sign-out of that session (handleLogout).

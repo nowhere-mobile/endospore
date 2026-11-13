@@ -9,20 +9,26 @@
 # mid-session (NWP-20260908-18). A regression here is silent on a device: the Gallery never learns the files.
 # test-roamd-seal-stop.sh only counts am calls around a stop.
 #
+# NWP-20261202-18 (S5 of docs/media-after-gate.md): the same hand-off also TAKES mediad's background-lander list,
+# $STATE/media-bg.list, by rename to media-bg.list.handoff, and appends its translated lines after the seal's. The
+# seal's list is usually ABSENT, so either list alone triggers the hand-off (H9-H11); a stopped seal takes nothing
+# (H12); and a lander append made after the take survives the block (H13). H12 and H13 also pass on a block that
+# never takes the list, by construction: their mutants (M13, M14) are what guard them.
+#
 # The hand-off block and the out arm are extracted from nowhere_roamd.sh BY ANCHOR, never copied (an anchor that is
 # missing or appears twice stops the suite with EXTRACTION FAILED, exit 2). Each case runs the block in a CHILD
-# shell (bash, sh, and dash and mksh where present) with STATE and USERDIR in a temp root, uid=11 and real sed and
-# wc. stat prints a scripted owner for the files dir; chown, chmod and restorecon record their argv (chmod also
+# shell (bash, sh, and dash and mksh where present) with STATE and USERDIR in a temp root, uid=11 and real sed, wc
+# and mv. stat prints a scripted owner for the files dir; chown, chmod and restorecon record their argv (chmod also
 # applies the mode); am records its argv, copies the chooser's list and its mode, and deletes the list, as the
-# receiver does.
+# receiver does. In append mode am also appends one path to $STATE/media-bg.list, as mediad's lander would.
 #
 # A mutant changes the extracted text and this process runs the same cases on it. It does not re-extract from a
 # mutated roamd, because M7 changes the block's first anchor. A mutant is CONVICTED under a shell only when the case
 # it names fails there and the child reached the end of the block, so a mutant that only breaks the shell's parse
 # is not a conviction.
 #
-#   bash test-mediasync-handoff.sh            # H1-H8 under every shell found
-#   bash test-mediasync-handoff.sh --mutate   # ... plus M1-M8, each of which must be convicted under EACH shell
+#   bash test-mediasync-handoff.sh            # H1-H13 under every shell found
+#   bash test-mediasync-handoff.sh --mutate   # ... plus M1-M15, each of which must be convicted under EACH shell
 set -uo pipefail
 
 MUTATE=no
@@ -38,8 +44,8 @@ ok(){ PASS=$((PASS+1)); printf '  ok    %s\n' "$1"; }
 no(){ FAIL=$((FAIL+1)); printf '  FAIL  %s\n' "$1"; }
 
 # --- extraction ------------------------------------------------------------------------------------------
-FIRST='    if [ "$stopped" = 0 ] && [ -s "$STATE/mediasync.list" ]; then'
-LAST='      unset _msdst _msown _msn'
+FIRST='    if [ "$stopped" = 0 ] && { [ -s "$STATE/mediasync.list" ] || [ -s "$STATE/media-bg.list" ]; }; then'
+LAST='      unset _msdst _msown _msn _msbg'
 PREPUSH='    rm -f "$STATE/mediasync.list" 2>> "$LOG"'
 for anchor in "$FIRST" "$LAST"; do
   n=$(grep -cxF -- "$anchor" "$ROAMD")
@@ -79,18 +85,23 @@ case "$r$p" in ''|*[!0-9]*) echo "no line numbers: rm [$r], push [$p]"; exit 1 ;
 EOF
 
 # --- harness ---------------------------------------------------------------------------------------------
-# run_case <shell> <block file> <stopped> <state list file> -> the case dir, which holds calls (the stubs' argv),
-# am-list and am-mode (the chooser's list as the broadcast found it), log, state/, user/, and ran when the child
-# reached the end of the block.
+# run_case <shell> <block file> <stopped> <state list file|ABSENT> [<media-bg list file|->] [append] -> the case dir,
+# which holds calls (the stubs' argv), am-list and am-mode (the chooser's list as the broadcast found it), log,
+# state/, user/, and ran when the child reached the end of the block. ABSENT creates no $STATE/mediasync.list; the
+# fifth argument becomes $STATE/media-bg.list; append makes am append LATE to $STATE/media-bg.list; faildst makes
+# the chooser's list path a directory, so writing it fails.
 run_case(){
   local T
   T=$(mktemp -d -p "$W") || exit 2
   mkdir -p "$T/state" "$T/user/com.nowhere.chooser/files"
-  cp "$4" "$T/state/mediasync.list"
+  [ "$4" = ABSENT ] || cp "$4" "$T/state/mediasync.list"
+  [ "${5:--}" = - ] || cp "$5" "$T/state/media-bg.list"
+  [ "${6:-}" = faildst ] && mkdir "$T/user/com.nowhere.chooser/files/nowhere-mediascan.list"
   : > "$T/calls"; : > "$T/log"
   {
     printf "umask 022\n"
-    printf "T='%s'; STATE=\$T/state; USERDIR=\$T/user; LOG=\$T/log; uid=11; stopped=%s\n" "$T" "$3"
+    printf "T='%s'; STATE=\$T/state; USERDIR=\$T/user; LOG=\$T/log; uid=11; stopped=%s; APPEND='%s'; LATE='%s'\n" \
+      "$T" "$3" "${6:-}" "$LATE"
     cat <<'EOF'
 L="$USERDIR/com.nowhere.chooser/files/nowhere-mediascan.list"
 stat(){
@@ -104,6 +115,7 @@ am(){
   echo "am $*" >> "$T/calls"
   [ -f "$L" ] && cp "$L" "$T/am-list" && command stat -c %a "$L" > "$T/am-mode"
   rm -f "$L"
+  [ "$APPEND" = append ] && printf '%s\n' "$LATE" >> "$STATE/media-bg.list"
 }
 EOF
     cat "$2"
@@ -113,9 +125,9 @@ EOF
   echo "$T"
 }
 
-# run_all <shell> <block file> <arm file>: H1-H8. Prints one ok or FAIL line per case; returns 1 when any fails.
+# run_all <shell> <block file> <arm file>: H1-H13. Prints one ok or FAIL line per case; returns 1 when any fails.
 run_all(){
-  local s="$1" block="$2" arm="$3" rc=0 T L got want calls log why
+  local s="$1" block="$2" arm="$3" rc=0 T L got want calls log why c
   say(){ if [ "$1" = 0 ]; then printf '  ok    %s: %s\n' "$s" "$2"; else printf '  FAIL  %s: %s\n' "$s" "$2"; rc=1; fi; }
   reached(){ [ -e "$1/ran" ] && return 0; say 1 "$2: the child did not reach the end of the block: $(tr '\n' ' ' < "$1/err")"; return 1; }
 
@@ -174,6 +186,73 @@ run_all(){
   if why=$("$s" "$W/pin.sh" "$arm" "$PREPUSH" 2>&1); then say 0 "H8: the out op clears the state list once, before the _push media line"
   else say 1 "H8: $why"; fi
 
+  # H9 / H9b: the lander's list alone is handed off, translated, with the seal's list ABSENT (the usual case: the
+  # pre-push rm, and the agent writes it only when it landed something) or present and EMPTY.
+  want='am broadcast --user 11 --include-stopped-packages -n com.nowhere.chooser/.MediaScanReceiver'
+  for c in H9:ABSENT H9b:"$W/empty"; do
+    T=$(run_case "$s" "$block" 0 "${c#*:}" "$W/bgfix")
+    if reached "$T" "${c%%:*}"; then
+      got=$(grep '^am ' "$T/calls"); log=$(cat "$T/log")
+      if ! cmp -s "$T/am-list" "$W/bgexp"; then
+        say 1 "${c%%:*}: the chooser's list differs: [$(cat "$T/am-list" 2>/dev/null | tr '\n' ' ')]"
+      elif [ "$got" != "$want" ]; then say 1 "${c%%:*}: am calls: [$got]"
+      else
+        case "$log" in
+          *'[roamd] media-sync: 2 path(s) landed -> chooser scan (user 11) bg=2 '*)
+            say 0 "${c%%:*}: media-bg.list alone: translated, one am, the log counts 2 and bg=2" ;;
+          *) say 1 "${c%%:*}: the log says: [$log]" ;;
+        esac
+      fi
+    fi
+  done
+
+  # H10 / H11: both lists. The chooser's list holds the seal's lines, then the lander's; the count is the sum. After
+  # it, neither the seal's list nor the taken handoff is left.
+  T=$(run_case "$s" "$block" 0 "$W/fixture" "$W/bgfix")
+  if reached "$T" "H10-H11"; then
+    log=$(cat "$T/log")
+    if ! cmp -s "$T/am-list" "$W/bothexp"; then
+      say 1 "H10: the chooser's list differs: [$(cat "$T/am-list" 2>/dev/null | tr '\n' ' ')]"
+    else
+      case "$log" in
+        *'[roamd] media-sync: 6 path(s) landed -> chooser scan (user 11) bg=2 '*)
+          say 0 "H10: both lists: the seal's lines then the lander's, the log counts 6 and bg=2" ;;
+        *) say 1 "H10: the log says: [$log]" ;;
+      esac
+    fi
+    if [ -e "$T/state/mediasync.list" ] || [ -e "$T/state/media-bg.list.handoff" ]; then
+      say 1 "H11: left behind: $(cd "$T/state" && ls | tr '\n' ' ')"
+    else say 0 "H11: neither mediasync.list nor media-bg.list.handoff is left"; fi
+  fi
+
+  # H11b: the chooser's list cannot be written: no broadcast, and both state lists are still removed.
+  T=$(run_case "$s" "$block" 0 "$W/fixture" "$W/bgfix" faildst)
+  if reached "$T" "H11b"; then
+    got=$(grep '^am ' "$T/calls")
+    if [ -z "$got" ] && [ ! -e "$T/state/mediasync.list" ] && [ ! -e "$T/state/media-bg.list.handoff" ]; then
+      say 0 "H11b: a failed write: no am, neither mediasync.list nor media-bg.list.handoff is left"
+    else say 1 "H11b: am: [$got]; state: $(cd "$T/state" && ls | tr '\n' ' ')"; fi
+  fi
+
+  # H12: a stopped seal takes nothing: the lander's list stays as it was, no handoff file, no am.
+  T=$(run_case "$s" "$block" 1 ABSENT "$W/bgfix")
+  L="$T/user/com.nowhere.chooser/files/nowhere-mediascan.list"
+  if reached "$T" "H12"; then
+    got=$(grep '^am ' "$T/calls")
+    if cmp -s "$T/state/media-bg.list" "$W/bgfix" && [ ! -e "$T/state/media-bg.list.handoff" ] \
+       && [ ! -e "$L" ] && [ -z "$got" ]; then
+      say 0 "H12: stopped=1: media-bg.list untouched, no handoff file, no am"
+    else say 1 "H12: stopped=1 state: $(cd "$T/state" && ls | tr '\n' ' '); am: [$got]"; fi
+  fi
+
+  # H13: a lander append made after the take (here: during the broadcast) survives the block.
+  T=$(run_case "$s" "$block" 0 ABSENT "$W/bgfix" append)
+  if reached "$T" "H13"; then
+    if [ "$(cat "$T/state/media-bg.list" 2>/dev/null)" = "$LATE" ]; then
+      say 0 "H13: an append after the take survives as the whole new media-bg.list"
+    else say 1 "H13: media-bg.list afterwards: [$(cat "$T/state/media-bg.list" 2>/dev/null | tr '\n' ' ')]"; fi
+  fi
+
   return "$rc"
 }
 
@@ -182,6 +261,11 @@ printf '%s\n' /data/media/11/DCIM/a.jpg /data/media/12/x/data/media/11/y /data/m
 printf '%s\n' /storage/emulated/11/DCIM/a.jpg /data/media/12/x/data/media/11/y /data/media/12/Pictures/b.jpg \
   /storage/emulated/11/c.jpg > "$W/expected"
 : > "$W/empty"
+# The lander's list: one name with a space on purpose. LATE is what am appends in append mode.
+printf '%s\n' /data/media/11/DCIM/n1.jpg '/data/media/11/Pictures/n 2.jpg' > "$W/bgfix"
+printf '%s\n' /storage/emulated/11/DCIM/n1.jpg '/storage/emulated/11/Pictures/n 2.jpg' > "$W/bgexp"
+cat "$W/expected" "$W/bgexp" > "$W/bothexp"
+LATE=/data/media/11/DCIM/late.jpg
 
 # --- the cases on main's block ---------------------------------------------------------------------------
 for s in $SHELLS; do
@@ -219,14 +303,21 @@ PY
       esac
     done
   }
-  mut 'M1 the sed loses its ^ anchor' block H1 '\|\^/data/media/\$uid/\|' '|/data/media/$uid/|'
-  mut 'M2 the sed pattern loses the uid' block H1 '\|\^/data/media/\$uid/\|' '|^/data/media/[0-9]*/|'
+  mut 'M1 the sed loses its ^ anchor' block H1 '\|\^/data/media/\$uid/(\|/storage/emulated/\$uid/\|" "\$STATE/mediasync\.list")' '|/data/media/$uid/\1'
+  mut 'M2 the sed pattern loses the uid' block H1 '\|\^/data/media/\$uid/(\|/storage/emulated/\$uid/\|" "\$STATE/mediasync\.list")' '|^/data/media/[0-9]*/\1'
   mut 'M3 the chown removed' block H2 '^ *\[ -n "\$_msown" \] && chown [^\n]*\n' ''
   mut 'M4 the chmod removed' block H2 '^ *chmod 600 [^\n]*\n' ''
-  mut 'M5 the count moved after the broadcast' block H4 '^( *_msn=[^\n]*\n)( *am broadcast [^\n]*\n[^\n]*\n)' '\2\1'
+  mut 'M5 the count moved after the broadcast' block H4 '^( *_msn=[^\n]*\n)( *_msbg=[^\n]*\n)( *am broadcast [^\n]*\n[^\n]*\n)' '\2\3\1'
   mut 'M6 the post-hand-off rm removed' block H5 '^      rm -f "\$STATE/mediasync\.list" 2>> "\$LOG"\n' ''
   mut 'M7 the stopped test removed' block H6 '\[ "\$stopped" = 0 \] && ' ''
   mut 'M8 the pre-push rm moved after _push media' arm H8 '^(    rm -f "\$STATE/mediasync\.list" 2>> "\$LOG"\n)(    \[ -d "/data/media/\$uid" \] +&& _push media (?:[^\n]*\\\n)+[^\n]*\n)' '\2\1'
+  mut 'M9 the condition ignores media-bg.list' block H9 ' \|\| \[ -s "\$STATE/media-bg\.list" \]' ''
+  mut 'M10 the missing mediasync.list handed to sed' block H9 '\[ ! -s "\$STATE/mediasync\.list" \] \|\| ' ''
+  mut 'M11 the media-bg lines not translated' block H9 'sed "s\|\^/data/media/\$uid/\|/storage/emulated/\$uid/\|" ("\$STATE/media-bg\.list\.handoff")' 'cat \1'
+  mut 'M12 the handoff file not removed' block H11 '^ *rm -f "\$STATE/media-bg\.list\.handoff" 2>> "\$LOG"\n' ''
+  mut 'M13 the list taken when stopped' block H12 '^(    if \[ "\$stopped" = 0 \][^\n]*\n(?:[^\n]*\n)*?)( *\[ -s "\$STATE/media-bg\.list" \] && mv [^\n]*\n)' '\2\1'
+  mut 'M14 the live list removed instead of only the taken copy' block H13 'rm -f "\$STATE/media-bg\.list\.handoff"' 'rm -f "$STATE/media-bg.list" "$STATE/media-bg.list.handoff"'
+  mut 'M15 the bg count dropped from the log' block H9 ' bg=\$\{_msbg:-0\}' ''
 fi
 
 echo "$PASS passed, $FAIL failed"

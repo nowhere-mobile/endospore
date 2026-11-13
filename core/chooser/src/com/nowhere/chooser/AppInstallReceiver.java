@@ -117,6 +117,7 @@ public class AppInstallReceiver extends BroadcastReceiver {
                 SmsRoleRoam.onMaterialised(context, pkg);
                 if (!replacing) recaptureCode(context, pkg, "new"); // NWP-20261119-10: REPLACED covers an update
                 SettingsRoamLive.reconcile(context); // NWP-20261130-12: a Quick Settings tile that waited for this package
+                DefaultRoleRoam.onMaterialised(context, pkg); // NWP-20261202-05: a chosen default app takes its role back
             } catch (Throwable t) {
                 android.util.Log.w("NowhereChooser", "AppInstallReceiver", t);
             } finally {

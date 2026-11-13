@@ -72,7 +72,7 @@ EOF
     printf 'T=%s; STATE=$T/state; LOG=$T/log; RES=$T/res; USERDIR=$T/user; name=probe; pass=x; uid=7; skind=%s\n' "$T" "$7"
     printf 'AGENT=$T/agent.sh\n'
     printf 'unset NOWHERE_SEAL_STOPPABLE\n'
-    for f in bt_seal_capture nav_seal_capture aod_seal_capture a11y_seal_capture autofill_seal_capture tz_seal_capture \
+    for f in bt_seal_capture nav_seal_capture aod_seal_capture a11y_seal_capture autofill_seal_capture shortcut_seal_capture tz_seal_capture \
              vpn_deferred_retry vpn_seal_capture sync_apply_retry sync_seal_capture sroam_seal_capture ks_stage_drop restorecon chown \
              seal_wl_release seal_susp seal_wl_end; do
       printf '%s(){ :; }\n' "$f"

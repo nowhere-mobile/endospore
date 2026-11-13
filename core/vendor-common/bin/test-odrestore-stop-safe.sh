@@ -112,6 +112,7 @@ reown_ext_appdata() { :; }
 wait_acct_authenticator() { :; }
 acct_reload() { :; }
 sync_apply() { :; }
+vpn_preconsent_off() { :; }
 a11y_apply() { :; }
 autofill_apply() { :; }
 stat() { awk -v p="$3" '$1 == p {print $2; f=1} END{exit !f}' "$ROOT/sim/owners"; }

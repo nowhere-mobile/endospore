@@ -90,9 +90,11 @@ type sealDeltaReply struct {
 	// from a concurrent change. Scope and guard tokens only; omitted when empty, so an older chooser sees nothing new.
 	Scopes string `json:"scopes,omitempty"`
 	// LastStart / LastOK: #145 Signal 1.
-	LastStart   int64            `json:"lastStart"`     // unix sec; 0 = no seal dispatched this daemon lifetime
-	LastOK      int64            `json:"lastOK"`        // unix sec; 0 = none LANDED this daemon lifetime
-	Run         string           `json:"run,omitempty"` // a seal live right now ("periodic"|"logoff"|"manual"|"promote")
+	LastStart   int64            `json:"lastStart"`          // unix sec; 0 = no seal dispatched this daemon lifetime
+	LastOK      int64            `json:"lastOK"`             // unix sec; 0 = none LANDED this daemon lifetime
+	Run         string           `json:"run,omitempty"`      // a seal live right now ("periodic"|"logoff"|"manual"|"promote")
+	RunStart    int64            `json:"runStart,omitempty"` // unix sec: the live run's own announce (sealRunAt); omitted with no run
+	RunProg     string           `json:"runProg,omitempty"`  // the live run's frame "<phase> <done> <total>[ <scope>]": SEAL-STATUS line 1 less "SEALING "
 	Deferrals   int64            `json:"deferrals"`
 	BlindPkgs   []string         `json:"blind,omitempty"`
 	StoredApps  map[string]int64 `json:"storedApps,omitempty"` // pkg -> sealed bytes in the #apps head
@@ -251,7 +253,16 @@ func handleSealDelta(conn net.Conn, dest string) {
 	r.LastOK = lastSealOKAt.Load()
 	pendingReapMu.Lock()
 	r.Run = sealRunKind
+	if sealRunKind != "" && !sealRunAt.IsZero() {
+		r.RunStart = sealRunAt.Unix() // the live run's OWN start, read with its kind under one lock (not lastStart)
+	}
 	pendingReapMu.Unlock()
+	// composeSealStatus takes pendingReapMu itself: never call it under the lock above.
+	if r.Run != "" {
+		if l := composeSealStatus(dest); len(l) > 0 && strings.HasPrefix(l[0], "SEALING ") {
+			r.RunProg = strings.TrimSpace(strings.TrimPrefix(l[0], "SEALING "))
+		}
+	}
 	r.Deferrals = sealDeferCount.Load()
 	// #55 (NWP-20261117-18): the line describes the last MANUAL save, so it is sent only while that save is still the
 	// last seal to land; a later landed seal (periodic, sign-out, promote) hides it. Sequence first, figures after:
@@ -357,77 +368,9 @@ func handleSealDeltaWalk(conn net.Conn, dest string) {
 	}
 	// Refresh the index at most once per TTL; a stale index only mis-sorts a file between the exact rule
 	// and the estimate rule, and the walk's own since-filter still bounds the answer.
-	c := &sealDeltaIdxCache
-	c.mu.Lock()
-	fresh := c.name == name && c.ok && time.Since(c.at) < sealDeltaCacheTTL
-	c.mu.Unlock()
-	if !fresh {
-		scopes := map[string]map[string]deferredFile{}
-		listed := map[string]map[string]int64{}
-		for scope, suffix := range map[string]string{"vault": "", "de": "#de", "media": "#media"} {
-			// This runs in the login daemon, whose environment never carries NOWHERE_SE_SECRET (NWP-20260915-12): the session's secret is passed in.
-			if m, ok := scopeManifest(sealDeltaBase, name+suffix, pass, se); ok {
-				if len(m.Deferred) > 0 {
-					scopes[scope] = m.Deferred
-				}
-				if scope == "media" {
-					// NWP-20261126-06: the #media head lists its Deferred AND its Ess rels whenever it opens. A head with
-					// Ess and no Deferred is the normal head under the essential-media carry, and must still list its files.
-					lm := map[string]int64{}
-					for rel, d := range m.Deferred {
-						lm[rel] = d.Size
-					}
-					for rel, r := range m.Ess {
-						if r.Size > 0 {
-							lm[rel] = r.Size
-						}
-					}
-					listed["media"] = lm
-				}
-			}
-		}
-		// NWP-20261126-06: the vault and #de scan caches list the files of 1 MiB or more that the last seal saw. A
-		// scope's cache is read ONLY when no seal was dispatched after the last landed one (before and after the
-		// read), and the cache is not older than that landed seal: a cache from a seal that never landed is not
-		// read. Otherwise the scope's deletions are unknown, and the file says so with a #nocache line.
-		var noCache []string
-		for scope, suffix := range map[string]string{"vault": "", "de": "#de"} {
-			started, landed := lastSealStartedAt.Load(), lastLandedSealStartedAt.Load()
-			var rels map[string]int64
-			if started == landed {
-				if dk := sealDeltaScopeDK(sealDeltaBase, name+suffix, pass, se); dk != nil {
-					p := filepath.Join(dest, "scancache."+contentCacheTagFor(dk))
-					if fi, err := os.Stat(p); err == nil && fi.ModTime().Unix() >= landed {
-						if b, err := os.ReadFile(p); err == nil {
-							rels = map[string]int64{}
-							for _, line := range strings.Split(string(b), "\n") {
-								var rec scanRec
-								if line != "" && json.Unmarshal([]byte(line), &rec) == nil && rec.R != "" {
-									rels[rec.R] = rec.E.Size
-								}
-							}
-						}
-					}
-				}
-			}
-			if rels == nil || lastSealStartedAt.Load() != started {
-				noCache = append(noCache, scope)
-				continue
-			}
-			listed[scope] = rels
-		}
-		sort.Strings(noCache)
-		if err := writeSealDeltaIdx(sealDeltaIdxPath(dest), scopes); err != nil {
-			fmt.Fprint(conn, "ERR-IDX\n")
-			return
-		}
-		if err := writeSealDeltaListed(sealDeltaListedPath(dest), listed, noCache); err != nil {
-			fmt.Fprint(conn, "ERR-IDX\n")
-			return
-		}
-		c.mu.Lock()
-		c.name, c.at, c.ok = name, time.Now(), true
-		c.mu.Unlock()
+	if err := refreshSealDeltaIdx(dest, name, pass, se, func(at time.Time) bool { return time.Since(at) < sealDeltaCacheTTL }); err != nil {
+		fmt.Fprint(conn, "ERR-IDX\n")
+		return
 	}
 	conn.SetDeadline(time.Now().Add(60 * time.Second))
 	out := strings.TrimSpace(triggerRoamWorkerKind(dest, "sealdelta", name, "", uid, "", "", fmt.Sprint(since), "", nil))
@@ -440,4 +383,89 @@ func handleSealDeltaWalk(conn net.Conn, dest string) {
 	}
 	fmt.Fprintf(conn, "OK %d\n", len(out))
 	fmt.Fprint(conn, out)
+}
+
+// sealDeltaIdxWriteMu serialises refreshSealDeltaIdx (NWP-20261202-10): the delta screen and the periodic change test
+// write the same sealdelta.idx and sealdelta.listed files.
+var sealDeltaIdxWriteMu sync.Mutex
+
+// refreshSealDeltaIdx writes the walk's index files (the three data heads' Deferred indexes and the listed files) for
+// the profile, unless the cached index is this profile's and reuse accepts the time it was written. Lifted out of
+// handleSealDeltaWalk (NWP-20261202-10) so the periodic change test can write the index under its own rule; the
+// handler keeps its TTL rule. Any error means the index files cannot be trusted.
+func refreshSealDeltaIdx(dest, name, pass string, se []byte, reuse func(at time.Time) bool) error {
+	sealDeltaIdxWriteMu.Lock()
+	defer sealDeltaIdxWriteMu.Unlock()
+	c := &sealDeltaIdxCache
+	c.mu.Lock()
+	fresh := c.name == name && c.ok && reuse(c.at)
+	c.mu.Unlock()
+	if fresh {
+		return nil
+	}
+	scopes := map[string]map[string]deferredFile{}
+	listed := map[string]map[string]int64{}
+	for scope, suffix := range map[string]string{"vault": "", "de": "#de", "media": "#media"} {
+		// This runs in the login daemon, whose environment never carries NOWHERE_SE_SECRET (NWP-20260915-12): the session's secret is passed in.
+		if m, ok := scopeManifest(sealDeltaBase, name+suffix, pass, se); ok {
+			if len(m.Deferred) > 0 {
+				scopes[scope] = m.Deferred
+			}
+			if scope == "media" {
+				// NWP-20261126-06: the #media head lists its Deferred AND its Ess rels whenever it opens. A head with
+				// Ess and no Deferred is the normal head under the essential-media carry, and must still list its files.
+				lm := map[string]int64{}
+				for rel, d := range m.Deferred {
+					lm[rel] = d.Size
+				}
+				for rel, r := range m.Ess {
+					if r.Size > 0 {
+						lm[rel] = r.Size
+					}
+				}
+				listed["media"] = lm
+			}
+		}
+	}
+	// NWP-20261126-06: the vault and #de scan caches list the files of 1 MiB or more that the last seal saw. A
+	// scope's cache is read ONLY when no seal was dispatched after the last landed one (before and after the
+	// read), and the cache is not older than that landed seal: a cache from a seal that never landed is not
+	// read. Otherwise the scope's deletions are unknown, and the file says so with a #nocache line.
+	var noCache []string
+	for scope, suffix := range map[string]string{"vault": "", "de": "#de"} {
+		started, landed := lastSealStartedAt.Load(), lastLandedSealStartedAt.Load()
+		var rels map[string]int64
+		if started == landed {
+			if dk := sealDeltaScopeDK(sealDeltaBase, name+suffix, pass, se); dk != nil {
+				p := filepath.Join(dest, "scancache."+contentCacheTagFor(dk))
+				if fi, err := os.Stat(p); err == nil && fi.ModTime().Unix() >= landed {
+					if b, err := os.ReadFile(p); err == nil {
+						rels = map[string]int64{}
+						for _, line := range strings.Split(string(b), "\n") {
+							var rec scanRec
+							if line != "" && json.Unmarshal([]byte(line), &rec) == nil && rec.R != "" {
+								rels[rec.R] = rec.E.Size
+							}
+						}
+					}
+				}
+			}
+		}
+		if rels == nil || lastSealStartedAt.Load() != started {
+			noCache = append(noCache, scope)
+			continue
+		}
+		listed[scope] = rels
+	}
+	sort.Strings(noCache)
+	if err := writeSealDeltaIdx(sealDeltaIdxPath(dest), scopes); err != nil {
+		return err
+	}
+	if err := writeSealDeltaListed(sealDeltaListedPath(dest), listed, noCache); err != nil {
+		return err
+	}
+	c.mu.Lock()
+	c.name, c.at, c.ok = name, time.Now(), true
+	c.mu.Unlock()
+	return nil
 }

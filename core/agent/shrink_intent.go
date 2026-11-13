@@ -68,6 +68,7 @@ func handleExpectShrink(conn net.Conn, dest string) {
 		fmt.Fprint(conn, "ERR\n")
 		return
 	}
+	periodicDirty.Store(true) // NWP-20261202-10: a shrink marks the session for the next periodic save
 	fmt.Fprint(conn, "OK\n")
 }
 
@@ -86,6 +87,7 @@ func handleExpectShrinkInferred(conn net.Conn, r *bufio.Reader, dest string) {
 		fmt.Fprint(conn, "ERR\n")
 		return
 	}
+	periodicDirty.Store(true) // NWP-20261202-10: a shrink marks the session for the next periodic save
 	fmt.Fprint(conn, "OK\n")
 }
 
@@ -116,6 +118,7 @@ func handleExpectShrinkAndroid(conn net.Conn, r *bufio.Reader, dest string) {
 		fmt.Fprint(conn, "ERR\n")
 		return
 	}
+	periodicDirty.Store(true) // NWP-20261202-10: a shrink marks the session for the next periodic save
 	fmt.Fprint(conn, "OK\n")
 }
 

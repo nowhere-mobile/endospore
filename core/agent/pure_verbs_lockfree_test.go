@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -37,8 +38,8 @@ func TestPureVerbsAnswerWhileSessionMuIsHeld(t *testing.T) {
 	if got := heldReply(t, "GEN-PASSPHRASE\n", "GEN-PASSPHRASE"); !strings.HasPrefix(got, "OK ") || len(got) <= len("OK ") {
 		t.Fatalf("GEN-PASSPHRASE replied %q, want OK <words>", got)
 	}
-	if got := heldReply(t, "GET-SYNC-INTERVAL\n", "GET-SYNC-INTERVAL"); got != "120" {
-		t.Fatalf("GET-SYNC-INTERVAL replied %q, want the 120 default", got)
+	if got := heldReply(t, "GET-SYNC-INTERVAL\n", "GET-SYNC-INTERVAL"); got != strconv.Itoa(syncIntervalDefault) {
+		t.Fatalf("GET-SYNC-INTERVAL replied %q, want the %d default", got, syncIntervalDefault)
 	}
 }
 
@@ -90,7 +91,7 @@ func TestSetSyncIntervalFailedRenameLeavesNoTemp(t *testing.T) {
 	if _, err := os.Stat(p + ".tmp"); !os.IsNotExist(err) {
 		t.Fatalf("a failed SET left %s.tmp behind (stat err %v)", p, err)
 	}
-	if got := driveLogin(t, t.TempDir(), "GET-SYNC-INTERVAL\n"); got != "120" {
-		t.Fatalf("GET with a directory at the path replied %q, want the 120 default", got)
+	if got := driveLogin(t, t.TempDir(), "GET-SYNC-INTERVAL\n"); got != strconv.Itoa(syncIntervalDefault) {
+		t.Fatalf("GET with a directory at the path replied %q, want the %d default", got, syncIntervalDefault)
 	}
 }

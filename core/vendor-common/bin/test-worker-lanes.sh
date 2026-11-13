@@ -99,6 +99,9 @@ is REFUSED cred gmsexits ""         "cred lane refuses gmsexits (no credential, 
 is ALLOWED ro  healthprobe ""       "ro lane accepts healthprobe (NWP-20261201-08: the health checks' one dumpsys read)"
 is REFUSED ro  healthprobe "x"      "ro lane refuses a passphrase on healthprobe (it needs only the uid)"
 is REFUSED cred healthprobe ""      "cred lane refuses healthprobe (no credential, so it is not that lane's)"
+is ALLOWED ro  vpnstate ""          "ro lane accepts vpnstate (NWP-20261202-43: the issue report's always-on VPN read)"
+is REFUSED ro  vpnstate "x"         "ro lane refuses a passphrase on vpnstate (it needs only the uid)"
+is REFUSED cred vpnstate ""         "cred lane refuses vpnstate (no credential, so it is not that lane's)"
 
 echo "== $t no credential reaches the RO lane: not the passphrase, not the chip secret (NWP-20261110-17) =="
 # Line 5 carries the session's SE secret, which opens a TIED profile's vault, #de and #sys exactly as the
@@ -173,6 +176,10 @@ if [ "$MUTATE" = yes ]; then
          's@^\(    storagebreakdown|sealdelta|uiderrors|alarmrelay.*\)|gmsexits@\1@'
   mutate "ro lane closed to healthprobe (every health check is unmeasured: ERR-LANE)" \
          's@^\(    storagebreakdown|sealdelta|uiderrors|alarmrelay.*\)|healthprobe@\1@'
+  mutate "ro lane closed to vpnstate (every in-session report says vpn_state=unavailable: ERR-LANE)" \
+         's@^\(    storagebreakdown|sealdelta|uiderrors|alarmrelay.*\)|vpnstate@\1@'
+  mutate "userdir_recheck's guard comment drops vpnstate from the read-only lane's ops" \
+         's@, healthprobe, vpnstate) are arms of that@, healthprobe) are arms of that@' static
   mutate "userdir_recheck's guard comment drops alarmrelay from the read-only lane's ops" \
          's@ops (sealdelta, storagebreakdown, uiderrors, alarmrelay@ops (sealdelta, storagebreakdown, uiderrors@' static
   mutate "S1 ro lane's chip-secret refusal deleted (the secret rides into storagebreakdown's environment)" \

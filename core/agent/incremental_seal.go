@@ -33,6 +33,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -658,6 +659,11 @@ type fileScanCache struct {
 	gTotal   int                 // groups this walk flushed
 	gSkipped int                 // small regular files a reused group did not read
 
+	// NWP-20261202-15 (h49 #4 step 2): the groups this walk READ (the miss arm, a forced re-hash included) and the
+	// wall time of those reads, for the push log's walk cost line.
+	gRead      int
+	gReadNanos int64
+
 	writer sealWriterTally // NWP-20261201-12: what this walk found changed, for the push log line
 }
 
@@ -786,6 +792,7 @@ func (sc *fileScanCache) beginWalk() {
 	sc.mu.Lock()
 	sc.gPending, sc.gUsed = nil, map[string]bool{}
 	sc.gHits, sc.gTotal, sc.gSkipped = 0, 0, 0
+	sc.gRead, sc.gReadNanos = 0, 0
 	sc.writer.reset()
 	sc.mu.Unlock()
 }
@@ -850,6 +857,22 @@ func (sc *fileScanCache) groupStats() (hits, total, skipped int) {
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
 	return sc.gHits, sc.gTotal, sc.gSkipped
+}
+
+// noteGroupRead counts one group the miss arm read, and the wall time since t0 (just before its pipe opened).
+func (sc *fileScanCache) noteGroupRead(t0 time.Time) {
+	d := time.Since(t0)
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	sc.gRead++
+	sc.gReadNanos += int64(d)
+}
+
+// groupReadStats reports the groups this walk read and their total wall time, for the walk cost line.
+func (sc *fileScanCache) groupReadStats() (read int, d time.Duration) {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	return sc.gRead, time.Duration(sc.gReadNanos)
 }
 
 // saveGroups rewrites groupcache.<tag> atomically, keeping only the keys THIS walk reused or chunked clean, so a
@@ -1163,6 +1186,7 @@ func walkChunksExcl(src string, sc *fileScanCache, threshold int64, forceFull bo
 		// clean is written before CloseWithError, which is what ends cdcSplit's read, so reading it after the
 		// split returns is ordered behind that write (the tarErr argument in pushProfile's legacy arm).
 		clean := false
+		readT0 := time.Now() // NWP-20261202-15: the read's wall time, the emitSeal waits on the seal pool included
 		pr, pw := io.Pipe()
 		go func() {
 			c, err := writeEntriesTarChecked(pw, g)
@@ -1178,6 +1202,7 @@ func walkChunksExcl(src string, sc *fileScanCache, threshold int64, forceFull bo
 		})
 		if sc != nil {
 			sc.noteGroup(key, gs.start, gs.end, false, clean, regFiles)
+			sc.noteGroupRead(readT0)
 		}
 		if acct != nil && gs.start >= 0 {
 			acct.groups = append(acct.groups, gs)
@@ -1593,6 +1618,12 @@ func walkChunksExcl(src string, sc *fileScanCache, threshold int64, forceFull bo
 				})
 				return filepath.SkipDir
 			}
+		}
+		if info.Mode().IsRegular() && isMediaProviderDBRel(filepath.ToSlash(rel)) {
+			// NWP-20261202-02: MediaProvider's own databases are never sealed (see isMediaProviderDBRel). Priced for
+			// the shrink guard, as Play's cache, so the first seal's drop of what an old head held is explained.
+			dropped += info.Size()
+			return nil
 		}
 		if info.Mode().IsRegular() && isMediaTempName(info.Name()) {
 			// NWP-20261128-03 (docs/media-after-gate.md §5, last row): a .nwsync-*/.nwseed-* temp a media writer

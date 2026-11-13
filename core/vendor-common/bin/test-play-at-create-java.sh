@@ -17,8 +17,9 @@
 #       ensureSessionScreenTimeout(uid) stay adjacent.
 #   P4  sendPlayAtCreate sends an explicit broadcast to that user (sendBroadcastAsUser, PlayAtCreateReceiver.class,
 #       FLAG_INCLUDE_STOPPED_PACKAGES, UserHandle.of(uid)) carrying the value alone; it names no profile.
-#   P5  PlayAtCreateReceiver.onReceive returns unless PlayAtCreate.accepts(extra), before its one write, which goes
-#       through ProfileActivity.cfgPutStatic(ctx, PlayChoice.CFG_KEY, v); it writes nothing else and marks no package.
+#   P5  PlayAtCreateReceiver.onReceive returns unless PlayAtCreate.accepts(extra), before its two writes, both through
+#       ProfileActivity.cfgPutStatic: play.wanted (PlayChoice.CFG_KEY, v) first, then PlayFinishPrompt's pending marker
+#       (NWP-20261202-22); it writes nothing else and marks no package.
 #   P6  the manifest declares the receiver once, exactly `<receiver android:name=".PlayAtCreateReceiver"
 #       android:exported="false"/>`.
 #   P7  cfgPut only delegates to cfgPutStatic(this, key, val); cfgPutStatic reads through SettingsText.read and
@@ -206,10 +207,12 @@ pin('P4 sendPlayAtCreate names no profile', spc != '' and not re.search(r'(?<![\
 orc = flat(method(rcv, 'public void onReceive(Context ctx, Intent intent) {'))
 gate = orc.find('if(!PlayAtCreate.accepts(v))return;')
 put = orc.find('ProfileActivity.cfgPutStatic(ctx,PlayChoice.CFG_KEY,v);')
+mk = orc.find('ProfileActivity.cfgPutStatic(ctx,PlayFinishPrompt.CFG_KEY,PlayFinishPrompt.PENDING);')
 pin('P5 onReceive reads the value from PlayAtCreate.EXTRA',
     orc.count('Stringv=intent.getStringExtra(PlayAtCreate.EXTRA);') == 1, orc[:200])
-pin('P5 onReceive returns unless PlayAtCreate.accepts(v), before its one cfgPutStatic write',
-    0 <= gate < put and orc.count('cfgPutStatic(') == 1, 'gate at %d, write at %d' % (gate, put))
+pin('P5 onReceive returns unless PlayAtCreate.accepts(v), before its two cfgPutStatic writes, play.wanted first, '
+    'then the pending marker',
+    0 <= gate < put < mk and orc.count('cfgPutStatic(') == 2, 'gate at %d, write at %d, marker at %d' % (gate, put, mk))
 pin('P5 onReceive writes nothing else and marks no package',
     orc != '' and not re.search(r'writeAtomic|FileWriter|FileOutputStream|applyKeepMode|markKeep|setPlayDep|cfgPut\(', orc),
     'another write in onReceive')
@@ -317,6 +320,8 @@ mut 'M12b the broadcast is implicit' act 's/new Intent\(app, PlayAtCreateReceive
 mut 'M13 cfgPutStatic writes over an unreadable file' pro 's/(static void cfgPutStatic[^\n]*\n(?:[^\n]*\n){3})\s*if \(text == null\) \{\n[^\n]*\n\s*return;\n\s*\}\n/$1        if (text == null) text = "";\n/'
 mut 'M13b cfgPut keeps its own body again' pro 's/(    private void cfgPut\(String key, String val\) \{\n)        cfgPutStatic\(this, key, val\);\n/$1        String text = SettingsText.read(new java.io.File(getFilesDir(), CFG_FILE));\n        if (text == null) return;\n        cfgPutStatic(this, key, val);\n/'
 mut 'M14 the receiver also marks Play Store kept' rcv 's/(ProfileActivity\.cfgPutStatic\(ctx, PlayChoice\.CFG_KEY, v\);)/$1\n        ProfileActivity.cfgPutStatic(ctx, "keep.com.android.vending", "ondemand");/'
+mut 'M15 the receiver writes no pending marker (P5)' rcv 's/\n\s*ProfileActivity\.cfgPutStatic\(ctx, PlayFinishPrompt\.CFG_KEY, PlayFinishPrompt\.PENDING\);//'
+mut 'M15b the pending marker written before play.wanted (P5)' rcv 's/(\n\s*ProfileActivity\.cfgPutStatic\(ctx, PlayChoice\.CFG_KEY, v\);)(\n\s*ProfileActivity\.cfgPutStatic\(ctx, PlayFinishPrompt\.CFG_KEY, PlayFinishPrompt\.PENDING\);)/$2$1/'
 mut 'probe: the send line with its comment moved above it (must pass)' act 's/(\n(\s*)if \(isCreate && playAtCreate != null\) sendPlayAtCreate\(uid, playAtCreate\);) \/\/ NWP-20261124-09: before switch-in/\n$2\/\/ NWP-20261124-09: before switch-in$1/' pass
 mut 'probe: another call between the home role and the send (must pass)' act 's/(\n(\s*)if \(isCreate && playAtCreate != null\) sendPlayAtCreate)/\n$2android.util.Log.i("NowhereChooser", "x");$1/' pass
 [ "$fails" = 0 ] || { echo "FAILED: $fails mutant(s) not convicted"; exit 1; }

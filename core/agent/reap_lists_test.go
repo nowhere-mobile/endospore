@@ -15,7 +15,7 @@ import (
 
 var reapListsGone = []string{
 	"scancache.ab12", "scancache.ab12.tmp", "heal-handled-0123456789abcdef", "heal-handled-0123456789abcdef.tmp",
-	"sealdelta.idx", "sealdelta.idx.tmp", "sealdelta.listed", "sealdelta.listed.tmp",
+	"sealdelta.idx", "sealdelta.idx.tmp", "sealdelta.listed", "sealdelta.listed.tmp", "media-bg.list.handoff",
 }
 
 var reapListsStay = []string{
@@ -28,7 +28,7 @@ var reapCachesGone = []string{
 
 const (
 	reapListsKeptLine  = "[logind] reap: kept the session file lists and caches -- a session is live or parked (h59 #11, h60 #8)"
-	reapListsDoneLine  = "[logind] reap: removed 8 session file list(s) from the state tmpfs (h59 #11)"
+	reapListsDoneLine  = "[logind] reap: removed 9 session file list(s) from the state tmpfs (h59 #11)"
 	reapCachesDoneLine = "[logind] reap: removed 6 session cache file(s) from the state tmpfs (h60 #8)"
 )
 

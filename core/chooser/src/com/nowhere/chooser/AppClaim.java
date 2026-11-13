@@ -125,21 +125,21 @@ final class AppClaim {
                 // ⚠ "CLOSE IT THERE" WAS TRUE OF AN INTENTION AND FALSE OF THE MECHANISM, and it stopped
                 // being defensible the moment NWP-20260912-06 defined what a hold IS: a package is held
                 // from the moment it is opened until the holder SIGNS OUT, RELEASES it, uninstalls it, or
-                // goes ~15 minutes without sealing. Closing the app on the other handset changes nothing,
+                // goes ~60 minutes (claimTTL) without sealing. Closing the app on the other handset changes nothing,
                 // so the old copy sent the user to do a thing, watch it fail, and do it again. Say the
                 // things that DO work, and say them in the order the user can act on.
                 .setTitle("Held by " + where)
                 //
                 // ⚠ "IS AWAY FOR ABOUT FIFTEEN MINUTES" WAS THE SAME DEFECT A SECOND TIME, and the comment
-                // three lines above already said so: the claim lapses after ~15 minutes WITHOUT SEALING, not
+                // three lines above already said so: the claim lapses after ~60 minutes (claimTTL) WITHOUT SEALING, not
                 // without USE. A handset idle on a charger is away in every sense the reader means and seals
-                // every 120 s forever, so its claims never lapse -- and we were telling a blocked user to wait
+                // every interval, so its claims never lapse -- and we were telling a blocked user to wait
                 // for a release that cannot arrive. `ProfileActivity.java:2884` caught this on the held-apps
                 // screen and wrote the warning there; this surface never got the correction, so the string
                 // drifted from the comment that introduces it. Switched off is the case that DOES lapse, and
                 // it is what the reader can act on or wait for.
                 .setMessage("You opened this app on " + where + ", so it is held there. It opens here once "
-                        + "that device releases it, signs out, or uninstalls it — or about fifteen minutes "
+                        + "that device releases it, signs out, or uninstalls it — or about an hour "
                         + "after that device is switched off. Either way the change takes a few minutes to "
                         + "reach this device.")
                 .build();

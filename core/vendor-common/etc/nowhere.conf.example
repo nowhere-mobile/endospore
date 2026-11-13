@@ -114,6 +114,10 @@ S3_SECRET_KEY=__PROVISION_ME__
 # and the seal is not, so a flagless handset's grouped re-seal is no longer refused -- see rings/beta.conf
 # "NOT A ROLLOUT CONSTRAINT")
 #NOWHERE_CARRY_ESSENTIAL_MEDIA=0
+#
+# NOWHERE_MEDIA_AFTER_GATE -- user media restored after the gate (Q106, docs/media-after-gate.md); roamd and
+# mediad export it, OFF by default. Set it to 1 only for S7's lynx run, until S7 turns it on.
+#NOWHERE_MEDIA_AFTER_GATE=1
 
 # NOTE: there is intentionally no NOWHERE_PROFILE / NOWHERE_PASS here. Identity is the blind-login
 # chooser's job -- it hands the profile + passphrase to the daemon at login, and the sync is

@@ -1,0 +1,37 @@
+Canary pass -- which release versions the canary (husky) has smoke-tested, so the fleet may publish them (NWP-20261202-12).
+
+Decisions of record: docs/product-decisions.md, 2026-10-30 ("every release is proved on a canary first -- husky joins
+the release devices on a user build, publishes alone, and the rest of the fleet publishes only after its smoke test
+passes"), and 2026-11-04 ("nine answers to harvest 57 -- every recommendation accepted", h57 #2), which gives the gate
+its form: a committed canary-pass/<version>, read from the publishing checkout, or --without-canary, logged.
+
+What reads it: `editions/endospore/build/canary-guard.sh <device> <version> [--without-canary]`.
+`e4-ota-publish.sh` and `e4-ota-promote.sh` call it before any store write. The canary device (husky) publishes with
+no file here. Any other device is refused for a version with no file here.
+
+When husky's smoke test passes for a release, the operator writes a file named for the version (e.g. `0.5.55`) in the
+publishing checkout, exactly three lines:
+
+    canary husky
+    build 2026120501
+    smoke pass 2026-12-05
+
+- `canary` names the canary device that ran the smoke test. It must be a device in the guard's CANARY_DEVICES.
+- `build` is that device's build number, exactly 10 digits.
+- `smoke pass` is the day the smoke test passed, as YYYY-MM-DD. No other word than `pass` is accepted.
+- No fourth line, no blank line, no CR. A file that is not exactly this refuses, even with --without-canary (fail
+  closed).
+
+Then the operator publishes the fleet from the same checkout. The guard prints one line per device:
+`canary-guard: <device> <version> follows canary husky build <BN>, smoke passed <date>`. The file is committed
+afterwards, in the marker-bump PR that every release already gets (docs/release-runbook.md section 8).
+
+`--without-canary` is the only bypass. Only Chester decides to use it. The guard then prints
+`canary-guard: WITHOUT CANARY: <device> <version> is published with no canary pass (--without-canary)` on stderr;
+quote that line in the release's worklog row.
+
+Not guarded: the installer page publish (nowhere-cloud `publish-installer.sh`) does not read this directory. Publish a
+fleet device's installer only after the pass file exists.
+
+No pass file is committed with this README. Keep this README: the guard refuses when this directory is missing,
+because its absence means a wrong checkout. Pinned by test-canary-guard.sh (--mutate).

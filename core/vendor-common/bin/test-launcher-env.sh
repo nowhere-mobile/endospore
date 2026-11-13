@@ -62,6 +62,7 @@ NOWHERE_MULTIDEVICE|login roamd mediad|otad restores the published os ref, not a
 NOWHERE_SEQ_GUARD|roamd|worker-only: login-daemon never runs pushProfile; nowhere_login.sh still exports it (harmless)|restore_receipt.go:seqGuardEnabled, called only from main.go:pushProfile (the `push` subcommand roamd runs)
 NOWHERE_CARRY_ESSENTIAL|roamd|worker-only: pushProfile is reached only by the `push` subcommand (main.go:17172); the daemon never self-execs and calls no seal that reaches carryEssential/essIndexOn|main.go:carryEssential (pushProfile)
 NOWHERE_CARRY_ESSENTIAL_MEDIA|roamd|worker-only: same trace as NOWHERE_CARRY_ESSENTIAL|media_carry.go:carryEssentialMedia, essIndexOn (pushProfile)
+NOWHERE_MEDIA_AFTER_GATE|roamd mediad|login and otad never restore #media or run the lander|media_after_gate.go:mediaAfterGateOn (mediaRestorePlan in the restore roamd runs; startBgLander in mediad)
 '
 
 FAILS=0

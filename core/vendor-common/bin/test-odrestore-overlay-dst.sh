@@ -153,6 +153,7 @@ reown_ext_appdata() { :; }
 wait_acct_authenticator() { :; }
 acct_reload() { :; }
 sync_apply() { :; }
+vpn_preconsent_off() { :; }
 a11y_apply() { :; }
 autofill_apply() { :; }
 # _ref <path>: 0 when the kernel would refuse a write at <path> -- a listed overlay target or under one (the trailing

@@ -127,6 +127,7 @@ reown_ext_appdata() { :; }
 wait_acct_authenticator() { :; }
 acct_reload() { :; }
 sync_apply() { :; }
+vpn_preconsent_off() { :; }
 a11y_apply() { :; }
 autofill_apply() { :; }
 reown_restored() { :; }

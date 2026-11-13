@@ -14,6 +14,10 @@
 # survives only in a comment reads as absent. The rm line itself is EXECUTED against a scratch CE dir: it must remove a
 # planted marker and leave a planted record.
 #
+# NWP-20261202-05: the same holds for the default-app roles (DefaultRoleRoam): the `in` op removes their apply marker,
+# nowhere-roles-applied, after the CE restore and before OK, and no roamd code line ever touches their record,
+# nowhere-roles. Both are checked and executed the same way, and four more mutants must be convicted.
+#
 #   bash test-sms-marker-reset.sh            # the checks
 #   bash test-sms-marker-reset.sh --mutate   # ... plus mutations that must each CONVICT the suite
 set -uo pipefail
@@ -22,11 +26,16 @@ for a in "$@"; do case "$a" in --mutate) MUTATE=yes ;; *) SUT="$a" ;; esac; done
 SUT="${SUT:-$(dirname "$0")/nowhere_roamd.sh}"
 [ -f "$SUT" ] || { echo "no such script: $SUT" >&2; exit 2; }
 
+# ONE temp root: the scratch CE dir and every mutant copy live under it, and the EXIT trap removes it however this ends.
+W=$(mktemp -d) || exit 2
+trap 'rm -rf "$W"' EXIT
+
 PASS=0; FAIL=0
 ok(){ PASS=$((PASS+1)); printf '  ok    %s\n' "$1"; }
 no(){ FAIL=$((FAIL+1)); printf '  FAIL  %s\n' "$1"; }
 
 RM='      rm -f "$USERDIR/com.nowhere.chooser/files/nowhere-sms-applied" 2>>"$LOG"'
+RM2='      rm -f "$USERDIR/com.nowhere.chooser/files/nowhere-roles-applied" 2>>"$LOG"'
 OKL='      echo "OK $uid" > "$RES"; _inres=OK'
 # the CE vault restore: the rm must come AFTER it, or the restore untars the marker straight back
 RESTORE='    elif od_shipped_prep && NOWHERE_PARK_KEEP="$(od_park_var keep)" NOWHERE_PARK_SHIPPED="$(od_park_var shipped)" NOWHERE_UNFETCHED_LIST="$(od_park_var ce)" NOWHERE_PHASE=apps NOWHERE_CLAIMS_SEED="$STATE/claims.seed" "$AGENT" restore s3 "$name" "$(pw "$pass")" "$USERDIR" >> "$LOG" 2>&1; then'
@@ -36,6 +45,7 @@ CODE=$(printf '%s\n' "$IN" | sed -E 's/^[0-9]+: //')
 # lineof <exact line>: the roamd line number of that exact code line in the in op, or empty
 lineof(){ printf '%s\n' "$IN" | awk -v want="$1" '{ n = $0; sub(/^[0-9]+: /, "", n); if (n == want) { split($0, a, ":"); print a[1]; exit } }'; }
 L_RM=$(lineof "$RM")
+L_RM2=$(lineof "$RM2")
 L_OK=$(lineof "$OKL")
 L_RESTORE=$(lineof "$RESTORE")
 
@@ -44,8 +54,13 @@ if [ "$(printf '%s\n' "$CODE" | grep -cxF -- "$RM")" = 1 ]; then ok "the in op r
 if [ "$(printf '%s\n' "$CODE" | grep -cxF -- "$RESTORE")" = 1 ] && [ -n "$L_RM" ] && [ "$L_RM" -gt "$L_RESTORE" ]; then ok "it is removed AFTER the CE vault restore (line $L_RESTORE < $L_RM), which would otherwise untar it straight back"; else no "the marker is removed before the CE restore, or the restore anchor is not there exactly once (restore ${L_RESTORE:-none}, rm ${L_RM:-none})"; fi
 if [ -n "$L_RM" ] && [ -n "$L_OK" ] && [ "$L_RM" -lt "$L_OK" ]; then ok "it is removed before the in op answers OK (line $L_RM < $L_OK), so before the chooser can capture"; else no "the marker is removed after the OK, or not at all (rm ${L_RM:-none}, OK ${L_OK:-none})"; fi
 
+echo "== the in op clears the roles marker (NWP-20261202-05) =="
+if [ "$(printf '%s\n' "$CODE" | grep -cxF -- "$RM2")" = 1 ]; then ok "the in op removes nowhere-roles-applied (once, as code)"; else no "the in op does not remove nowhere-roles-applied as code -- a roles marker from another handset forges 'applied'"; fi
+if [ -n "$L_RM2" ] && [ -n "$L_RESTORE" ] && [ "$L_RM2" -gt "$L_RESTORE" ]; then ok "the roles marker is removed AFTER the CE vault restore (line $L_RESTORE < $L_RM2)"; else no "the roles marker is removed before the CE restore, or not at all (restore ${L_RESTORE:-none}, rm ${L_RM2:-none})"; fi
+if [ -n "$L_RM2" ] && [ -n "$L_OK" ] && [ "$L_RM2" -lt "$L_OK" ]; then ok "the roles marker is removed before the in op answers OK (line $L_RM2 < $L_OK)"; else no "the roles marker is removed after the OK, or not at all (rm ${L_RM2:-none}, OK ${L_OK:-none})"; fi
+
 echo "== the rm, executed =="
-T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
+T=$(mktemp -d -p "$W")
 mkdir -p "$T/u/com.nowhere.chooser/files"
 printf 'session=7\nstate=applied\napplied=a.b\ntarget=a.b\n' > "$T/u/com.nowhere.chooser/files/nowhere-sms-applied"
 printf 'app=a.b\n' > "$T/u/com.nowhere.chooser/files/nowhere-sms"
@@ -53,6 +68,13 @@ line=$(printf '%s\n' "$CODE" | grep -F 'nowhere-sms' | grep -E '^[[:space:]]*rm 
 ( USERDIR="$T/u"; LOG="$T/log"; eval "$line" )
 if [ ! -e "$T/u/com.nowhere.chooser/files/nowhere-sms-applied" ]; then ok "the marker is gone"; else no "the rm left the marker"; fi
 if [ -f "$T/u/com.nowhere.chooser/files/nowhere-sms" ] && [ "$(cat "$T/u/com.nowhere.chooser/files/nowhere-sms")" = "app=a.b" ]; then ok "the record is untouched"; else no "the rm took the profile's SMS-app record"; fi
+
+printf 'session=7\nandroid.app.role.BROWSER applied a.b\n' > "$T/u/com.nowhere.chooser/files/nowhere-roles-applied"
+printf 'android.app.role.BROWSER a.b\n' > "$T/u/com.nowhere.chooser/files/nowhere-roles"
+line=$(printf '%s\n' "$CODE" | grep -F 'nowhere-roles-applied' | grep -E '^[[:space:]]*rm ' | head -1)
+if [ -n "$line" ]; then ( USERDIR="$T/u"; LOG="$T/log"; eval "$line" ); fi
+if [ -n "$line" ] && [ ! -e "$T/u/com.nowhere.chooser/files/nowhere-roles-applied" ]; then ok "the roles marker is gone"; else no "the rm left the roles marker"; fi
+if [ -f "$T/u/com.nowhere.chooser/files/nowhere-roles" ] && [ "$(cat "$T/u/com.nowhere.chooser/files/nowhere-roles")" = "android.app.role.BROWSER a.b" ]; then ok "the roles record is untouched"; else no "the rm took the profile's default-app record"; fi
 
 echo "== the record is never reaped =="
 # Never `| grep -q` under pipefail: grep -q exits at its first match, the writer upstream takes SIGPIPE, and the
@@ -64,15 +86,24 @@ else
 fi
 # control: the scanner must see the marker's own rm, else "no line removes the record" proves nothing
 if grep -vE '^[[:space:]]*#' "$SUT" | grep -E 'rm ' | grep 'nowhere-sms-applied' >/dev/null; then ok "control: the scan sees the marker's rm"; else no "control: the scan does not even see the marker's rm"; fi
+if ! grep -vE '^[[:space:]]*#' "$SUT" | grep -E 'rm |mv |truncate|: >' | grep -E 'nowhere-roles("|[[:space:]]|$|\*)' >/dev/null; then
+  ok "no code line in roamd removes, moves or truncates nowhere-roles (the record)"
+else
+  no "a roamd code line removes nowhere-roles, the profile's default-app record: $(grep -vE '^[[:space:]]*#' "$SUT" | grep -E 'rm |mv |truncate|: >' | grep -E 'nowhere-roles("|[[:space:]]|$|\*)' | head -1)"
+fi
+if grep -vE '^[[:space:]]*#' "$SUT" | grep -E 'rm ' | grep 'nowhere-roles-applied' >/dev/null; then ok "control: the scan sees the roles marker's rm"; else no "control: the scan does not even see the roles marker's rm"; fi
 
 if [ "$MUTATE" = yes ]; then
   echo
   echo "== mutations (each MUST be convicted) =="
-  M=$(mktemp -d)
-  mutate(){
+  M=$(mktemp -d -p "$W")
+  mutate(){ # mutate <label> <sed script> [<the FAIL line the child must print>]
+    local out
     if ! sed "$2" "$SUT" > "$M/r.sh" 2>"$M/err"; then no "MUTATION BROKEN (sed): $1"; return; fi
     if cmp -s "$SUT" "$M/r.sh"; then no "MUTATION INERT: $1"; return; fi
-    if bash "$0" "$M/r.sh" >/dev/null 2>&1; then no "NOT CONVICTED: $1 -- suite passes on broken code"; else ok "convicted: $1"; fi
+    if out=$(bash "$0" "$M/r.sh" 2>&1); then no "NOT CONVICTED: $1 -- suite passes on broken code"; return; fi
+    if [ -n "${3:-}" ] && ! grep -qF -- "FAIL  $3" <<<"$out"; then no "CONVICTED, BUT NOT BY '$3': $1"; return; fi
+    ok "convicted: $1"
   }
   mutate "the marker rm dropped"            '/^      rm -f "\$USERDIR\/com.nowhere.chooser\/files\/nowhere-sms-applied" 2>>"\$LOG"$/d'
   mutate "the marker rm commented out"      's/^      rm -f "\$USERDIR\/com.nowhere.chooser\/files\/nowhere-sms-applied" 2>>"\$LOG"$/      # &/'
@@ -81,7 +112,17 @@ if [ "$MUTATE" = yes ]; then
   mutate "the record removed as well"       's/^      rm -f "\$USERDIR\/com.nowhere.chooser\/files\/nowhere-sms-applied" 2>>"\$LOG"$/&\n      rm -f "$USERDIR\/com.nowhere.chooser\/files\/nowhere-sms" 2>>"$LOG"/'
   mutate "the rm moved to the top of the in op, before the restore" '/^      rm -f "\$USERDIR\/com.nowhere.chooser\/files\/nowhere-sms-applied" 2>>"\$LOG"$/d; s/^  in)$/&\n      rm -f "$USERDIR\/com.nowhere.chooser\/files\/nowhere-sms-applied" 2>>"$LOG"/'
   mutate "the rm moved out of the in op"    '/^      rm -f "\$USERDIR\/com.nowhere.chooser\/files\/nowhere-sms-applied" 2>>"\$LOG"$/d; s/^case "\$op" in$/rm -f "$USERDIR\/com.nowhere.chooser\/files\/nowhere-sms-applied" 2>>"$LOG"\n&/'
-  rm -rf "$M"
+  # NWP-20261202-05: the default-app roles' marker
+  R2='/^      rm -f "\$USERDIR\/com.nowhere.chooser\/files\/nowhere-roles-applied" 2>>"\$LOG"$/'
+  mutate "the roles marker rm dropped"        "${R2}d" \
+    "the in op does not remove nowhere-roles-applied as code"
+  mutate "the roles marker rm commented out"  "${R2}s/^/      # /" \
+    "the in op does not remove nowhere-roles-applied as code"
+  mutate "the roles marker rm moved to the top of the in op, before the restore" \
+    "${R2}d; s/^  in)\$/&\n      rm -f \"\$USERDIR\/com.nowhere.chooser\/files\/nowhere-roles-applied\" 2>>\"\$LOG\"/" \
+    "the roles marker is removed before the CE restore"
+  mutate "the roles record removed instead"   's/nowhere-roles-applied" 2>>"\$LOG"$/nowhere-roles" 2>>"$LOG"/' \
+    "a roamd code line removes nowhere-roles"
 fi
 
 echo

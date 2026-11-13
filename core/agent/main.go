@@ -3073,6 +3073,10 @@ func laneFor(op string) workerLane {
 		// NWP-20261201-01: two read-only activity-manager dumps for an issue report. Its own arm because
 		// test-alarmrelay-lane.sh pins the case line above byte for byte.
 		return laneRO
+	case "vpnstate":
+		// NWP-20261202-43: three secure-settings reads and one package dump for an issue report. Its own arm because
+		// test-alarmrelay-lane.sh pins the case line above byte for byte.
+		return laneRO
 	case "healthprobe":
 		// NWP-20261201-08: the health checks' one `dumpsys activity oom` read. Its own arm because
 		// test-alarmrelay-lane.sh pins the case line above byte for byte.
@@ -3122,6 +3126,10 @@ func workerWaitCap(op string) time.Duration {
 	case "gmsstate":
 		// NWP-20261201-01: two activity-manager dumps for an issue report, whose preview the user is waiting on. A busy
 		// answer costs the report one honest "not collected" line, never the report.
+		return 10 * time.Second
+	case "vpnstate":
+		// NWP-20261202-43: three secure-settings reads and one package dump for an issue report, whose preview the user
+		// is waiting on. A busy answer costs the report one honest "unavailable" value, never the report.
 		return 10 * time.Second
 	case "gmsexits":
 		// NWP-20261201-02: one dumpsys for an issue report, whose preview the user is waiting on. Inside gmsExitsWait,
@@ -7446,6 +7454,9 @@ func pushProfile(base, profile, pass, src string) {
 				return nil // NWP-20261128-03: the seal walks skip a media writer's temp -- keep the denominator in step
 			}
 			if fi.Mode().IsRegular() {
+				if rel, _ := filepath.Rel(src, p); isMediaProviderDBRel(filepath.ToSlash(rel)) {
+					return nil // NWP-20261202-02: the seal walks skip MediaProvider's databases -- keep the denominator in step
+				}
 				sum += fi.Size()
 			}
 			return nil
@@ -7769,6 +7780,7 @@ func pushProfile(base, profile, pass, src string) {
 			effThreshold = 0
 		}
 		thr := effThreshold
+		wcBefore := walkCostNow() // NWP-20261202-15: read before walkT0, so the snapshot's own reads are not walk time
 		walkT0 := time.Now()
 		ranges, seen, deferredR, carriedDef, sealBlind, sealDropped, sealStats, sealDiscard = walkChunksExcl(src, sc, thr, forceFull, ondemandMedia() && sealScopeDefers(profile), oldM.Deferred,
 			unders, pins, tiers, budget, sealChunk, cachedChunk, func(n int64) { atomic.AddInt64(&doneBytes, n) }, acct, walkExcl)
@@ -7787,6 +7799,14 @@ func pushProfile(base, profile, pass, src string) {
 		}
 		fmt.Printf("push: profile %s group cache: %d of %d group(s) reused, %d small file(s) not read, walk %s%s\n",
 			logProfile(profile), gHits, gTotal, gSkipped, time.Since(walkT0).Round(time.Millisecond), full)
+		// NWP-20261202-15: the h49 #4 step-2 split -- where the walk's time went: the groups read and their time,
+		// the rest of the walk, the process CPU and the /proc/pressure stall over it. Counts and times only.
+		// CPU near the walk time means hashing; low CPU with an io stall means reading; a large rest with few
+		// groups read means the lstat walk itself. Caveats: the read time includes emitSeal's wait on the
+		// bounded seal pool (sealChunk's sem); CPU is the whole agent process (the seal workers too); PSI is
+		// system-wide, not this process.
+		gRead, gReadD := sc.groupReadStats()
+		fmt.Printf("push: profile %s %s\n", logProfile(profile), walkCostLine(wcBefore, walkCostNow(), gRead, gReadD, time.Since(walkT0)))
 		fmt.Printf("push: profile %s changed since the last seal: %s\n", logProfile(profile), sealWriterLine(sc.sealWriterStats(), forceFull))
 		// NWP-20261123-04: a #media walk equal to the last landed seal's, over the same head, ends here -- no carry,
 		// no manifest, no lease, no head write (media_nochange.go has every condition).
@@ -7898,6 +7918,8 @@ func pushProfile(base, profile, pass, src string) {
 	if (ondemandMedia() || os.Getenv("NOWHERE_CARRY_DEFERRED") == "1" || !scopeDefersMedia(profile)) && len(oldM.Deferred) > 0 {
 		tomb := mediaTombstones(src) // #84 deletion: deferred files the app UNLINKED through the overlay
 		carryDrop := loadDropList()  // DIA-20260804-04: switched-off apps must not be carried forward either
+		// NWP-20261202-17: read AFTER the tombstones (media_heal_late.go writes its line before the tombstone).
+		lateLanded := mediaLateLanded(src)
 		// NWP-20260923-02: the rels this session's sign-in heal handled (media_heal.go); empty when it did not run.
 		healHandled, _ := readHealList(os.Getenv("NOWHERE_STATE"), profile, pass)
 		for rel, prev := range oldM.Deferred {
@@ -7947,7 +7969,8 @@ func pushProfile(base, profile, pass, src string) {
 				// would undo the deletion, or re-fetch and bill the parked bytes twice, at the next sign-in.
 				continue
 			}
-			if tomb[rel] {
+			if tomb[rel] && !lateLandedUnwalked(src, rel, lateLanded, seen) {
+				// NWP-20261202-17: a file the late heal landed after the walk passed its dir is not a deletion.
 				continue // #84 deletion: a POSITIVE app unlink (mediad tombstone) -- genuinely deleted, drop it.
 				// This is the ONE safe way to drop a deferred entry the walk didn't see: a not-seen file is
 				// normally carried (it may just be unmaterialized), but a tombstone is an explicit unlink.
@@ -8427,9 +8450,10 @@ func pushProfile(base, profile, pass, src string) {
 	// retired by the seal that used it and not by an unrelated one. DIA-20260804-04: clearing on every
 	// committed push made the whole mechanism a no-op in the common case -- captureAppCode runs ONLY from
 	// doLogoff (ProfileActivity.java), so a keep-set change first takes effect at the LOGOFF seal, while the
-	// periodic sync commits every syncIntervalDefault=120s. The periodic seal in between shrank nothing,
-	// committed, and cleared the marker; the logoff seal that actually shrank then met a bare guard and was
-	// REFUSED -- exactly the failure the marker exists to prevent, with the user's clearing silently undone.
+	// periodic sync commits every syncIntervalDefault (15 minutes by default). The periodic seal in between
+	// shrank nothing, committed, and cleared the marker; the logoff seal that actually shrank then met a bare
+	// guard and was REFUSED -- exactly the failure the marker exists to prevent, with the user's clearing
+	// silently undone.
 	usedShrinkIntent := false
 	var shrinkIntentGenSeen string // the marker generation the guard authorized against (clearShrinkIntentGen)
 	if os.Getenv("NOWHERE_SEAL_FORCE") != "1" {
@@ -9114,6 +9138,10 @@ func tarDirToExcl(dir string, w io.Writer, excl map[string]bool) (int64, error) 
 			// cache slipped through the exact-match before -> its `.fetch-*` / `*.ready.downloading` scratch sealed
 			// with a torn Size ("size mismatch" forever) + a cache-path rel (ring mis-attributed). Matches walkChunks.
 		}
+		if info.Mode().IsRegular() && isMediaProviderDBRel(filepath.ToSlash(rel)) {
+			dropped += info.Size() // priced for the shrink guard, same as walkChunks
+			return nil             // NWP-20261202-02: MediaProvider's databases -- see isMediaProviderDBRel
+		}
 		if info.Mode().IsRegular() && isMediaTempName(info.Name()) {
 			return nil // NWP-20261128-03: a media writer's .nwsync-*/.nwseed-* temp is never sealed -- matches walkChunks
 		}
@@ -9199,8 +9227,12 @@ func copyDropCache(dst *os.File, src io.Reader) error {
 // anyway, `restore: profile "odtest30" (18 chunks) -> /data/user/11` printed as success -- and the next seal
 // replaced an 18-chunk head with a 2-chunk one. The profile was destroyed by the code that exists to protect
 // it. Returning the count is what lets the caller withhold the receipt and leave the good head standing.
+//
+// NWP-20261202-02: a MediaProvider database entry (isMediaProviderDBRel) that an older seal still carries is left
+// unwritten -- the live provider holds no lock on it -- and it is NOT a skip: it must not withhold the receipt.
 func untarFrom(dir string, r io.Reader) int {
 	skipped := 0
+	mpDBLeft := 0 // NWP-20261202-02: MediaProvider database entries left unwritten; never counted in skipped
 	tr := tar.NewReader(r)
 	ctxCache := map[string]string{} // parent dir -> its security.selinux; one package dir answers for all its files
 	// NWP-20260829-01: directory mtimes are applied in a SECOND PASS, after every entry has landed. Writing a
@@ -9254,7 +9286,7 @@ func untarFrom(dir string, r io.Reader) int {
 			// A directory entry carries no file's chunks, so its mode costs no dedup: 0700 is recorded at the
 			// next seal and stays stable from then on.
 			if err := os.MkdirAll(target, 0o700); err != nil {
-				fmt.Fprintf(os.Stderr, "[restore] skip dir %q: %v\n", hdr.Name, err)
+				fmt.Fprint(os.Stderr, restoreSkipLine(dir, hdr.Name, "dir", err))
 				skipped++
 			} else {
 				inheritSELinuxLevel(target, filepath.Dir(target), ctxCache)
@@ -9264,12 +9296,16 @@ func untarFrom(dir string, r io.Reader) int {
 			}
 			continue
 		}
+		if isMediaProviderDBRel(filepath.ToSlash(hdr.Name)) {
+			mpDBLeft++ // NWP-20261202-02: no open, no truncate, no mkdir -- and not a skip (see the header comment)
+			continue
+		}
 		// Best-effort per file: a roamed-to user may not have every app the sealed data carries (a
 		// not-yet-installed or absent package has no app-data dir to write into). Skip that file and keep
 		// going rather than aborting the whole restore -- a slightly different app set must not blank the
 		// login. The app-provisioning pass reinstalls the apps; their data re-seals on the next logout.
 		if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
-			fmt.Fprintf(os.Stderr, "[restore] skip %q: mkdir parent: %v\n", hdr.Name, err)
+			fmt.Fprint(os.Stderr, restoreSkipLine(dir, hdr.Name, "mkdir parent", err))
 			skipped++
 			continue
 		}
@@ -9282,13 +9318,13 @@ func untarFrom(dir string, r io.Reader) int {
 			f, err = os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC|unix.O_NOFOLLOW, os.FileMode(hdr.Mode))
 		}
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "[restore] skip %q: %v\n", hdr.Name, err)
+			fmt.Fprint(os.Stderr, restoreSkipLine(dir, hdr.Name, "", err))
 			skipped++
 			continue
 		}
 		if err := copyDropCache(f, tr); err != nil { // #76: bounded page cache (fsync+fadvise) so a multi-GB restore doesn't OOM
 			f.Close()
-			fmt.Fprintf(os.Stderr, "[restore] skip %q: copy: %s\n", hdr.Name, logSafeErrText(err))
+			fmt.Fprint(os.Stderr, restoreSkipLine(dir, hdr.Name, "copy", err))
 			skipped++
 			continue
 		}
@@ -9332,6 +9368,9 @@ func untarFrom(dir string, r io.Reader) int {
 				mtimeFails++
 			}
 		}
+	}
+	if mpDBLeft > 0 {
+		fmt.Fprintf(os.Stderr, "[restore] left %d MediaProvider database file(s) of an older seal unrestored (NWP-20261202-02)\n", mpDBLeft)
 	}
 	// Second pass: directory mtimes, now that every child has landed (see dirTimes above).
 	for _, d := range dirTimes {
@@ -10617,6 +10656,10 @@ func concurrentSafeCmd(name string) bool {
 	// keep their RAM state under their own mutex; a Fix must not wait behind a seal.
 	case "HEALTH-FIX", "GET-HEALTH-FIX":
 		return true
+	// MEDIA-RESTART (NWP-20261202-20) reads the session marker and sets an atomic flag; its wait for a save runs in its own
+	// goroutine, which never takes sessionMu.
+	case "MEDIA-RESTART":
+		return true
 	// POLL-REAP + ACK-REAP are the no-reboot teardown handshake and touch ONLY the in-memory queue (guarded
 	// by pendingReapMu) -- never the state dir, store or passphrase. They were serialised on sessionMu by
 	// oversight, and that cost a user-visible strand (#141, Chester 2026-08-15): a DELETE holds sessionMu for
@@ -11691,6 +11734,10 @@ func handleLogin(conn net.Conn, dest string) {
 		}
 		out := triggerRoamWorker(dest, "freemedia", nm, "", uid, "", nil) // "OK <bytes>" | ERR-...
 		fmt.Fprintf(conn, "%s\n", strings.TrimSpace(out))
+		return
+	}
+	if name == "MEDIA-RESTART" {
+		handleMediaRestart(conn, dest) // NWP-20261202-20: a health notice's Fix, a restart of the session user's MediaProvider
 		return
 	}
 	if name == "GET-SEAL-BLIND" {
@@ -13786,16 +13833,20 @@ func otaTimeSet(v string) error {
 
 // syncIntervalGet/Set persist the continuous-seal cadence in SECONDS (DIA-20260619-11), so the user can
 // tune it from gate -> Settings. Effective value = the /data/nowhere/sync-interval file if set, else
-// NOWHERE_SYNC_INTERVAL (conf/env), else the 120s default. Same device-level /data/nowhere storage as the
-// OTA prefs (survives reboot + the power-off wipe, factory-reset-cleared, never roams). Lower = less data
-// lost on an unclean power-off; convergent dedup keeps frequent cycles cheap. syncLoop re-reads each cycle.
+// NOWHERE_SYNC_INTERVAL (conf/env), else the 900 s (15 minute) default (`docs/product-decisions.md`,
+// 2026-11-10). A stored value the gate no longer offers (30 s, 60 s) still applies, clamped to [15, 86400].
+// Same device-level /data/nowhere storage as the OTA prefs (survives reboot + the power-off wipe,
+// factory-reset-cleared, never roams). Lower = less data lost on an unclean power-off, but dedup keeps only
+// the UPLOAD cheap, not each save's local work (the #apps stage alone takes about 2 minutes per save on
+// frankel), so a save every few minutes keeps the worker busy most of the day (NW-95c3dc838176: 230 saves in
+// 24 h). syncLoop re-reads each cycle, and starts the next save one interval after the previous one ENDS.
 var syncIntervalPath = "/data/nowhere/sync-interval" // a var only so a test can point it at a temp dir
 
 // syncIntervalMu serializes syncIntervalSet: SET-SYNC-INTERVAL runs outside sessionMu (concurrentSafeCmd), and two
 // writers must not race one temp file.
 var syncIntervalMu sync.Mutex
 
-const syncIntervalDefault = 120
+const syncIntervalDefault = 900
 
 func syncIntervalGet() int {
 	if b, err := os.ReadFile(syncIntervalPath); err == nil {
@@ -15147,6 +15198,7 @@ func resetSealSignals() {
 	lastSaveAreas.Store(0)
 	lastSaveSeq.Store(0) // #55 (NWP-20261117-18): and the sequence that ties them to their save
 	sealDeferCount.Store(0)
+	resetPeriodicChange() // NWP-20261202-10: the change test's mark, wallet stamp and skip count
 	resetSealDeltaCaches()
 	sealMu.Lock()
 	sealScopes = "" // NWP-20261113-08: the last session's scope lines are not this one's
@@ -16029,6 +16081,8 @@ func handleRoamIn(conn net.Conn, dest, name, pass, uid, seSecret, srcUnit string
 		// 3. Discovery (keep it in sync: this identity -> the current store config).
 		// 4. #91 slice 4's enrolment of this device in the account directory (gated + best-effort; a no-op unless
 		//    multi-device).
+		// 5. Arm the deferred drain of the wallet's pending claim codes (NWP-20261202-01): no request, no lock; the drain
+		//    fires 10-40 min later (pending_claim_drain.go).
 		//
 		// Every value is captured here: nothing in the job reads a variable this handler changes after it returns.
 		lateName, latePass, lateSE := name, pass, seKey
@@ -16040,6 +16094,11 @@ func handleRoamIn(conn net.Conn, dest, name, pass, uid, seSecret, srcUnit string
 			},
 			func(lw *lateWork) { autoPublishGuarded(lateName, latePass, lw.mayWrite) },
 			func(lw *lateWork) { enrollUnitAtLoginGuarded("s3", lateName, latePass, lateSE, lw.mayWrite) },
+			func(lw *lateWork) {
+				if lw.mayWrite() {
+					armPendingClaimDrain(dest, lateName, latePass)
+				}
+			},
 		)
 	} else if strings.HasPrefix(out, "BLANK NET") {
 		// NWP-20260910-06: the restore could not reach the store (roamd saw exitStoreUnreachable). Still BLANK
@@ -21194,6 +21253,33 @@ func syncLoop(dest string) {
 			fmt.Fprintf(os.Stderr, "[logind] periodic seal deferred: %s\n", reason)
 			continue
 		}
+		// NWP-20261202-10 (docs/product-decisions.md, 2026-11-09 item 4): the change test. A cycle saves only when no
+		// save has landed this session, periodicChangeFloor (60 min) has passed since the last landed one, a shrink or
+		// a wallet change marked the session, or the change walk (periodicChangeProbe) reports a change. Every doubt
+		// saves: a probe that fails or answers no single JSON object, and an agent whose walk has no change mode
+		// (until M07aa is on the image, every cycle saves exactly as before). The floor bounds a writer the test does
+		// not see: it loses at most one hour. After the defers, so a deferred cycle runs no probe; before the
+		// announce, so a skipped cycle announces nothing and SEAL-STATUS never shows a seal that does not run.
+		// A skipped cycle still retries the wallet restore (a session whose restore failed retries every cycle),
+		// kicks mediad and renews the lease. It runs no "out" op, so roamd's out arm does not run either: another
+		// handset's claims, landed media handed to the chooser and the VPN and sync retries wait for the next save,
+		// at most the floor.
+		periodicNoteWallet(dest)
+		due, _, probed := periodicGate(dest, name, pass, uid)
+		if probed {
+			if _, _, u := readRoamSession(dest); u == "" || u != uid {
+				continue // the session ended or changed while the probe ran
+			}
+		}
+		if !due {
+			fmt.Fprintf(os.Stderr, "[logind] periodic seal skipped: no change since the last landed save %d min ago (floor 60 min) (NWP-20261202-10)\n",
+				(time.Now().Unix()-lastLandedSealStartedAt.Load())/60)
+			periodicNoChangeSkips.Add(1)
+			retrySessionWallet(dest, name, pass, seFromSession(dest), wgen, walletSignInWait)
+			kickMediad(dest)
+			maybePayRent(dest, name, pass, wgen)
+			continue
+		}
 		// NWP-20261013-24: not while a DELETE (or a ROTATE, NWP-20261113-04) began since the decision above.
 		// announcePeriodicSeal is the announce (NWP-20260901-25: the run nothing announced -- SEAL-STATUS said DONE
 		// all through it).
@@ -21202,6 +21288,7 @@ func syncLoop(dest string) {
 			fmt.Fprintf(os.Stderr, "[logind] periodic seal deferred: delete-or-rotate-in-flight\n")
 			continue
 		}
+		periodicDirty.Store(false) // NWP-20261202-10: this seal covers the mark; one set while it runs is kept
 		// NWP-20261013-20: the seal's fold is this session's routine wallet publisher, and it is refused while the
 		// generation has no restore proof. Read the stored wallet once more first (locked, as "Add credits" does): a
 		// store that is back makes the wallet publishable again from this seal on. Best-effort; the refusal holds
@@ -21246,6 +21333,7 @@ func syncLoop(dest string) {
 		clearSealRunIf("periodic") // NWP-20260901-25/-26: only OUR announce -- never erase a logoff's that overwrote it
 		recordSeal(out)            // drives the chooser's "not backed up" notification, WITH the reason
 		noteSealLanded(periodicSealStartedAt.Load(), out)
+		periodicSealVerdict(dest, out) // NWP-20261202-10: the wallet stamp on a landed seal, the mark back on any other
 		fmt.Fprintf(os.Stderr, "[logind] periodic seal %q user %s -> %s%s\n", name, uid, sealVerdictLog(out),
 			sealSplitSuffixFor(out, split))
 		// #84 self-heal: the periodic seal no longer touches the media overlays (the walker reads their .under
@@ -22407,8 +22495,8 @@ func main() {
 			// gate's restore bar via writeProg inside cdcRestore; no-op when the env isn't set (CLI/host).
 			// NWP-20261125-03 (Q106 S2): under NOWHERE_MEDIA_AFTER_GATE the #media restore streams only bgSplit's
 			// pre-gate chunks (mediaRestorePlan). Everything below keeps the FULL m: the receipt and the roster name the
-			// head, and the pre-gate pass's skipped is what earns them. ⚠ S3 (the seal's carry under a split) must land
-			// before any daemon exports the flag: without it the next seal drops every background file not yet landed.
+			// head, and the pre-gate pass's skipped is what earns them. S3 (the seal's carry under a split) is built: without
+			// it the next seal drops every background file not yet landed. roamd exports the flag off until S7.
 			// NWP-20261130-03: and the bare vault and #de skip the spans of packages the session parks, listing them
 			// in this scope's unfetched list (unfetched_fetch.go); off, restoreSkippingParked is cdcRestore. The two
 			// never both apply: mediaRestorePlan changes only #media.

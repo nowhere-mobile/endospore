@@ -38,7 +38,7 @@ has(){ case "$1" in *"$2"*) return 0 ;; *) return 1 ;; esac; }
 PRINT_SHIM='command -v print >/dev/null 2>&1 || print() { _pn=1; while [ $# -gt 0 ]; do case "$1" in -rn|-nr) _pn=0; shift ;; -r) shift ;; --) shift; break ;; *) break ;; esac; done; if [ "$_pn" = 1 ]; then printf "%s\n" "$*"; else printf "%s" "$*"; fi; }'
 
 FUNCS=""
-for fn in qn pw pkgname_ok appcode_pm_snapshot appcode_pm_row live_code_dir live_code_ver stage_apk_copy stage_live_apks stage_keep_mtimes appcode_stage_play_dormant appcode_seal; do
+for fn in qn pw pkgname_ok appcode_pm_snapshot appcode_pm_row live_code_dir live_code_ver stage_apk_copy stage_live_apks stage_keep_mtimes appcode_stage_play_dormant appcode_inputs_fp appcode_seal; do
   body=$(awk -v h="$fn() {" '$0 == h {f=1} f{print} f&&/^\}$/{exit}' "$ROAMD")
   case "$body" in
     "$fn() {"*'}') FUNCS="$FUNCS$body
@@ -420,7 +420,7 @@ com.g||8|"
     run_seal "$s" "$T"
     ROW=$(grep "^com\.a$(printf '\t')" "$T/snap.copy" 2>/dev/null)
     if has "$(snapline)" '#apps pm snapshot: 8 package(s) in ' && has "$(snapline)" 'ms (NWP-20261130-16) ' && [ "$(grep -c . "$T/snap.copy" 2>/dev/null)" = 8 ] \
-       && [ "$ROW" = "$(printf 'com.a\t%s\t0\t7' "$(live com.a)")" ]; then ok "$t s12 the log names the rows and the ms, and a row is <pkg> TAB <codePath> TAB <SYSTEM> TAB <versionCode>"
+       && [ "$ROW" = "$(printf 'com.a\t%s\t0\t7\t' "$(live com.a)")" ]; then ok "$t s12 the log names the rows and the ms, and a row is <pkg> TAB <codePath> TAB <SYSTEM> TAB <versionCode> TAB <lastUpdateTime>"
     else no "$t s12 line [$(snapline)] row [$ROW]"; fi
   fi
 done

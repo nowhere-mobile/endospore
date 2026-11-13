@@ -1,0 +1,8 @@
+version 0.5.56
+previous 0.5.55
+- Photos, screenshots and app downloads show up in Gallery again after sign-in: signing in no longer rewrites the media storage's database.
+- A health check notices when the media storage stops answering and offers to restart it.
+- Your default apps (browser, phone, assistant and others) and your pinned home-screen shortcuts follow you to every phone.
+- Your data shows a running save's stage, progress and start time.
+- Automatic saves run every 15 minutes by default, and only when something has changed.
+- After you create a profile with Google Play on, a card helps you finish setting up Google Play.

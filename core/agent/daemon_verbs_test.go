@@ -657,13 +657,14 @@ func verbIn(l []string, s string) bool {
 // chooserVerbsAwaitingArm are verbs the chooser sends before the agent slice that serves them is merged. GET-HEALTH:
 // NWP-20261201-10 reads it and P12a of harvest 62 (the check runner) adds its arm. An entry has no effect once
 // handleLogin has the arm: both TestDaemonVerbs and TestGatePollersNeverWaitOnTheSession then judge the verb in full.
-var chooserVerbsAwaitingArm = map[string]bool{"GET-HEALTH": true}
+// MEDIA-RESTART: NWP-20261202-26 sends it from MediaFixReceiver and M12a of harvest 63 adds its arm.
+var chooserVerbsAwaitingArm = map[string]bool{"GET-HEALTH": true, "MEDIA-RESTART": true}
 
 // senderFiles are the chooser files that touch the daemon socket. A file that starts to and is not here fails.
 var senderFiles = map[string]bool{
 	"AppInstallReceiver.java": true, "BackupNowReceiver.java": true, "ChooserActivity.java": true, "HealthFixReceiver.java": true,
 	"CredentialService.java": true, "DaemonSocket.java": true, "DiagReportJob.java": true, "DozeAppsMirror.java": true, "GateAlarmActivity.java": true, "GateTrace.java": true,
-	"IdleLogoffReceiver.java": true, "Ingest.java": true, "NfcFido2.java": true, "OdDataBarrierHost.java": true, "OtaUpdate.java": true,
+	"IdleLogoffReceiver.java": true, "Ingest.java": true, "MediaFixReceiver.java": true, "NfcFido2.java": true, "OdDataBarrierHost.java": true, "OtaUpdate.java": true,
 	"OtaTimeReceiver.java": true, "OtaWakeReceiver.java": true, "ProfileActivity.java": true, "ReloginReceiver.java": true,
 	"SkipNoticeActivity.java": true, "SmsDeliverReceiver.java": true, "StoreService.java": true, "TelArrival.java": true, "TelIngest.java": true,
 	"UnarchiveService.java": true, "WifiMirror.java": true,

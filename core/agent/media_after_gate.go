@@ -11,13 +11,14 @@ package main
 // NWP-20261125-03).
 //
 // mediaRestorePlan is bgSplit's one caller, from the #media restore in main.go, behind NOWHERE_MEDIA_AFTER_GATE.
-// No daemon exports that flag, so no device restores anything differently.
+// roamd and mediad export that flag since S5 (NWP-20261202-18), "0" by default, so no device restores anything
+// differently until S7 turns it on after the lynx run.
 //
 // NWP-20261128-03 (slice S3, §5): the seal's side of a split. aftergateActive reads the marker, loadLandedRoster
 // reads what the lander placed (pushProfile reads it once, before its walk), and unlandedBackground names the background rels the seal must carry by span and
 // leave to the lander. isMediaTempName is the one test the three walks use to skip a lander or seed temp. mediad
-// starts the lander (S4b, media_lander_run.go). ⚠ S5 must land before any daemon exports the flag: S5 hands the landed
-// paths to the media scan.
+// starts the lander (S4b, media_lander_run.go). S5 (NWP-20261202-18) hands the landed paths to the media scan:
+// roamd's out op takes $STATE/media-bg.list with the seal's own list. roamd and mediad export the flag off.
 
 import (
 	"errors"
@@ -33,8 +34,8 @@ import (
 )
 
 // mediaAfterGateOn is NOWHERE_MEDIA_AFTER_GATE, on only when it is exactly "1". "true", "0" and unset are all
-// off. ⚠ The flag is not in nowhere.conf.example: S5 exports it, and TestEveryDocumentedConfFlagIsExportedByADaemon
-// refuses a documented flag that no daemon exports.
+// off. nowhere.conf.example documents it commented; roamd and mediad export it (S5, NWP-20261202-18), "0" unless
+// the conf sets it, until S7 flips the default.
 func mediaAfterGateOn() bool { return os.Getenv("NOWHERE_MEDIA_AFTER_GATE") == "1" }
 
 // aftergateFile maps a store ref to the AFTER-GATE MARKER (docs/media-after-gate.md §5 item 1): the head a #media

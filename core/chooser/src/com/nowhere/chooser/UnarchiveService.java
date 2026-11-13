@@ -289,6 +289,14 @@ public class UnarchiveService extends Service {
                 // with the APPLICATION context, as the phantom reconcile above: the read may take up to 70 s and must
                 // delay neither the sweep nor the service lifetime.
                 if (!byHand) {
+                    // NWP-20261202-22: the one-time "Finish setting up Google Play" card, once per profile;
+                    // PlayFinishActivity.check decides. Its own daemon thread, as the skip notice below.
+                    try {
+                        final android.content.Context playCtx = getApplicationContext();
+                        Thread pf = new Thread(() -> PlayFinishActivity.check(playCtx), "nowhere-play-finish");
+                        pf.setDaemon(true);
+                        pf.start();
+                    } catch (Throwable t) { android.util.Log.w("NowhereChooser", "play finish start", t); }
                     try {
                         final android.content.Context appCtx = getApplicationContext();
                         Thread sn = new Thread(() -> SkipNoticeActivity.check(appCtx), "nowhere-skip-notice");
@@ -849,6 +857,7 @@ public class UnarchiveService extends Service {
         OdDataBarrierHost.afterReply(ctx, pkg, "OK");
         // NWP-20261010-13: the profile's SMS app may have been waiting for exactly this app to materialise.
         SmsRoleRoam.onMaterialised(ctx, pkg);
+        DefaultRoleRoam.onMaterialised(ctx, pkg); // NWP-20261202-05: and any default app the profile chose
     }
 
     private boolean odRestored(String pkg) { return odRestored(this, pkg); }

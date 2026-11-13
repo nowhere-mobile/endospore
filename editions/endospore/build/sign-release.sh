@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# sign-release.sh <BN> <verified-commit> <dev>[:<out-dir>]... -- sign every device of one release in ONE sitting (NWP-20261122-01).
+# sign-release.sh [--preflight-only] <BN> <verified-commit> <dev>[:<out-dir>]... -- sign every device of one release in ONE sitting (NWP-20261122-01).
 #
 # WHY. build-device.sh --release prompts once per device, only after that device's own `m`. So N devices cost N attended
 # prompts spread over hours, and a wrong passphrase shows only after the first device's ~17 minutes of signing. Nothing
@@ -26,13 +26,29 @@
 # SIGN_SHM_DIR (/dev/shm), NOWHERE_OTA_STORE_CONF and NOWHERE_AGENT (as build-device.sh --release).
 #   exit 0  every device signed      exit 1  a refusal, or a device failed      exit 2  usage
 # Pinned by test-sign-release.sh (--mutate).
+#
+# --preflight-only (first argument only; NWP-20261202-14, docs/release-desk.md §4.3 item 2) runs steps 1 and 2, then
+# exits before the prompt: it never reads stdin, never runs openssl, generate-release or tar, and makes no key dir. Its
+# stdout holds ONLY these lines, fields separated by one TAB (every other line of the run goes to stderr):
+#   PREFLIGHT<TAB><OK|FAIL|WARN><TAB><device or -><TAB><check><TAB><text>
+#   PREFLIGHT<TAB>PASS   or   PREFLIGHT<TAB>REFUSED<TAB><number of FAIL lines>       (the last line)
+# <check> is one of: commit ota-conf (once), then per device image build-number build-type os-ref source-commit
+# patch-markers ring keys signer-key support ota-stamp, then tmpdir stale-keys upstream-gate session (once; device -).
+# A check that ran prints one OK line (empty text) or one FAIL line per refusal, whose text is the refusal's own words
+# with every TAB and newline turned into a space; WARN is only signer-key (no id_ed25519). A check that did not run
+# prints nothing. A commit refusal does not stop the run: every device's source-commit then FAILs. A session FAIL's
+# text is sitting-guard.sh's own stderr words without its `pid <n> <comm>` lines, which stay on stderr only.
+#   exit 0  PASS      exit 1  REFUSED      exit 2  usage (no last line)
+# The grammar is pinned by test-sign-release.sh and the Release Desk's suite.
 set -uo pipefail
 
 usage() {
-  echo "usage: sign-release.sh <BN> <verified-commit> <dev>[:<out-dir>]..." >&2
+  echo "usage: sign-release.sh [--preflight-only] <BN> <verified-commit> <dev>[:<out-dir>]..." >&2
   [ -z "${1:-}" ] || echo "    $1" >&2
   exit 2
 }
+PF=""
+if [ "${1:-}" = --preflight-only ]; then PF=1; shift; fi
 [ "$#" -ge 3 ] || usage "name the build number, the verified commit and at least one device"
 BN="$1"; VERIFIED="$2"; shift 2
 case "$BN" in [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]) ;; *) usage "build number '$BN' is not 10 digits" ;; esac
@@ -44,6 +60,8 @@ for a in "$@"; do
   for e in "${DEVS[@]}"; do [ "$e" = "$d" ] && usage "device '$d' is named twice"; done
   DEVS+=("$d"); OUTS+=("$o")
 done
+# Preflight-only: fd 3 is the original stdout and holds only the PREFLIGHT lines; every other stdout line goes to stderr.
+[ -z "$PF" ] || exec 3>&1 1>&2
 
 TREE="${ENDOSPORE_TREE:-/mnt/build/graphene/grapheneos-2026110200}"
 REPO="${ENDOSPORE_REPO:-/mnt/build/nowhere-phone}"
@@ -87,13 +105,33 @@ export TMPDIR="${TMPDIR:-/mnt/build/tmp}"
 mkdir -p "$TMPDIR" || { echo "cannot create TMPDIR=$TMPDIR" >&2; exit 1; }
 T=$(mktemp -d -p "$TMPDIR" sign-release.XXXXXXXX) || { echo "cannot make a temp dir in $TMPDIR" >&2; exit 1; }
 
-REFUSED=0
-refuse() { echo "REFUSING: $1" >&2; REFUSED=1; }
+REFUSED=0; NFAIL=0; declare -A PFF=()
+pf_line() {        # <OK|FAIL|WARN> <dev|-> <check> <text>: one PREFLIGHT line on fd 3, in preflight-only mode only
+  [ -n "$PF" ] || return 0
+  printf 'PREFLIGHT\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$(printf '%s' "$4" | tr '\t\n' '  ')" >&3
+}
+pf_fail() { PFF["$1 $2"]=1; NFAIL=$((NFAIL+1)); pf_line FAIL "$1" "$2" "$3"; }
+pf_ok() { [ -n "${PFF["$1 $2"]:-}" ] || pf_line OK "$1" "$2" ""; }   # <dev|-> <check>: after the check ran, OK unless it refused
+refuse() { echo "REFUSING: $3" >&2; REFUSED=1; pf_fail "$1" "$2" "$3"; }   # <dev|-> <check> <text>
 
 # ---- PREFLIGHT: every device, before any prompt ---------------------------------------------------------------------
-# 2a: the verified commit, once (Q094). Its exit code passes through, as in build-device.sh.
-sh "$B/verified-commit-guard.sh" "$REPO" "$VERIFIED" || exit $?
-FULL=$(git -C "$REPO" rev-parse --verify "$VERIFIED^{commit}") || { echo "cannot resolve $VERIFIED in $REPO" >&2; exit 1; }
+# 2a: the verified commit, once (Q094). Its exit code passes through, as in build-device.sh. Preflight-only goes on with
+# FULL empty, so every device's source-commit check refuses too.
+if [ -z "$PF" ]; then   # normal mode: a commit refusal ends the run here
+  sh "$B/verified-commit-guard.sh" "$REPO" "$VERIFIED" || exit $?
+  FULL=$(git -C "$REPO" rev-parse --verify "$VERIFIED^{commit}") || { echo "cannot resolve $VERIFIED in $REPO" >&2; exit 1; }
+else
+  FULL=""
+  sh "$B/verified-commit-guard.sh" "$REPO" "$VERIFIED" 2> "$T/commit.err"; rc=$?
+  cat "$T/commit.err" >&2
+  if [ "$rc" != 0 ]; then
+    e=$(cat "$T/commit.err"); REFUSED=1; pf_fail - commit "${e:-verified-commit-guard.sh exit $rc}"
+  elif ! FULL=$(git -C "$REPO" rev-parse --verify "$VERIFIED^{commit}"); then
+    FULL=""; echo "cannot resolve $VERIFIED in $REPO" >&2; REFUSED=1; pf_fail - commit "cannot resolve $VERIFIED in $REPO"
+  else
+    pf_ok - commit
+  fi
+fi
 
 # 2d: the OTA stamp check needs the store conf and an agent; the text is build-device.sh's.
 OTA_AGENT="${NOWHERE_AGENT:-/tmp/agent_host}"
@@ -103,7 +141,9 @@ if [ -z "${NOWHERE_OTA_STORE_CONF:-}" ] || [ ! -f "$NOWHERE_OTA_STORE_CONF" ] ||
   echo "    binary (NOWHERE_AGENT, default /tmp/agent_host); one of them is missing. Without them a stamp the field" >&2
   echo "    already has cannot be told from a new one." >&2
   REFUSED=1; OTA_OK=0
+  pf_fail - ota-conf "the OTA version check needs NOWHERE_OTA_STORE_CONF (path to the store conf) and an agent"
 fi
+[ "$OTA_OK" = 0 ] || pf_ok - ota-conf
 STAMP=$(tr -d '[:space:]' < "$REPO/core/vendor-common/etc/nowhere-ota-version")
 
 # ':.*' not ':user.*', byte for byte build-device.sh's FPRE.
@@ -113,88 +153,119 @@ check_image() {    # <dev> <out>: 2b, on the target-files zip build-device.sh le
   case "$OUT" in /*) ABS="$OUT" ;; *) ABS="$TREE/$OUT" ;; esac
   TFI="$ABS/target/product/$DEV/obj/PACKAGING/target_files_intermediates/$DEV-target_files.zip"
   if [ ! -f "$TFI" ]; then
-    refuse "$DEV: no target-files at $TFI -- build it first: VARIANT=user OUT_DIR=$OUT build-device.sh $DEV $BN"
+    refuse "$DEV" image "$DEV: no target-files at $TFI -- build it first: VARIANT=user OUT_DIR=$OUT build-device.sh $DEV $BN"
     return
   fi
+  pf_ok "$DEV" image
   IMG_BN=$(unzip -p "$TFI" VENDOR/build.prop 2>/dev/null | sed -n "$FPRE" | head -1)
-  [ "$IMG_BN" = "$BN" ] || refuse "$DEV: image baked build number '$IMG_BN', not $BN"
+  [ "$IMG_BN" = "$BN" ] || refuse "$DEV" build-number "$DEV: image baked build number '$IMG_BN', not $BN"
+  pf_ok "$DEV" build-number
   IMG_TYPE=$(unzip -p "$TFI" SYSTEM/build.prop 2>/dev/null | sed -n 's/^ro\.build\.type=//p' | head -1)
-  [ "$IMG_TYPE" = user ] || refuse "$DEV: image is a '$IMG_TYPE' build, not user"
+  [ "$IMG_TYPE" = user ] || refuse "$DEV" build-type "$DEV: image is a '$IMG_TYPE' build, not user"
+  pf_ok "$DEV" build-type
   IMG_OSREF=$(unzip -p "$TFI" SYSTEM/etc/nowhere/os-ref 2>/dev/null | tr -d '\n')
-  [ "$IMG_OSREF" = "os-$DEV" ] || refuse "$DEV: image os-ref is '$IMG_OSREF', not os-$DEV"
+  [ "$IMG_OSREF" = "os-$DEV" ] || refuse "$DEV" os-ref "$DEV: image os-ref is '$IMG_OSREF', not os-$DEV"
+  pf_ok "$DEV" os-ref
   IMG_COMMIT=$(unzip -p "$TFI" SYSTEM/etc/nowhere/source-commit 2>/dev/null | tr -d '\n')
-  [ "$IMG_COMMIT" = "$FULL" ] || refuse "$DEV: image was staged from '$IMG_COMMIT', not the verified commit $FULL"
-  python3 "$B/check-patch-markers.py" --table "$B/patch-markers.tsv" --zip "$TFI" >&2 || refuse "$DEV: a framework patch's artifact literal is missing"
+  [ -n "$FULL" ] && [ "$IMG_COMMIT" = "$FULL" ] || refuse "$DEV" source-commit "$DEV: image was staged from '$IMG_COMMIT', not the verified commit ${FULL:-<unresolved>}"
+  pf_ok "$DEV" source-commit
+  python3 "$B/check-patch-markers.py" --table "$B/patch-markers.tsv" --zip "$TFI" >&2 || refuse "$DEV" patch-markers "$DEV: a framework patch's artifact literal is missing"
+  pf_ok "$DEV" patch-markers
   # The sitting signs the RECORD's release ring, whatever NOWHERE_RING the operator's shell holds.
   if ! RING=$(env -u NOWHERE_RING -u NOWHERE_RING_OVERRIDE sh "$B/ring-for-build.sh" "$DEV" release); then
-    refuse "$DEV: ring-for-build.sh has no release ring"
+    refuse "$DEV" ring "$DEV: ring-for-build.sh has no release ring"
     return
   fi
-  D=$(mktemp -d -p "$T" ring.XXXXXXXX) || { refuse "$DEV: cannot make a temp dir"; return; }
+  D=$(mktemp -d -p "$T" ring.XXXXXXXX) || { refuse "$DEV" ring "$DEV: cannot make a temp dir"; return; }
   # assert-baked-ring.sh takes a DIRECTORY; its no-ring control needs an os-ref-* there. No conf in the image, no file.
   printf '%s\n' "$IMG_OSREF" > "$D/os-ref-$DEV"
   if unzip -l "$TFI" SYSTEM/etc/nowhere/nowhere.conf >/dev/null 2>&1; then
     unzip -p "$TFI" SYSTEM/etc/nowhere/nowhere.conf > "$D/nowhere.conf" 2>/dev/null
   fi
   if ! sh "$B/assert-baked-ring.sh" "$D" "$RING" "$REPO" >&2; then
-    refuse "$DEV: the image does not bake its release ring '$RING'"
+    refuse "$DEV" ring "$DEV: the image does not bake its release ring '$RING'"
     echo "    $DEV: rebuild with NOWHERE_RING=$RING NOWHERE_RING_OVERRIDE=1 VARIANT=user OUT_DIR=$OUT build-device.sh $DEV $BN" >&2
   fi
+  pf_ok "$DEV" ring
 }
 check_keys() {     # <dev>: 2c, the key files build-device.sh checks before its own prompt
   local DEV="$1" K="$TREE/keys/$1" f
   # NWP-20261105-19: as build-device.sh --release, keys-home.sh first links a tree with no keys/ to the keys home (it never
   # creates a key). Its refusal is this device's; the file checks below would only repeat it.
   if ! sh "$B/keys-home.sh" "$TREE" "$DEV" >&2; then
-    refuse "$DEV: no usable keys/$DEV (keys-home.sh, above)"
+    refuse "$DEV" keys "$DEV: no usable keys/$DEV (keys-home.sh, above)"
     return
   fi
   f=$(compgen -G "$K/*.pk8" || true)
-  [ -n "$f" ] || refuse "$DEV: keys/$DEV/*.pk8 is MISSING"
-  [ -f "$K/avb.pem" ] || refuse "$DEV: keys/$DEV/avb.pem is MISSING"
-  [ -f "$K/avb_pkmd.bin" ] || refuse "$DEV: keys/$DEV/avb_pkmd.bin is MISSING -- restore it from the off-box key backup, never gen-keys.sh"
+  [ -n "$f" ] || refuse "$DEV" keys "$DEV: keys/$DEV/*.pk8 is MISSING"
+  [ -f "$K/avb.pem" ] || refuse "$DEV" keys "$DEV: keys/$DEV/avb.pem is MISSING"
+  [ -f "$K/avb_pkmd.bin" ] || refuse "$DEV" keys "$DEV: keys/$DEV/avb_pkmd.bin is MISSING -- restore it from the off-box key backup, never gen-keys.sh"
+  pf_ok "$DEV" keys
   if [ ! -f "$K/id_ed25519" ]; then
     echo "WARNING: keys/$DEV/id_ed25519 is MISSING -- generate-release will SILENTLY skip signing $DEV-install-$BN.zip" >&2
+    pf_line WARN "$DEV" signer-key "$DEV: keys/$DEV/id_ed25519 is MISSING -- generate-release will SILENTLY skip signing $DEV-install-$BN.zip"
+  else
+    pf_ok "$DEV" signer-key
   fi
 }
 check_tmp() {      # 2e: unlike build-device.sh, an unmeasurable df REFUSES: the sitting is the expensive part
   local kb gib
   kb=$(df -Pk "$TMPDIR" 2>/dev/null | awk 'NR==2 {print $4}')
   case "$kb" in
-    *[!0-9]* | "") refuse "could not measure the free space of TMPDIR $TMPDIR" ;;
+    *[!0-9]* | "") refuse - tmpdir "could not measure the free space of TMPDIR $TMPDIR" ;;
     *) gib=$(( kb / 1024 / 1024 ))
-       [ "$gib" -ge "$MIN_GIB" ] || refuse "TMPDIR $TMPDIR has $gib GiB free, the sitting needs $MIN_GIB (about 9 GiB per device pass)" ;;
+       [ "$gib" -ge "$MIN_GIB" ] || refuse - tmpdir "TMPDIR $TMPDIR has $gib GiB free, the sitting needs $MIN_GIB (about 9 GiB per device pass)" ;;
   esac
 }
 check_stale_key_dirs() {   # 2f: a key dir left by a sitting that died without its sweep
   local s
   s=$(own_key_dirs)
-  [ -z "$s" ] || refuse "stale key dir(s) of this user in $SHM: $(printf '%s' "$s" | tr '\n' ' ')-- a sitting died without its sweep; remove them"
+  [ -z "$s" ] || refuse - stale-keys "stale key dir(s) of this user in $SHM: $(printf '%s' "$s" | tr '\n' ' ')-- a sitting died without its sweep; remove them"
 }
 check_upstream_gate() {    # 2g: what this script relies on in the GrapheneOS tree's script/
   local a b
   a=$(cat "$TREE/script/decrypt-keys" 2>/dev/null); b=$(cat "$TREE/script/generate-release.sh" 2>/dev/null)
-  case "$a" in *"-v password"*) ;; *) refuse "an upstream sync changed the password gate or the key dir; re-read them before signing (script/decrypt-keys has no '-v password')"; return ;; esac
-  case "$b" in *"/dev/shm/release_keys."*) ;; *) refuse "an upstream sync changed the password gate or the key dir; re-read them before signing (script/generate-release.sh has no '/dev/shm/release_keys.')" ;; esac
+  case "$a" in *"-v password"*) ;; *) refuse - upstream-gate "an upstream sync changed the password gate or the key dir; re-read them before signing (script/decrypt-keys has no '-v password')"; return ;; esac
+  case "$b" in *"/dev/shm/release_keys."*) ;; *) refuse - upstream-gate "an upstream sync changed the password gate or the key dir; re-read them before signing (script/generate-release.sh has no '/dev/shm/release_keys.')" ;; esac
 }
 
 case "$MIN_GIB" in '' | *[!0-9]*) usage "SIGN_MIN_TMP_GIB '$MIN_GIB' is not a number" ;; esac
 for i in "${!DEVS[@]}"; do
   check_image "${DEVS[$i]}" "${OUTS[$i]}"
   check_keys "${DEVS[$i]}"
-  sh "$B/support-guard.sh" "${DEVS[$i]}" || refuse "${DEVS[$i]}: past GrapheneOS's full support"
+  sh "$B/support-guard.sh" "${DEVS[$i]}" || refuse "${DEVS[$i]}" support "${DEVS[$i]}: past GrapheneOS's full support"
+  pf_ok "${DEVS[$i]}" support
   if [ "$OTA_OK" = 1 ]; then
-    bash "$B/ota-field-guard.sh" "${DEVS[$i]}" "$STAMP" "$NOWHERE_OTA_STORE_CONF" "$OTA_AGENT" >&2 || refuse "${DEVS[$i]}: the OTA stamp $STAMP is not above the field's"
+    bash "$B/ota-field-guard.sh" "${DEVS[$i]}" "$STAMP" "$NOWHERE_OTA_STORE_CONF" "$OTA_AGENT" >&2 || refuse "${DEVS[$i]}" ota-stamp "${DEVS[$i]}: the OTA stamp $STAMP is not above the field's"
+    pf_ok "${DEVS[$i]}" ota-stamp
   fi
 done
 check_tmp
+pf_ok - tmpdir
 check_stale_key_dirs
+pf_ok - stale-keys
 check_upstream_gate
+pf_ok - upstream-gate
 if [ "$REFUSED" = 1 ]; then
   echo "sign-release: preflight refused -- nothing was signed, no passphrase was asked for" >&2
-  exit 1
+  [ -n "$PF" ] || exit 1
+else
+  echo "sign-release: preflight passed for ${DEVS[*]} at $BN (commit $FULL)"
 fi
-echo "sign-release: preflight passed for ${DEVS[*]} at $BN (commit $FULL)"
+
+# ---- preflight-only: the session guard, the verdict line, and out before the prompt ------------------------------------
+if [ -n "$PF" ]; then
+  # The guard's stderr is kept in $T and copied to stderr; the FAIL text is its own words without the `pid <n> <comm>`
+  # lines, so the names stay on stderr only and a process-table failure reads as itself.
+  if sh "$B/sitting-guard.sh" "$$" 2> "$T/session.err"; then rc=0; else rc=$?; fi
+  cat "$T/session.err" >&2
+  if [ "$rc" = 0 ]; then pf_ok - session; else
+    REFUSED=1; why=$(grep -v '^pid [0-9]' "$T/session.err" | tr '\n' ' ' | sed 's/ *$//')
+    pf_fail - session "${why:-sitting-guard.sh refused (exit $rc) and printed no reason}"
+  fi
+  if [ "$NFAIL" = 0 ]; then printf 'PREFLIGHT\tPASS\n' >&3; else printf 'PREFLIGHT\tREFUSED\t%d\n' "$NFAIL" >&3; fi
+  exit "$(( NFAIL > 0 ))"
+fi
 
 # ---- the same-user refusal ------------------------------------------------------------------------------------------
 sh "$B/sitting-guard.sh" "$$" || exit 1

@@ -255,6 +255,9 @@ export GATEWAY_URL NOWHERE_STATE="$STATE"
 # and a post-flag profile reads "empty/absent -> nothing to serve" -- byte-identical to genuinely having
 # no deferred media. Latent until the #91 rollout flips the flag; found by the NWP-20260822-08 audit.
 export NOWHERE_MULTIDEVICE="${NOWHERE_MULTIDEVICE:-0}"
+# NWP-20261202-18 (S5 of docs/media-after-gate.md §8, Q106): user media restored after the gate. startBgLander
+# (S4b) refuses "flag off" unless this is exactly "1". OFF by default: S7 flips this default after the lynx run.
+export NOWHERE_MEDIA_AFTER_GATE="${NOWHERE_MEDIA_AFTER_GATE:-0}"
 export SSL_CERT_DIR=/system/etc/security/cacerts
 export NOWHERE_DNS="${NOWHERE_DNS:-}"
 # #84 P5: media fetch-cache eviction. Default is FREE-SPACE based -- keep 2 GiB free on /data (evict only under

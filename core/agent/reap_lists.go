@@ -15,7 +15,7 @@ import (
 func isSessionFileList(name string) bool {
 	switch name {
 	case "sealdelta.idx", "sealdelta.idx.tmp", "sealdelta.listed", "sealdelta.listed.tmp",
-		"media-bg.list", "media-bg.list.tmp":
+		"media-bg.list", "media-bg.list.tmp", "media-bg.list.handoff":
 		return true
 	}
 	return strings.HasPrefix(name, "scancache.") || strings.HasPrefix(name, "heal-handled-")

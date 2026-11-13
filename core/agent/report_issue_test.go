@@ -289,6 +289,8 @@ func TestIssueReportRedactsDepartedProfileNames(t *testing.T) {
 // TestIssueReportKeepsRestorePaths guards the scope of the above: `[restore] skip %q` quotes FILE PATHS, and
 // those are what make a broken restore diagnosable (they are how DIA-20260806-10 was found). They are not
 // identity and must survive. A scrub that eats them trades a real leak for a real blindness.
+// *(Since NWP-20261201-24, h60 #9: the skip lines print `pkg=` or `scope=` and an error code, no path. The exemption
+// now serves the `[restore] rejected ...` lines and the skip lines older builds wrote; the input below is one of those.)*
 func TestIssueReportKeepsRestorePaths(t *testing.T) {
 	ln := `[restore] skip "net.thunderbird.android/databases/global.db": mkdir parent: permission denied`
 	got, _ := scrubIssueLine(ln, []string{"currentuser"})

@@ -125,6 +125,7 @@ reown_ext_appdata() { :; }
 wait_acct_authenticator() { :; }
 acct_reload() { :; }
 sync_apply() { :; }
+vpn_preconsent_off() { :; }
 a11y_apply() { :; }
 autofill_apply() { :; }
 stat() { awk -v p="$3" '$1 == p {print $2; f=1} END{exit !f}' "$ROOT/sim/owners"; }
@@ -181,6 +182,8 @@ EOF
   M_XT="[roamd] on-demand $PKG (ROOT/data/media/$UID_/Android/data) merged canonical into existing ext hold, newest wins (NWP-20260922-09) DATE"
   M_OD="[roamd] odrestore $OD_PKG (ROOT/data/user/$OD_UID) restored+reowned DATE"
   F_OD="[roamd] odrestore $OD_PKG -> force-stopped pre-restore, rc=0 (gap process; hold exists) DATE"
+  # NWP-20261202-16: the op's steps line, with no _ms here every ms field 0, and grant_perms_for a stub (shared3 none)
+  S_OD="[roamd] odrestore steps user $UID_ one: stop=0 copy=0 pmread=0 grant=0 shared3=0:none a11y=0 autofill=0 keystore=0 ext=0 total=0 code=yes reply=OK (NWP-20261202-16) DATE"
   K_OD="[roamd] odrestore $OD_PKG -> hold(s) kept on 1 volume(s) -- ERR-NOTREADY so the next sweep or tap retries the restore (NWP-20260922-09, NWP-20261013-22) DATE"
   exp() { printf '%s' "${1//ROOT/$R}"; }                 # exp <line with ROOT> -> the line for this case's root
 
@@ -262,8 +265,9 @@ $(exp "$M_XT")"
     plant "$H/f.txt" payload; mkdir -p "$R/data/user/$OD_UID/$OD_PKG"
     echo "$R/data/user/$OD_UID/$OD_PKG $OD_OWNED" > "$R/sim/owners"
     run "$sh" "$R" od
-    chk "$L C6 odrestore: exactly today's two lines" eqv "$(cat "$R/roam.log")" "$(exp "$F_OD")
-$(exp "$M_OD")"
+    chk "$L C6 odrestore: exactly today's three lines" eqv "$(cat "$R/roam.log")" "$(exp "$F_OD")
+$(exp "$M_OD")
+$S_OD"
     chk "$L C6 odrestore: the reply is OK $OD_PKG" eqv "$(cat "$R/res" 2>/dev/null)" "OK $OD_PKG"
     chk "$L C6 odrestore: the hold is consumed" eqv "$([ -e "$H" ] && echo kept || echo gone)" gone
   done

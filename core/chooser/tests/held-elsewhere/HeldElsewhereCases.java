@@ -3,7 +3,7 @@ public class HeldElsewhereCases {
     static int fails = 0;
 
     static final String RELEASE = "These are in use on your other device, so they won't open here. Each opens here "
-            + "once that device releases it, signs out or uninstalls it, or about fifteen minutes after that device "
+            + "once that device releases it, signs out or uninstalls it, or about an hour after that device "
             + "is switched off.";
 
     static void ok(String name, boolean cond, String detail) {
@@ -60,8 +60,8 @@ public class HeldElsewhereCases {
 
         java.util.List<String> ab = java.util.Arrays.asList("A", "B");
         String named = HeldElsewhereCopy.body(ab, "Pixel 8");
-        String cond = "Each opens here once that device releases it, signs out or uninstalls it, or about fifteen "
-                + "minutes after that device is switched off.";
+        String cond = "Each opens here once that device releases it, signs out or uninstalls it, or about an "
+                + "hour after that device is switched off.";
         ok("H2 body names the holder", named != null && named.contains("in use on Pixel 8"), "got " + named);
         ok("H2 body keeps the release conditions", named != null && named.endsWith(cond), "got " + named);
         ok("H2 body does not say your other device", named != null && !named.contains("your other device"),

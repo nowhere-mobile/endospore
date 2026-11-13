@@ -6,7 +6,7 @@
 # adapted for lynx + the per-edition os-ref / version-ref (os-lynx -> ota/lynx/version; see
 # core/vendor-common/bin/nowhere_otad.sh OSREF + the agent's otaVersionRef()).
 #
-# Usage: e4-ota-publish.sh --device <dev> [--ring <name>|--beta] [--stable-current] [--force] <<dev>-ota_update-<BN>.zip> <version eg 0.2.0> <store-conf> [agent_host]
+# Usage: e4-ota-publish.sh --device <dev> [--ring <name>|--beta] [--stable-current] [--force] [--without-canary] <<dev>-ota_update-<BN>.zip> <version eg 0.2.0> <store-conf> [agent_host]
 #   <ota_update zip>  signed A/B OTA from generate-release: releases/<BN>/release-<dev>-<BN>/<dev>-ota_update-<BN>.zip
 #   <version>         semver to publish; MUST EQUAL the version baked into that image
 #                     (read from <dev>-target_files.zip beside the OTA zip; see the check below)
@@ -39,6 +39,9 @@
 #   --force           NWP-20261026-04: allow a marker move that is NOT forward -- publishing a version LOWER than the
 #                     one the ring already offers (a deliberate rollback). Without it that is refused. It never
 #                     overrides an UNREADABLE ring marker: a marker that cannot be read cannot be compared.
+#   --without-canary  NWP-20261202-12: publish a fleet device with no canary pass for <version>. Without it a device
+#                     that is not the canary (husky) is refused until editions/endospore/canary-pass/<version> records
+#                     the canary's passed smoke test (canary-guard.sh). Chester's call only; the guard logs it on stderr.
 #
 # After publishing, on the device (or via the gate "Check for updates"): nowhere_otad ota-checks ota/lynx/version,
 # CDC-restores os-lynx into /data/ota_package, and update_engine applies it -> reboots into the new slot, yellow,
@@ -66,6 +69,7 @@ DEV=""
 FIRST_NOTES=0
 FORCE=0
 STABLE_CURRENT=0
+WITHOUT_CANARY=""
 POS=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -77,6 +81,7 @@ while [ $# -gt 0 ]; do
     --first-notes) FIRST_NOTES=1 ;;
     --force)    FORCE=1 ;;
     --stable-current) STABLE_CURRENT=1 ;;
+    --without-canary) WITHOUT_CANARY=1 ;;
     *)          POS+=("$1") ;;
   esac
   shift
@@ -84,7 +89,7 @@ done
 set -- "${POS[@]}"
 case "$DEV" in
   '' ) echo "refusing: --device is REQUIRED (e.g. --device frankel)."
-       echo "          usage: e4-ota-publish.sh --device <dev> [--ring <name>|--beta] [--stable-current] [--force] <<dev>-ota_update-<BN>.zip> <version> <store-conf> [agent_host]"
+       echo "          usage: e4-ota-publish.sh --device <dev> [--ring <name>|--beta] [--stable-current] [--force] [--without-canary] <<dev>-ota_update-<BN>.zip> <version> <store-conf> [agent_host]"
        echo "          It sets BOTH the payload ref (os-<dev>) and the marker (ota/<dev>/version). There is no"
        echo "          default on purpose: guessing it wrong publishes one device's image to another's fleet,"
        echo "          and the image-stamp guard below cannot catch that -- a wrong device makes it look for"
@@ -95,10 +100,14 @@ esac
 # NWP-20261124-19 (#23): no release for a device past GrapheneOS's full support (editions/endospore/support-ended/).
 sh "$(dirname "$0")/support-guard.sh" "$DEV" || exit 2
 
-OTAZIP="${1:?usage: e4-ota-publish.sh --device <dev> [--ring <name>|--beta] [--stable-current] [--force] <ota_update zip> <version> <store-conf> [agent_host]}"
+OTAZIP="${1:?usage: e4-ota-publish.sh --device <dev> [--ring <name>|--beta] [--stable-current] [--force] [--without-canary] <ota_update zip> <version> <store-conf> [agent_host]}"
 VERSION="${2:?need <version> (semver, strictly > the baked device stamp; enforced below)}"
 CONF="${3:?need <store-conf with S3_* creds>}"
 AGENT="${4:-/tmp/agent_host}"
+# NWP-20261202-12 (docs/product-decisions.md, 2026-11-04 h57 #2): a fleet device publishes <version> only after husky's
+# smoke passed for it (editions/endospore/canary-pass/<version>, read from this checkout), or with --without-canary,
+# logged. Before the agent is run and before any store call.
+sh "$(dirname "$0")/canary-guard.sh" "$DEV" "$VERSION" ${WITHOUT_CANARY:+--without-canary} || exit 2
 # ⚠ OSREF WAS HARDCODED os-lynx (and DEV derived FROM it), so this script could only ever publish for lynx.
 # The device pulls the ref baked at /system/etc/nowhere/os-ref (nowhere_otad.sh:20) -- os-frankel on frankel --
 # so no frankel/tegu/stallion payload was ever pushed and ota/<dev>/version was never marked: those devices

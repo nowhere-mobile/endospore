@@ -633,6 +633,15 @@ func mergeLateRestore(stored, local *Wallet) *Wallet {
 			out.PendingClaims = append(out.PendingClaims, c)
 		}
 	}
+	// The miss hashes (NWP-20261202-01): both sides' union, stored first, kept only for a code the merged list holds.
+	var stMiss, loMiss []string
+	if stored != nil {
+		stMiss = stored.PendingClaimMisses
+	}
+	if local != nil {
+		loMiss = local.PendingClaimMisses
+	}
+	out.PendingClaimMisses = pendingClaimMissesFor(out.PendingClaims, stMiss, loMiss)
 	if local == nil {
 		return &out
 	}

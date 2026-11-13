@@ -6,4 +6,5 @@
         OdDataBarrierHost.afterReply(ctx, pkg, "OK");
         // NWP-20261010-13: the profile's SMS app may have been waiting for exactly this app to materialise.
         SmsRoleRoam.onMaterialised(ctx, pkg);
+        DefaultRoleRoam.onMaterialised(ctx, pkg); // NWP-20261202-05: and any default app the profile chose
     }

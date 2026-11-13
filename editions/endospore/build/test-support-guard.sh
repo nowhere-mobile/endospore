@@ -21,7 +21,7 @@ for t in git unzip python3; do command -v "$t" >/dev/null 2>&1 || { echo "FAIL: 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../../.." && pwd)"
 DIR="${DIR:-$HERE}"
-SCRIPTS="support-guard.sh build-device.sh sign-release.sh e4-ota-publish.sh e4-ota-promote.sh"
+SCRIPTS="support-guard.sh canary-guard.sh build-device.sh sign-release.sh e4-ota-publish.sh e4-ota-promote.sh"
 for f in $SCRIPTS; do [ -s "$DIR/$f" ] || { echo "FAIL: $DIR/$f does not exist or is empty" >&2; exit 1; }; done
 SG="$DIR/support-guard.sh"
 
@@ -43,6 +43,10 @@ mark() { printf '%s' "$GOOD" > "$1/$2"; }   # <support-ended-dir> <dev>
 # empty_ended <dir>: a support-ended dir holding only the README. A world never copies the committed markers, so a
 # real marker (lynx's, when GrapheneOS moves it) cannot turn a control case into a refusal; markers come from mark().
 empty_ended() { mkdir -p "$1" && cp "$ROOT/editions/endospore/support-ended/README" "$1/"; }
+# canary_pass <dir>: a canary-pass dir with its README and a pass for 0.5.43, the version the publish cases use, so
+# canary-guard.sh (NWP-20261202-12) lets the fleet device lynx past it and every case runs as before.
+canary_pass() { mkdir -p "$1" && cp "$ROOT/editions/endospore/canary-pass/README" "$1/" \
+  && printf 'canary husky\nbuild 2026120101\nsmoke pass 2026-12-01\n' > "$1/0.5.43"; }
 has() { case "$1" in *"$2"*) return 0 ;; *) return 1 ;; esac; }   # <text> <needle>
 
 # ---- guard cases, under every shell ---------------------------------------------------------------------------------
@@ -105,8 +109,9 @@ publish_world() {
   local T B
   T=$(mktemp -d -p "$W" pub.XXXXXX) || return 1; B="$T/editions/endospore/build"
   mkdir -p "$B" "$T/editions/endospore/ota-mandatory" "$T/core/vendor-common/etc/ota-notes" "$T/rel" "$T/img/SYSTEM/etc"
-  cp "$DIR/e4-ota-publish.sh" "$DIR/support-guard.sh" "$B/"
+  cp "$DIR/e4-ota-publish.sh" "$DIR/support-guard.sh" "$DIR/canary-guard.sh" "$B/"
   empty_ended "$T/editions/endospore/support-ended"
+  canary_pass "$T/editions/endospore/canary-pass"
   [ "$1" = - ] || mark "$T/editions/endospore/support-ended" "$1"
   printf '#!/bin/sh\nexit 0\n' > "$B/check-agent-fresh.sh"; chmod +x "$B/check-agent-fresh.sh"
   echo 0.5.43 > "$T/core/vendor-common/etc/nowhere-ota-version"; echo 0.5.43 > "$T/img/SYSTEM/etc/nowhere-ota-version"
@@ -123,7 +128,8 @@ publish_world() {
 promote_world() {   # <marker-dev|-> -> prints its dir; the script copy is in <dir>/build
   local T
   T=$(mktemp -d -p "$W" pro.XXXXXX) || return 1
-  mkdir -p "$T/build"; cp "$DIR/e4-ota-promote.sh" "$DIR/support-guard.sh" "$T/build/"
+  mkdir -p "$T/build"; cp "$DIR/e4-ota-promote.sh" "$DIR/support-guard.sh" "$DIR/canary-guard.sh" "$T/build/"
+  canary_pass "$T/canary-pass"
   printf '#!/bin/sh\nexit 0\n' > "$T/build/check-agent-fresh.sh"; chmod +x "$T/build/check-agent-fresh.sh"
   empty_ended "$T/support-ended"
   [ "$1" = - ] || mark "$T/support-ended" "$1"

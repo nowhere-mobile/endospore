@@ -14,6 +14,14 @@
 # showsDraftMark(), builds two separate CheckBoxes, enables its one button only through canContinue on every toggle,
 # writes the marker before it goes on, and has no other way out.
 #
+# Since NWP-20261202-23 (docs/product-decisions.md, 2026-11-10, item 2) Create asks for the same lost-passphrase
+# acknowledgement behind the same one gate. The cases check createStep, createAckShown and createAckText. Pins C1-C6
+# check the create form: C1 readCreateAckGate reads GET-OS-AGREEMENT once, never stores null and sets the box only
+# through createAckShown; C2 the box is built unticked and hidden after the Play switch; C3 setCreateMode shows it
+# through createAckShown, unticks it and re-reads the gate at every entry; C4 the Create click asks createStep after the
+# passphrase match and before create(n, p), and the WAIT and ASK branches return; C5 lockGateForm locks the box and
+# clearSignInFields unticks it; C6 no code ticks the box.
+#
 # ⚠ IT FAILS WHEN THERE IS NO JAVAC, IT NEVER SKIPS. javac comes from PATH, else from the build host's JDK below.
 #
 #   bash test-os-agreement-java.sh            # the cases and the pins
@@ -78,7 +86,7 @@ none() {
 # -> 0 pass, 1 a case or a pin failed, 2 a source is missing, 3 the class did not compile. Only 1 convicts a mutant.
 suite() {
   local f="$1" cls="$2" rc src b lstore lhint lag lui lif lels lm lmark ladd lbody ltitle lg lok len lend lclick lchk
-  local lset lnext n
+  local lset lnext n lbuild laddb lstep lcreate lwait lask lmatch lplay span
   [ -f "$f" ] || { echo "  FAIL missing $f" >&2; return 2; }
   [ -f "$cls" ] || { echo "  FAIL missing $cls" >&2; return 2; }
   [ -f "$RUN" ] || { echo "  FAIL missing $RUN" >&2; return 2; }
@@ -96,7 +104,7 @@ suite() {
   [ "$lhint" = $((lstore + 1)) ] && [ "$lag" -gt "$lhint" ] && [ "$lag" -le $((lhint + 2)) ] && [ "$lui" = $((lag + 1)) ] || {
     echo "  PIN P1 order: configured=no at $lstore, hint at $lhint, read at $lag, launch at $lui" >&2; return 1; }
   read -r n _ <<<"$(line_of "$src" 'GET-OS-AGREEMENT')"
-  [ "$n" = 1 ] || { echo "  PIN P1 $n lines name GET-OS-AGREEMENT, want 1" >&2; return 1; }
+  [ "$n" = 2 ] || { echo "  PIN P1 $n lines name GET-OS-AGREEMENT, want 2 (the first-run read and C1's)" >&2; return 1; }
   none "$src" 'launchFirstRun()' P1 || return 1
 
   # P2 launchFirstRun: the agreement branch shows the screen with the welcome as its next step; the other branch is
@@ -190,6 +198,73 @@ suite() {
   [ -n "$b" ] || { echo "  PIN P7 no osAgreementAccepted() in $f" >&2; return 1; }
   one "$b" 'return OsAgreement.VERSION.equals(getSharedPreferences("nowhere_gate", MODE_PRIVATE)' P7 >/dev/null || return 1
   one "$b" '.getString("os_agreement_accepted", null));' P7 >/dev/null || return 1
+
+  # C1 readCreateAckGate (NWP-20261202-23): one read of the gate, any failure stored as "", never null; the box's
+  # visibility only through createAckShown.
+  b=$(body "$f" 'private void readCreateAckGate() {')
+  [ -n "$b" ] || { echo "  PIN C1 no readCreateAckGate() in $f" >&2; return 1; }
+  b=$(printf '%s\n' "$b" | grep -v '^[[:space:]]*//')
+  one "$b" 'try { r = DaemonSocket.roundTrip("GET-OS-AGREEMENT\n", 5000); } catch (Throwable t) { r = ""; }' C1 >/dev/null || return 1
+  read -r n _ <<<"$(line_of "$b" 'GET-OS-AGREEMENT')"
+  [ "$n" = 1 ] || { echo "  PIN C1 $n lines name GET-OS-AGREEMENT in readCreateAckGate, want 1" >&2; return 1; }
+  one "$b" 'createAckReply = r == null ? "" : r;' C1 >/dev/null || return 1
+  read -r n _ <<<"$(line_of "$b" 'createAckReply =')"
+  [ "$n" = 1 ] || { echo "  PIN C1 $n lines assign createAckReply in readCreateAckGate, want 1" >&2; return 1; }
+  read -r n _ <<<"$(line_of "$b" 'setVisibility(')"
+  [ "$n" = 1 ] || { echo "  PIN C1 $n setVisibility( lines in readCreateAckGate, want 1" >&2; return 1; }
+  one "$b" 'createAckBox.setVisibility(OsAgreement.createAckShown(createAckReply, createMode) ? View.VISIBLE : View.GONE);' C1 >/dev/null || return 1
+  none "$src" 'createAckReply = null' C1 || return 1
+
+  # C2 the box: built after the Play switch, unticked and hidden, added once, the gate read once at build.
+  lplay=$(one "$src" 'll.addView(playAtCreateSw, playLp);' C2) || return 1
+  lbuild=$(one "$src" 'createAckBox = new android.widget.CheckBox(this);' C2) || return 1
+  one "$src" 'createAckBox.setText(OsAgreement.createAckText());' C2 >/dev/null || return 1
+  laddb=$(one "$src" 'll.addView(createAckBox, ackLp);' C2) || return 1
+  [ "$lplay" -lt "$lbuild" ] && [ "$lbuild" -lt "$laddb" ] || {
+    echo "  PIN C2 order: Play switch added at $lplay, box built at $lbuild, box added at $laddb" >&2; return 1; }
+  span=$(printf '%s\n' "$src" | sed -n "${lbuild},$((laddb + 1))p")
+  one "$span" '        createAckBox.setChecked(false);' C2 >/dev/null || return 1
+  one "$span" '        createAckBox.setVisibility(View.GONE);' C2 >/dev/null || return 1
+  n=$(printf '%s\n' "$span" | grep -cE '^[[:space:]]*readCreateAckGate\(\);[[:space:]]*$' || true)
+  [ "$n" = 1 ] || { echo "  PIN C2 $n gate reads right after the box is added, want 1" >&2; return 1; }
+  n=$(printf '%s\n' "$src" | grep -c 'readCreateAckGate();' || true)
+  [ "$n" = 3 ] || { echo "  PIN C2 $n lines call readCreateAckGate();, want 3 (build, setCreateMode, WAIT)" >&2; return 1; }
+
+  # C3 setCreateMode: the three lines, byte for byte, right after the Play switch's untick.
+  b=$(body "$f" 'private void setCreateMode(boolean on) {')
+  [ -n "$b" ] || { echo "  PIN C3 no setCreateMode(boolean on) in $f" >&2; return 1; }
+  lplay=$(one "$b" '        playAtCreateSw.setChecked(false);' C3) || return 1
+  lstep=$(one "$b" '        createAckBox.setVisibility(OsAgreement.createAckShown(createAckReply, createMode) ? View.VISIBLE : View.GONE); // NWP-20261202-23' C3) || return 1
+  lwait=$(one "$b" '        createAckBox.setChecked(false); // NWP-20261202-23: unticked every time' C3) || return 1
+  lask=$(one "$b" '        if (createMode) readCreateAckGate(); // NWP-20261202-23: re-read at every entry' C3) || return 1
+  [ "$lstep" = $((lplay + 1)) ] && [ "$lwait" = $((lplay + 2)) ] && [ "$lask" = $((lplay + 3)) ] || {
+    echo "  PIN C3 order: Play untick at $lplay, box at $lstep, untick at $lwait, re-read at $lask" >&2; return 1; }
+
+  # C4 the Create click: createStep after the passphrase match and before create(n, p); WAIT and ASK both return.
+  b=$(body "$f" 'btn.setOnClickListener(v -> {')
+  [ -n "$b" ] || { echo "  PIN C4 no Unlock click in $f" >&2; return 1; }
+  b=$(printf '%s\n' "$b" | grep -v '^[[:space:]]*//')
+  lmatch=$(one "$b" 'result.setText("passphrases don'"'"'t match"); return;' C4) || return 1
+  lstep=$(one "$b" 'final int ackStep = OsAgreement.createStep(createAckReply, createAckBox != null && createAckBox.isChecked());' C4) || return 1
+  lcreate=$(one "$b" 'create(n, p);' C4) || return 1
+  one "$b" 'if (ackStep == OsAgreement.CREATE_WAIT) {' C4 >/dev/null || return 1
+  one "$b" 'if (ackStep == OsAgreement.CREATE_ASK) {' C4 >/dev/null || return 1
+  lwait=$(one "$b" 'result.setText(OsAgreement.CREATE_WAIT_TEXT); readCreateAckGate(); return;' C4) || return 1
+  lask=$(one "$b" 'result.setText(OsAgreement.CREATE_ACK_NEED); return;' C4) || return 1
+  [ "$lmatch" -lt "$lstep" ] && [ "$lstep" -lt "$lwait" ] && [ "$lwait" -lt "$lask" ] && [ "$lask" -lt "$lcreate" ] || {
+    echo "  PIN C4 order: match at $lmatch, createStep at $lstep, WAIT at $lwait, ASK at $lask, create at $lcreate" >&2
+    return 1; }
+
+  # C5 lockGateForm locks the box; clearSignInFields unticks it.
+  b=$(body "$f" 'private void lockGateForm(boolean lock) {')
+  one "$b" 'addPhoneLink, playAtCreateSw, createAckBox};' C5 >/dev/null || return 1
+  b=$(body "$f" 'private void clearSignInFields() {')
+  one "$b" '        if (createAckBox != null) createAckBox.setChecked(false); // NWP-20261202-23' C5 >/dev/null || return 1
+
+  # C6 no code ticks the box: every setChecked on it passes false.
+  none "$src" 'createAckBox.setChecked(true)' C6 || return 1
+  n=$(printf '%s\n' "$src" | grep -cE 'createAckBox\.setChecked\([^f]' || true)
+  [ "$n" = 0 ] || { echo "  PIN C6 $n lines call createAckBox.setChecked( with an argument other than false" >&2; return 1; }
   echo "  pins ok"
   return 0
 }
@@ -233,5 +308,16 @@ mut 'M18 ticking the acknowledgement does not re-check' act 's/ack\.setOnChecked
 mut 'M19 the click does not re-check' act 's/\n[ \t]*if \(!OsAgreement\.canContinue\(agree\.isChecked\(\), ack\.isChecked\(\)\)\) return;//'
 mut 'M20 the marker records no time' act 's/\n[ \t]*\.putLong\("os_agreement_accepted_at", System\.currentTimeMillis\(\)\)\.apply\(\);/.apply();/'
 mut 'M21 the gate enables on the agreement alone' act 's/boolean ok = OsAgreement\.canContinue\(agree\.isChecked\(\), ack\.isChecked\(\)\);/boolean ok = agree.isChecked();/'
+mut 'M22 createStep lets an unticked draft go (case createStep draft unticked)' cls 's/return shouldShow\(gateReply\) \? \(acknowledged \? CREATE_GO : CREATE_ASK\) : CREATE_GO;/return CREATE_GO;/'
+mut 'M23 an unread gate goes (case createStep(null, false) is CREATE_WAIT)' cls 's/: CREATE_WAIT;/: CREATE_GO;/'
+mut 'M24 createAckShown ignores createMode (case createAckShown off create mode)' cls 's/return createMode && shouldShow\(gateReply\);/return shouldShow(gateReply);/'
+mut 'M25 setCreateMode drops the untick (pin C3)' act 's/\n[ \t]*createAckBox\.setChecked\(false\); \/\/ NWP-20261202-23: unticked every time//'
+mut 'M26 the ASK branch does not return (pin C4)' act 's/result\.setText\(OsAgreement\.CREATE_ACK_NEED\); return;/result.setText(OsAgreement.CREATE_ACK_NEED);/'
+mut 'M27 create(n, p) moved above the createStep line (pin C4)' act 's/\n[ \t]*create\(n, p\);//; s/(\n[ \t]*final int ackStep = )/\n                create(n, p);$1/'
+mut 'M28 lockGateForm drops the box (pin C5)' act 's/addPhoneLink, playAtCreateSw, createAckBox\}/addPhoneLink, playAtCreateSw}/'
+mut 'M29 clearSignInFields drops the untick (pin C5)' act 's/\n[ \t]*if \(createAckBox != null\) createAckBox\.setChecked\(false\); \/\/ NWP-20261202-23//'
+mut 'M30 readCreateAckGate stores a null reply (pin C1)' act 's/createAckReply = r == null \? "" : r;/createAckReply = r;/'
+mut 'M31 createAckText drops the DRAFT mark (case createAckText holds DRAFT_MARK)' cls 's/return showsDraftMark\(\) \? ACK \+ "\\n" \+ DRAFT_MARK : ACK;/return ACK;/'
+mut 'M32 setCreateMode drops the re-read (pin C2 call count; C3 also holds it)' act 's/\n[ \t]*if \(createMode\) readCreateAckGate\(\); \/\/ NWP-20261202-23: re-read at every entry//'
 [ "$fails" = 0 ] || { echo "FAILED: $fails mutant(s) not convicted"; exit 1; }
 echo "all mutants convicted"

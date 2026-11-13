@@ -134,6 +134,13 @@ func (r *mediaRoot) Lookup(ctx context.Context, name string, out *fuse.EntryOut)
 // app to UPDATE a media file it owns -- e.g. Organic Maps deletes the old <region>.mwm before writing the new
 // one. A real sibling (essential file, or an app write that passed through the loopback) unlinks normally.
 func (r *mediaRoot) Unlink(ctx context.Context, name string) syscall.Errno {
+	if r.deferSet[name] {
+		// NWP-20261202-17: the late heal (media_heal_late.go) checks the tombstone, renames and tombstones under
+		// this lock. So an unlink either tombstones the stub before the heal looks (the heal then lands nothing),
+		// or finds the landed file and unlinks it through the loopback. Without it a deleted file came back.
+		r.srv.landMu.Lock()
+		defer r.srv.landMu.Unlock()
+	}
 	if r.deferSet[name] && !r.srv.isDeleted(path.Join(r.dir, name)) {
 		rel := path.Join(r.dir, name)
 		// NWP-20261127-06: a tombstone that did not reach .deleted would not reach the seal either, so the
@@ -971,6 +978,9 @@ func serveMediaScope(base, name, pass, userDir, cacheDir, stateDir string) []med
 	// miss it -- POLL instead"); it was never applied to pins. Polling makes the kick advisory: it still matters
 	// when mediad is NOT running, and is harmless when it is. Its own goroutine, so a long Tier-2 pass cannot
 	// delay a pin the user is waiting on.
+	// NWP-20261202-17: the vault heal of unkept apps, which the sign-in left for after landing (media_heal_late.go).
+	// Once per scope, now that undersByDir holds only live overlays; healLate returns at once for #media.
+	goSafe("vault heal", func() { srv.healLate(name, userDir, undersByDir) })
 	goSafeLoop("pin loop", func() {
 		last := "" // no legal fingerprint is empty, so the first non-empty set always triggers a pass
 		for {

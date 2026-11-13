@@ -24,7 +24,15 @@
 #      ProfileActivity.reportStatus and the run's keys, no note, no preview, no ticket row, no loop.
 #   S4 the manifest declares .DiagReportJob with BIND_JOB_SERVICE, not exported.
 #   S5 sweepAuto's first statement is `try { DiagReportJob.arm(this); }`.
-#   S6 schedule() is one periodic 1 h job, NETWORK_TYPE_ANY, not persisted.
+#   S6 schedule() is one periodic 1 h job, NETWORK_TYPE_ANY, not persisted, and returns its record code.
+#   NWP-20261202-08, the scheduled sender's run record (RUNS_FILE, carried in a report as diag_job):
+#   D8 record keeps the newest 16 lines, skips an unparsable one, never throws; jobStatus ages in minutes (capped,
+#      a future ms left out, `none`), no run of 7+ digits; replyClass / throwCode / netCode, every code
+#      [a-z0-9-]{1,16} and free of a word the agent's report scrub drops.
+#   D9 over the fake Port: what switchOn / switchOff / arm / runJob record, and nothing with the opt-in off.
+#   S7 reportRequestJson adds DiagReports.jobStatus( once, inside the opt-in `if`.
+#   S8 sendScheduled adds the jobStatus keys before its roundTrip.
+#   S9 onStartJob records start before t.start(); onStopJob records stop; noteJob checks optedIn first.
 #
 # It needs a JDK, and it FAILS when there is none: a Java suite that skips without one would read green on a runner
 # that never ran it. javac/java come from PATH, then the build VM's prebuilt JDK 21.
@@ -33,7 +41,7 @@
 # (INERT) or does not compile (BROKEN) counts as a failure, never a pass.
 #
 #   bash test-diag-reports-java.sh            # the cases and the source checks
-#   bash test-diag-reports-java.sh --mutate   # ... plus the mutants M1-M19
+#   bash test-diag-reports-java.sh --mutate   # ... plus the mutants M1-M26
 set -uo pipefail
 MUTATE=no
 for a in "$@"; do case "$a" in --mutate) MUTATE=yes ;; *) echo "usage: $0 [--mutate]" >&2; exit 2 ;; esac; done
@@ -57,10 +65,10 @@ MF=core/chooser/AndroidManifest.xml
 CASES=$ROOT/core/chooser/tests/diag-reports/DiagReportsCases.java
 FILES="$CH/DiagReports.java $CH/DiagReportJob.java $CH/ProfileActivity.java $CH/UnarchiveService.java $MF"
 
-# cases <root>: compile <root>'s DiagReports with the cases into a fresh dir and run them (D1-D7).
+# cases <root>: compile <root>'s DiagReports with the cases into a fresh dir and run them (D1-D9).
 cases() {
   local d
-  [ -f "$1/$CH/DiagReports.java" ] || { echo "FAIL D1-D7 $CH/DiagReports.java does not exist"; return 1; }
+  [ -f "$1/$CH/DiagReports.java" ] || { echo "FAIL D1-D9 $CH/DiagReports.java does not exist"; return 1; }
   d=$(mktemp -d -p "$W")
   "$JAVAC" -J-Djava.io.tmpdir="$W" -encoding UTF-8 -d "$d" "$1/$CH/DiagReports.java" "$CASES" || return 3
   "$JAVA" -Djava.io.tmpdir="$W" -cp "$d" com.nowhere.chooser.DiagReportsCases
@@ -89,16 +97,17 @@ verdict() {
   return 0
 }
 
-# sources <root>: S1-S6 over <root>'s files.
+# sources <root>: S1-S9 over <root>'s files.
 sources() {
-  local r=$1 rep req run start stopj send sched sweep bad=0 out
+  local r=$1 rep req run start stopj send sched sweep note bad=0 out
   rep=$(code "$r/$CH/ProfileActivity.java" "    private void showReportIssue() {")
   req=$(code "$r/$CH/ProfileActivity.java" "    private String reportRequestJson(String note, boolean preview) {")
   run=$(code "$r/$CH/DiagReports.java" "    static String runJob(Port p, AtomicBoolean stopped) {")
   start=$(code "$r/$CH/DiagReportJob.java" "    @Override public boolean onStartJob(final JobParameters params) {")
   stopj=$(code "$r/$CH/DiagReportJob.java" "    @Override public boolean onStopJob(JobParameters params) {")
   send=$(code "$r/$CH/DiagReportJob.java" "    private static String sendScheduled(Context ctx, Map<String, String> extra) {")
-  sched=$(code "$r/$CH/DiagReportJob.java" "    static void schedule(Context ctx) {")
+  sched=$(code "$r/$CH/DiagReportJob.java" "    static String schedule(Context ctx) {")
+  note=$(code "$r/$CH/DiagReportJob.java" "    static void noteJob(Context ctx, String ev) {")
   sweep=$(code "$r/$CH/UnarchiveService.java" "    private void sweepAuto(boolean byHand) {")
 
   out=$(perl -0777 -ne '
@@ -150,11 +159,11 @@ sources() {
       unless length $s && length $j && length $k && length $t;
     my $opt = index($s, q{if (!optedIn(p.read(OPT_FILE))) { p.cancel(); return R_OFF; }});
     my $st = index($s, q{String st = p.status();});
-    my $no = index($s, q{if (notOffered(st)) { p.cancel(); return R_NOT_OFFERED; }});
-    my $off = index($s, q{if (!offered(st)) return R_UNAVAILABLE;});
+    my $no = index($s, q{if (notOffered(st)) { p.cancel(); return ran(p, R_NOT_OFFERED); }});
+    my $off = index($s, q{if (!offered(st)) return ran(p, R_UNAVAILABLE);});
     my $lk = index($s, q!synchronized (LOCK) {!);
     my $snd = index($s, q{p.report(});
-    push @f, "S3 runJob has no `if (!offered(st)) return R_UNAVAILABLE;`" if $off < 0;
+    push @f, "S3 runJob has no `if (!offered(st)) return ran(p, R_UNAVAILABLE);`" if $off < 0;
     push @f, "S3 runJob has no notOffered cancel" if $no < 0;
     push @f, "S3 the opt-in, the status read and the OFFERED checks do not all sit before the lock and p.report("
       unless $opt >= 0 && $st > $opt && $no > $st && $off > $no && $lk > $off && $snd > $lk;
@@ -202,12 +211,55 @@ $send")
   out=$(perl -0777 -ne '
     my @f;
     for my $w (q{.setPeriodic(3600_000L)}, q{.setRequiredNetworkType(JobInfo.NETWORK_TYPE_ANY)}, q{.setPersisted(false)},
-               q{js.getPendingJob(JOB_ID) != null) return;}) {
+               q{if (js.getPendingJob(JOB_ID) != null) return "pending";},
+               q{return r == JobScheduler.RESULT_SUCCESS ? "scheduled" : "err-result";}) {
       push @f, "S6 schedule lacks $w" if index($_, $w) < 0;
     }
     print "FAIL $_\n" for @f; print "ok S6 one periodic 1 h job, any network, not persisted\n" unless @f;
   ' <<<"$sched")
   verdict S6 "$out" || bad=1
+
+  out=$(perl -0777 -ne '
+    my $s = $_; my @f;
+    my $n = () = $s =~ /DiagReports\.jobStatus\(/g;
+    push @f, "S7 reportRequestJson calls DiagReports.jobStatus( $n times, want 1" if $n != 1;
+    if ($s =~ /if \(DiagReports\.optedIn\([^\n]*\) && DiagReports\.tagOk\(tag\)\) (\{(?:[^{}]++|(?1))*\})/s) {
+      push @f, "S7 DiagReports.jobStatus( is not inside the opt-in if" if index($1, q{DiagReports.jobStatus(}) < 0;
+    } else { push @f, "S7 no opt-in `if (DiagReports.optedIn(...) && DiagReports.tagOk(tag)) {` block"; }
+    for my $w (q{DiagReports.jobStatus(DiagReportJob.readFile(this, DiagReports.RUNS_FILE),}, q{DiagReportJob.pending(this)}) {
+      push @f, "S7 the jobStatus call lacks $w" if index($s, $w) < 0;
+    }
+    print "FAIL $_\n" for @f; print "ok S7 a by-hand report carries diag_job only when the opt-in says on\n" unless @f;
+  ' <<<"$req")
+  verdict S7 "$out" || bad=1
+
+  out=$(perl -0777 -ne '
+    my $t = $_; my @f;
+    my $j = index($t, q{DiagReports.jobStatus(readFile(ctx, DiagReports.RUNS_FILE),});
+    my $rt = index($t, q{DaemonSocket.roundTrip(});
+    push @f, "S8 sendScheduled does not add the jobStatus keys before its roundTrip" unless $j >= 0 && $rt > $j;
+    push @f, "S8 sendScheduled\x27s jobStatus does not read pending(ctx)" if index($t, q{pending(ctx)).entrySet()) st.put(}) < 0;
+    print "FAIL $_\n" for @f; print "ok S8 a scheduled report carries diag_job up to its send\n" unless @f;
+  ' <<<"$send")
+  verdict S8 "$out" || bad=1
+
+  out=$(perl -0777 -ne '
+    my ($j, $k, $n) = split /\n=====PART=====\n/, $_, 3; my @f;
+    my $ns = index($j, q{noteJob(ctx, "start");}); my $ts = index($j, q{t.start();});
+    push @f, "S9 onStartJob does not record start before t.start()" unless $ns >= 0 && $ts > $ns;
+    push @f, "S9 onStopJob does not record stop" if index($k, q{noteJob(getApplicationContext(), "stop");}) < 0;
+    push @f, "S9 noteJob records without the optedIn check"
+      if index($n, q{if (DiagReports.optedIn(readFile(ctx, DiagReports.OPT_FILE))) DiagReports.record(}) < 0;
+    my $r = () = $n =~ /DiagReports\.record\(/g;
+    push @f, "S9 noteJob calls DiagReports.record( $r times, want 1" if $r != 1;
+    push @f, "S9 noteJob takes LOCK" if $n =~ /\bLOCK\b/;
+    print "FAIL $_\n" for @f; print "ok S9 the job records its start and stop only with the opt-in on\n" unless @f;
+  ' <<<"$start
+=====PART=====
+$stopj
+=====PART=====
+$note")
+  verdict S9 "$out" || bad=1
   return "$bad"
 }
 
@@ -244,19 +296,26 @@ mut "M1 the 6 h spacing made 0" "$CH/DiagReports.java" 's/SIX_H = 6 \* 3600_000L
 mut "M2 the 12 h rule dropped (mobile always sends)" "$CH/DiagReports.java" 's/if \(now - Math\.max\(lastWifi, onSince\) >= TWELVE_H\) return SEND;\n        return WAIT;/return SEND;/' "D4 mobile, no Wi-Fi seen, on 12 h - 1 ms" || fails=$((fails+1))
 mut "M3 offered always true" "$CH/DiagReports.java" 's/return statusReply != null && statusReply\.trim\(\)\.startsWith\("OFFERED 1 "\);/return true;/' 'D1 offered("OFFERED 0 ON 1")' || fails=$((fails+1))
 mut "M4 the tag added with the switch off" "$CH/ProfileActivity.java" 's/if \(DiagReports\.optedIn\(DiagReportJob\.readFile\(this, DiagReports\.OPT_FILE\)\) && DiagReports\.tagOk\(tag\)\)/if (DiagReports.tagOk(tag))/' "S2 the tag is added without DiagReports.optedIn(" || fails=$((fails+1))
-mut "M5 the job sends without the OFFERED check" "$CH/DiagReports.java" 's/        if \(notOffered\(st\)\) \{ p\.cancel\(\); return R_NOT_OFFERED; \}\n        if \(!offered\(st\)\) return R_UNAVAILABLE;\n//' "D6 OFFERED 0 sends no report" || fails=$((fails+1))
+mut "M5 the job sends without the OFFERED check" "$CH/DiagReports.java" 's/        if \(notOffered\(st\)\) \{ p\.cancel\(\); return ran\(p, R_NOT_OFFERED\); \}\n        if \(!offered\(st\)\) return ran\(p, R_UNAVAILABLE\);\n//' "D6 OFFERED 0 sends no report" || fails=$((fails+1))
 mut "M6 an all-digit tag kept" "$CH/DiagReports.java" 's/if \(letter\) return sb\.toString\(\);/return sb.toString();/' "D3 an all-digit body is drawn again" || fails=$((fails+1))
 mut "M7 tagOk widened to [a-z0-9]" "$CH/DiagReports.java" 's/t\.matches\("t-\[a-z2-7\]\{10\}"\)/t.matches("t-[a-z0-9]{10}")/' "D3 tagOk rejects 1" || fails=$((fails+1))
 mut "M8 the switch drawn on any status reply" "$CH/ProfileActivity.java" 's/if \(DiagReports\.offered\(diagSt\)\) \{/if (diagSt != null) {/' "S1 no \`if (DiagReports.offered" || fails=$((fails+1))
 mut "M9 the JobService exported" "$MF" 's/(android:name="\.DiagReportJob"\s+android:permission="android\.permission\.BIND_JOB_SERVICE"\s+)android:exported="false"/${1}android:exported="true"/' "S4 the manifest does not declare" || fails=$((fails+1))
 mut "M10 sweepAuto no longer arms" "$CH/UnarchiveService.java" 's/        try \{ DiagReportJob\.arm\(this\); \}\n[^\n]*\n//' "S5" || fails=$((fails+1))
-mut "M11 SENT_FILE written on any reply" "$CH/DiagReports.java" 's/            if \(reply == null \|\| !reply\.startsWith\("OK "\)\) return R_NOT_SENT;\n//' "D6 an ERR reply records no SENT_FILE" || fails=$((fails+1))
+mut "M11 SENT_FILE written on any reply" "$CH/DiagReports.java" 's/            if \(reply == null \|\| !reply\.startsWith\("OK "\)\) return ran\(p, R_NOT_SENT\);\n//' "D6 an ERR reply records no SENT_FILE" || fails=$((fails+1))
 mut "M12 the job persisted" "$CH/DiagReportJob.java" 's/\.setPersisted\(false\)/.setPersisted(true)/' "S6 schedule lacks .setPersisted(false)" || fails=$((fails+1))
 mut "M13 the run keeps its first opt-in read (an Off during status still sends)" "$CH/DiagReports.java" 's/            if \(!optedIn\(opt\)\) return R_OFF;[^\n]*\n//' "D6 an Off during the status request sends no report" || fails=$((fails+1))
-mut "M14 the stop flag ignored" "$CH/DiagReports.java" 's/            if \(stopped\.get\(\)\) return R_STOPPED;\n//g' "D6 a stop during the status request sends no report" || fails=$((fails+1))
+mut "M14 the stop flag ignored" "$CH/DiagReports.java" 's/            if \(stopped\.get\(\)\) return ran\(p, R_STOPPED\);\n//g' "D6 a stop during the status request sends no report" || fails=$((fails+1))
 mut "M15 switchOff without the consent lock" "$CH/DiagReports.java" 's/synchronized \(LOCK\) \{\n            p\.remove\(OPT_FILE\);/{\n            p.remove(OPT_FILE);/' "D6 an Off tapped during a send waits for it" || fails=$((fails+1))
-mut "M16 a missing status reply cancels the job" "$CH/DiagReports.java" 's/if \(!offered\(st\)\) return R_UNAVAILABLE;/if (!offered(st)) { p.cancel(); return R_UNAVAILABLE; }/' "D6 no status reply keeps the schedule" || fails=$((fails+1))
+mut "M16 a missing status reply cancels the job" "$CH/DiagReports.java" 's/if \(!offered\(st\)\) return ran\(p, R_UNAVAILABLE\);/if (!offered(st)) { p.cancel(); return ran(p, R_UNAVAILABLE); }/' "D6 no status reply keeps the schedule" || fails=$((fails+1))
 mut "M17 SWITCH runs transitions in parallel" "$CH/DiagReports.java" 's/Executors\.newSingleThreadExecutor\(/Executors.newCachedThreadPool(/' "D7 SWITCH does not start a second transition" || fails=$((fails+1))
 mut "M18 the Off tap on a thread of its own" "$CH/ProfileActivity.java" 's/DiagReports\.SWITCH\.execute\(\(\) -> DiagReports\.switchOff\(port\)\);/new Thread(() -> DiagReports.switchOff(port)).start();/' "S1 the offered block starts a thread of its own" || fails=$((fails+1))
 mut "M19 onStopJob does not set the stop flag" "$CH/DiagReportJob.java" 's/        if \(s != null\) s\.set\(true\);\n//' "S3 onStopJob does not set the stop flag" || fails=$((fails+1))
+mut "M20 record drops the trim to RUNS_KEEP" "$CH/DiagReports.java" 's/Math\.max\(0, keep\.size\(\) - RUNS_KEEP\)/0/' "D8 record keeps the newest 16 lines" || fails=$((fails+1))
+mut "M21 runJob's send record removed" "$CH/DiagReports.java" 's/            record\(p, "send", replyClass\(reply\)\);\n//' "D9 a sent run records send ok-ticket" || fails=$((fails+1))
+mut "M22 arm's sched record removed" "$CH/DiagReports.java" 's/^            record\(p, "sched", p\.schedule\(\)\);$/            p.schedule();/m' "D9 arm records arm ok, sched scheduled" || fails=$((fails+1))
+mut "M23 jobStatus prints ms, not minutes" "$CH/DiagReports.java" 's/\(now - ms\) \/ 60_000L/(now - ms)/' "D8 jobStatus ages in minutes" || fails=$((fails+1))
+mut "M24 reportRequestJson's jobStatus moved outside the opt-in if" "$CH/ProfileActivity.java" 's/(\n                for \(java\.util\.Map\.Entry<String, String> e : DiagReports\.jobStatus\([^;]*;)(\n            \})/$2$1/' "S7 DiagReports.jobStatus( is not inside the opt-in if" || fails=$((fails+1))
+mut "M25 replyClass keeps the ticket" "$CH/DiagReports.java" 's/return "ok-ticket";/return "ok-" + t.substring(3).trim();/' "D8 replyClass(\"OK 4711\") is ok-ticket" || fails=$((fails+1))
+mut "M26 noteJob records without the optedIn check" "$CH/DiagReportJob.java" 's/if \(DiagReports\.optedIn\(readFile\(ctx, DiagReports\.OPT_FILE\)\)\) DiagReports\.record/DiagReports.record/' "S9 noteJob records without the optedIn check" || fails=$((fails+1))
 [ "$fails" -eq 0 ] && echo "== all mutations convicted" || { echo "== $fails mutation(s) not convicted"; exit 1; }

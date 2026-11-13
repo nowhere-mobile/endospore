@@ -11,6 +11,14 @@
 # comment-stripped real files pin that the watcher reads every line and routes them through MediaStatus, and the
 # premise: writeProg writes the three kinds as separate lines and the daemon relays them whole.
 #
+# NWP-20261202-28 (S6a of docs/media-after-gate.md §8): a fourth kind. mediad writes
+# "RESTORING <done B> <total B> <files left>" while the after-gate #media restore has files left (NWP-20261201-14).
+# route() gives it slot 3, restoring() validates it, and the watcher posts the media notice in its restoring form
+# (MediaStatus.RESTORING_TITLE, a byte bar) after an on-access LOADING and before a background PREFETCH. The D-checks
+# pin that order and that postMediaNotice parses through MediaStatus.restoring with the decided title and a
+# determinate bar from MediaStatus.restoringPermille (a zero-byte set too: RESTORING 0 0 1); B4 pins the line in
+# writeProg.
+#
 # ⚠ IT FAILS WHEN THERE IS NO JAVAC, IT NEVER SKIPS.
 #
 #   bash test-media-status-java.sh            # the cases and the source checks
@@ -95,6 +103,37 @@ source_check() {
     echo "  FAIL  A3 the watcher still reads GET-MEDIA-STATUS with a one-line helper" >&2; bad=1
   fi
 
+  # (d) NWP-20261202-28: the watcher shows the RESTORING line, after LOADING and before PREFETCH.
+  has D1 'the watcher does not read the RESTORING slot mr[3]' "$body" 'mr[3]' || bad=1
+  has D2 'the watcher does not parse the RESTORING line with MediaStatus.restoring(' "$body" 'MediaStatus.restoring(' \
+    || bad=1
+  local nl='if (loadLine != null)' nr='} else if (MediaStatus.restoring(restLine) != null)' np='} else if (prefetchActive)'
+  if [[ $body != *"$nl"* || $body != *"$nr"* || $body != *"$np"* ]]; then
+    echo "  FAIL  D3 the notice choice lacks one of: the loadLine, restoring or prefetchActive branch" >&2; bad=1
+  else
+    local il ir ip pre
+    pre=${body%%"$nl"*}; il=${#pre}
+    pre=${body%%"$nr"*}; ir=${#pre}
+    pre=${body%%"$np"*}; ip=${#pre}
+    if ! [ "$il" -lt "$ir" ] || ! [ "$ir" -lt "$ip" ]; then
+      echo "  FAIL  D3 the notice choice is not loadLine, then restoring, then prefetchActive" >&2; bad=1
+    fi
+  fi
+  local pmn
+  pmn=$(printf '%s\n' "$code" \
+    | awk '/private static void postMediaNotice\(Context app, int uid, String status\) \{/ { on = 1 } on { print } on && /^    }$/ { exit }')
+  pmn=$(tr -s ' \n' '  ' <<<"$pmn")
+  if [ -z "$pmn" ]; then
+    echo "  FAIL  D4 postMediaNotice EXTRACTION FAILED (its signature is not found)" >&2; bad=1
+  else
+    has D5 'postMediaNotice does not title the restoring form with MediaStatus.RESTORING_TITLE' \
+      "$pmn" 'MediaStatus.RESTORING_TITLE' || bad=1
+    has D6 'postMediaNotice does not parse the restoring form with MediaStatus.restoring(' \
+      "$pmn" 'MediaStatus.restoring(' || bad=1
+    has D7 'postMediaNotice does not give the restoring form a determinate bar from MediaStatus.restoringPermille' \
+      "$pmn" 'if (rest != null) { b.setProgress(1000, MediaStatus.restoringPermille(done, total), false);' || bad=1
+  fi
+
   # (b) the premise: writeProg writes the three kinds as separate "\n"-ended lines.
   raw=$(awk '/^func \(s \*mediaServer\) writeProg\(\) \{/ { on = 1 } on { print } on && /^}$/ { exit }' "$mediago")
   body=$(strip_go <<<"$raw")
@@ -103,6 +142,7 @@ source_check() {
   has B1 'writeProg no longer writes a "LOADING ...\n" line' "$body" 'lines = fmt.Sprintf("LOADING %d %d %d %s\n",' || bad=1
   has B2 'writeProg no longer appends a "DAMAGED ...\n" line' "$body" 'lines += fmt.Sprintf("DAMAGED %d %s\n",' || bad=1
   has B3 'writeProg no longer appends an "INCOMPLETE ...\n" line' "$body" 'lines += fmt.Sprintf("INCOMPLETE %d %s\n",' || bad=1
+  has B4 'writeProg no longer appends a "RESTORING ...\n" line' "$body" 'lines += fmt.Sprintf("RESTORING %d %d %d\n",' || bad=1
 
   # (c) the daemon's GET-MEDIA-STATUS arm relays the file whole.
   raw=$(awk '/^\tif name == "GET-MEDIA-STATUS" \{/ { on = 1 } on { print } on && /^\t}$/ { exit }' "$maingo")
@@ -166,5 +206,32 @@ mutsrc "R4 the watcher reads with pollDaemon again" chooser \
 mutsrc "R5 the DAMAGED format loses its newline" media 's/"DAMAGED %d %s\\n"/"DAMAGED %d %s"/' || fails=$((fails+1))
 mutsrc "R6 the daemon arm relays only the first line" main \
   's/(if name == "GET-MEDIA-STATUS" \{.*?)fmt\.Fprint\(conn, line\+"\\n"\)/$1fmt.Fprint(conn, strings.SplitN(line, "\\n", 2)[0]+"\\n")/s' \
+  || fails=$((fails+1))
+# NWP-20261202-28: the RESTORING slot, its parser, the watcher's order and the notice's title.
+mut "R7 slot 3 is never filled (cases S10-S13)" \
+  's/\n\s*: line\.startsWith\("RESTORING"\) \? 3 : -1;/ : -1;/' || fails=$((fails+1))
+mut "R8 RESTORING is routed into slot 0 (cases S10, S12, S13)" \
+  's/startsWith\("RESTORING"\) \? 3/startsWith("RESTORING") ? 0/' || fails=$((fails+1))
+mut "R9 restoring accepts left 0 (case P3)" 's/if \(v\[2\] <= 0\) return null;/if (v[2] < 0) return null;/' \
+  || fails=$((fails+1))
+mut "R10 restoring accepts done > total (case P4)" 's/if \(v\[0\] > v\[1\]\) return null;/if (false) return null;/' \
+  || fails=$((fails+1))
+mutsrc "R11 the watcher checks prefetchActive before the restoring line (D3)" chooser \
+  's/\} else if \(MediaStatus\.restoring\(restLine\) != null\) \{(.*?)\} else if \(prefetchActive\) \{/} else if (prefetchActive) {$1} else if (MediaStatus.restoring(restLine) != null) {/s' \
+  || fails=$((fails+1))
+mutsrc "R12 the watcher drops the restoring branch (D2, D3)" chooser \
+  's/\} else if \(MediaStatus\.restoring\(restLine\) != null\) \{.*?(\} else if \(prefetchActive\) \{)/$1/s' \
+  || fails=$((fails+1))
+mutsrc "R13 postMediaNotice uses a literal title, not the constant (D5)" chooser \
+  's/\? MediaStatus\.RESTORING_TITLE/? "Restoring photos and files"/' || fails=$((fails+1))
+mutsrc "R14 the RESTORING format loses its newline (B4)" media 's/"RESTORING %d %d %d\\n"/"RESTORING %d %d %d"/' \
+  || fails=$((fails+1))
+mut "R15 restoringPermille gives a zero total the indeterminate -1 (case Q2)" \
+  's/if \(total <= 0 \|\| done <= 0\) return 0;/if (total <= 0) return -1;\n        if (done <= 0) return 0;/' \
+  || fails=$((fails+1))
+mut "R16 restoringPermille multiplies in long and overflows (case Q5)" \
+  's/\(int\) \(\(double\) done \* 1000 \/ total\)/(int) (done * 1000 \/ total)/' || fails=$((fails+1))
+mutsrc "R17 postMediaNotice gates the restoring bar on total > 0 (D7)" chooser \
+  's/if \(rest != null\) \{\s*(?:\/\/[^\n]*\s*)?b\.setProgress\(1000, MediaStatus\.restoringPermille\(done, total\), false\);\s*\} else if \(!prefetch && total > 0/if (!prefetch \&\& total > 0/' \
   || fails=$((fails+1))
 [ "$fails" -eq 0 ] && echo "== all mutations convicted" || { echo "== $fails mutation(s) not convicted"; exit 1; }

@@ -136,7 +136,7 @@ run_dropoff() {
 # run_dropoff_seal), or nothing when one is not found.
 extract_funcs() {
   local fn body all=""
-  for fn in qn pw pkgname_ok live_code_dir live_code_ver stage_apk_copy stage_live_apks stage_keep_mtimes appcode_stage_play_dormant appcode_seal; do
+  for fn in qn pw pkgname_ok live_code_dir live_code_ver stage_apk_copy stage_live_apks stage_keep_mtimes appcode_stage_play_dormant appcode_inputs_fp appcode_seal; do
     body=$(awk -v h="$fn() {" '$0 == h {f=1} f{print} f&&/^\}$/{exit}' "$1")
     case "$body" in "$fn() {"*'}') all="$all$body
 " ;; *) return 0 ;; esac

@@ -39,6 +39,11 @@ setup() {
   # its README (never the committed markers: a real one for lynx would refuse every case here).
   cp "$(dirname "$0")/support-guard.sh" "$T/editions/endospore/build/"; mkdir -p "$T/editions/endospore/support-ended"
   cp "$(dirname "$0")/../support-ended/README" "$T/editions/endospore/support-ended/"
+  # NWP-20261202-12: the copy runs canary-guard.sh beside itself too; a canary pass for 0.5.43, the version every case
+  # publishes, so lynx (a fleet device) gets past the guard and every case runs as before.
+  cp "$(dirname "$0")/canary-guard.sh" "$T/editions/endospore/build/"; mkdir -p "$T/editions/endospore/canary-pass"
+  cp "$(dirname "$0")/../canary-pass/README" "$T/editions/endospore/canary-pass/"
+  printf 'canary husky\nbuild 2026120101\nsmoke pass 2026-12-01\n' > "$T/editions/endospore/canary-pass/0.5.43"
   printf '#!/bin/sh\nexit 0\n' > "$T/editions/endospore/build/check-agent-fresh.sh"; chmod +x "$T/editions/endospore/build/check-agent-fresh.sh"
   echo 0.5.43 > "$T/core/vendor-common/etc/nowhere-ota-version"
   printf '%s' "$NOTES_OK" > "$T/core/vendor-common/etc/ota-notes/0.5.43"

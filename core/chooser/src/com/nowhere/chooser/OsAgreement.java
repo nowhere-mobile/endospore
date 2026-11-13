@@ -51,6 +51,30 @@ final class OsAgreement {
         return accepted && acknowledged;
     }
 
+    // ---- CREATE (NWP-20261202-23) --------------------------------------------------------------------------------
+    // docs/product-decisions.md, 2026-11-10, "Create offers to finish setting up Google Play after the first
+    // switch-in, asks for the lost-passphrase acknowledgement at every Create, and shows the OS agreement at Create at
+    // least on rental phones", item 2: Create asks for the same separate, affirmative acknowledgement (ACK) before the
+    // profile is made, with the same DRAFT text and behind the same one gate (PRODUCTION_APPROVED). No second flip.
+    // Nothing about the acknowledgement is recorded, sent or logged.
+    static final int CREATE_WAIT = 0, CREATE_ASK = 1, CREATE_GO = 2;
+
+    /** What a Create tap does. A null reply means the gate was not read yet: with the gate off, wait and re-read. */
+    static int createStep(String gateReply, boolean acknowledged) {
+        if (gateReply == null) return PRODUCTION_APPROVED ? (acknowledged ? CREATE_GO : CREATE_ASK) : CREATE_WAIT;
+        return shouldShow(gateReply) ? (acknowledged ? CREATE_GO : CREATE_ASK) : CREATE_GO;
+    }
+
+    /** True when the create form shows the acknowledgement box: create mode, and the gate shows the text. */
+    static boolean createAckShown(String gateReply, boolean createMode) {
+        return createMode && shouldShow(gateReply);
+    }
+
+    /** The box's text: {@link #ACK}, and the DRAFT mark under it while the text is not approved. */
+    static String createAckText() {
+        return showsDraftMark() ? ACK + "\n" + DRAFT_MARK : ACK;
+    }
+
     // ---- THE TEXT (DRAFT) ----------------------------------------------------------------------------------------
     static final String TITLE = "Before you set up this phone";
 
@@ -83,4 +107,10 @@ final class OsAgreement {
             + "recover my data. Not Nowhere, and not anyone else.";
 
     static final String ACCEPT = "Agree and continue";
+
+    /** Create refused: the box is not ticked (DRAFT). */
+    static final String CREATE_ACK_NEED = "tick the box to confirm you understand, then create the profile";
+
+    /** Create refused: the gate is not read yet (DRAFT). */
+    static final String CREATE_WAIT_TEXT = "one moment, then tap Create profile again";
 }

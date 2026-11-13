@@ -62,13 +62,19 @@ chmod +x "$W/agent"
 
 # run_case <script> <name> <setup-cmds...> -> sets OUT, RC, FX; script copied beside a stub freshness check.
 run_case() {
-  local sut="$1" name="$2" args="${3:-}" setup="${4:-}" bin
+  local sut="$1" name="$2" args="${3:-}" setup="${4:-}" bin v
   bin="$W/bin-$name"; FX="$W/fx-$name"
   mkdir -p "$bin" "$FX"
   cp "$sut" "$bin/e4-ota-promote.sh"
   # NWP-20261124-19: the copy runs support-guard.sh beside itself; it reads $W/support-ended, which holds only the
   # README (never the committed markers: a real one for lynx would refuse every case here).
   cp "$HERE/support-guard.sh" "$bin/"; mkdir -p "$W/support-ended"; cp "$HERE/../support-ended/README" "$W/support-ended/"
+  # NWP-20261202-12: and canary-guard.sh, which reads $W/canary-pass: a canary pass for every version a case promotes
+  # (0.5.40 to 0.5.49), so the device 'fixture' (a fleet device) gets past the guard and every case runs as before.
+  cp "$HERE/canary-guard.sh" "$bin/"; mkdir -p "$W/canary-pass"; cp "$HERE/../canary-pass/README" "$W/canary-pass/"
+  for v in 0.5.40 0.5.41 0.5.42 0.5.43 0.5.44 0.5.45 0.5.46 0.5.47 0.5.48 0.5.49; do
+    printf 'canary husky\nbuild 2026120101\nsmoke pass 2026-12-01\n' > "$W/canary-pass/$v"
+  done
   printf '#!/usr/bin/env bash\nexit 0\n' > "$bin/check-agent-fresh.sh"
   chmod +x "$bin/check-agent-fresh.sh" "$bin/e4-ota-promote.sh"
   eval "$setup"

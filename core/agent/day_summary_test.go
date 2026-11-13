@@ -3,8 +3,12 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"encoding/json"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -173,7 +177,7 @@ func TestDaySummaryPrune16KiB(t *testing.T) {
 	var lines []string
 	size := 0
 	for i := 0; ; i++ {
-		l := fmt.Sprintf("v=1 t=1800000000 ev=sweep apps=%d ok=1 fail=0 ms=100000", 100000+i)
+		l := fmt.Sprintf("v=1 t=1800000000 ev=save ms=%d rc=ok kib=%d", 100000+i, 100000+i)
 		if size+len(l)+1 > daySummaryMaxBytes {
 			break
 		}
@@ -182,7 +186,7 @@ func TestDaySummaryPrune16KiB(t *testing.T) {
 	}
 	dsPlant(t, "44", strings.Join(lines, "\n")+"\n")
 	// Longer than any planted line, so the planted file plus it is over the cap.
-	add := "v=1 t=1800000000 ev=sweep apps=999999999 ok=999999999 fail=999999999 ms=999999999"
+	add := "v=1 t=1800000000 ev=save ms=999999999999 rc=ok kib=999999999999999"
 	daySummaryAppend("44", add)
 	got := dsRead(t, daySummaryPath("44"))
 	if len(got) > daySummaryMaxBytes {
@@ -195,6 +199,115 @@ func TestDaySummaryPrune16KiB(t *testing.T) {
 		t.Error("the newest lines are not kept")
 	}
 	if daySummaryStatus(daySummaryPath("44"))["day_summary"] == "unreadable" {
+		t.Error("the writer's own pruned file reads as unreadable")
+	}
+}
+
+// NWP-20261202-09 (backlog: The diagnostic day summary's 16 KiB lets periodic saves push the sign-in and the Auto
+// sweep out of it): a day of periodic saves fills the file, and the sign-in and the sweep are still in it.
+func TestDaySummaryKeepsSigninAndSweepUnderSaves(t *testing.T) {
+	dsSetup(t, "dstest25", "67", 67*100000+10123)
+	dsMarkerOn(t, "67")
+	now := int64(1800000000)
+	signin := fmt.Sprintf("v=1 t=%d ev=signin ms=1200+300+10+5000+1", now-20*3600)
+	sweep := fmt.Sprintf("v=1 t=%d ev=sweep apps=12 ok=11 fail=1 ms=90000", now-19*3600)
+	daySummaryAppend("67", signin)
+	daySummaryAppend("67", sweep)
+	var saves []string
+	for i := 0; i < 400; i++ {
+		l := fmt.Sprintf("v=1 t=%d ev=save ms=%d rc=ok kib=%d", now-18*3600+int64(i)*150, 10000+i*37, 100+i)
+		saves = append(saves, l)
+		daySummaryAppend("67", l)
+	}
+	got := dsRead(t, daySummaryPath("67"))
+	if len(got) > daySummaryMaxBytes {
+		t.Fatalf("file is %d bytes, want at most %d", len(got), daySummaryMaxBytes)
+	}
+	si, wi := strings.Index(got, signin+"\n"), strings.Index(got, sweep+"\n")
+	if si < 0 {
+		t.Error("the signin line was dropped")
+	}
+	if wi < 0 {
+		t.Error("the sweep line was dropped")
+	}
+	if fi := strings.Index(got, " ev=save "); si >= 0 && wi >= 0 && !(si < wi && wi < fi) {
+		t.Errorf("file order: signin at %d, sweep at %d, first save at %d; want signin < sweep < saves", si, wi, fi)
+	}
+	if strings.Contains(got, saves[0]+"\n") {
+		t.Error("the first save survived the size prune")
+	}
+	if !strings.HasSuffix(got, saves[len(saves)-1]+"\n") {
+		t.Error("the last save is not the file's last line")
+	}
+	st := daySummaryStatus(daySummaryPath("67"))["day_summary"]
+	if st == "unreadable" || !strings.Contains(st, signin) || !strings.Contains(st, sweep) {
+		t.Errorf("day_summary (%d bytes) is unreadable or lacks the signin or the sweep", len(st))
+	}
+}
+
+// NWP-20261202-09: every non-save line has its own 4 KiB budget, oldest first, so a session's own DIAG-EVENT calls
+// cannot fill the file; saves then never push the surviving sweeps out.
+func TestDaySummaryKeptBudget(t *testing.T) {
+	dsSetup(t, "dstest26", "68", 68*100000+10123)
+	dsMarkerOn(t, "68")
+	now := int64(1800000000)
+	keptBytes := func(body string) int {
+		n := 0
+		for _, l := range strings.Split(strings.TrimSuffix(body, "\n"), "\n") {
+			if l != "" && !daySummarySaveRe.MatchString(l) {
+				n += len(l) + 1
+			}
+		}
+		return n
+	}
+	signin := fmt.Sprintf("v=1 t=%d ev=signin ms=1200+300+10+5000+1", now-20*3600)
+	dsPlant(t, "68", signin+"\n")
+	var sweeps []string
+	for i := 0; i < 200; i++ {
+		l := fmt.Sprintf("v=1 t=%d ev=sweep apps=12 ok=11 fail=1 ms=%d", now-19*3600+int64(i)*60, 100000+i)
+		sweeps = append(sweeps, l)
+		daySummaryAppend("68", l)
+	}
+	got := dsRead(t, daySummaryPath("68"))
+	if k := keptBytes(got); k > daySummaryKeptMaxBytes || k <= daySummaryKeptMaxBytes-200 {
+		t.Fatalf("non-save lines total %d bytes, want at most %d and more than %d", k, daySummaryKeptMaxBytes,
+			daySummaryKeptMaxBytes-200)
+	}
+	if strings.Contains(got, signin+"\n") {
+		t.Error("the signin line (the oldest kept line) survived the kept budget")
+	}
+	if strings.Contains(got, sweeps[0]+"\n") {
+		t.Error("the oldest sweep survived the kept budget")
+	}
+	if !strings.HasSuffix(got, sweeps[len(sweeps)-1]+"\n") {
+		t.Fatal("the newest sweep is not the file's last line")
+	}
+	k := len(sweeps) - 1
+	for k > 0 && strings.Contains(got, sweeps[k-1]+"\n") {
+		k--
+	}
+	if want := strings.Join(sweeps[k:], "\n") + "\n"; got != want {
+		t.Fatalf("the survivors are not the newest sweeps in order: file %q, want %q", got, want)
+	}
+	kept := sweeps[k:]
+	var last string
+	for i := 0; i < 300; i++ {
+		last = fmt.Sprintf("v=1 t=%d ev=save ms=%d rc=ok kib=%d", now-10*3600+int64(i)*60, 10000+i, 100+i)
+		daySummaryAppend("68", last)
+	}
+	got = dsRead(t, daySummaryPath("68"))
+	for _, l := range kept {
+		if !strings.Contains(got, l+"\n") {
+			t.Errorf("a surviving sweep was pushed out by saves: %q", l)
+		}
+	}
+	if len(got) > daySummaryMaxBytes {
+		t.Fatalf("file is %d bytes, want at most %d", len(got), daySummaryMaxBytes)
+	}
+	if !strings.HasSuffix(got, last+"\n") {
+		t.Error("the last save is not the file's last line")
+	}
+	if daySummaryStatus(daySummaryPath("68"))["day_summary"] == "unreadable" {
 		t.Error("the writer's own pruned file reads as unreadable")
 	}
 }
@@ -689,5 +802,246 @@ func TestDaySummarySaveKiBNotTaken(t *testing.T) {
 	}
 	if got := dsRead(t, filepath.Join(dest, sealSplitFile)); got != dsSplitBody+"\n" {
 		t.Fatalf("after the record the split file is %q, want it untouched (syncLoop's take removes it)", got)
+	}
+}
+
+// NWP-20261202-11: every REPORT-ISSUE the agent sends at session scope adds a report line (the caller's report_kind
+// and the reply's class, no ticket) after its reply, so the NEXT report shows whether a scheduled report reached the
+// agent and how the gateway answered.
+
+// dsReportGateway starts a fake gateway that answers POST /support with status and body, and records every POSTed
+// report. It sets GATEWAY_URL to it (after dsSetup, which clears it) and stubs the two RO-lane workers.
+func dsReportGateway(t *testing.T, status int, body string) *[]issueReport {
+	t.Helper()
+	var got []issueReport
+	gw := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		var rep issueReport
+		if err := json.Unmarshal(b, &rep); err != nil {
+			t.Errorf("gateway: bad report body: %v", err)
+		}
+		got = append(got, rep)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		_, _ = io.WriteString(w, body)
+	}))
+	t.Cleanup(gw.Close)
+	t.Setenv("GATEWAY_URL", gw.URL)
+	dsReportWorkers(t)
+	return &got
+}
+
+// dsReportWorkers gives the test its own NOWHERE_DIR and stubs the RO-lane workers (each would wait up to 15 s).
+func dsReportWorkers(t *testing.T) {
+	t.Helper()
+	t.Setenv("NOWHERE_DIR", t.TempDir())
+	prevU, prevG := uiderrorsWorker, gmsStateWorker
+	t.Cleanup(func() { uiderrorsWorker, gmsStateWorker = prevU, prevG })
+	uiderrorsWorker = func(string, string, string) string { return "" }
+	gmsStateWorker = func(string, string, string) string { return "" }
+}
+
+// dsReport drives the real handleReportIssue with one request line and returns its reply.
+func dsReport(dest, req string) string {
+	c := &dsConn{r: strings.NewReader("")}
+	handleReportIssue(c, dest, req)
+	return c.out.String()
+}
+
+func TestDaySummaryReportShapeRoundTrip(t *testing.T) {
+	dsSetup(t, "dstest31", "81", 81*100000+10123)
+	dsMarkerOn(t, "81")
+	lines := []string{
+		"v=1 t=1800000000 ev=report kind=scheduled rc=ok",
+		"v=1 t=1800000000 ev=report kind=by_hand rc=net",
+		"v=1 t=1800000000 ev=report kind=none rc=nogw",
+		"v=1 t=1800000000 ev=report kind=scheduled rc=toobig",
+		"v=1 t=1800000000 ev=report kind=scheduled rc=disabled",
+		"v=1 t=1800000000 ev=report kind=by_hand rc=http",
+	}
+	dsPlant(t, "81", lines[0]+"\n")
+	if got := daySummaryStatus(daySummaryPath("81")); got["day_summary"] != lines[0] {
+		t.Fatalf("a file of one report line: %v, want day_summary=%q (not unreadable)", got, lines[0])
+	}
+	for _, l := range lines[1:] {
+		daySummaryAppend("81", l)
+	}
+	if got, want := dsRead(t, daySummaryPath("81")), strings.Join(lines, "\n")+"\n"; got != want {
+		t.Fatalf("the prune dropped a report line: file %q, want %q", got, want)
+	}
+	if got := daySummaryStatus(daySummaryPath("81")); len(got) != 1 || got["day_summary"] != strings.Join(lines, ";") {
+		t.Fatalf("status %v, want day_summary=%q", got, strings.Join(lines, ";"))
+	}
+	for _, bad := range []string{
+		"v=1 t=1 ev=report kind=other rc=ok",
+		"v=1 t=1 ev=report kind=scheduled rc=ok ticket=NW-1",
+		"v=1 t=1 ev=report kind=scheduled rc=okNW-0123456789ab",
+	} {
+		dsPlant(t, "81", bad+"\n")
+		if got := daySummaryStatus(daySummaryPath("81")); got["day_summary"] != "unreadable" {
+			t.Errorf("%q read as %v, want unreadable", bad, got)
+		}
+	}
+}
+
+func TestDaySummaryReportKind(t *testing.T) {
+	for in, want := range map[string]string{
+		"scheduled": "scheduled", "by_hand": "by_hand", "junk": "none", "Scheduled": "none", "": "none", "by_hand ": "none",
+	} {
+		if got := daySummaryReportKind(in); got != want {
+			t.Errorf("daySummaryReportKind(%q) = %q, want %q", in, got, want)
+		}
+	}
+	if got := daySummaryReportKind(map[string]string(nil)["report_kind"]); got != "none" {
+		t.Errorf("an absent report_kind = %q, want none", got)
+	}
+}
+
+func TestDaySummaryReportRC(t *testing.T) {
+	word := regexp.MustCompile(`^(ok|net|nogw|toobig|disabled|http)$`)
+	for in, want := range map[string]string{
+		"OK NW-0123456789ab": "ok", "OK 12345678": "ok", "OK ": "ok", "OK": "ok",
+		"ERR-NET": "net", "ERR-NOGW": "nogw", "ERR-TOOBIG": "toobig", "ERR-DISABLED": "disabled",
+		"ERR 503": "http", "ERR 500": "http", "ERR 401": "http",
+	} {
+		got := daySummaryReportRC(in)
+		if got != want {
+			t.Errorf("daySummaryReportRC(%q) = %q, want %q", in, got, want)
+		}
+		if !word.MatchString(got) {
+			t.Errorf("daySummaryReportRC(%q) = %q, not a word the report shape accepts", in, got)
+		}
+		if strings.ContainsAny(got, "0123456789") {
+			t.Errorf("daySummaryReportRC(%q) = %q kept a digit of the ticket or code", in, got)
+		}
+	}
+}
+
+func TestDaySummaryReportRecordDeviceScope(t *testing.T) {
+	dsSetup(t, "dstest32", "82", 82*100000+10123)
+	dsMarkerOn(t, "82")
+	daySummaryRecordReport("82", true, "scheduled", "ok")
+	if dsExists(daySummaryPath("82")) {
+		t.Fatal("a device-scope record wrote a line")
+	}
+	daySummaryRecordReport("82", false, "scheduled", "ok")
+	if got, want := dsRead(t, daySummaryPath("82")), "v=1 t=1800000000 ev=report kind=scheduled rc=ok\n"; got != want {
+		t.Errorf("a session record: file %q, want %q", got, want)
+	}
+}
+
+func TestDaySummaryReportSendOK(t *testing.T) {
+	dest := dsSetup(t, "dstest33", "83", 83*100000+10123)
+	dsMarkerOn(t, "83")
+	dsReportGateway(t, http.StatusOK, `{"ticket":"NW-0123456789ab"}`)
+	if got := dsReport(dest, `{"note":"t","status":{"report_kind":"scheduled"}}`); got != "OK NW-0123456789ab\n" {
+		t.Fatalf("reply %q, want OK NW-0123456789ab", got)
+	}
+	f := dsRead(t, daySummaryPath("83"))
+	if f != "v=1 t=1800000000 ev=report kind=scheduled rc=ok\n" {
+		t.Errorf("file %q, want one ev=report kind=scheduled rc=ok line", f)
+	}
+	if strings.Contains(f, "NW-") || strings.Contains(f, "0123456789ab") {
+		t.Errorf("the file holds the ticket: %q", f)
+	}
+}
+
+func TestDaySummaryReportSend503(t *testing.T) {
+	dest := dsSetup(t, "dstest34", "84", 84*100000+10123)
+	dsMarkerOn(t, "84")
+	dsReportGateway(t, http.StatusServiceUnavailable, `{"error":"support intake full"}`)
+	if got := dsReport(dest, `{"note":"t","status":{"report_kind":"by_hand"}}`); got != "ERR 503\n" {
+		t.Fatalf("reply %q, want ERR 503", got)
+	}
+	if got, want := dsRead(t, daySummaryPath("84")), "v=1 t=1800000000 ev=report kind=by_hand rc=http\n"; got != want {
+		t.Errorf("file %q, want %q", got, want)
+	}
+}
+
+func TestDaySummaryReportNoGateway(t *testing.T) {
+	dest := dsSetup(t, "dstest35", "85", 85*100000+10123)
+	dsMarkerOn(t, "85")
+	dsReportWorkers(t)
+	if got := dsReport(dest, `{"note":"t"}`); got != "ERR-NOGW\n" {
+		t.Fatalf("reply %q, want ERR-NOGW", got)
+	}
+	if got, want := dsRead(t, daySummaryPath("85")), "v=1 t=1800000000 ev=report kind=none rc=nogw\n"; got != want {
+		t.Errorf("file %q, want %q", got, want)
+	}
+}
+
+func TestDaySummaryReportPreviewWritesNothing(t *testing.T) {
+	dest := dsSetup(t, "dstest36", "86", 86*100000+10123)
+	dsMarkerOn(t, "86")
+	posts := dsReportGateway(t, http.StatusOK, `{"ticket":"NW-0123456789ab"}`)
+	if got := dsReport(dest, `{"preview":true,"status":{"report_kind":"scheduled"}}`); !strings.HasPrefix(got, "{") {
+		t.Fatalf("preview reply %q, want the report JSON", got)
+	}
+	if dsExists(daySummaryPath("86")) {
+		t.Errorf("a preview wrote a line: %q", dsRead(t, daySummaryPath("86")))
+	}
+	if len(*posts) != 0 {
+		t.Errorf("a preview reached the gateway %d time(s)", len(*posts))
+	}
+	// The control: the same session's send does write, so the absence above is the preview's.
+	dsReport(dest, `{"status":{"report_kind":"scheduled"}}`)
+	if got, want := dsRead(t, daySummaryPath("86")), "v=1 t=1800000000 ev=report kind=scheduled rc=ok\n"; got != want {
+		t.Errorf("after a preview and a send: file %q, want the send's line alone %q", got, want)
+	}
+}
+
+func TestDaySummaryReportGateWritesNothing(t *testing.T) {
+	dest := dsSetup(t, "dstest37", "87", 87*100000+10123)
+	dsMarkerOn(t, "87")
+	dsReportGateway(t, http.StatusOK, `{"ticket":"NW-0123456789ab"}`)
+	if got := dsReport(dest, `{"gate":true,"status":{"report_kind":"scheduled"}}`); !strings.HasPrefix(got, "OK ") {
+		t.Fatalf("gate reply %q, want OK <ticket>", got)
+	}
+	if dsExists(daySummaryPath("87")) {
+		t.Errorf("a gate report with a live session wrote a line: %q", dsRead(t, daySummaryPath("87")))
+	}
+	// The control: the same request without gate does write, so the absence above is the gate's.
+	dsReport(dest, `{"status":{"report_kind":"scheduled"}}`)
+	if got, want := dsRead(t, daySummaryPath("87")), "v=1 t=1800000000 ev=report kind=scheduled rc=ok\n"; got != want {
+		t.Errorf("after a gate report and a session report: file %q, want the session report's line alone %q", got, want)
+	}
+}
+
+func TestDaySummaryReportNoMarkerWritesNothing(t *testing.T) {
+	dest := dsSetup(t, "dstest38", "88", 88*100000+10123)
+	dsReportGateway(t, http.StatusOK, `{"ticket":"NW-0123456789ab"}`)
+	if got := dsReport(dest, `{"note":"t","status":{"report_kind":"scheduled"}}`); !strings.HasPrefix(got, "OK ") {
+		t.Fatalf("reply %q, want OK <ticket>", got)
+	}
+	if dsExists(daySummaryPath("88")) {
+		t.Errorf("a session that has not opted in wrote a line: %q", dsRead(t, daySummaryPath("88")))
+	}
+	// The control: once the marker exists the same request writes, so the absence above is the marker's.
+	dsMarkerOn(t, "88")
+	dsReport(dest, `{"note":"t","status":{"report_kind":"scheduled"}}`)
+	if got, want := dsRead(t, daySummaryPath("88")), "v=1 t=1800000000 ev=report kind=scheduled rc=ok\n"; got != want {
+		t.Errorf("after opting in: file %q, want %q", got, want)
+	}
+}
+
+func TestDaySummaryReportShowsInNextReport(t *testing.T) {
+	dest := dsSetup(t, "dstest39", "89", 89*100000+10123)
+	dsMarkerOn(t, "89")
+	posts := dsReportGateway(t, http.StatusOK, `{"ticket":"NW-0123456789ab"}`)
+	if got := dsReport(dest, `{"note":"t","status":{"report_kind":"scheduled"}}`); !strings.HasPrefix(got, "OK ") {
+		t.Fatalf("first reply %q, want OK <ticket>", got)
+	}
+	if got := dsReport(dest, `{"note":"t","status":{"report_kind":"by_hand"}}`); !strings.HasPrefix(got, "OK ") {
+		t.Fatalf("second reply %q, want OK <ticket>", got)
+	}
+	if len(*posts) != 2 {
+		t.Fatalf("the gateway got %d report(s), want 2", len(*posts))
+	}
+	line := "v=1 t=1800000000 ev=report kind=scheduled rc=ok"
+	if ds := (*posts)[0].Status["day_summary"]; strings.Contains(ds, "ev=report") {
+		t.Errorf("the first report carries its own report line: %q", ds)
+	}
+	if ds := (*posts)[1].Status["day_summary"]; ds != line {
+		t.Errorf("the second report's day_summary %q, want %q (the first report's line)", ds, line)
 	}
 }

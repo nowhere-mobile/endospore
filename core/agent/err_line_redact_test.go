@@ -248,6 +248,9 @@ func TestUntarSkipLineCarriesNoPresignedQuery(t *testing.T) {
 	if !strings.Contains(out, "context deadline exceeded") {
 		t.Errorf("the copy skip line lost the cause\n%s", out)
 	}
+	if strings.Contains(out, "a.bin") {
+		t.Errorf("the copy skip line carries the entry's name\n%s", out)
+	}
 	e, _ := rec.(error)
 	if rec == nil || !errors.Is(e, errStoreUnreachable) || exitStatus(rec) != exitStoreUnreachable {
 		t.Errorf("the recovered value %v is not the raw store-unreachable chain", rec)
@@ -300,7 +303,8 @@ func errLineBody(t *testing.T, file, fn string) []string {
 func TestErrLineSourcePins(t *testing.T) {
 	for _, c := range []struct{ file, fn, head, want string }{
 		{"main.go", "main", `"ERR:"`, "logSafeErrText("},
-		{"main.go", "untarFrom", `copy: %`, "logSafeErrText("},
+		{"main.go", "untarFrom", "restoreSkipLine(dir, hdr.Name, \"copy\"", "restoreSkipLine("},
+		{"restore_skip_line.go", "restoreSkipLine", "errCode(", "errCode("},
 		{"main.go", `case "restore-app":`, `re:"restore-app: %[sv]\\n"`, "logSafeErrText("},
 		{"main.go", `case "ota-notes-get":`, `re:"ota-notes-get: %[sv]\\n"`, "logSafeErrText("},
 		{"main.go", `case "build-warning-check", "build-warning-put":`, `"%s: %s: %`, "logSafeErrText("},

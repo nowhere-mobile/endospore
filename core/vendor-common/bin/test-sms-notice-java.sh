@@ -125,7 +125,7 @@ if [ "$MUTATE" = yes ] && [ "$rc" = 0 ]; then
   # the profile's SMS app (Chester, 2026-10-11)
   mutate "the listener never starts the SMS-app capture"   $S '/^        startRoleCapture();$/d'
   mutate "the role listener never registered"              $S 's/getSystemService(android.app.role.RoleManager.class).addOnRoleHoldersChangedListenerAsUser(/if (false) getSystemService(android.app.role.RoleManager.class).addOnRoleHoldersChangedListenerAsUser(/'
-  mutate "the sign-in apply never runs"                    $CS 's/try { SmsRoleRoam.applyAtSignIn(this); } finally { finishUnit(); }/try { } finally { finishUnit(); }/'
+  mutate "the sign-in apply never runs"                    $CS 's/try { SmsRoleRoam.applyAtSignIn(this); DefaultRoleRoam.applyAtSignIn(this); } finally { finishUnit(); }/try { DefaultRoleRoam.applyAtSignIn(this); } finally { finishUnit(); }/'
   mutate "the materialise hook dropped"                    $U '/^        SmsRoleRoam.onMaterialised(ctx, pkg);$/d'
   mutate "no listener grant at sign-in"                    $RR '/^        TelIngest.ensureNotificationListener(ctx);$/d'
   mutate "a capture before this session's apply"           $RR 's/^        if (!session.equals(s)) return null;$/        if (s == null) return null;/'

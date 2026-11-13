@@ -373,7 +373,8 @@ suite() {
   n=$(printf '%s\n' "$inarm" | grep -c '^    rm -f "\$STATE/.a11yapplied.\$uid" 2>/dev/null')
   if [ "$n" = 1 ]; then ok "P3 in clears .a11yapplied for its uid"; else no "P3 in's marker clear missing or repeated ($n)"; fi
   n=$(printf '%s\n' "$odarm" | grep -c '^      a11y_apply "\$uid" "\$pkg"')
-  pl=$(printf '%s\n' "$odarm" | grep -B1 '^      a11y_apply "\$uid" "\$pkg"' | head -n 1)
+  # NWP-20261202-16: the odrestore steps line's time stamps (`_odtN=$(_ms 2>/dev/null)`) are skipped, so only a stamp may sit between the two.
+  pl=$(printf '%s\n' "$odarm" | grep -v '^      _odt[0-9]*=\$(_ms 2>/dev/null)$' | grep -B1 '^      a11y_apply "\$uid" "\$pkg"' | head -n 1)
   case "$pl" in '      grant_perms_for "$uid" "$pkg" "$_first"'*) pl=yes ;; *) pl=no ;; esac
   if [ "$n" = 1 ] && [ "$pl" = yes ]; then ok "P4 odrestore calls a11y_apply <uid> <pkg> once, on the line after grant_perms_for"; else no "P4 odrestore call missing, repeated or misplaced ($n, after grant_perms_for: $pl)"; fi
   n=$(printf '%s\n' "$inarm" | grep -c '^      rm -f "\$STATE/.a11ydone.\$uid" 2>>"\$LOG"')

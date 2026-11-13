@@ -131,6 +131,7 @@ suite() {  # suite <roamd.sh> <sh> [quiet] -> 0 all ok, 1 a case failed, 2 the h
                wait_acct_authenticator acct_reload sync_apply a11y_apply autofill_apply; do
         printf '%s() { echo "%s $*" >> "$C"; }\n' "$t" "$t"
       done
+      printf '%s\n' 'vpn_preconsent_off() { :; }'
       cat <<'STUBS'
 # the hold's state at the instant of the external re-own: the order assertion for case 4
 reown_ext_appdata() {

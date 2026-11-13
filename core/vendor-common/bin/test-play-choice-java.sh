@@ -202,8 +202,11 @@ pin('P1c the focus listener is added while the row is attached and removed when 
     'publicvoidonViewAttachedToWindow(Viewv){v.getViewTreeObserver().addOnWindowFocusChangeListener(onFocus);}' in prow
     and 'publicvoidonViewDetachedFromWindow(Viewv){v.getViewTreeObserver().removeOnWindowFocusChangeListener(onFocus);}' in prow
     and 'row.addOnAttachStateChangeListener(' in prow, 'attach/detach wiring missing')
-pin('P1b openGosStore opens the GrapheneOS App Store by its launch intent',
-    'getPackageManager().getLaunchIntentForPackage(GOS_STORE_PKG)' in pstore and 'startActivity(i);' in pstore, pstore[:160])
+pin('P1b openGosStore opens the App Store at the Play entry through GosStoreLink.route, by its launch intent otherwise',
+    'newandroid.content.Intent(GosStoreLink.ACTION).setPackage(GosStoreLink.STORE_PKG).putExtra(GosStoreLink.EXTRA,GosStoreLink.ENTRY_PKG);' in pstore
+    and 'switch(GosStoreLink.route(' in pstore
+    and 'getPackageManager().getLaunchIntentForPackage(GOS_STORE_PKG)' in pstore
+    and 'startActivity(start);' in pstore, pstore[:200])
 pin('P1b turnPlayOn writes "1", checks it landed, then opens the App Store',
     pon.startswith('privatevoidturnPlayOn(){cfgPut(PlayChoice.CFG_KEY,PlayChoice.raw(PlayChoice.State.ON));'
                    'if(playState()!=PlayChoice.State.ON){') and 'openGosStore();' in pon, pon[:200])

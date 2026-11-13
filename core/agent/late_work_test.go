@@ -483,6 +483,7 @@ func TestLateWorkBackupAndSyncLoopWait(t *testing.T) {
 	})
 	t.Run("a syncLoop cycle", func(t *testing.T) {
 		lateWorkFresh(t)
+		resetSealSignals() // NWP-20261202-10: no landed save, so the change test answers nobase and runs no probe
 		lateWorkShrink(t, 300*time.Millisecond)
 		dest := t.TempDir()
 		p := lateWorkBlockedJob(t, dest, "35")

@@ -1,0 +1,13 @@
+# The Release Desk, read-only (docs/release-desk.md §7 stage 4, NWP-20261202-24). A systemd USER unit of the signing
+# user, started by nowhere-release-desk.socket. It exits after 900 s with no request and no child.
+# The tailnet name stays out of the repo: the env file holds one line, NOWHERE_DESK_NAME=<tailnet name>.
+[Unit]
+Description=Nowhere Release Desk, read-only (stage 4, NWP-20261202-24)
+Requires=nowhere-release-desk.socket
+
+[Service]
+Type=simple
+Environment=ENDOSPORE_TREE=/mnt/build/graphene/grapheneos-2026110200
+Environment=ENDOSPORE_REPO=/mnt/build/nowhere-phone
+EnvironmentFile=%h/.config/nowhere-release-desk.env
+ExecStart=/usr/bin/python3 %h/nowhere-release-desk/release_desk.py serve --name ${NOWHERE_DESK_NAME} --idle 900

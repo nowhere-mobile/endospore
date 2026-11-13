@@ -7,8 +7,8 @@ package main
 // items 2 and its fail-direction table (the landed roster), §6's retry rule and §10 O4's order. The split it works
 // from is bgSplit (S1); the seal reads what it records through loadLandedRoster (S3).
 //
-// mediad starts landBackground (S4b, media_lander_run.go), behind NOWHERE_MEDIA_AFTER_GATE. ⚠ S5 must land before any
-// daemon exports that flag: S5 hands the landed paths to the media scan.
+// mediad starts landBackground (S4b, media_lander_run.go), behind NOWHERE_MEDIA_AFTER_GATE. S5 (NWP-20261202-18)
+// hands the landed paths to the media scan; mediad and roamd export the flag off until S7.
 //
 // ⚠ NEVER THROUGH AN OVERLAY. A folder mediad overlays lands in that overlay's hidden real directory. That directory
 // sits under mediad's cache dir (`<cacheDir>/.under/<leaf>`, mediafs.go), outside the media root, so its write is

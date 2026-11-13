@@ -20,6 +20,16 @@ package main
 //      mtime, the package dir's MCS level). It runs at EVERY sign-in whose head carries deferred entries, so
 //      the heal is standing, not a one-time migration: a #58 rollback, a web clone, /profile-restore,
 //      repoint-scope or an older handset can each put entries back.
+//      NWP-20261202-17 (docs/product-decisions.md 2026-10-26, #2: the vault heal may run after landing) moves
+//      part of it. Where each scope heals now:
+//        - #de: in the sign-in, always. mediad does not serve #de, so an entry left for later would be a file
+//          its app cannot read.
+//        - the vault, an app in the keep set (nowhere-appkeep): in the sign-in, as before. hold_ondemand parks
+//          every kept app's data, in any mode, before any install; an entry landed later would go into the
+//          app's placeholder skeleton instead of parking with its data.
+//        - the vault, every other app: with NOWHERE_HEAL_AFTER_LANDING=1 (roamd `in`), the sign-in fetches
+//          nothing for it. mediad serves each entry on demand and lands it in the background after landing
+//          (media_heal_late.go). The entry is not on the heal list, so the carry keeps it until it lands.
 //
 // Chester's answers of 2026-09-25 shape the heal: existing #de entries are fetched, never dropped; the first
 // sign-in's download has no time cap of its own (but must stop cleanly before the login daemon's limits, so
@@ -148,15 +158,26 @@ type healResult struct {
 // healDeferred writes every fetchable deferred file of m into dest. It never fails the restore: a file it
 // cannot write stays deferred in the head (the carry keeps it), so it costs nothing that was there before.
 func healDeferred(base string, key []byte, m chunkManifest, dest string) healResult {
+	return healDeferredLate(base, key, m, dest, nil)
+}
+
+// healDeferredLate is healDeferred with a late predicate (NWP-20261202-17). nil heals every fetchable file, as
+// healDeferred always did. A rel for which late is true and that passes the static checks, is not on the phone
+// and is not held stays deferred with the reason "after landing": no fetch, no progress bytes, no read cap, and
+// it is NOT handled, so mediad serves it and the carry keeps it until mediad lands it (media_heal_late.go).
+func healDeferredLate(base string, key []byte, m chunkManifest, dest string, late func(rel string) bool) healResult {
 	res := healResult{reasons: map[string]int{}}
 	until := healUntil(time.Now())
 	reserve := healReserve()
+	isLate := func(rel string) bool { return late != nil && late(rel) }
 
 	rels := make([]string, 0, len(m.Deferred))
 	var total int64
 	for rel, d := range m.Deferred {
 		rels = append(rels, rel)
-		total += d.Size
+		if !isLate(rel) {
+			total += d.Size
+		}
 	}
 	sort.Strings(rels) // deterministic, so a deadline makes the same progress every sign-in
 	writeProg(0, int(total))
@@ -174,7 +195,7 @@ func healDeferred(base string, key []byte, m chunkManifest, dest string) healRes
 			strings.Contains(rel, "/"+odHoldDirName+"/") {
 			continue
 		}
-		if _, ok := safeJoin(dest, rel); !ok {
+		if _, ok := safeJoin(dest, rel); !ok || isLate(rel) {
 			continue
 		}
 		for _, h := range d.Chunks {
@@ -215,6 +236,11 @@ func healDeferred(base string, key []byte, m chunkManifest, dest string) healRes
 			// Parked by an earlier sign-in's heal: the hold already holds THESE bytes, sealed essential.
 			res.held++
 			res.handledRels = append(res.handledRels, rel)
+			continue
+		}
+		if isLate(rel) {
+			// NWP-20261202-17: mediad lands it after landing. Not handled: served and carried until then.
+			stay(rel, "after landing")
 			continue
 		}
 		if !time.Now().Before(until) {
@@ -511,7 +537,7 @@ func restoreHeal(base string, key []byte, m chunkManifest, dest, profile, pass, 
 	}
 	if len(m.Deferred) > 0 {
 		hStart := time.Now()
-		hr = healDeferred(base, key, m, dest)
+		hr = healDeferredLate(base, key, m, dest, healAfterLanding(profile, dest))
 		hr.ms = time.Since(hStart).Milliseconds()
 		fmt.Printf("restore: heal %s: fetched %d (%d B), already held %d, already present %d, still deferred %d %v [%dms] (NWP-20260923-02)\n",
 			logProfile(profile), hr.fetched, hr.bytes, hr.held, hr.present, hr.unfetched, hr.reasons, hr.ms)
@@ -520,6 +546,32 @@ func restoreHeal(base string, key []byte, m chunkManifest, dest, profile, pass, 
 		fmt.Fprintf(os.Stderr, "[restore] heal list write failed: %v -- every deferred file keeps the pre-heal treatment\n", err)
 	}
 	return hr
+}
+
+// healAfterLanding is restoreHeal's late predicate (NWP-20261202-17), nil to heal everything in the sign-in.
+// Non-nil only when roamd set NOWHERE_HEAL_AFTER_LANDING=1 AND the scope is the bare vault: #de has no serve
+// path, so it always heals here. The predicate is true for a rel whose package is NOT in the keep file the
+// restore has just put back: hold_ondemand parks a kept app's data before any install, so its entries must be
+// on the phone by then. No keep file means no kept apps; a keep file that cannot be read means heal all.
+func healAfterLanding(profile, dest string) func(rel string) bool {
+	if os.Getenv("NOWHERE_HEAL_AFTER_LANDING") != "1" {
+		return nil
+	}
+	if strings.Contains(profile, "#") {
+		return nil
+	}
+	keep := map[string]string{}
+	b, err := os.ReadFile(filepath.Join(dest, chooserPkg, "files", "nowhere-appkeep"))
+	switch {
+	case err == nil:
+		keep = parseKeepModes(b)
+	case !errors.Is(err, os.ErrNotExist):
+		return nil // present but unreadable: fetch all, as before this build
+	}
+	return func(rel string) bool {
+		_, kept := keep[healPkgOf(rel)]
+		return !kept
+	}
 }
 
 // mediadHealFilter is mediad's half: drop what this sign-in's heal handled from the deferred index it is

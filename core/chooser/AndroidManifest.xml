@@ -1,8 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.nowhere.chooser"
-    android:versionCode="646"
-    android:versionName="8.81">
+    android:versionCode="657"
+    android:versionName="8.92">
   <uses-sdk android:minSdkVersion="24" android:targetSdkVersion="34"/>
   <!-- #747 (DIA-20260818-08): the storefront UI now lives in its OWN package (nApps) so it appears in
        Settings > Apps as its own app. It cannot talk to the login daemon: the daemon pins the first peer's
@@ -400,6 +400,12 @@
     <activity android:name=".SkipNoticeActivity" android:exported="false"
               android:theme="@android:style/Theme.Material.Dialog.NoActionBar"
               android:excludeFromRecents="true"/>
+    <!-- NWP-20261202-22 (2026-11-10, item 1): the one-time "Finish setting up Google Play" card of a profile created
+         with Play on. Started by PlayFinishActivity.check from UnarchiveService's switch-landing start. Dismissible,
+         not pinned; excluded from recents. Not exported: only the chooser's own process starts it. -->
+    <activity android:name=".PlayFinishActivity" android:exported="false"
+              android:theme="@android:style/Theme.Material.Dialog.NoActionBar"
+              android:excludeFromRecents="true"/>
     <!-- NWP-20261127-07 (h50 #4 A1): the blocked-encrypted-DNS dialog in a signed-in session, opened by the notification
          PrivateDnsWatch posts there. Translucent: only the dialog shows. noHistory: leaving it without a choice
          finishes it and sends nothing, so the notification asks again. Not exported: only the chooser's own immutable
@@ -518,6 +524,9 @@
          where the call is same-user and rides the stock app_domain binder rules, while endospore_priv has
          no rule towards MediaProvider at all. Not exported; only the daemon (root, cross-user) reaches it. -->
     <receiver android:name=".MediaScanReceiver" android:exported="false"/>
+    <!-- NWP-20261202-26: the media-health notice's Fix fires this IN the roamed user; it sends only MEDIA-RESTART.
+         Not exported; only our own notification PendingIntent. -->
+    <receiver android:name=".MediaFixReceiver" android:exported="false"/>
     <!-- NWP-20261002-03: the session half of the live Doze record. The user-0 gate (DozeAppsMirror.relayToLiveSession)
          relays an explicit, extra-free broadcast here when the live session's own battery-Unrestricted set changes,
          and this re-records it so the next periodic seal carries it. Not exported: a cross-user broadcast between

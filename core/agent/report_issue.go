@@ -112,6 +112,8 @@ var (
 	// log_scrub_fuzz_test.go can hold the two to the same output on generated names, and report_issue_names_test.go
 	// to the same shapes. quoted rules skip [restore] lines (reIssueRestoreLine), as the shell's `/^\[restore\]/!`
 	// does: `[restore] skip %q` quotes FILE PATHS, which are what make a broken restore diagnosable.
+	// *(Since NWP-20261201-24, h60 #9: the skip lines print `pkg=` or `scope=` and an error code, no path. This
+	// exemption now serves the `[restore] rejected ...` lines and the skip lines older builds wrote.)*
 	issueNameRules = []struct {
 		re     *regexp.Regexp
 		rep    string
@@ -150,6 +152,8 @@ var (
 	// DIA-20260807-14: the one shape whose quotes are NOT a name. `[restore] skip "pkg/path"` and
 	// `[restore] rejected unsafe tar entry "..."` quote FILE PATHS, and those are what make a broken restore
 	// diagnosable -- DIA-20260806-10 was found through them. Everything else quoted is treated as a name.
+	// *(Since NWP-20261201-24, h60 #9: the skip lines print `pkg=` or `scope=` and an error code, no path. This
+	// shape now serves the `[restore] rejected ...` lines and the skip lines older builds wrote.)*
 	reIssueRestoreLine = regexp.MustCompile(`^\s*\[restore\]`)
 
 	// NWP-20261011-36: the resolver's LEGACY egress line, `[resolver] egress iface=... dns=[<addr:port> ...]
@@ -959,6 +963,61 @@ func fetchUiderrors(dest, name, uid string) string {
 	}
 }
 
+// vpnstateWait bounds how long a report waits for the vpnstate worker (NWP-20261202-43). A wedged worker costs the
+// report one "unavailable" value, never the report.
+var vpnstateWait = 10 * time.Second
+
+// vpnstateWorker is the RO-lane request; a var so a test can replace it. It never carries a passphrase.
+var vpnstateWorker = func(dest, name, uid string) string {
+	return triggerRoamWorker(dest, "vpnstate", name, "", uid, "", nil)
+}
+
+// fetchVpnState asks the RO-lane worker for the session user's always-on VPN state. The worker op runs on in its
+// goroutine if the wait expires; it only reads, and the RO lane's own slot keeps it from piling up.
+func fetchVpnState(dest, name, uid string) string {
+	if name == "" || uid == "" {
+		return "ERR-NOSESSION the session marker names no profile or no user id"
+	}
+	ch := make(chan string, 1)
+	goSafe("vpnstate", func() { ch <- vpnstateWorker(dest, name, uid) })
+	select {
+	case r := <-ch:
+		return r
+	case <-time.After(vpnstateWait):
+		return fmt.Sprintf("ERR-TIMEOUT the worker did not answer within %s", vpnstateWait)
+	}
+}
+
+// vpnStateReplyRe is roamd's vpnstate reply, the only one accepted: four codes, nothing else. A package name, an
+// extra field or a second line fails it.
+var vpnStateReplyRe = regexp.MustCompile(`^VPNSTATE app=(1|0|-) lock=(1|0|-) pend=(1|0|-) net=(1|0|-)$`)
+
+// mergeVpnState sets the report's vpn_state key (NWP-20261202-43): the always-on VPN's live state for the session's
+// user, "app=<c> lock=<c> pend=<c> net=<c>" with each code 1, 0 or -, or "unavailable" (no session, a busy lane, a
+// timeout or any other reply). A caller-sent vpn_state is removed at every scope. Device scope (the gate, or no
+// session) asks nothing and sets nothing. It returns the value it set from a valid reply, else "". The value is
+// rebuilt from the reply's codes, never copied from it, so no package name can reach the report.
+func mergeVpnState(rep *issueReport, fetch func() string, deviceScope bool) string {
+	if rep == nil {
+		return ""
+	}
+	delete(rep.Status, "vpn_state")
+	if deviceScope {
+		return ""
+	}
+	if rep.Status == nil {
+		rep.Status = map[string]string{}
+	}
+	m := vpnStateReplyRe.FindStringSubmatch(strings.TrimSuffix(fetch(), "\n"))
+	if m == nil {
+		rep.Status["vpn_state"] = "unavailable"
+		return ""
+	}
+	v := fmt.Sprintf("app=%s lock=%s pend=%s net=%s", m[1], m[2], m[3], m[4])
+	rep.Status["vpn_state"] = v
+	return v
+}
+
 // uiderrorsSection renders the worker's reply ALWAYS-HONESTLY, the avc/prev_boot rule (DIA-20260811-10): "we
 // read it and it is empty" and "we could not read it" must never be the same output. Only a successful read or
 // an ENOENT may say "nothing was logged"; every other outcome says NOT collected and says that this is not
@@ -1510,7 +1569,8 @@ func postIssueReport(gw string, rep issueReport) (ticket string, code int, reaso
 // "ERR-NET" | "ERR <code>". Every other 503 -- "support intake full", "support intake unavailable", no body, a
 // proxy's page -- is "ERR 503": the report was not sent, and the reporters say so ("Couldn't send the report
 // (ERR 503).") instead of telling the user support is switched off (dn-1101 #2, docs/product-decisions.md).
-// The live profile name (if any) is redacted from everything sent.
+// The live profile name (if any) is redacted from everything sent. At session scope, after the reply, the caller's
+// report_kind and the reply's class go into the day summary (daySummaryRecordReport, NWP-20261202-11).
 func handleReportIssue(conn net.Conn, dest, reqLine string) {
 	var req struct {
 		Note        string            `json:"note"`
@@ -1523,6 +1583,8 @@ func handleReportIssue(conn net.Conn, dest, reqLine string) {
 	if s := strings.TrimSpace(reqLine); s != "" {
 		_ = json.Unmarshal([]byte(s), &req) // tolerate a bad/absent body -> empty note+status
 	}
+	// NWP-20261202-11: the day summary's report kind, from the caller's raw value, read before the build.
+	kind := daySummaryReportKind(req.Status["report_kind"])
 	// Redact the live profile name; "" at the gate. NWP-20260904-08: readRoamSessionState, not readRoamSession,
 	// on purpose -- a DAMAGED marker that still carries a name must still redact it (a note like "alice won't
 	// sync" would otherwise POST unredacted, the exact failure the temp+rename write exists to prevent), and
@@ -1538,6 +1600,11 @@ func handleReportIssue(conn net.Conn, dest, reqLine string) {
 	mergeGmsState(&rep, func() string { return fetchGmsState(dest, name, uid) }, deviceScope, nameSpellings(name)...) // NWP-20261201-01: session scope only
 	trimIssueReport(&rep)                                                                                             // the crash section can be about 20 KiB: trim again
 	// After trimIssueReport, so outside the size limit: about 200 bytes against 200 KiB, harmless.
+	// NWP-20261202-43: session scope only. A sent report also appends the codes to the day summary, before
+	// mergeDaySummary reads it, so this report carries the line; a preview appends nothing.
+	if v := mergeVpnState(&rep, func() string { return fetchVpnState(dest, name, uid) }, deviceScope); v != "" && !req.Preview {
+		daySummaryAppend(uid, daySummaryVpnStateLine(daySummaryNow(), v))
+	}
 	mergeSigninFail(rep.Status, dest, deviceScope, time.Now()) // NWP-20261106-07 (Q065): after the chooser's status, gate scope only
 	mergeSigninSummary(rep.Status, uid, deviceScope)           // NWP-20261122-09: session scope only, this session's uid only
 	mergeDaySummary(rep.Status, uid, deviceScope)              // NWP-20261124-12: session scope only, this session's uid only
@@ -1557,19 +1624,24 @@ func handleReportIssue(conn net.Conn, dest, reqLine string) {
 	gw := issueGatewayURL()
 	if gw == "" {
 		fmt.Fprint(conn, "ERR-NOGW\n") // local / self-hosted-only device: no support endpoint to reach
+		daySummaryRecordReport(uid, deviceScope, kind, daySummaryReportRC("ERR-NOGW"))
 		return
 	}
 	ticket, code, reason, err := postIssueReport(gw, rep)
+	var reply string
 	switch {
 	case err == nil:
-		fmt.Fprintf(conn, "OK %s\n", ticket)
+		reply = "OK " + ticket
 	case code == http.StatusServiceUnavailable && reason == supportNotConfigured:
-		fmt.Fprint(conn, "ERR-DISABLED\n")
+		reply = "ERR-DISABLED"
 	case code == http.StatusRequestEntityTooLarge:
-		fmt.Fprint(conn, "ERR-TOOBIG\n")
+		reply = "ERR-TOOBIG"
 	case code == 0:
-		fmt.Fprint(conn, "ERR-NET\n") // never reached the gateway (offline)
+		reply = "ERR-NET" // never reached the gateway (offline)
 	default:
-		fmt.Fprintf(conn, "ERR %d\n", code)
+		reply = fmt.Sprintf("ERR %d", code)
 	}
+	fmt.Fprint(conn, reply+"\n")
+	// NWP-20261202-11: after the reply, so the NEXT report shows it.
+	daySummaryRecordReport(uid, deviceScope, kind, daySummaryReportRC(reply))
 }

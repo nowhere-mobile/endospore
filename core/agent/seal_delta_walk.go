@@ -30,7 +30,6 @@ package main
 
 import (
 	"bufio"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -173,7 +172,16 @@ type sealDeltaWalkOut struct {
 // rel, and never reads through the overlay itself. listed (sealdelta.listed) feeds the deletion pass only; nil
 // counts no deletion.
 func sealDeltaWalk(roots map[string]string, unders map[string]string, idx map[string]sealDeltaIdxEnt, listed map[string]int64, since int64) sealDeltaWalkOut {
+	out, _ := sealDeltaWalkMode(roots, unders, idx, listed, since, false)
+	return out
+}
+
+// sealDeltaWalkMode is sealDeltaWalk with the change mode of seal_change_walk.go: change adds the directory rule
+// and skips the save's own writes in rule B. With change false every change arm is skipped, so the plain walk
+// cannot move.
+func sealDeltaWalkMode(roots map[string]string, unders map[string]string, idx map[string]sealDeltaIdxEnt, listed map[string]int64, since int64, change bool) (sealDeltaWalkOut, sealChangeCounts) {
 	out := sealDeltaWalkOut{V: 1, Since: since}
+	var cc sealChangeCounts
 	met := map[string]bool{}       // every entry the walk read, as sealDeltaIdxKey(scope, rel)
 	var blindPre, skipPre []string // dirs it could not read, and the seal's skips: a key under one is not known gone
 	var walkDir func(scope, dir, relBase string)
@@ -183,6 +191,15 @@ func sealDeltaWalk(roots map[string]string, unders map[string]string, idx map[st
 			blindPre = append(blindPre, sealDeltaIdxKey(scope, relBase))
 			out.Blind++
 			return
+		}
+		if change {
+			// The directory rule: a dir's own mtime moves when a file in it is created, deleted or renamed, which
+			// rule B (no new file) and the deletion pass (small files are listed nowhere) do not see.
+			if fi, err := os.Stat(dir); err != nil {
+				out.Blind++
+			} else if fi.ModTime().Unix() >= since && !(scope == "vault" && relBase == sealChangeSelfDir) {
+				cc.ChangedDirs++
+			}
 		}
 		for _, e := range ents {
 			p := filepath.Join(dir, e.Name())
@@ -208,6 +225,9 @@ func sealDeltaWalk(roots map[string]string, unders map[string]string, idx map[st
 			if !e.Type().IsRegular() {
 				continue
 			}
+			if isMediaProviderDBRel(rel) {
+				continue // NWP-20261202-02: the seal never carries MediaProvider's databases -- no save moves them
+			}
 			fi, err := e.Info()
 			if err != nil {
 				out.Blind++
@@ -223,6 +243,10 @@ func sealDeltaWalk(roots map[string]string, unders map[string]string, idx map[st
 			}
 			// rule B: mtime at/after the last dispatch. Disabled with no baseline (since==0).
 			if since > 0 && fi.ModTime().Unix() >= since {
+				if change && sealChangeIsSelf(scope, rel) {
+					cc.SelfSkipped++ // the out op rewrote it after its announce: not the session's change
+					continue
+				}
 				out.ChangedBytes += fi.Size()
 				out.ChangedFiles++
 			}
@@ -232,7 +256,7 @@ func sealDeltaWalk(roots map[string]string, unders map[string]string, idx map[st
 		walkDir(scope, root, "")
 	}
 	sealDeltaCountDeleted(&out, roots, unders, idx, listed, met, blindPre, skipPre)
-	return out
+	return out, cc
 }
 
 // sealDeltaCountDeleted is the deletion pass. A listed or Deferred key counts once, when the walk did not meet it,
@@ -322,10 +346,10 @@ func deferredStatMatches(fi os.FileInfo, ent sealDeltaIdxEnt) bool {
 	return fi.ModTime().UnixNano() == ent.mtime
 }
 
-// runSealDeltaWalkCLI is the worker-side entry: sealdeltawalk <uid> <since>. Root in the endospore_priv
-// domain (the only one that can read a roamed user's MCS-categorised data); prints one JSON object.
+// runSealDeltaWalkCLI is the worker-side entry: sealdeltawalk <uid> <since>, or sealdeltawalk <uid> "<since> change"
+// (one argument) for the change test (seal_change_walk.go). Root in the endospore_priv domain (the only one that can
+// read a roamed user's MCS-categorised data); prints one JSON object.
 func runSealDeltaWalkCLI(uid, sinceArg string) {
-	since, _ := strconv.ParseInt(strings.TrimSpace(sinceArg), 10, 64)
 	roots := map[string]string{
 		"vault": "/data/user/" + uid,
 		"de":    "/data/user_de/" + uid,
@@ -340,12 +364,6 @@ func runSealDeltaWalkCLI(uid, sinceArg string) {
 			unders[k] = v
 		}
 	}
-	out := sealDeltaWalk(roots, unders, idx, listed, since)
-	b, err := json.Marshal(out)
-	if err != nil {
-		fmt.Println("{}")
-		return
-	}
-	os.Stdout.Write(b)
+	os.Stdout.Write(sealDeltaWalkJSON(uid, sinceArg, roots, unders, idx, listed))
 	fmt.Println()
 }

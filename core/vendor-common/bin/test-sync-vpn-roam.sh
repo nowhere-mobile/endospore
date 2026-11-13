@@ -660,7 +660,7 @@ sync_seal_capture '$U' 10"
     mkdir -p "$T/data/nowhere"
     [ "$1" = y ] && mkdir -p "$T/data/user/10/com.nowhere.chooser/.nowhere-odhold/com.google.android.gms"
     run "ACCT_AUTH_PKG=com.google.android.gms; PLAY_STORE_PKG=com.android.vending
-nav_apply(){ echo nav_apply >> \"\$T/trace\"; }; aod_apply(){ echo aod_apply >> \"\$T/trace\"; }; home_pin(){ echo home_pin >> \"\$T/trace\"; }; a11y_apply(){ :; }; autofill_apply(){ :; }; keystore_register_all(){ :; }; ks_in_dir(){ return 1; }
+nav_apply(){ echo nav_apply >> \"\$T/trace\"; }; aod_apply(){ echo aod_apply >> \"\$T/trace\"; }; home_pin(){ echo home_pin >> \"\$T/trace\"; }; a11y_apply(){ :; }; autofill_apply(){ :; }; shortcut_apply(){ :; }; keystore_register_all(){ :; }; ks_in_dir(){ return 1; }
 grant_perms_for(){ :; }; _ms(){ echo 0; }; _tlog(){ :; }
 acct_reload(){ echo acct_reload >> \"\$T/trace\"; }; sync_apply(){ echo sync_apply >> \"\$T/trace\"; }
 $body"
@@ -810,7 +810,7 @@ echo REACHED" > "$T/out" 2>/dev/null
   # G1: the grant arm's acct-deferred mark (the authenticator held on-demand), then the tap's odrestore
   tgrant() {
     trun "ACCT_AUTH_PKG=com.google.android.gms; PLAY_STORE_PKG=com.android.vending
-nav_apply(){ :; }; aod_apply(){ :; }; home_pin(){ :; }; a11y_apply(){ :; }; autofill_apply(){ :; }; keystore_register_all(){ :; }; ks_in_dir(){ return 1; }
+nav_apply(){ :; }; aod_apply(){ :; }; home_pin(){ :; }; a11y_apply(){ :; }; autofill_apply(){ :; }; shortcut_apply(){ :; }; keystore_register_all(){ :; }; ks_in_dir(){ return 1; }
 grant_perms_for(){ :; }; _ms(){ echo 0; }; _tlog(){ :; }
 acct_reload(){ echo acct_reload >> \"\$T/trace\"; }; sync_apply(){ echo sync_apply >> \"\$T/trace\"; }
 $(printf '%s\n' "$GRANT" | sed "s#/data/#$T/data/#g")"

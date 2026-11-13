@@ -236,9 +236,11 @@ public class CredentialService extends Service {
         }
         // NWP-20261010-13: an "smsrole" start (fired by the gate's cede at sign-in) gives this user's SMS role to the
         // profile's own SMS app, which only this user's chooser can read from its CE dir (SmsRoleRoam.applyAtSignIn).
+        // NWP-20261202-05: then the profile's other default apps (DefaultRoleRoam), after the SMS apply has granted the
+        // notification listener their capture rides on.
         if (intent != null && intent.getBooleanExtra("smsrole", false)) {
             new Thread(() -> {
-                try { SmsRoleRoam.applyAtSignIn(this); } finally { finishUnit(); }
+                try { SmsRoleRoam.applyAtSignIn(this); DefaultRoleRoam.applyAtSignIn(this); } finally { finishUnit(); }
             }, "nowhere-smsrole").start();
             return START_NOT_STICKY;
         }

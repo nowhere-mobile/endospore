@@ -1,6 +1,7 @@
 package com.nowhere.chooser;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
@@ -11,7 +12,8 @@ import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
-/** NWP-20261126-02: executes DiagReports, the rules of a beta profile's scheduled diagnostic reports. */
+/** NWP-20261126-02: executes DiagReports, the rules of a beta profile's scheduled diagnostic reports.
+ *  NWP-20261202-08: D8 the run record and jobStatus, D9 what each run and transition records. */
 public class DiagReportsCases {
     static int runs = 0, fails = 0;
     static final long H = 3600_000L;
@@ -38,11 +40,16 @@ public class DiagReportsCases {
         final List<String> ev = Collections.synchronizedList(new ArrayList<>());
         volatile String statusReply = "OFFERED 1 ON 1", onReply = "OK", reportReply = "OK 4711";
         volatile boolean online = true, wifi = true;
+        volatile String scheduleReply = "scheduled", pendingReply = "0";
+        volatile boolean failRunsWrite;
         volatile long now = 1_800_000_000_000L;
         volatile Runnable duringStatus, duringReport, duringOff;
         Fake optIn() { files.put(DiagReports.OPT_FILE, DiagReports.optLine(now - 24 * H)); return this; }
         @Override public String read(String f) { String v = files.get(f); return v == null ? "" : v; }
-        @Override public boolean write(String f, String t) { files.put(f, t); ev.add("write " + f); return true; }
+        @Override public boolean write(String f, String t) {
+            if (failRunsWrite && DiagReports.RUNS_FILE.equals(f)) return false;
+            files.put(f, t); ev.add("write " + f); return true;
+        }
         @Override public void remove(String f) { files.remove(f); ev.add("remove " + f); }
         @Override public String status() { ev.add("status"); Runnable r = duringStatus; if (r != null) r.run(); return statusReply; }
         @Override public String on() { ev.add("on"); return onReply; }
@@ -50,13 +57,22 @@ public class DiagReportsCases {
         @Override public String report(Map<String, String> extra) {
             ev.add("report " + extra); Runnable r = duringReport; if (r != null) r.run(); ev.add("report done"); return reportReply;
         }
-        @Override public void schedule() { ev.add("schedule"); }
+        @Override public String schedule() { ev.add("schedule"); return scheduleReply; }
+        @Override public String pending() { ev.add("pending"); return pendingReply; }
         @Override public void cancel() { ev.add("cancel"); }
         @Override public boolean[] net() { return new boolean[] {online, wifi}; }
         @Override public long now() { return now; }
         @Override public String newTag() { return "t-abcdefghij"; }
         int count(String prefix) { int n = 0; synchronized (ev) { for (String e : ev) if (e.startsWith(prefix)) n++; } return n; }
         int last(String e) { synchronized (ev) { return ev.lastIndexOf(e); } }
+        /** RUNS_FILE's lines with the ms dropped ("on ok", ...); empty when absent. */
+        List<String> runs() {
+            List<String> out = new ArrayList<>();
+            String t = files.get(DiagReports.RUNS_FILE);
+            if (t == null) return out;
+            for (String l : t.split("\n")) if (!l.isEmpty()) out.add(l.substring(l.indexOf(' ') + 1));
+            return out;
+        }
     }
 
     /** Run {@code r} on another thread and wait for it ({@code waitMs} at most); true when it finished. */
@@ -187,6 +203,155 @@ public class DiagReportsCases {
         eq("D7 after Off then On: the job is scheduled after the cancel", true, o.last("schedule") > o.last("cancel"));
     }
 
+    static List<String> L(String... a) { return Arrays.asList(a); }
+
+    /** D8: record and jobStatus, the codes. */
+    static void runRecord() {
+        Fake f = new Fake();
+        long t0 = f.now;
+        for (int i = 0; i < 20; i++) { f.now = t0 + i * 60_000L; DiagReports.record(f, "run", "c" + i); }
+        List<String> r = f.runs();
+        eq("D8 record keeps the newest 16 lines", "16 run c4 run c19", r.size() + " " + r.get(0) + " " + r.get(r.size() - 1));
+
+        f = new Fake();
+        f.files.put(DiagReports.RUNS_FILE, "junk\n" + (f.now - 1) + " arm ok\n12 run OK 4711\n");
+        DiagReports.record(f, "sched", "scheduled");
+        eq("D8 record skips an unparsable line", L("arm ok", "sched scheduled"), f.runs());
+        DiagReports.record(f, "send", "OK 4711");
+        eq("D8 a code of another shape is recorded as other", "send other", f.runs().get(2));
+        DiagReports.record(f, "boot", "ok");
+        DiagReports.record(f, null, "ok");
+        eq("D8 an unknown ev records nothing", 3, f.runs().size());
+        DiagReports.record(f, "stop", null);
+        eq("D8 a null code is recorded as other", "stop other", f.runs().get(3));
+
+        f = new Fake(); f.failRunsWrite = true;
+        boolean threw = false;
+        try { DiagReports.record(f, "start", "ok"); } catch (Throwable t) { threw = true; }
+        eq("D8 a failed write is ignored", "false []", threw + " " + f.runs());
+        f = new Fake() { @Override public String read(String file) { throw new IllegalStateException("x"); } };
+        threw = false;
+        try { DiagReports.record(f, "start", "ok"); } catch (Throwable t) { threw = true; }
+        eq("D8 record never throws", false, threw);
+
+        long now = 1_800_000_000_000L;
+        Map<String, String> js = DiagReports.jobStatus((now - 5 * 60_000L) + " arm ok\n" + now + " run sent\n", now, "1");
+        eq("D8 jobStatus ages in minutes, newest first", "run:sent:0,arm:ok:5", js.get("diag_job"));
+        eq("D8 jobStatus passes pending through", "1", js.get("diag_job_pending"));
+        eq("D8 jobStatus has exactly the two keys", "[diag_job, diag_job_pending]", js.keySet().toString());
+        eq("D8 jobStatus caps the age at 999999", "arm:ok:999999", DiagReports.jobStatus("1 arm ok\n", now, "0").get("diag_job"));
+        eq("D8 jobStatus leaves out a future ms", "arm:ok:2",
+                DiagReports.jobStatus((now - 120_000L) + " arm ok\n" + (now + 60_000L) + " run sent\n", now, "0").get("diag_job"));
+        eq("D8 jobStatus leaves out an unparsable line", "send:err-net:1",
+                DiagReports.jobStatus("junk\n" + (now - 60_000L) + " send err-net\n99999999999999999 x y\n", now, "0").get("diag_job"));
+        eq("D8 jobStatus none (empty)", "none", DiagReports.jobStatus("", now, "0").get("diag_job"));
+        eq("D8 jobStatus none (null)", "none", DiagReports.jobStatus(null, now, "0").get("diag_job"));
+        eq("D8 jobStatus null pending is err", "err", DiagReports.jobStatus("", now, null).get("diag_job_pending"));
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < 16; i++) sb.append(now - 7_654_321L * i - 1_234_567L).append(" send ok-ticket\n");
+        String v = DiagReports.jobStatus(sb.toString(), now, "1").toString();
+        eq("D8 jobStatus holds no run of 7+ digits", false, v.matches("(?s).*[0-9]{7,}.*"));
+
+        // replyClass, throwCode, netCode.
+        String[][] rc = {{"OK", "ok"}, {" OK\n", "ok"}, {"OK 4711", "ok-ticket"}, {"ERR-NOT-BETA", "err-not-beta"},
+                {"DENIED", "denied"}, {"ERR-STATE", "err-state"}, {"ERR-NET", "err-net"}, {"ERR-NOGW", "err-nogw"},
+                {"ERR-TOOBIG", "err-toobig"}, {"ERR-DISABLED", "err-disabled"}, {"ERR 503", "err-http"}, {"", "noreply"},
+                {null, "noreply"}, {"garbage", "other"}, {"ERR-NETX", "other"}};
+        List<String> codes = new ArrayList<>();
+        for (String[] c : rc) {
+            String got = DiagReports.replyClass(c[0]);
+            codes.add(got);
+            eq(c[0] != null && c[0].equals("OK 4711") ? "D8 replyClass(\"OK 4711\") is ok-ticket"
+                    : "D8 replyClass(" + c[0] + ")", c[1], got);
+        }
+        eq("D8 replyClass(\"OK 4711\") holds no digit", false, DiagReports.replyClass("OK 4711").matches(".*[0-9].*"));
+        Object[][] tc = {{new IllegalArgumentException(), "err-iae"}, {new SecurityException(), "err-sec"},
+                {new IllegalStateException(), "err-ise"}, {new RuntimeException(), "err-other"}};
+        for (Object[] c : tc) {
+            String got = DiagReports.throwCode((Throwable) c[0]);
+            codes.add(got);
+            eq("D8 throwCode(" + c[0].getClass().getSimpleName() + ")", c[1], got);
+        }
+        eq("D8 netCode", "o0w0 o0w1 o1w0 o1w1", DiagReports.netCode(false, false) + " " + DiagReports.netCode(false, true)
+                + " " + DiagReports.netCode(true, false) + " " + DiagReports.netCode(true, true));
+        codes.addAll(L("o0w0", "o0w1", "o1w0", "o1w1", "scheduled", "pending", "nojs", "err-result", "ok", "1", "0", "err"));
+        for (String rr : new String[] {DiagReports.R_NOT_OFFERED, DiagReports.R_UNAVAILABLE, DiagReports.R_STOPPED,
+                DiagReports.R_WAIT, DiagReports.R_SENT, DiagReports.R_NOT_SENT}) {
+            Fake g = new Fake();
+            DiagReports.ran(g, rr);
+            codes.add(g.runs().get(0).substring(4));
+        }
+        List<String> bad = new ArrayList<>(), scrubbed = new ArrayList<>();
+        for (String c : codes) {
+            if (!c.matches(DiagReports.RUN_CODE) || !c.matches("[a-z0-9-]{1,16}")) bad.add(c);
+            if (c.matches(".*(secret|token|key|pass|cred|sig|auth).*")) scrubbed.add(c);
+        }
+        for (String e : DiagReports.RUN_EVENTS.split("\\|")) if (e.matches(".*(secret|token|key|pass|cred|sig|auth).*")) scrubbed.add(e);
+        eq("D8 every code matches [a-z0-9-]{1,16}", "[]", bad.toString());
+        eq("D8 no code holds a word the report scrub drops", "[]", scrubbed.toString());
+    }
+
+    /** D9: what each run and transition records, over the Fake. */
+    static void runsRecorded() {
+        Fake f = new Fake();
+        DiagReports.switchOn(f);
+        eq("D9 switchOn records on ok, sched scheduled", L("on ok", "sched scheduled"), f.runs());
+        f = new Fake(); f.onReply = "ERR-NOT-BETA";
+        DiagReports.switchOn(f);
+        eq("D9 a refused switchOn records on err-not-beta only", L("on err-not-beta"), f.runs());
+        f = new Fake().optIn();
+        DiagReports.switchOff(f);
+        eq("D9 switchOff records off ok", L("off ok"), f.runs());
+
+        f = new Fake().optIn();
+        DiagReports.arm(f);
+        eq("D9 arm records arm ok, sched scheduled", L("arm ok", "sched scheduled"), f.runs());
+        f = new Fake().optIn(); f.scheduleReply = "pending"; f.onReply = "";
+        DiagReports.arm(f);
+        eq("D9 arm records sched pending", L("arm noreply", "sched pending"), f.runs());
+        f = new Fake();
+        DiagReports.arm(f);
+        eq("D9 an opted-out arm records nothing", false, f.files.containsKey(DiagReports.RUNS_FILE));
+
+        f = new Fake().optIn();
+        DiagReports.runJob(f, new AtomicBoolean());
+        eq("D9 a sent run records send ok-ticket", L("run o1w1", "send ok-ticket", "run sent"), f.runs());
+        f = new Fake().optIn(); f.statusReply = "OFFERED 0 ON 0";
+        DiagReports.runJob(f, new AtomicBoolean());
+        eq("D9 OFFERED 0 records run not-offered", L("run not-offered"), f.runs());
+        f = new Fake().optIn(); f.statusReply = "";
+        DiagReports.runJob(f, new AtomicBoolean());
+        eq("D9 no status reply records run unavailable", L("run unavailable"), f.runs());
+        final AtomicBoolean stop = new AtomicBoolean();
+        f = new Fake().optIn(); f.duringStatus = () -> stop.set(true);
+        DiagReports.runJob(f, stop);
+        eq("D9 a stop during the status request records run stopped", L("run stopped"), f.runs());
+        f = new Fake().optIn(); f.files.put(DiagReports.SENT_FILE, (f.now - H) + "\n");
+        DiagReports.runJob(f, new AtomicBoolean());
+        eq("D9 sent 1 h ago records run o1w1, run wait", L("run o1w1", "run wait"), f.runs());
+        f = new Fake().optIn(); f.online = false; f.wifi = false;
+        DiagReports.runJob(f, new AtomicBoolean());
+        eq("D9 offline records run o0w0, run wait", L("run o0w0", "run wait"), f.runs());
+        f = new Fake().optIn(); f.reportReply = "ERR-NET";
+        DiagReports.runJob(f, new AtomicBoolean());
+        eq("D9 send err-net", L("run o1w1", "send err-net", "run not-sent"), f.runs());
+        f = new Fake().optIn(); f.reportReply = "";
+        DiagReports.runJob(f, new AtomicBoolean());
+        eq("D9 send noreply (empty)", L("run o1w1", "send noreply", "run not-sent"), f.runs());
+        f = new Fake().optIn(); f.reportReply = null;
+        DiagReports.runJob(f, new AtomicBoolean());
+        eq("D9 send noreply (null)", L("run o1w1", "send noreply", "run not-sent"), f.runs());
+        f = new Fake();
+        DiagReports.runJob(f, new AtomicBoolean());
+        eq("D9 an opted-out run records nothing", false, f.files.containsKey(DiagReports.RUNS_FILE));
+        final Fake g = new Fake().optIn();
+        g.duringStatus = () -> onOtherThread(() -> DiagReports.switchOff(g), 2000);
+        DiagReports.runJob(g, new AtomicBoolean());
+        eq("D9 an Off during the status request records no run line", L("off ok"), g.runs());
+        f = new Fake().optIn(); f.failRunsWrite = true;
+        eq("D9 a failed record write does not change the run", DiagReports.R_SENT, DiagReports.runJob(f, new AtomicBoolean()));
+    }
+
     public static void main(String[] args) throws Exception {
         // D1 offered: only "OFFERED 1 ...".
         eq("D1 offered(\"OFFERED 1 ON 0\")", true, DiagReports.offered("OFFERED 1 ON 0"));
@@ -259,7 +424,9 @@ public class DiagReportsCases {
         eq("D5 parseMs(\"-5\")", 0L, DiagReports.parseMs("-5"));
         eq("D5 parseMs(null)", 0L, DiagReports.parseMs(null));
 
+        runRecord();
         jobAndSwitch();
+        runsRecorded();
 
         System.out.println(runs + " cases, " + fails + " failed");
         if (fails > 0) System.exit(1);

@@ -22,12 +22,12 @@ import java.io.File;
  * <h3>What "held" means — the definition, decided 2026-09-12 ({@code NWP-20260912-05})</h3>
  *
  * <blockquote>An app is held by this handset if you have opened it here since you signed in or last released
- * it — and it stops being held when you sign out, release it, uninstall it, or this handset goes fifteen
- * minutes without sealing.</blockquote>
+ * it — and it stops being held when you sign out, release it, uninstall it, or this handset goes an hour
+ * without sealing (an hour since 2026-11-10; fifteen minutes when decided).</blockquote>
  *
  * One sentence, implementable and honest to a user, and every clause maps to something below: "opened it
  * here" is the usage query; "since you signed in" is the stamp; "or last released it" is the floor; "sign
- * out" and "release" are both {@link #clear}; "uninstall" is an exclusion; and the fifteen minutes is
+ * out" and "release" are both {@link #clear}; "uninstall" is an exclusion; and the hour is
  * {@code claimTTL} on the agent side, which needs nothing here — a handset that stops sealing stops
  * refreshing, and its claims lapse by arithmetic.
  *

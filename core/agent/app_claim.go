@@ -54,16 +54,21 @@ import (
 //
 // The tension is real and this value is the whole of it. Too SHORT and a claim lapses while the app is
 // genuinely in use, so both handsets edit it and the decision's discard fires for no reason. Too LONG and a
-// handset that powered off holds its apps shut on every other device for that long. 15 minutes is roughly
-// seven `syncIntervalDefault` cycles, so a claim survives a handset that is merely slow, offline for a few
-// cycles, or between seals -- while a device that is actually gone releases everything well inside the time
-// it takes a user to walk to their other phone.
+// handset that powered off holds its apps shut on every other device for that long.
+//
+// A seal refreshes the claims (`claimsToPublish`). syncLoop starts the next seal one interval after the
+// previous one ENDS, and a save can take 10 minutes, so on the 15-minute `syncIntervalDefault` the gap
+// between two refreshes is up to about 25 minutes. 60 minutes is four default cycles, so a claim survives a
+// handset that is merely slow, or offline for a cycle or two. The cost: a handset switched off mid-session
+// holds its apps shut on the other phone for about an hour. It was 15 minutes (the 2026-09-12 decision, set
+// when the default interval was 2 minutes); Chester chose 60 minutes on 2026-11-10 (the recommended option A,
+// `docs/product-decisions.md`).
 //
 // ⚠ It is deliberately NOT derived from the sync interval. That interval is per-device and configurable
 // (`syncIntervalGet` reads a settings file, then the env, then this default, and clamps to [15, 86400]), so
 // one handset cannot know another's cadence -- a TTL computed from the local value would mean something
 // different on each device, which is exactly how a distributed timeout becomes unanalysable.
-const claimTTL int64 = 15 * 60
+const claimTTL int64 = 60 * 60
 
 // appClaim is one package's holder. Short JSON keys, like essRegion next door: this map is published in every
 // head and a package name is already the long half of each entry.
