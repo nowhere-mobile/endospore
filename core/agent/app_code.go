@@ -360,8 +360,12 @@ func restoreOdOne(conn net.Conn, dest, name, pass, uid, seSecret, pkg, kind, lea
 	// exact #204 shape, on the new path. NWP-20261011-01: armed AFTER the caller's guards, which used to return
 	// with it armed and nothing left to close it.
 	armOdLease(pkg, time.Now(), odFetchLease)
+	// NWP-20261130-03: an install that bypassed materializeapp reaches here with its data still in the store. Block the
+	// app before this request can queue behind a seal.
+	stopBarrier := odLaunchBarrier(dest, name, uid, pkg)
 	// pkg rides the srcUnit slot; the worker's `odrestore` op restores + reowns the hold and re-grants perms for it.
 	out := odRestoreWorker(dest, "odrestore", name, pass, uid, seSecret, kind, pkg, "", nil)
+	stopBarrier()
 	// #204 (DIA-20260726-08): the grant has landed -- close the materialising window so periodic seals resume
 	// immediately (don't wait out the install lease). Paired with the open in handleMaterializeApp.
 	// NWP-20261011-01: only THIS package's lease ends. Another tap's fetch or install lease keeps the window open.

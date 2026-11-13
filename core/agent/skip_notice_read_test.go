@@ -175,7 +175,8 @@ func skipNoticeVerbDrive(t *testing.T, req string, h func(c net.Conn, r *bufio.R
 	}
 	defer cli.Close()
 	// An empty request is no write: a handler that reads nothing can answer and close first, and a zero-length write
-	// to a closed peer fails with EPIPE (NWP-20261128-31 and NWP-20261128-33, a CI flake of TestSkipNoticeReadLabelOneLine).
+	// to a closed peer fails with EPIPE (NWP-20261128-31 and NWP-20261128-33, a CI flake of TestSkipNoticeReadLabelOneLine;
+	// NWP-20261129-07 met it too: a refused GET-SKIP-NOTICE replies and closes without reading, in a farm CI run under load).
 	if req != "" {
 		if _, err := cli.Write([]byte(req)); err != nil {
 			t.Fatal(err)

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # test-reap-lists.sh [--mutate] -- runs the reap's file-name-list cases (reap_lists_test.go; NWP-20261129-19, h59 #11):
-# CLEAN-STORAGE with no session live or parked removes a departed session's plaintext lists from the state tmpfs.
+# CLEAN-STORAGE with no session live or parked removes a departed session's plaintext lists and (NWP-20261201-35, h60
+# #8) its content and group caches, sealcount and mnochange from the state tmpfs.
 # --mutate re-runs them against a COPY of the package with each rule broken in turn; the tree is never touched. Each
 # mutant must be CONVICTED by a real `--- FAIL`; one that fails to apply or to compile is a failure.
 set -uo pipefail
@@ -40,10 +41,27 @@ mut "M2 the marker check removed" reap_lists.go \
   "$(one "r'\tif _, _, _, state := readRoamSessionState\(dest\); state != roamSessionAbsent \{\n[^\n]*\n\t\}\n'" "''")"
 mut "M3 the .coldlock check removed" reap_lists.go \
   "$(one "r'\tif _, err := os\.Lstat\(filepath\.Join\(dest, \"\.coldlock\"\)\); [^\n]*\n[^\n]*\n\t\}\n'" "''")"
-mut "M4 the prefix match as strings.Contains" reap_lists.go \
-  "(lambda r: r[0] if r[1] == 2 else None)(re.subn(r'strings\.HasPrefix\(name,', 'strings.Contains(name,', s))"
+scoped() { echo "(lambda m: (lambda r: s[:m.start()] + r[0] + s[m.end():] if r[1] == $2 else None)(re.subn(r'strings\.HasPrefix\(name,', 'strings.Contains(name,', m.group(0))) if m else None)(re.search(r'func $1\(.*?\n\}\n', s, re.S))"; }
+mut "M4 isSessionFileList's prefix match as strings.Contains (L1: xscancache.1, xheal-handled-1)" reap_lists.go \
+  "$(scoped isSessionFileList 2)"
+mut "M4b isSessionCache's prefix match as strings.Contains (L1: xcontentcache.1, xsealcount.1)" reap_lists.go \
+  "$(scoped isSessionCache 1)"
 mut "M5 directories removed too" reap_lists.go \
   "$(one "r'if !fi\.Mode\(\)\.IsRegular\(\) \{'" "'if !fi.Mode().IsRegular() && !fi.IsDir() {'")"
 mut "M6 resetSealDeltaCaches dropped" reap_lists.go \
   "$(one "r'\tresetSealDeltaCaches\(\)[^\n]*\n'" "''")"
+mut "M7 contentcache. dropped from isSessionCache (L1)" reap_lists.go \
+  "$(one "r'\"contentcache\.\", '" "''")"
+mut "M8 groupcache. dropped from isSessionCache (L1)" reap_lists.go \
+  "$(one "r'\"groupcache\.\", '" "''")"
+mut "M9 sealcount. dropped from isSessionCache (L1)" reap_lists.go \
+  "$(one "r'\"sealcount\.\", '" "''")"
+mut "M10 mnochange. dropped from isSessionCache (L1)" reap_lists.go \
+  "$(one "r', \"mnochange\.\"'" "''")"
+mut "M11 the contentCache reset removed (L9, L10)" reap_lists.go \
+  "$(one "r'\tcontentCacheMu\.Lock\(\)\n\tcontentCache = nil\n\tcontentCacheLoadedTag = \"\"\n\tcontentCacheMu\.Unlock\(\)\n'" "''")"
+mut "M12 the kept branch's early return dropped (L8, L2)" reap_lists.go \
+  "$(one "r'\t\treturn 0, true\n'" "''")"
+mut "M13 the IsRegular guard deleted (L1: groupcache.d, mnochange.link)" reap_lists.go \
+  "$(one "r'(?s)fi, err := os\.Lstat\(p\)(.*?)\t\tif !fi\.Mode\(\)\.IsRegular\(\) \{\n\t\t\tcontinue\n\t\t\}\n'" "r'_, err := os.Lstat(p)\1'")"
 [ "$fails" -eq 0 ] && echo "== all mutations convicted" || { echo "== $fails mutation(s) not convicted"; exit 1; }

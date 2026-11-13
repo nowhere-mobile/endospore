@@ -2,6 +2,8 @@
         try (java.io.FileWriter w = new java.io.FileWriter(new File(ctx.getFilesDir(), "nowhere-od-restored"), true)) {
             w.write(pkg + "\n");
         } catch (Throwable ignore) {}
+        // NWP-20261130-03: an app suspended until its data landed opens now, before any launch below this call.
+        OdDataBarrierHost.afterReply(ctx, pkg, "OK");
         // NWP-20261010-13: the profile's SMS app may have been waiting for exactly this app to materialise.
         SmsRoleRoam.onMaterialised(ctx, pkg);
     }

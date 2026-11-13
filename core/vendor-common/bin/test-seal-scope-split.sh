@@ -78,11 +78,12 @@ EOF
     printf 'AGENT=$T/agent.sh\n'
     printf 'unset NOWHERE_PUSH_STAT APPCODE_PUSH_MS\n'
     for f in bt_seal_capture nav_seal_capture aod_seal_capture a11y_seal_capture autofill_seal_capture tz_seal_capture \
-             vpn_deferred_retry vpn_seal_capture sync_apply_retry sync_seal_capture ks_stage_drop restorecon chown \
+             vpn_deferred_retry vpn_seal_capture sync_apply_retry sync_seal_capture sroam_seal_capture ks_stage_drop restorecon chown \
              seal_wl_release seal_susp seal_wl_end bt_reset am; do
       printf '%s(){ :; }\n' "$f"
     done
     printf 'pw(){ echo pw; }\n'
+    printf 'od_unf_path(){ echo "$STATE/odfetch.$1/unfetched.$2"; }\n'   # NWP-20261130-03
     if [ "${5:-}" = tick ]; then
       printf '_ms(){ local _n; _n=$(cat "$T/clock" 2>/dev/null || echo 0); _n=$((_n + 100)); echo "$_n" > "$T/clock"; echo "$_n"; }\n'
       printf 'APM=40\n'

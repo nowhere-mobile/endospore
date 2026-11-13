@@ -115,7 +115,7 @@ sources() {
     else {
       my $b = substr($s, $i + length($loop));
       push @f, "the chunk loop does not check SignOutGate.begun() before anything else"
-        unless $b =~ /\A\s*if \(SignOutGate\.begun\(\)\) break;\s*java\.util\.List<String> chunk = retry\.subList\(c, Math\.min\(c \+ OdRestoreList\.CHUNK, retry\.size\(\)\)\);\s*MAT_LOCK\.lock\(\);/;
+        unless $b =~ /\A\s*if \(SignOutGate\.begun\(\)\) break;\s*if \(SweepHold\.held\(\)\) break;\s*java\.util\.List<String> chunk = retry\.subList\(c, Math\.min\(c \+ OdRestoreList\.CHUNK, retry\.size\(\)\)\);\s*MAT_LOCK\.lock\(\);/;
       push @f, "the chunk loop does not re-read autoAction(hasInstalledCode(pkg), odRestored(pkg), false) under MAT_LOCK"
         unless $b =~ /\A[^}]*?MAT_LOCK\.lock\(\);\s*try \{\s*java\.util\.List<String> keep = new ArrayList<>\(\);\s*for \(String pkg : chunk\) \{\s*if \(autoAction\(hasInstalledCode\(pkg\), odRestored\(pkg\), false\)\s*== AUTO_RESTORE_ONLY\) keep\.add\(pkg\);\s*\}/;
       push @f, "the chunk loop does not send one app through restoreOnlyLocked and two or more through restoreOnlyListLocked"

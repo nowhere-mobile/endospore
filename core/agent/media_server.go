@@ -234,6 +234,10 @@ type mediaServer struct {
 	dmg         map[string]string    // #110: cache-key -> basename of a file with corrupt chunks (published DAMAGED)
 	incomplete  map[string]bool      // DIA-20260730: app whose deferred dir had to be RECREATED (short restore) -> published INCOMPLETE
 	lastAppProg time.Time            // #128: throttle publishAppProg from per-chunk progSet (guarded by progMu)
+	restoring   struct {             // NWP-20261201-14: the #media lander's numbers, published RESTORING (guarded by progMu)
+		done, total int64
+		left        int
+	}
 }
 
 // errDamagedChunk marks a fetch failure as PERMANENT store corruption (verified-hash mismatch after retries,
@@ -288,6 +292,32 @@ func (s *mediaServer) markDamaged(key, rel string, i int) {
 		s.dmg = map[string]string{}
 	}
 	s.dmg[key] = path.Base(rel)
+	s.writeProg()
+}
+
+// setRestoring publishes the lander's progress (NWP-20261201-14): numbers only, and left 0 ends the line.
+func (s *mediaServer) setRestoring(done, total int64, left int) {
+	s.progMu.Lock()
+	defer s.progMu.Unlock()
+	if s.progPath == "" {
+		return
+	}
+	s.restoring.done, s.restoring.total, s.restoring.left = done, total, left
+	s.writeProg()
+}
+
+// markBgDamaged publishes a corrupt rel the lander met as the DAMAGED line (§6). Its dmg key is never a cache key, and
+// it logs nothing: markDamaged's log line names the rel.
+func (s *mediaServer) markBgDamaged(rel string) {
+	s.progMu.Lock()
+	defer s.progMu.Unlock()
+	if s.progPath == "" {
+		return
+	}
+	if s.dmg == nil {
+		s.dmg = map[string]string{}
+	}
+	s.dmg["bg:"+rel] = path.Base(rel)
 	s.writeProg()
 }
 
@@ -482,7 +512,7 @@ func (s *mediaServer) publishAppProg() {
 // writeProg atomically publishes the dominant active fetch (+ any damaged verdict, #110), or removes the file
 // when there is nothing to say. Caller holds progMu.
 func (s *mediaServer) writeProg() {
-	if len(s.active) == 0 && len(s.dmg) == 0 && len(s.incomplete) == 0 {
+	if len(s.active) == 0 && len(s.dmg) == 0 && len(s.incomplete) == 0 && s.restoring.left == 0 {
 		os.Remove(s.progPath)
 		return
 	}
@@ -524,6 +554,10 @@ func (s *mediaServer) writeProg() {
 			}
 		}
 		lines += fmt.Sprintf("INCOMPLETE %d %s\n", len(s.incomplete), first)
+	}
+	if s.restoring.left > 0 {
+		// NWP-20261201-14: "RESTORING <done B> <total B> <files left>" -- the #media lander. Numbers only (§6).
+		lines += fmt.Sprintf("RESTORING %d %d %d\n", s.restoring.done, s.restoring.total, s.restoring.left)
 	}
 	tmp := s.progPath + ".tmp"
 	if os.WriteFile(tmp, []byte(lines), 0o600) == nil {

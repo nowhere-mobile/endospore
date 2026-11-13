@@ -194,15 +194,31 @@ func TestUnfetchedCarry_U2_ThirdSealCarriesAgain(t *testing.T) {
 }
 
 // com.b's hold is back on disk with one file changed: the walk's copy wins, and the old chunks do not come back.
-func TestUnfetchedCarry_U3_WalkedCopyWins(t *testing.T) {
+// NWP-20261130-03 superseded "the walk's copy wins": while a package is listed, its stored span goes forward byte for
+// byte, and a changed copy of it on the phone (what an app wrote on fresh data before its fetch) is left out.
+func TestUnfetchedCarry_U3_StoredSpanWinsOverLocalCopy(t *testing.T) {
 	const scope = "ucu3"
-	base := ucFirstSeal(t, scope, ucUnion(ucAFiles(), ucBFiles(1<<20)))
+	stored := ucUnion(ucAFiles(), ucBFiles(1<<20))
+	base := ucFirstSeal(t, scope, stored)
 	t.Setenv("NOWHERE_UNFETCHED_LIST", unfList(t, ucB))
 	now := ucUnion(ucAFiles(), ucBFiles(1<<20))
 	now[psHold(ucB)+"/shared_prefs/b.xml"] = []byte(strings.Repeat("changed-b ", 500))
 	out := ucLands(t, base, scope, now)
-	ucLine(t, out, "0 package(s) carried by span, 1 left to the guard")
-	ucRestoreIs(t, base, scope, now)
+	ucLine(t, out, "1 package(s) carried by span, 0 left to the guard")
+	ucRestoreIs(t, base, scope, stored)
+}
+
+// carryUnfetched never re-emits a package the walk recorded (that would put two copies in one tar), and the guard
+// refuses the seal that then leaves the stored span behind.
+func TestUnfetchedCarry_U3_WalkedIsNotCarriedAndIsRefused(t *testing.T) {
+	oldM := chunkManifest{Chunks: []string{"a", "b", "f"}, PkgSpan: map[string][][2]int{ucB: {{1, 2}}}, Pkg: map[string]int64{ucB: 9}}
+	_, spans, _, n := carryUnfetched(oldM, []string{"x", "f2"}, map[string]bool{ucB: true}, map[string]bool{ucB: true}, nil)
+	if n != 0 || spans[ucB] != nil {
+		t.Fatalf("a walked package was carried: n=%d spans=%v", n, spans)
+	}
+	if got := unfetchedNotCarried(oldM.Pkg, spans, map[string]bool{ucB: true}, nil); got != 1 {
+		t.Errorf("unfetchedNotCarried = %d, want 1 for a listed package not carried by its span", got)
+	}
 }
 
 func TestUnfetchedCarry_U4_UntrustedSpanRefused(t *testing.T) {
@@ -259,6 +275,16 @@ func TestUnfetchedCarry_U6_OtherScopesNeverCarry(t *testing.T) {
 		base := ucFirstSeal(t, scope, all)
 		t.Setenv("NOWHERE_UNFETCHED_LIST", unfList(t, ucB))
 		ucNoLine(t, ucLands(t, base, scope, all))
+	})
+	// NWP-20261130-03: pushProfile hands the carry the list it read once (sealUnfetchedList, nil for these scopes), so the
+	// carry's own scope gate is pinned directly, with a list handed in.
+	t.Run("gate", func(t *testing.T) {
+		oldM := chunkManifest{Chunks: []string{"a", "f"}, PkgSpan: map[string][][2]int{ucB: {{0, 1}}}, Pkg: map[string]int64{ucB: 9}}
+		for _, scope := range []string{"ucu6g#media", "ucu6g#apps"} {
+			if _, spans, _, n := sealCarryUnfetched(scope, oldM, []string{"x", "f"}, nil, nil, map[string]bool{ucB: true}, true); n != 0 || spans != nil {
+				t.Errorf("%s: the carry ran (n=%d)", scope, n)
+			}
+		}
 	})
 }
 

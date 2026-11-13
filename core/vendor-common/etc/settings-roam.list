@@ -1,0 +1,8 @@
+# The curated per-user settings allowlist (Q012, docs/product-decisions.md 2026-10-20). Roamd's capture and the
+# chooser's apply both read this file. A setting off this list is never read at seal and never written at sign-in.
+#
+# One row per line: <scope> <key> [<kind>]
+#   scope  secure or system. Never global (Q012).
+#   kind   absent for a plain value, or tiles for a comma list of Quick Settings tiles. Only one row has kind tiles.
+# A later slice adds a row here and changes no code.
+secure sysui_qs_tiles tiles

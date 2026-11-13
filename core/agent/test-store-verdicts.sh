@@ -3,11 +3,13 @@
 # TEST-STORE and PING-STORE, driven through handleLogin against a local S3 fake, answer OK (200), ERR-AUTH (403),
 # ERR-BUCKET (404), ERR-NET (a closed port), ERR-CONFIG (TEST-STORE, an endpoint with a path) and ERR-NOSTORE
 # (PING-STORE, no keys). BucketExists sends a HEAD, whose error response has no body, so the 403 status arm is the only
-# one that maps a wrong key to ERR-AUTH. --mutate re-runs the tests against a COPY of core/agent under a temp root,
+# one that maps a wrong key to ERR-AUTH. PING-STORE answers OK MANAGED only in cap mode, a gateway and no keys; a
+# self-hosted store with a GATEWAY_URL keeps its S3 probe (NWP-20261129-41). --mutate re-runs the tests against a COPY of core/agent under a temp root,
 # main.go broken in turn; the checked-out tree is never touched. Each mutant must be CONVICTED by a `--- FAIL`; one
 # that fails to apply, or fails to compile, counts as a failure. Each anchor is pinned byte for byte and must occur
 # exactly once in its function. Mutants: M1 handleTestStore drops the 403 status arm; M2 handlePingStore drops it;
-# M3 handleTestStore answers OK for a missing bucket; M4 handlePingStore answers ERR-AUTH for an unreachable store.
+# M3 handleTestStore answers OK for a missing bucket; M4 handlePingStore answers ERR-AUTH for an unreachable store;
+# M5 handlePingStore's managed arm keyed on GATEWAY_URL again.
 set -uo pipefail
 cd "$(dirname "$0")"
 . ./suite-report.sh
@@ -56,4 +58,7 @@ mut "M3 handleTestStore answers OK for a missing bucket" handleTestStore \
 mut "M4 handlePingStore answers ERR-AUTH for an unreachable store" handlePingStore \
   "$T$T${T}fmt.Fprint(conn, \"ERR-NET\\n\") // can't reach the endpoint (DNS/TLS/host/offline)" \
   "$T$T${T}fmt.Fprint(conn, \"ERR-AUTH\\n\") // M4"
+mut "M5 handlePingStore's managed arm keyed on GATEWAY_URL again" handlePingStore \
+  "${T}if capMode() {" \
+  "${T}if os.Getenv(\"GATEWAY_URL\") != \"\" {"
 [ "$fails" -eq 0 ] && echo "== all mutations convicted" || { echo "== $fails mutation(s) not convicted"; exit 1; }

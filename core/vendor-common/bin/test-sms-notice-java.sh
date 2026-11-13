@@ -68,7 +68,7 @@ if [ "$MUTATE" = yes ] && [ "$rc" = 0 ]; then
   T=src/com/nowhere/chooser/TelIngest.java; S=src/com/nowhere/chooser/MessagingSuppressor.java
   C=src/com/nowhere/chooser/ChooserActivity.java; R=src/com/nowhere/chooser/SmsDeliverReceiver.java
   RR=src/com/nowhere/chooser/SmsRoleRoam.java; CS=src/com/nowhere/chooser/CredentialService.java
-  U=src/com/nowhere/chooser/UnarchiveService.java
+  U=src/com/nowhere/chooser/UnarchiveService.java; SN=src/com/nowhere/chooser/SenderName.java
   # the clear
   mutate "a blind read-back polls"                         $T 's/^        return NOTICE_KEEP;$/        return NOTICE_POLL;/'
   mutate "a blind read-back clears"                        $T 's/^        return NOTICE_KEEP;$/        return NOTICE_CLEAR;/'
@@ -175,6 +175,19 @@ if [ "$MUTATE" = yes ] && [ "$rc" = 0 ]; then
   mutate "a stale repair runs into the next session"       $RR 's/return scheduledSerial >= 0 \&\& scheduledSerial == nowSerial;/return true;/'
   mutate "the repair ignores its session"                  $C '/^            if (!SmsRoleRoam.repairStillValid(serial, userSerial(uid))) {$/,/^            }$/d'
   mutate "the repair assigns an empty role without a second look" $RR '/^                if (!confirmed) { \/\/ a repair: look again before taking a role that may be changing hands$/,/^                }$/d'
+  # the sender's name (NWP-20261201-29)
+  mutate "M1 the notice ignores the contact's name (case: title: a saved contact shows the name)" $SN '/if (!name.isEmpty()) return name;/d'
+  mutate "M2 a blank name does not fall back (case: title: a blank name falls back to the number)" $SN 's/if (!name.isEmpty()) return name;/if (contactName != null) return name;/'
+  mutate "M3 the lookup runs in user 0 (case: lookup: never in user 0)" $SN 's/ \&\& userId != 0;/;/'
+  mutate "M4 the call site passes no name (pin: TelIngest.postRoamedMessageNotice)" $T 's/? contactName(ctx, from) : null);/? null : null);/'
+  mutate "M5 run() never grants READ_CONTACTS (pin: TelIngest.run.contactsGrant)" $T '/^        ensureContactsRead(ctx);/d'
+  mutate "M6 the grant adds WRITE_CONTACTS (pin: TelIngest.ensureContactsRead)" $T '/private static void ensureContactsRead(/,/^    }$/s/^            if (dpm == null) return;$/&\n            dpm.setPermissionGrantState(new android.content.ComponentName(ctx, AdminReceiver.class), ctx.getPackageName(), android.Manifest.permission.WRITE_CONTACTS, android.app.admin.DevicePolicyManager.PERMISSION_GRANT_STATE_GRANTED);/'
+  mutate "M7 the notice loses the envelope (pin: TelIngest.postRoamedMessageNotice)" $T '/private static void postRoamedMessageNotice(/,/^    }$/s/.setSmallIcon(R.drawable.ic_notif_message)/.setSmallIcon(R.drawable.ic_nowhere_notif)/'
+  mutate "M8 the tap takes the title (pin: TelIngest.postRoamedMessageNotice)" $T 's/^                    messageTapIntent(ctx, from),$/                    messageTapIntent(ctx, title),/'
+  mutate "M9 contactName logs the name (pin: TelIngest.contactName)" $T '/private static String contactName(/,/^    }$/s/^            return c != null \&\& c.moveToFirst() ? c.getString(0) : null;$/            String n = c != null \&\& c.moveToFirst() ? c.getString(0) : null; android.util.Log.i("NowhereChooser", "contact " + n); return n;/'
+  mutate "M10 the grant's user-0 guard removed (pin: TelIngest.ensureContactsRead)" $T '/private static void ensureContactsRead(/,/^    }$/{/android.os.UserHandle.myUserId() == 0/d}'
+  mutate "M11 the envelope not white (case: drawable: ic_notif_message path 0)" res/drawable/ic_notif_message.xml 's/#FFFFFFFF/#FF000000/'
+  mutate "M11b the envelope's second path not white (case: drawable: ic_notif_message path 1)" res/drawable/ic_notif_message.xml '/fillColor="#FFFFFFFF"/{N;/M4,6 L12/s/#FFFFFFFF/#FF000000/}'
 fi
 
 echo

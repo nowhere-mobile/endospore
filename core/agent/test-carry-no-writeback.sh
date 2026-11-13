@@ -42,7 +42,7 @@ PY
   fi
   restore
 }
-mut "V1 the call site lands every carried rel" main.go 'materializeCarried(base, dk, oldM, carriedToLand(landRels, seen), src)' 'materializeCarried(base, dk, oldM, landRels, src)' TestEssentialUnreadable_AFileDeletedMidSealIsNotWrittenBack
+mut "V1 the call site lands every carried rel" main.go 'materializeCarried(base, dk, oldM, carriedToLand(landRels, seen), src, budget)' 'materializeCarried(base, dk, oldM, landRels, src, budget)' TestEssentialUnreadable_AFileDeletedMidSealIsNotWrittenBack
 mut "V2 carriedToLand keeps only visited rels" media_carry.go 'if _, visited := seen[rel]; !visited {' 'if _, visited := seen[rel]; visited {' TestMediaSync_AnotherHandsetsPhotoLandsWithoutALogin TestCarriedToLand
 mut "V3 carriedToLand tests the value, not the key" media_carry.go 'if _, visited := seen[rel]; !visited {' 'if !seen[rel] {' TestEssentialUnreadable_AFileDeletedMidSealIsNotWrittenBack TestCarriedToLand
 [ "$fails" -eq 0 ] && echo "== all mutations convicted" || { echo "== $fails mutation(s) not convicted"; exit 1; }

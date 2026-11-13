@@ -3,9 +3,12 @@
 # (docs/product-decisions.md, 2026-10-20, Q061). Backlog row "A permission answered in a session that never signs out
 # is lost: permissions are captured only at sign-out". NWP-20261123-11: backlog row "An unreadable nowhere-perms or
 # keep-set at a permission capture drops every On-demand placeholder's carried lines, re-granting INTERNET to a
-# Network-off app" (r4, r5, r7-r9).
+# Network-off app" (r4, r5, r7-r9). NWP-20261201-20: backlog row "A roamed app can come back with GrapheneOS's Network
+# permission off, so on a working network it reports "No Internet Connection"" (r3, r10, r11, and the heal count in the
+# cases).
 #
-# Runs core/chooser/tests/perms-capture (PermsCaptureRule.keepCarried and oldLinesByPkg, compiled and EXECUTED), then
+# Runs core/chooser/tests/perms-capture (PermsCaptureRule.keepCarried, oldLinesByPkg and the heal count, compiled and
+# EXECUTED), then
 # source checks on
 # the real files:
 #   r1 capturePerms is `static void capturePerms(Context ctx, Map<String,String> keptModes, boolean midSession)` and its
@@ -13,15 +16,19 @@
 #      (it runs from PermsCaptureReceiver, with no Activity);
 #   r2 the whole body is inside synchronized (PERMS_CAPTURE_LOCK), so a relayed capture and the sign-out's never
 #      interleave their read-modify-write of nowhere-perms;
-#   r3 the live loop skips a package PermsCaptureRule.keepCarried holds (with UnarchiveService.odRestored(ctx, pkg)),
-#      and the carry-forward re-emits its old lines verbatim, before the softening branch;
+#   r3 the live loop skips a package PermsCaptureRule.keepCarried holds (with UnarchiveService.odRestored(ctx, pkg) and
+#      PermsCaptureRule.healPending(pkg)), and the carry-forward re-emits its old lines verbatim, before the softening
+#      branch;
 #   r4 doLogoffImpl calls capturePerms(this, readAppModesStrictIn(getFilesDir()), false), after captureAppCode();
 #   r5 PermsCaptureReceiver returns for user 0 before goAsync, and passes readAppModesStrictIn and true;
 #   r6 the manifest declares PermsCaptureReceiver exported="false";
 #   r7 capturePerms returns on a null keptModes (an unreadable keep-set) before it enumerates anything;
 #   r8 capturePerms reads nowhere-perms through SettingsText.read and PermsCaptureRule.oldLinesByPkg, and returns on
 #      null (an unreadable record) before it enumerates or writes anything;
-#   r9 neither caller passes the lenient readAppModes() or readAppModesIn( (an unreadable keep-set read as empty).
+#   r9 neither caller passes the lenient readAppModes() or readAppModesIn( (an unreadable keep-set read as empty);
+#  r10 AppInstallReceiver.heal calls PermsCaptureRule.healBegun(pkg) after the no-code skip and directly before the
+#      thread starts, the thread body's healEnded(pkg) sits in a finally, and a thread that cannot start ends it too;
+#  r11 a held package outside the keep-set has its old lines re-emitted verbatim, after the keep-set carry.
 # What it does not prove: the chooser is not compiled here (the build host's javac check is), nothing runs on a
 # device, and nothing sends to the receiver until the user-0 listener and relay (NOWHERE-1073).
 #
@@ -53,6 +60,7 @@ SRCDIR="$ROOT/core/chooser/src/com/nowhere/chooser"
 RULE="$SRCDIR/PermsCaptureRule.java"
 PA="$SRCDIR/ProfileActivity.java"
 RCV="$SRCDIR/PermsCaptureReceiver.java"
+AIR="$SRCDIR/AppInstallReceiver.java"
 MAN="$ROOT/core/chooser/AndroidManifest.xml"
 
 SIG='    static void capturePerms(android.content.Context ctx, java.util.Map<String,String> keptModes, boolean midSession) {'
@@ -76,10 +84,26 @@ lineof() {
   echo "${n:-0}"
 }
 
-# check <rule> <ProfileActivity.java> <PermsCaptureReceiver.java> <AndroidManifest.xml>: the cases, then r1-r9.
+HEAL_SIG='    private static void heal(Context context, String pkg, boolean replacing) {'
+
+# healbody <file>: AppInstallReceiver.heal up to its closing `    }`, `//` comments and blank lines dropped. A line that
+# held a trailing comment keeps the spaces before it, so callers compare with every space removed.
+healbody() {
+  awk -v sig="$HEAL_SIG" '
+    !on && $0 == sig { on=1 }
+    on { code=$0; sub(/\/\/.*$/, "", code); if (code !~ /^ *$/) print code; if ($0 == "    }") exit }' "$1"
+}
+
+# lineis <n> <want> <text>: true when line n of the text is exactly <want>
+lineis() {
+  [ "$(sed -n "${1}p" <<<"$3")" = "$2" ]
+}
+
+# check <rule> <ProfileActivity.java> <PermsCaptureReceiver.java> <AndroidManifest.xml> <AppInstallReceiver.java>: the
+# cases, then r1-r11.
 # Returns 3 when the cases do not compile, 1 on any failed case or check.
 check() {
-  local rule=$1 pa=$2 rcv=$3 man=$4 rc b src n l1 l2 l3 nxt start rs ps
+  local rule=$1 pa=$2 rcv=$3 man=$4 air=$5 rc b src n l1 l2 l3 l4 h nxt start rs ps
   JAVAC=$JAVAC JAVA=$JAVA bash "$ROOT/core/chooser/tests/perms-capture/run.sh" "$rule"; rc=$?
   [ "$rc" -eq 0 ] || { echo "FAIL cases (run.sh rc=$rc)"; [ "$rc" -eq 3 ] && return 3; return 1; }
   src=$(cat "$pa")
@@ -99,10 +123,10 @@ check() {
   [ "$n" = 1 ] || { echo "FAIL r2: PERMS_CAPTURE_LOCK is declared $n time(s), want 1"; return 1; }
   echo "  ok   r2 the whole body runs under PERMS_CAPTURE_LOCK"
   # (r3) the live-loop skip, and the verbatim carry before the softening branch
-  l1=$(lineof 'if (PermsCaptureRule.keepCarried(midSession, keptModes.get(pkg), UnarchiveService.odRestored(ctx, pkg))) {' "$b")
+  l1=$(lineof 'if (PermsCaptureRule.keepCarried(midSession, keptModes.get(pkg), UnarchiveService.odRestored(ctx, pkg), PermsCaptureRule.healPending(pkg))) {' "$b")
   l2=$(lineof 'for (String pkg : pkgs) {' "$b")
   [ "$l1" -gt 0 ] && [ "$l2" -gt 0 ] && [ "$l1" -gt "$l2" ] \
-    || { echo "FAIL r3: the live loop does not ask PermsCaptureRule.keepCarried(..., UnarchiveService.odRestored(ctx, pkg))"; return 1; }
+    || { echo "FAIL r3: the live loop does not ask PermsCaptureRule.keepCarried(..., UnarchiveService.odRestored(ctx, pkg), PermsCaptureRule.healPending(pkg))"; return 1; }
   [ "$(sed -n "$((l1+1))p" <<<"$b" | tr -d ' ')" = 'held.add(pkg);' ] && [ "$(sed -n "$((l1+2))p" <<<"$b" | tr -d ' ')" = 'continue;' ] \
     || { echo "FAIL r3: a held package is not skipped in the live loop (held.add + continue)"; return 1; }
   l1=$(lineof 'if (held.contains(pkg)) {' "$b")
@@ -113,7 +137,7 @@ check() {
   [ "$(sed -n "$((l1+1))p" <<<"$b" | tr -d ' ')" = "for(Stringln:old)sb.append(ln).append('\\n');" ] \
     && [ "$(sed -n "$((l1+2))p" <<<"$b" | tr -d ' ')" = 'continue;' ] \
     || { echo "FAIL r3: a held package's old lines are not re-emitted verbatim"; return 1; }
-  echo "  ok   r3 an unrestored deferred app is held mid-session and carried verbatim"
+  echo "  ok   r3 a package keepCarried holds (an unrestored deferred app, a running heal) is carried verbatim"
   # (r4) doLogoffImpl: captureAppCode(); then capturePerms(this, readAppModesStrictIn(getFilesDir()), false);, and no
   # other caller
   n=$(sed 's#//.*$##' <<<"$src" | grep -c 'capturePerms(')
@@ -169,36 +193,71 @@ check() {
   n=$(grep -cE 'capturePerms\(.*readAppModes(\(\)|In\()' <<<"$rs")
   [ "$n" = 0 ] || { echo "FAIL r9: PermsCaptureReceiver passes capturePerms a lenient keep-set read $n time(s)"; return 1; }
   echo "  ok   r9 neither caller passes readAppModes() or readAppModesIn("
+  # (r10) every line is compared with all its spaces removed: healbody leaves the spaces before a dropped trailing comment
+  h=$(healbody "$air" | tr -d ' ')
+  n=$(grep -cxF 'PermsCaptureRule.healBegun(pkg);' <<<"$h")
+  [ "$n" = 1 ] || { echo "FAIL r10: heal calls PermsCaptureRule.healBegun(pkg) $n time(s), want 1"; return 1; }
+  n=$(grep -cxF 'PermsCaptureRule.healEnded(pkg);' <<<"$h")
+  [ "$n" = 2 ] || { echo "FAIL r10: heal calls PermsCaptureRule.healEnded(pkg) $n time(s), want 2 (the finally and the failed start)"; return 1; }
+  l1=$(grep -nxF 'if(!UnarchiveService.hasInstalledCode(context,pkg)){' <<<"$h" | head -1 | cut -d: -f1)
+  [ -n "$l1" ] || { echo "FAIL r10: heal has no hasInstalledCode skip"; return 1; }
+  l2=$(awk -v s="$l1" 'NR>s && $0=="}" { print NR; exit }' <<<"$h")
+  l3=$(grep -nxF 'PermsCaptureRule.healBegun(pkg);' <<<"$h" | head -1 | cut -d: -f1)
+  l4=$(grep -nxF 'newThread(()->{' <<<"$h" | head -1 | cut -d: -f1)
+  [ -n "$l2" ] && [ -n "$l4" ] && [ "$l3" -gt "$l2" ] && [ "$l4" -eq "$((l3+2))" ] && lineis "$((l3+1))" 'try{' "$h" \
+    || { echo "FAIL r10: healBegun(pkg) is not after the no-code skip and directly before the guarded thread start"; return 1; }
+  lineis "$((l4+1))" 'try{' "$h" && lineis "$((l4+2))" 'for(intattempt=1;;attempt++){' "$h" \
+    || { echo "FAIL r10: the try does not open the thread body"; return 1; }
+  l1=$(grep -nxF '}finally{' <<<"$h" | head -1 | cut -d: -f1)
+  [ -n "$l1" ] && lineis "$((l1+1))" 'PermsCaptureRule.healEnded(pkg);' "$h" && lineis "$((l1+2))" '}' "$h" \
+    && lineis "$((l1+3))" '},"nowhere-install-heal").start();' "$h" \
+    || { echo "FAIL r10: healEnded(pkg) is not alone in a finally that closes the thread body"; return 1; }
+  lineis "$((l1+4))" '}catch(Throwablet){' "$h" && lineis "$((l1+5))" 'PermsCaptureRule.healEnded(pkg);' "$h" \
+    && lineis "$((l1+6))" 'throwt;' "$h" \
+    || { echo "FAIL r10: a thread that cannot start does not call healEnded(pkg) and rethrow"; return 1; }
+  echo "  ok   r10 heal begins after the no-code skip and every exit ends it"
+  # (r11) a held package the keptModes loop never met
+  l1=$(lineof 'if (held.contains(pkg)) {' "$b")
+  l2=$(lineof 'for (String pkg : held) {' "$b")
+  l3=$(lineof 'StoreInstaller.writeAtomic(' "$b")
+  [ "$l1" -gt 0 ] && [ "$l2" -gt "$l1" ] && [ "$l3" -gt "$l2" ] \
+    || { echo "FAIL r11: no loop over held between the keptModes carry and the write"; return 1; }
+  [ "$(sed -n "$((l2+1))p" <<<"$b" | tr -d ' ')" = 'if(keptModes.containsKey(pkg))continue;' ] \
+    && [ "$(sed -n "$((l2+2))p" <<<"$b" | tr -d ' ')" = 'java.util.ArrayList<String>old=oldByPkg.get(pkg);' ] \
+    && [ "$(sed -n "$((l2+3))p" <<<"$b" | tr -d ' ')" = "if(old!=null)for(Stringln:old)sb.append(ln).append('\\n');" ] \
+    || { echo "FAIL r11: a held package outside the keep-set does not have its old lines re-emitted verbatim"; return 1; }
+  echo "  ok   r11 a held package outside the keep-set keeps its old lines"
 }
-check "$RULE" "$PA" "$RCV" "$MAN" || { echo "FAILED"; exit 1; }
+check "$RULE" "$PA" "$RCV" "$MAN" "$AIR" || { echo "FAILED"; exit 1; }
 echo "== all checks pass"
 [ "$MUTATE" = yes ] || exit 0
 
 command -v perl >/dev/null 2>&1 || { echo "FAIL: --mutate needs perl, and there is none -- refusing to report" >&2; exit 1; }
 echo "== mutations (each must be CONVICTED; a mutant that does not apply or compile proves nothing)"
-mut() { # mut <label> <rule|pa|rcv|man> <perl-expr> <text the failure must contain>
-  local d f orig rule pa rcv man out rc
-  d=$(mktemp -d -p "$W"); rule=$RULE; pa=$PA; rcv=$RCV; man=$MAN
+mut() { # mut <label> <rule|pa|rcv|man|air> <perl-expr> <text the failure must contain>
+  local d f orig rule pa rcv man air out rc
+  d=$(mktemp -d -p "$W"); rule=$RULE; pa=$PA; rcv=$RCV; man=$MAN; air=$AIR
   case "$2" in
     rule) orig=$RULE; f="$d/PermsCaptureRule.java"; rule=$f ;;
     pa)   orig=$PA;   f="$d/ProfileActivity.java";  pa=$f ;;
     rcv)  orig=$RCV;  f="$d/PermsCaptureReceiver.java"; rcv=$f ;;
     man)  orig=$MAN;  f="$d/AndroidManifest.xml";   man=$f ;;
+    air)  orig=$AIR;  f="$d/AppInstallReceiver.java"; air=$f ;;
     *) echo "  ERROR     $1 -- unknown target $2"; return 1 ;;
   esac
   cp "$orig" "$f"
   if ! perl -0pi -e "$3" "$f"; then echo "  ERROR     $1 -- perl failed"; return 1; fi
   if cmp -s "$orig" "$f"; then echo "  INERT     $1"; return 1; fi
-  out=$(check "$rule" "$pa" "$rcv" "$man" 2>&1); rc=$?
+  out=$(check "$rule" "$pa" "$rcv" "$man" "$air" 2>&1); rc=$?
   if [ "$rc" -eq 0 ]; then echo "  SURVIVED  $1"; return 1; fi
   if [ "$rc" -ne 1 ]; then echo "  BROKEN    $1 -- rc=$rc (did not compile)"; return 1; fi
   case "$out" in *"$4"*) ;; *) echo "  BROKEN    $1 -- it failed, but not with '$4'"; return 1 ;; esac
   echo "  convicted $1"
 }
 fails=0
-mut "M1 keepCarried ignores restored" rule 's/ && !restored;/;/' "FAIL mid-session, ondemand, restored" || fails=$((fails+1))
-mut "M2 keepCarried ignores midSession" rule 's/return midSession && /return /' "FAIL sign-out, ondemand" || fails=$((fails+1))
-mut "M3 the keepCarried skip removed from capturePerms" pa 's/\n *\/\/ NWP-20261112-07: mid-session, a deferred app[^\n]*\n[^\n]*\n *if \(PermsCaptureRule\.keepCarried\([^\n]*\n *held\.add\(pkg\);\n *continue;\n *\}//' "FAIL r3" || fails=$((fails+1))
+mut "M1 keepCarried ignores restored" rule 's/ && !restored//' "FAIL mid-session, ondemand, restored" || fails=$((fails+1))
+mut "M2 keepCarried ignores midSession" rule 's/return midSession && \(healPending/return (healPending/' "FAIL sign-out, ondemand" || fails=$((fails+1))
+mut "M3 the keepCarried skip removed from capturePerms" pa 's/\n *\/\/ NWP-20261112-07: mid-session, a deferred app[^\n]*\n[^\n]*\n *\/\/ NWP-20261201-20:[^\n]*\n[^\n]*\n *if \(PermsCaptureRule\.keepCarried\([^\n]*\n *held\.add\(pkg\);\n *continue;\n *\}//' "FAIL r3" || fails=$((fails+1))
 mut "M4 a bare getFilesDir() left in capturePerms" pa 's/SettingsText\.read\(new java\.io\.File\(ctx\.getFilesDir\(\), "nowhere-perms"\)\)/SettingsText.read(new java.io.File(getFilesDir(), "nowhere-perms"))/' "FAIL r1" || fails=$((fails+1))
 mut "M5 the synchronized block removed" pa 's/^        synchronized \(PERMS_CAPTURE_LOCK\) \{$/        {/m' "FAIL r2" || fails=$((fails+1))
 mut "M6 the receiver's user-0 return removed" rcv 's/^ *if \(android\.os\.UserHandle\.myUserId\(\) == 0\) return;[^\n]*\n//m' "FAIL r5" || fails=$((fails+1))
@@ -210,4 +269,14 @@ mut "M11 the keep-set null guard removed" pa 's/\n *if \(keptModes == null\) \{.
 mut "M12 the nowhere-perms null guard removed" pa 's/\n *if \(oldByPkg == null\) \{.*?\n *return;\n *\}//s' "FAIL r8" || fails=$((fails+1))
 mut "M13 the receiver back on readAppModesIn" rcv 's/ProfileActivity\.readAppModesStrictIn\(app\.getFilesDir\(\)\)/ProfileActivity.readAppModesIn(app.getFilesDir())/' "FAIL r5" || fails=$((fails+1))
 mut "M14 doLogoff back on readAppModes()" pa 's/capturePerms\(this, readAppModesStrictIn\(getFilesDir\(\)\), false\);/capturePerms(this, readAppModes(), false);/' "FAIL r4" || fails=$((fails+1))
+mut "M15 keepCarried ignores healPending" rule 's/return midSession && \(healPending \|\| /return midSession \&\& (/' "FAIL mid-session, installed, heal pending" || fails=$((fails+1))
+mut "M16 healPending also holds at sign-out" rule 's/return midSession && \(healPending \|\| (.*?);\n/return healPending || (midSession \&\& $1;\n/' "FAIL sign-out, installed, heal pending" || fails=$((fails+1))
+mut "M17 the count made a set" rule 's/HEALS\.merge\(pkg, 1, Integer::sum\)/HEALS.put(pkg, 1)/' "FAIL begun x2, ended x1" || fails=$((fails+1))
+mut "M18 healBegun removed from heal" air 's/\n *PermsCaptureRule\.healBegun\(pkg\);[^\n]*//' "FAIL r10" || fails=$((fails+1))
+mut "M19 healEnded moved out of the finally" air 's/\} finally \{[^\n]*\n *PermsCaptureRule\.healEnded\(pkg\);\n *\}/PermsCaptureRule.healEnded(pkg);\n                } finally {\n                }/' "FAIL r10" || fails=$((fails+1))
+mut "M20 the call site passes false" pa 's/, PermsCaptureRule\.healPending\(pkg\)\)\) \{/, false)) {/' "FAIL r3" || fails=$((fails+1))
+mut "M21 the not-in-keptModes re-emit removed" pa 's/\n *for \(String pkg : held\) \{\n *if \(keptModes\.containsKey\(pkg\)\) continue;\n.*?\n *\}\n/\n/s' "FAIL r11" || fails=$((fails+1))
+mut "M22 a negative count kept" rule 's/if \(n == null\) return;/if (n == null) { HEALS.put(pkg, -1); return; }/' "FAIL ended with none begun" || fails=$((fails+1))
+mut "M23 no healEnded when the thread cannot start" air 's/(\} catch \(Throwable t\) \{[^\n]*\n) *PermsCaptureRule\.healEnded\(pkg\);\n/$1/' "FAIL r10" || fails=$((fails+1))
+mut "M24 a held kept package emitted twice" pa 's/\n *if \(keptModes\.containsKey\(pkg\)\) continue;//' "FAIL r11" || fails=$((fails+1))
 [ "$fails" -eq 0 ] && echo "== all mutations convicted" || { echo "== $fails mutation(s) not convicted"; exit 1; }

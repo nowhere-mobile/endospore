@@ -1,6 +1,6 @@
 package com.nowhere.chooser;
 
-/** NWP-20261122-15, NWP-20261126-05, NWP-20261130-09: LandingLine's rules and words, compiled with LandingLine.java
+/** NWP-20261122-15, NWP-20261126-05, NWP-20261130-09, NWP-20261201-34: LandingLine's rules and words, compiled with LandingLine.java
  *  and AppDeps.java, the rule the card's list reads (test-landing-line-java.sh). */
 public class LandingLineCases {
     static int fails = 0;
@@ -44,8 +44,17 @@ public class LandingLineCases {
     }
 
     static void rows(String what, int total, boolean[] landed, int[] want, int wantMore) {
-        eqa(what + ": rows", LandingLine.rows(pkgs(total), landed), want);
-        eqi(what + ": moreCount", LandingLine.moreCount(pkgs(total), landed), wantMore);
+        eqa(what + ": rows", LandingLine.rows(pkgs(total), landed, -1, -1), want);
+        eqi(what + ": moreCount", LandingLine.moreCount(pkgs(total), landed, -1, -1), wantMore);
+    }
+
+    /** The card's window read from LandingLine.Sweep, as the card's sync() and render() read it. */
+    static void win(String what, String[] p, long sweep, int wantInstalling, int[] want, int wantMore) {
+        boolean[] l = LandingLine.Sweep.landed(sweep);
+        int in = LandingLine.Sweep.installing(sweep), last = LandingLine.Sweep.lastLanded(sweep);
+        eqi(what + ": installing", in, wantInstalling);
+        eqa(what + ": rows", LandingLine.rows(p, l, in, last), want);
+        eqi(what + ": moreCount", LandingLine.moreCount(p, l, in, last), wantMore);
     }
 
     static final String GMS = "com.google.android.gms", GSF = "com.google.android.gsf", VENDING = "com.android.vending";
@@ -214,15 +223,108 @@ public class LandingLineCases {
         long d5 = LandingLine.Sweep.begin(six);
         for (String p : new String[] {"a", "b", "c"}) LandingLine.Sweep.outcome(d5, p, true);
         eqa("C45 from-5 card: the services row stays on top while plain apps land",
-                LandingLine.rows(six, LandingLine.Sweep.landed(d5)), new int[] {0, 4, 5});
+                LandingLine.rows(six, LandingLine.Sweep.landed(d5), -1, -1), new int[] {0, 4, 5});
         LandingLine.Sweep.depLanded(GMS);
         eqa("C45 from-5 card: its row leaves when it lands",
-                LandingLine.rows(six, LandingLine.Sweep.landed(d5)), new int[] {4, 5});
+                LandingLine.rows(six, LandingLine.Sweep.landed(d5), -1, -1), new int[] {4, 5});
 
         eq("C46 depLabel names Play services", LandingLine.depLabel(GMS), "Google Play services");
         eq("C46 depLabel names GSF", LandingLine.depLabel(GSF), "Google Services Framework");
         is("C46 depLabel names nothing else", LandingLine.depLabel("a") == null, true);
         is("C46 depLabel of null is null", LandingLine.depLabel(null) == null, true);
+
+        // C48-C52 NWP-20261201-31: a row keeps one name for the life of the card.
+        String[] nameRows = {VENDING, "a"};
+        long n1 = LandingLine.Sweep.begin(nameRows);
+        eq("C48 the first read is the row's name", LandingLine.Sweep.keepLabel(n1, 0, "Play Store"), "Play Store");
+        LandingLine.Sweep.outcome(n1, VENDING, true);
+        eq("C48 the app landing does not rename the row", LandingLine.Sweep.keepLabel(n1, 0, "Google Play Store"), "Play Store");
+        eq("C49 a recreated card reads the stored name", LandingLine.Sweep.keepLabel(n1, 0, "Google Play Store"), "Play Store");
+        eq("C49 another row is independent", LandingLine.Sweep.keepLabel(n1, 1, "A"), "A");
+        long n2 = LandingLine.Sweep.begin(nameRows);
+        eq("C50 a new sweep forgets the old names", LandingLine.Sweep.keepLabel(n2, 0, "Google Play Store"), "Google Play Store");
+        eq("C51 another sweep id reads its own name", LandingLine.Sweep.keepLabel(n2 - 1, 0, "X"), "X");
+        eq("C51 sweep id 0 reads its own name", LandingLine.Sweep.keepLabel(0, 0, "X"), "X");
+        eq("C51 neither stored anything", LandingLine.Sweep.keepLabel(n2, 0, "Y"), "Google Play Store");
+        eq("C51 an index past the end stores nothing", LandingLine.Sweep.keepLabel(n2, 5, "Z"), "Z");
+        eq("C51 a negative index stores nothing", LandingLine.Sweep.keepLabel(n2, -1, "Z"), "Z");
+        long n3 = LandingLine.Sweep.begin(nameRows);
+        is("C52 a null read returns null", LandingLine.Sweep.keepLabel(n3, 0, null) == null, true);
+        eq("C52 a null read stored nothing", LandingLine.Sweep.keepLabel(n3, 0, "A"), "A");
+
+        // W1-W7 NWP-20261201-34: the rolling window and the installing row (h62 #3).
+        String[] fifty = pkgs(50);
+        long w1 = LandingLine.Sweep.begin(fifty);
+        is("W1 starting p0 changes the installing row", LandingLine.Sweep.started(w1, "p0"), true);
+        win("W1 p0 started: 0 installing, the next two coming back", fifty, w1, 0, new int[] {0, 1, 2}, 47);
+        is("W1 a RETRY of p0 changes nothing", LandingLine.Sweep.started(w1, "p0"), false);
+        LandingLine.Sweep.outcome(w1, "p0", true);
+        eqi("W1 p0's outcome ends its install", LandingLine.Sweep.installing(w1), -1);
+        LandingLine.Sweep.started(w1, "p1");
+        win("W1 p0 ready, p1 installing, p2 coming back", fifty, w1, 1, new int[] {0, 1, 2}, 47);
+        LandingLine.Sweep.outcome(w1, "p1", true);
+        LandingLine.Sweep.started(w1, "p2");
+        win("W1 p1 ready: the previous ready left and all moved up", fifty, w1, 2, new int[] {1, 2, 3}, 46);
+
+        long w2 = LandingLine.Sweep.begin(fifty);
+        LandingLine.Sweep.outcome(w2, "p0", true);
+        LandingLine.Sweep.started(w2, "p1");
+        LandingLine.Sweep.outcome(w2, "p1", false);
+        LandingLine.Sweep.started(w2, "p2");
+        win("W2 p1 failed: the window passes it and it counts in +more", fifty, w2, 2, new int[] {0, 2, 3}, 47);
+
+        String[] gmsSix = {GMS, "a0", "a1", "a2", "a3", "a4", "a5"};
+        long w3 = LandingLine.Sweep.begin(gmsSix);
+        LandingLine.Sweep.started(w3, "a0");
+        eqi("W3 a0 installing", LandingLine.Sweep.installing(w3), 1);
+        is("W3 the dep's start changes the installing row", LandingLine.Sweep.depStarted(GMS), true);
+        win("W3 the dep installing: its row is first", gmsSix, w3, 0, new int[] {0, 1, 2}, 4);
+        is("W3 the same dep again changes nothing", LandingLine.Sweep.depStarted(GMS), false);
+        LandingLine.Sweep.depLanded(GMS);
+        win("W3 the dep landed: back to a0, the dep is the ready row", gmsSix, w3, 1, new int[] {0, 1, 2}, 4);
+
+        long w4 = LandingLine.Sweep.begin(gmsSix);
+        LandingLine.Sweep.started(w4, "a0");
+        LandingLine.Sweep.depStarted(GMS);
+        LandingLine.Sweep.outcome(w4, "a0", false);
+        eqi("W4 a failed dep and a0's failed outcome: nothing installing", LandingLine.Sweep.installing(w4), -1);
+
+        String[] sixApps = pkgs(6);
+        long w5 = LandingLine.Sweep.begin(sixApps);
+        LandingLine.Sweep.started(w5, "p0");
+        LandingLine.Sweep.end(w5);
+        eqi("W5 the end clears the installing row", LandingLine.Sweep.installing(w5), -1);
+        is("W5 a dep start after the end changes nothing", LandingLine.Sweep.depStarted("p1"), false);
+        is("W5 an app start after the end changes nothing", LandingLine.Sweep.started(w5, "p1"), false);
+        eqi("W5 the installing row stays clear after the end", LandingLine.Sweep.installing(w5), -1);
+        long w5b = LandingLine.Sweep.begin(sixApps);
+        for (int i = 0; i < 6; i++) {
+            LandingLine.Sweep.started(w5b, "p" + i);
+            LandingLine.Sweep.outcome(w5b, "p" + i, true);
+        }
+        LandingLine.Sweep.end(w5b);
+        win("W5 the last app landed: its row alone, no more row", sixApps, w5b, -1, new int[] {5}, 0);
+
+        long w6 = LandingLine.Sweep.begin(sixApps);
+        is("W6 another sweep's start changes nothing", LandingLine.Sweep.started(w6 + 1, "p0"), false);
+        eqi("W6 this sweep has no installing row after it", LandingLine.Sweep.installing(w6), -1);
+        LandingLine.Sweep.started(w6, "p0");
+        LandingLine.Sweep.outcome(w6, "p0", true);
+        LandingLine.Sweep.started(w6, "p1");
+        eqi("W6 installing(another sweep) is -1", LandingLine.Sweep.installing(w6 + 1), -1);
+        eqi("W6 lastLanded(another sweep) is -1", LandingLine.Sweep.lastLanded(w6 + 1), -1);
+        long w6b = LandingLine.Sweep.begin(sixApps);
+        eqi("W6 a new sweep has no installing row", LandingLine.Sweep.installing(w6b), -1);
+        eqi("W6 a new sweep has no last-landed row", LandingLine.Sweep.lastLanded(w6b), -1);
+
+        boolean[] w7 = {true, false, false};
+        eqa("W7 3 apps: every row, in order", LandingLine.rows(pkgs(3), w7, 1, 0), new int[] {0, 1, 2});
+        eqi("W7 3 apps: no more row", LandingLine.moreCount(pkgs(3), w7, 1, 0), 0);
+        eq("W7 INSTALLING", LandingLine.INSTALLING, "installing");
+        eq("W7 state: ready", LandingLine.state(true, false), "✓ ready");
+        eq("W7 state: landed wins over installing", LandingLine.state(true, true), "✓ ready");
+        eq("W7 state: installing, no glyph", LandingLine.state(false, true), "installing");
+        eq("W7 state: coming back", LandingLine.state(false, false), "◷ coming back");
         System.exit(fails == 0 ? 0 : 1);
     }
 }

@@ -20,7 +20,13 @@
 #   T8  every `am start` failing: exactly 4 tries and one `gate launch FAILED` line
 #   T9  a failing locksettings: one `keyguard disable FAILED rc=3` line
 #   T10 the switcher reads back 1: one `user switcher NOT hidden` line
-# /system/bin/nowhere_db_fix, /data/user/0 and /data/user_de/0 are rewritten to a scratch root (each rewrite counted:
+# The one `[gate] boot:` line in provision.log (T11-T14, NWP-20261129-31): the whole format and the whole field set of
+# each run, no `/`, no `"`, nothing else written to that file:
+#   T11 the clean run (ok=7, absent=1), and a line already in provision.log stays there
+#   T12 one failed scrub: failed=1 and failed-dbs=calllog.ce:6
+#   T13 the tool absent: telscrub=SKIPPED, still one line
+#   T14 each boot step's status (home-pin, launch and tries, keyguard) and the switcher read-back, sanitized
+# /system/bin/nowhere_db_fix, /data/user/0, /data/user_de/0 and /data/nowhere/provision.log are rewritten to a scratch root (each rewrite counted:
 # a miscount is REWRITE FAILED, exit 2; the FAILED line's /data/ prefix is stripped by the script, so under the
 # rewrite the scratch root stays in the path). Each case runs under every POSIX shell found (bash, sh, dash, mksh).
 #
@@ -57,17 +63,20 @@ DBS="$TP/databases/mmssms.db $CP/databases/calllog.db $CP/databases/calllog_shad
 # line (3); a base path by the database loop and, since NWP-20261019-15, the file-wipe loop (2) -- or by the one shared loop
 # of origin/main (1), which this suite must still be able to run against and convict. A mutant that drops /data/user_de/0
 # from one loop leaves 1 or 2 as well.
-N_TOOL="3"; N_CE="1 2"; N_DE="1 2"
+# provision.log is named once by PLOG=; 0 lets this suite run against origin/main's script, which has no such line, and
+# convict it there.
+N_TOOL="3"; N_CE="1 2"; N_DE="1 2"; N_PLOG="0 1"
 
 # setup <script> <root> <tool:yes|no> -> $root/gate.sh, stubs in $root/bin, planted files
 setup() {
   local script="$1" root="$2" tool="$3" b n
-  mkdir -p "$root/bin" "$root/sys/bin" "$root/data/user/0" "$root/data/user_de/0"
-  for pair in "/system/bin/nowhere_db_fix:$N_TOOL" "/data/user/0:$N_CE" "/data/user_de/0:$N_DE"; do
+  mkdir -p "$root/bin" "$root/sys/bin" "$root/data/user/0" "$root/data/user_de/0" "$root/data/nowhere"
+  for pair in "/system/bin/nowhere_db_fix:$N_TOOL" "/data/user/0:$N_CE" "/data/user_de/0:$N_DE" "/data/nowhere/provision.log:$N_PLOG"; do
     n=$(grep -v '^[[:space:]]*#' "$script" | grep -o "${pair%%:*}" | wc -l); n=$((n + 0))
     case " ${pair#*:} " in *" $n "*) ;; *) echo "REWRITE FAILED: ${pair%%:*} found $n times, expected ${pair#*:}" >&2; exit 2 ;; esac
   done
   sed -e "s@/system/bin/nowhere_db_fix@$root/sys/bin/nowhere_db_fix@g" \
+      -e "s@/data/nowhere/provision.log@$root/data/nowhere/provision.log@g" \
       -e "s@/data/user_de/0@$root/data/user_de/0@g" \
       -e "s@/data/user/0@$root/data/user/0@g" "$script" > "$root/gate.sh"
   : > "$root/calls.log"
@@ -82,6 +91,8 @@ setup() {
   printf '#!/bin/sh\nprintf "am:" >> "$CALLS"; for a in "$@"; do printf " %%s" "$a" >> "$CALLS"; done; echo >> "$CALLS"\nn=$(cat "$ROOT/am.n" 2>/dev/null || echo 0); n=$((n+1)); echo $n > "$ROOT/am.n"\n[ "$n" -gt "${AM_FAILS:-0}" ]\n' > "$root/bin/am"
   # nowhere_db_fix: records, exits FAILRC when the db path ends with FAILDB
   printf '#!/bin/sh\nprintf "telscrub-call:" >> "$CALLS"; for a in "$@"; do printf " %%s" "$a" >> "$CALLS"; done; echo >> "$CALLS"\ncase "$2" in *"$FAILDB") [ -n "$FAILDB" ] && exit "$FAILRC";; esac\nexit 0\n' > "$root/sys/bin/nowhere_db_fix"
+  # date prints a fixed value: T11-T14 pin the whole line, and a host locale's date format can hold a /
+  printf '#!/bin/sh\necho "%s"\n' "$BOOT_DATE" > "$root/bin/date"
   chmod +x "$root"/bin/* "$root/sys/bin/nowhere_db_fix"
   [ "$tool" = yes ] || rm -f "$root/sys/bin/nowhere_db_fix"
   for b in user/0 user_de/0; do
@@ -92,6 +103,22 @@ setup() {
   done
 }
 
+BOOT_DATE='Thu Nov 12 12:00:00 UTC 2026'
+BOOT_RE='^\[gate\] boot: home-pin rc=[0-9]+ launch=(ok|FAILED) tries=[1-4] keyguard rc=[0-9]+ switcher=([0-9a-z]{1,8}|\?) telscrub=(ran|SKIPPED) ok=[0-9]+ failed=[0-9]+ absent=[0-9]+ failed-dbs=(-|[a-z_]+\.(ce|de):[0-9]+(,[a-z_]+\.(ce|de):[0-9]+)*) \(NWP-20261129-31\) Thu Nov 12 12:00:00 UTC 2026$'
+# boot_line <root> <fields>: provision.log is exactly one line, it has the whole format, its fields are exactly <fields>,
+# and it holds no / and no ". Nothing else in the file passes, because the file is one line.
+boot_line() {
+  local f="$1/data/nowhere/provision.log" got
+  [ -f "$f" ] || return 1
+  [ "$(wc -l < "$f")" -eq 1 ] || return 1
+  got=$(cat "$f")
+  [[ "$got" =~ $BOOT_RE ]] || return 1
+  [ "$got" = "[gate] boot: $2 (NWP-20261129-31) $BOOT_DATE" ] || return 1
+  case "$got" in */*|*\"*) return 1 ;; esac
+}
+# bl <case> <shell name> <root> <label> <fields>
+bl() { if boot_line "$3" "$5"; then ok "$1 [$2] $4"; else no "$1 [$2] $4 -- provision.log: $(cat "$3/data/nowhere/provision.log" 2>/dev/null)"; fi; }
+
 # run_gate <shell> <root> -- env: FAILDB FAILRC AM_FAILS CMD_RC LOCK_RC SW_VALUE
 run_gate() {
   ROOT="$2" CALLS="$2/calls.log" PATH="$2/bin:$PATH" "$1" "$2/gate.sh" >/dev/null 2>&1
@@ -99,7 +126,7 @@ run_gate() {
 
 # check <label> <script> -- runs every case against $2 under every shell
 check() {
-  local script="$1" sh root n want db b nm
+  local script="$1" sh root n want db b nm sv swv
   for sh in "${SHELLS[@]}"; do
     nm=$(basename "$sh")
     # --- T1/T2/T3/T5(clean)/T6: tool present, everything exits 0
@@ -152,6 +179,17 @@ check() {
     done
     [ "$t6" = yes ] && ok "T6 [$nm] home pin before the launch, launch retried to success (3 calls), keyguard and switcher once, no failure line" \
                     || no "T6 [$nm] boot order/retry/re-assertions wrong, or a clean run wrote a failure line"
+    bl T11 "$nm" "$root" "clean run, one db absent: exactly one boot line, launched on try 3, ok=7 absent=1" \
+       "home-pin rc=0 launch=ok tries=3 keyguard rc=0 switcher=0 telscrub=ran ok=7 failed=0 absent=1 failed-dbs=-"
+    rm -rf "$root"
+    # --- T11: the line appends to provision.log; the earlier line stays
+    root=$(mktemp -d -p "$W") || exit 2; setup "$script" "$root" yes
+    echo "earlier line" > "$root/data/nowhere/provision.log"
+    FAILDB="" FAILRC=0 run_gate "$sh" "$root"
+    # The earlier line must be line 1. Then bl reads the rest; with that line lost, bl reads no file and fails.
+    if [ "$(sed -n 1p "$root/data/nowhere/provision.log")" = "earlier line" ]; then sed -i 1d "$root/data/nowhere/provision.log"; else rm -f "$root/data/nowhere/provision.log"; fi
+    bl T11 "$nm" "$root" "a line already in provision.log stays, and the boot line follows it" \
+       "home-pin rc=0 launch=ok tries=1 keyguard rc=0 switcher=0 telscrub=ran ok=8 failed=0 absent=0 failed-dbs=-"
     rm -rf "$root"
     # --- T4: tool absent
     root=$(mktemp -d -p "$W") || exit 2; setup "$script" "$root" no
@@ -166,6 +204,8 @@ check() {
     done
     [ "$t4" = yes ] && ok "T4 [$nm] tool absent: one SKIPPED line, no telscrub call, file wipes still done in both bases" \
                     || no "T4 [$nm] tool-absent boot wrong (SKIPPED line / telscrub calls / file wipes)"
+    bl T13 "$nm" "$root" "tool absent: still one boot line, telscrub=SKIPPED, every count 0" \
+       "home-pin rc=0 launch=ok tries=1 keyguard rc=0 switcher=0 telscrub=SKIPPED ok=0 failed=0 absent=0 failed-dbs=-"
     rm -rf "$root"
     # --- T5: one failure
     root=$(mktemp -d -p "$W") || exit 2; setup "$script" "$root" yes
@@ -178,6 +218,8 @@ check() {
     grep -qxF "telscrub-call: telscrub $root/data/user_de/0/$PH/databases/telephony_analytics.db $AN" <<<"$log" || t5=no
     [ "$t5" = yes ] && ok "T5 [$nm] rc=6 on user/0 calllog.db: exactly one FAILED line naming it, every other db still scrubbed" \
                     || no "T5 [$nm] failure not reported once and by name, or it stopped the other scrubs"
+    bl T12 "$nm" "$root" "rc=6 on user/0 calllog.db: failed=1, ok=7, failed-dbs=calllog.ce:6" \
+       "home-pin rc=0 launch=ok tries=1 keyguard rc=0 switcher=0 telscrub=ran ok=7 failed=1 absent=0 failed-dbs=calllog.ce:6"
     rm -rf "$root"
     # --- T7: the HOME pin fails
     root=$(mktemp -d -p "$W") || exit 2; setup "$script" "$root" yes
@@ -191,6 +233,8 @@ check() {
     [ "$(printf '%s\n' "$log" | grep -c '^telscrub-call:')" -eq 8 ] || t7=no
     [ "$t7" = yes ] && ok "T7 [$nm] pin rc=1: one pin call before the launch, one home pin FAILED line, launch and janitor still run" \
                     || no "T7 [$nm] failed HOME pin not reported once, or it stopped the launch or the janitor"
+    bl T14 "$nm" "$root" "pin rc=1: home-pin rc=1" \
+       "home-pin rc=1 launch=ok tries=1 keyguard rc=0 switcher=0 telscrub=ran ok=8 failed=0 absent=0 failed-dbs=-"
     rm -rf "$root"
     # --- T8: every launch fails
     root=$(mktemp -d -p "$W") || exit 2; setup "$script" "$root" yes
@@ -200,6 +244,8 @@ check() {
     [ "$(printf '%s\n' "$log" | grep -cxF "log: -t nowhere_gate gate launch FAILED after 4 tries -- the BootReceiver's launch is the only one left")" -eq 1 ] || t8=no
     [ "$t8" = yes ] && ok "T8 [$nm] every am start fails: 4 tries and one gate launch FAILED line" \
                     || no "T8 [$nm] launch failure: wrong try count or not reported once"
+    bl T14 "$nm" "$root" "every am start fails: launch=FAILED tries=4" \
+       "home-pin rc=0 launch=FAILED tries=4 keyguard rc=0 switcher=0 telscrub=ran ok=8 failed=0 absent=0 failed-dbs=-"
     rm -rf "$root"
     # --- T9: locksettings fails
     root=$(mktemp -d -p "$W") || exit 2; setup "$script" "$root" yes
@@ -208,6 +254,8 @@ check() {
     [ "$(printf '%s\n' "$log" | grep -cxF 'log: -t nowhere_gate keyguard disable FAILED rc=3')" -eq 1 ] \
       && ok "T9 [$nm] locksettings rc=3: one keyguard disable FAILED rc=3 line" \
       || no "T9 [$nm] failed keyguard re-assert not reported once"
+    bl T14 "$nm" "$root" "locksettings rc=3: keyguard rc=3" \
+       "home-pin rc=0 launch=ok tries=1 keyguard rc=3 switcher=0 telscrub=ran ok=8 failed=0 absent=0 failed-dbs=-"
     rm -rf "$root"
     # --- T10: the switcher reads back 1
     root=$(mktemp -d -p "$W") || exit 2; setup "$script" "$root" yes
@@ -216,7 +264,18 @@ check() {
     [ "$(printf '%s\n' "$log" | grep -cxF 'log: -t nowhere_gate user switcher NOT hidden -- user_switcher_enabled=1 want=0')" -eq 1 ] \
       && ok "T10 [$nm] switcher reads back 1: one user switcher NOT hidden line" \
       || no "T10 [$nm] switcher left visible not reported once"
+    bl T14 "$nm" "$root" "switcher reads back 1: switcher=1" \
+       "home-pin rc=0 launch=ok tries=1 keyguard rc=0 switcher=1 telscrub=ran ok=8 failed=0 absent=0 failed-dbs=-"
     rm -rf "$root"
+    # --- T14: the switcher read-back, sanitized: <read-back>:<field>, 1 to 8 characters of [0-9a-z] or ?
+    for sv in '1 /x:?' ':?' 'abcdefgh:abcdefgh' 'abcdefghi:?'; do
+      swv=${sv##*:}
+      root=$(mktemp -d -p "$W") || exit 2; setup "$script" "$root" yes
+      FAILDB="" FAILRC=0 SW_VALUE="${sv%:*}" run_gate "$sh" "$root"
+      bl T14 "$nm" "$root" "switcher reads back '${sv%:*}': switcher=$swv" \
+         "home-pin rc=0 launch=ok tries=1 keyguard rc=0 switcher=$swv telscrub=ran ok=8 failed=0 absent=0 failed-dbs=-"
+      rm -rf "$root"
+    done
   done
 }
 
@@ -268,6 +327,13 @@ if [ "$MUTATE" = yes ]; then
   mutate "M3 the launch-failure line dropped" sed '/gate launch FAILED after 4 tries/d' "T8"
   mutate "M4 the keyguard rc ignored" sed 's/ || _krc=\$?$//' "T9"
   mutate "M5 the switcher read-back dropped" sed 's/^_sw=\$(settings get global user_switcher_enabled .*$/_sw=0/' "T10"
+  # NWP-20261129-31: the boot line in provision.log, each convicted by its named case
+  mutate "N1 the boot line removed" sed '/^echo "\[gate\] boot:/d' "T11"
+  mutate "N2 the absent count never incremented" sed 's/_ts_absent=\$((_ts_absent + 1)); //' "T11"
+  mutate "N3 a failed scrub counted ok" sed 's/^    if \[ "\$_rc" -eq 0 \]; then$/    if true; then/' "T12"
+  mutate "N4 the SKIPPED flag never set" sed '/^  _ts=SKIPPED$/d' "T13"
+  mutate "N5 the switcher sanitizer removed" sed 's/^case "\$_sw" in .*$/_swv=$_sw/' "T14"
+  mutate "N6 the boot line overwrites provision.log" sed '/^echo "\[gate\] boot:/s/ >> "\$PLOG"/ > "$PLOG"/' "T11"
 fi
 
 echo

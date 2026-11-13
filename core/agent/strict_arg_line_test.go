@@ -14,6 +14,8 @@ import (
 // snapshot, and REMOVE-FIDO2-KEY read a missing credID line as "" ("remove every key"). A request whose argument line
 // never arrived rolled the head back and ended the session unsaved, or stripped every security key. These tests pin
 // the refusals; test-strict-arg-line.sh re-runs them against main.go with each refusal removed.
+// NWP-20261129-47: SET-PIN read a missing PIN line as "clear the stored PIN" and SET-GATE-ALARM a missing time line as
+// "clear the gate's alarm copy", and both took a cut line as whole. The same rule and the same suite now cover them.
 
 // strictArgDrive sends req to handleLogin over a REAL unix socket (net.Pipe cannot half-close), closes the client's
 // write side so the daemon's next ReadString returns io.EOF at once, and returns the trimmed reply. The socket dir
@@ -152,5 +154,80 @@ func TestStrictArgLine_RemoveKeyMissingLine(t *testing.T) {
 	}
 	if got := strictArgDrive(t, dest, "REMOVE-FIDO2-KEY\nAAAA\n"); got != "ERR-NOSESSION" {
 		t.Errorf("a marker with no uid: got %q, want ERR-NOSESSION", got)
+	}
+}
+
+func TestStrictArgLine_SetPinMissingLine(t *testing.T) {
+	dest := t.TempDir() // no .roamsession: a request that reaches the arm's session check answers ERR-NOSESSION
+	t.Setenv("NOWHERE_STATE", dest)
+	for _, c := range []struct{ req, want string }{
+		{"SET-PIN\n", "ERR"},                 // T1: no PIN line
+		{"SET-PIN\n1234", "ERR"},             // T2: a cut line
+		{"SET-PIN\n1234\n", "ERR-NOSESSION"}, // control: a whole line still reaches the session check
+		{"SET-PIN\n\n", "ERR-NOSESSION"},     // control: a whole empty line too (the clear)
+	} {
+		if got := strictArgDrive(t, dest, c.req); got != c.want {
+			t.Errorf("%q: got %q, want %q", c.req, got, c.want)
+		}
+	}
+}
+
+// strictAlarmRefused sends req with a stash and an owner file in place and requires the refusal: ERR, both files
+// byte-identical, the relay counted once (a cold-lock teardown waits on that count) and a relay-err line in gate.log.
+func strictAlarmRefused(t *testing.T, req string) {
+	t.Helper()
+	logPath := gateLogTestFile(t)
+	dest := t.TempDir()
+	p, ps := filepath.Join(dest, "gate-alarm"), filepath.Join(dest, "gate-alarm-src")
+	if err := os.WriteFile(p, []byte("1760000000000"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(ps, []byte("15\tcom.android.deskclock"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	before := gateAlarmRelays.Load()
+	if got := strictArgDrive(t, dest, req); got != "ERR" {
+		t.Errorf("%q: got %q, want ERR", req, got)
+	}
+	relayHolds(t, p, "1760000000000")
+	relayHolds(t, ps, "15\tcom.android.deskclock")
+	if moved := gateAlarmRelays.Load() - before; moved != 1 {
+		t.Errorf("%q: the relay count moved by %d, want 1", req, moved)
+	}
+	if l := relayLog(t, logPath); !strings.Contains(l, "relay-err") {
+		t.Errorf("%q: gate.log lacks relay-err: %q", req, l)
+	}
+}
+
+func TestStrictArgLine_SetGateAlarmMissingLine(t *testing.T) { // T3
+	strictAlarmRefused(t, "SET-GATE-ALARM\n")
+}
+
+func TestStrictArgLine_SetGateAlarmCutLine(t *testing.T) { // T4
+	strictAlarmRefused(t, "SET-GATE-ALARM\n1800000000000")
+}
+
+func TestStrictArgLine_SetGateAlarmWholeLine(t *testing.T) {
+	gateLogTestFile(t)
+	dest := t.TempDir()
+	cutoffHoldMu.Lock()
+	prev := cutoffHoldUID
+	cutoffHoldUID = "" // a held clear keeps the stash: this control is the plain clear
+	cutoffHoldMu.Unlock()
+	t.Cleanup(func() {
+		cutoffHoldMu.Lock()
+		cutoffHoldUID = prev
+		cutoffHoldMu.Unlock()
+	})
+	p := filepath.Join(dest, "gate-alarm")
+	if got := strictArgDrive(t, dest, "SET-GATE-ALARM\n1800000000000\n"); got != "OK" {
+		t.Errorf("a whole time line: got %q, want OK", got)
+	}
+	relayHolds(t, p, "1800000000000")
+	if got := strictArgDrive(t, dest, "SET-GATE-ALARM\n0\n"); got != "OK" {
+		t.Errorf("a whole 0 line: got %q, want OK", got)
+	}
+	if _, err := os.Stat(p); !os.IsNotExist(err) {
+		t.Errorf("a whole 0 line left the stash in place (%v)", err)
 	}
 }

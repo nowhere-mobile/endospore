@@ -1,0 +1,1 @@
+        ensureContactsRead(ctx); // NWP-20261201-29: so a text's notice can name its sender from this profile's contacts.

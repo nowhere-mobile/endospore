@@ -134,6 +134,22 @@ public class BackNowCycleCases {
         eq("reset: a landed seal cancels nothing", b.onLanded(2500), N);
         eq("reset: online posts nothing", b.onOnline(2600), N);
 
+        // NWP-20261201-09: reconnectAt() is the POST tick's stamp, and 0 whenever no prompt is posted.
+        b = new BackNowCycle();
+        eq("reconnectAt: 0 on a new cycle", b.reconnectAt(), 0);
+        b.onDrop();
+        eq("reconnectAt: 0 before the POST", b.reconnectAt(), 0);
+        eq("reconnectAt: posted at 2000", b.onOnline(2000), P);
+        eq("reconnectAt: the POST's stamp after it", b.reconnectAt(), 2000);
+        b.onOnline(2010);
+        eq("reconnectAt: a later online tick does not move it", b.reconnectAt(), 2000);
+        eq("reconnectAt: cancelled", b.onLanded(2100), C);
+        eq("reconnectAt: 0 after a CANCEL", b.reconnectAt(), 0);
+        b.onDrop();
+        b.onOnline(3000);
+        b.reset();
+        eq("reconnectAt: 0 after reset", b.reconnectAt(), 0);
+
         // Replies: only "OK <digits>" is a stamp; anything else is NOTHING and keeps the notice.
         String[] bad = {null, "", "BUSY", "OK", "OK ", "OK -5", "OK 12x", "OK 2100 extra", "ERR", "IDLE",
                 "OK 99999999999999999999", "ok 2100", "OK +2100", "STALE"};
@@ -220,7 +236,7 @@ pins() {
     || { echo "  PIN   P2 the no-session arm does not reset the cycle" >&2; bad=1; }
   perl -0ne 'exit(/if \(offTicks >= 3\) \{(?:(?!\n\s*\}\n).)*?postDropNotice\(app, uid\);\s*dropShownForUid = uid; backNow\.onDrop\(\);\s*\}/s ? 0 : 1)' "$w" \
     || { echo "  PIN   P3 the debounced drop arm does not arm the cycle" >&2; bad=1; }
-  perl -0ne 'exit(/if \(backNow\.onOnline\(System\.currentTimeMillis\(\) \/ 1000L\) == BackNowCycle\.POST\) \{\s*postBackNowNotice\(app, uid\);\s*backNowShownForUid = uid;\s*\}/ ? 0 : 1)' "$w" \
+  perl -0ne 'exit(/if \(backNow\.onOnline\(System\.currentTimeMillis\(\) \/ 1000L\) == BackNowCycle\.POST\) \{\s*postBackNowNotice\(app, uid, backNow\.reconnectAt\(\), SaveMode\.backNowBody\(pollDaemon\("GET-SAVE-MODE\\n"\), unmeteredCtx\(app\)\)\);\s*backNowShownForUid = uid;\s*\}/ ? 0 : 1)' "$w" \
     || { echo "  PIN   P4 the online arm does not post the prompt on POST" >&2; bad=1; }
   perl -0ne 'exit(/if \(backNow\.awaitingLanded\(\)\s*&& backNow\.onReply\(pollDaemon\("GET-SEAL-LANDED\\n"\)\.trim\(\)\) == BackNowCycle\.CANCEL\) \{\s*cancelBackNowNotice\(app, uid\);\s*backNowShownForUid = -1;\s*\}/ ? 0 : 1)' "$w" \
     || { echo "  PIN   P7 the slow tick does not cancel the prompt on GET-SEAL-LANDED's CANCEL" >&2; bad=1; }
@@ -273,4 +289,6 @@ mut "C6 the not-STALE arm resets the cycle"       ch 's/(\} else \{\n(\s*)if \(s
 mut "C7 every online tick moves reconnectAt"      bc 's/(int onOnline\(long nowSec\) \{\n)/$1        reconnectAt = nowSec;\n/' || fails=$((fails+1))
 mut "C8 a malformed reply reads as a stamp"       bc 's/return v < 0 \? NOTHING : onLanded\(v\);/return onLanded(v < 0 ? Long.MAX_VALUE : v);/' || fails=$((fails+1))
 mut "C9 the online arm posts on every tick"       ch 's/if \(backNow\.onOnline\(System\.currentTimeMillis\(\) \/ 1000L\) == BackNowCycle\.POST\) \{/if (backNow.onOnline(System.currentTimeMillis() \/ 1000L) >= 0) {/' || fails=$((fails+1))
+mut "C10 reconnectAt returns 0 (case reconnectAt: the POST's stamp after it)" bc 's/(long reconnectAt\(\) \{\n\s*)return reconnectAt;/$1return 0;/' || fails=$((fails+1))
+mut "C11 the watcher passes no stamp (pin P4)"     ch 's/postBackNowNotice\(app, uid, backNow\.reconnectAt\(\), /postBackNowNotice(app, uid, 0L, /' || fails=$((fails+1))
 [ "$fails" -eq 0 ] && echo "== all mutations convicted" || { echo "== $fails mutation(s) not convicted"; exit 1; }

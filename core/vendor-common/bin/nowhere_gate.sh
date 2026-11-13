@@ -11,6 +11,10 @@
 # ChooserActivity is singleTask, so a duplicate launch is a no-op. Also clears the Android-12+ "stopped"
 # state of a freshly-flashed system app on EVERY boot (not just first-provision), so the gate auto-arms.
 
+# NWP-20261129-31: the gate has no log of its own and its logcat lines reach no issue report, so the boot's outcome
+# also goes to provision.log, which every report carries (as NWP-20261128-28's start line).
+PLOG=/data/nowhere/provision.log
+
 # #46: pin the GATE as user 0's HOME (BEFORE launching it, so home resolves to the gate). The chooser declares
 # CATEGORY_HOME, so a user-0 gate task-death (crash / the a11y-dump NPE / a foreground race) relaunches THE
 # GATE instead of dropping user 0 to launcher3 (which exposes the drawer + Settings, un-authenticated). The
@@ -95,14 +99,23 @@ for _base in /data/user/0 /data/user_de/0; do
   rm -rf "$_base/com.nowhere.chooser/cache/mms"/* 2>/dev/null
 done
 
+_ts=ran; _ts_ok=0; _ts_failed=0; _ts_absent=0; _ts_dbs=
 if [ -x /system/bin/nowhere_db_fix ]; then
   scrub_db() { # $1=db path, $2..=content tables to empty
-    local _db _rc
+    local _db _rc _nm _sc
     _db="$1"; shift
-    [ -f "$_db" ] || return 0
+    [ -f "$_db" ] || { _ts_absent=$((_ts_absent + 1)); return 0; }
     /system/bin/nowhere_db_fix telscrub "$_db" "$@" >/dev/null 2>&1
     _rc=$?
     [ "$_rc" -eq 0 ] || log -t nowhere_gate "telscrub FAILED rc=$_rc on ${_db#/data/} -- its deleted rows may still be on disk" 2>/dev/null
+    if [ "$_rc" -eq 0 ]; then
+      _ts_ok=$((_ts_ok + 1))
+    else
+      _ts_failed=$((_ts_failed + 1))
+      _nm=${_db##*/}; _nm=${_nm%.db}
+      case "$_db" in */user_de/*) _sc=de ;; *) _sc=ce ;; esac
+      _ts_dbs="${_ts_dbs:+$_ts_dbs,}$_nm.$_sc:$_rc"
+    fi
     return 0
   }
   for _base in /data/user/0 /data/user_de/0; do
@@ -127,8 +140,23 @@ if [ -x /system/bin/nowhere_db_fix ]; then
   done
 else
   # Both editions' .mk lists ship nowhere_db_fix, so reaching here means a build-configuration
-  # regression. The gate has no log file; the Android logger is the only channel it has, and one line
-  # beats the old `command -v sqlite3` behaviour, which skipped this entire janitor on every user
-  # build in perfect silence.
+  # regression. The gate has no log file of its own; this logcat line names the missing tool, the boot line at the
+  # end of this script records telscrub=SKIPPED, and either beats the old `command -v sqlite3` behaviour, which
+  # skipped this entire janitor on every user build in perfect silence.
   log -t nowhere_gate "telscrub SKIPPED: /system/bin/nowhere_db_fix missing on this build" 2>/dev/null
+  _ts=SKIPPED
 fi
+
+# NWP-20261129-31: the boot's outcome, one line in provision.log. What each field answers: home-pin rc, did user 0's
+# HOME pin land; launch and tries, did `am start` succeed and on which of the four tries; keyguard rc, did the
+# re-assert land; switcher, what user_switcher_enabled reads back (`?` when that is not 1 to 8 characters of [0-9a-z],
+# empty included); telscrub, did the janitor run or was the tool absent; ok, failed and absent, how each database
+# call ended; failed-dbs, each refused database as <db>.<ce|de>:<rc>, or - when none was. Device facts only: no path,
+# no uid, no package, no `"` (log_scrub reads one as the start of a name), no count of deleted rows or wiped files.
+# Every run of nowhere.rc's boot_completed action writes one `[gate] boot:` line beside provision's `[provision] start:`
+# line, so a second pair whose start line reads mounts=2 or more is the action re-running over a live state dir (the
+# NWP-20261128-28 question). A failed write changes nothing else. Residual: roamd's boot log scrub (log_scrub) rewrites
+# provision.log in place shortly after BOOT_COMPLETED, so a line appended during that rewrite can be lost.
+if [ "$i" -lt 4 ]; then _launch=ok; _tries=$((i + 1)); else _launch=FAILED; _tries=4; fi
+case "$_sw" in ''|?????????*|*[!0-9a-z]*) _swv='?' ;; *) _swv=$_sw ;; esac
+echo "[gate] boot: home-pin rc=$_hrc launch=$_launch tries=$_tries keyguard rc=$_krc switcher=$_swv telscrub=$_ts ok=$_ts_ok failed=$_ts_failed absent=$_ts_absent failed-dbs=${_ts_dbs:--} (NWP-20261129-31) $(date)" >> "$PLOG" 2>/dev/null

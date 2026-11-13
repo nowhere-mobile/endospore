@@ -1,0 +1,8 @@
+version 0.5.55
+previous 0.5.54
+- Profile's Save automatically setting chooses Always, Only on Wi-Fi or Off, and your choice follows you to every phone.
+- Sign-in is faster: an app that is not installed gets its data when you open it or when the Auto sweep installs it.
+- The Auto sweep's card has Pause and Stop, and a tap outside the card no longer closes it.
+- Text and picture message notices show the sender's name from your contacts.
+- Your apps shows when Play Store has a newer version of an app than your saved copy, with a button to open it there.
+- A health check notices when Play services stops delivering notifications and offers to restart it.

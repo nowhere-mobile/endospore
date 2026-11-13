@@ -129,10 +129,11 @@ agent_sim() {
 }
 pw() { printf '%s\n' "$ROOT/sim/pw"; }
 _ms() { echo 0; }
+od_fetch_data() { return 0; }; od_listed() { return 1; }; od_block_app() { return 0; }; od_unblock_app() { :; }; od_pending_clear() { :; }; od_block_installed() { :; }; od_shipped_prep() { return 0; }; od_park_var() { :; }; od_unf_path() { echo "$STATE/odfetch.$1/unfetched.$2"; }   # NWP-20261130-03
 sleep() { return 0; }
 for t in stop_mediad usb_host relabel_launcher remap_media_db insert_deferred_media remap_per_pkg _tlog _ssum acct_restore remap_tree reown_ext_appdata \
          hold_ondemand od_parked_report reap_stale_ondemand reap_orphan_provisioned restorecon \
-         uiderrors_floor_take uiderrors_floor_commit tz_surface; do
+         uiderrors_floor_take uiderrors_floor_commit tz_surface sroam_surface; do
   eval "$t() { :; }"
 done
 in_scope_tokens() { printf '+de +media'; }   # NWP-20261113-15: the IN line's scope tokens
@@ -333,15 +334,15 @@ EOF
     say "== [$sh] S6: source pins on the arm =="
     n=$(armcode | grep -cF 'ks_signin_reset "$uid"')
     chk "S6 [$sh] exactly one ks_signin_reset \"\$uid\" in the arm" eqv "$n" 1
-    a=$(lineno 'NOWHERE_PHASE=apps NOWHERE_CLAIMS_SEED'); b=$(lineno 'ks_signin_reset "$uid"'); c=$(lineno 'CHOOSER0="')
-    chk "S6 [$sh] it follows the CE restore and precedes CHOOSER0=" eval '[ -n "$a" ] && [ -n "$b" ] && [ -n "$c" ] && [ "$a" -lt "$b" ] && [ "$b" -lt "$c" ]'
+    a=$(lineno 'NOWHERE_PHASE=apps NOWHERE_CLAIMS_SEED'); v=$(lineno 'if [ -n "$_innet" ]; then'); b=$(lineno 'ks_signin_reset "$uid"'); c=$(lineno 'keystore_restore   # #210 p2')
+    chk "S6 [$sh] it follows the CE restore and the scope verdict, and precedes keystore_restore" eval '[ -n "$a" ] && [ -n "$v" ] && [ -n "$b" ] && [ -n "$c" ] && [ "$a" -lt "$v" ] && [ "$v" -lt "$b" ] && [ "$b" -lt "$c" ]'
     chk "S6 [$sh] the arm calls no keystore_push" eqv "$(armcode | grep -c 'keystore_push')" 0
     chk "S6 [$sh] no top-level KS_IMPORT clear on every in" eqv "$(grep -cF '[ "$op" = "in" ] && rm -f "$KS_IMPORT"' "$f")" 0
 
     say "== [$sh] K4: source pins on the keystore_restore call =="
     chk "K4 [$sh] exactly one keystore_restore call in the arm" eqv "$(armcode | grep -cxE '[[:space:]]*keystore_restore([[:space:]].*)?')" 1
     e=$(lineno '_tlog appcode-agent "$_tt"   # the blank/failed arm')
-    a=""; [ -n "$e" ] && a=$(printf '%s\n' "$IN" | awk -v s="$e" 'NR > s && /^      fi$/ {print NR; exit}')
+    a=""; [ -n "$e" ] && a=$(printf '%s\n' "$IN" | awk -v s="$e" 'NR > s && /^          fi$/ {print NR; exit}')
     b=$(printf '%s\n' "$IN" | grep -nE '^[[:space:]]*keystore_restore([[:space:]]|$)' | head -1 | cut -d: -f1)
     c=$(printf '%s\n' "$IN" | grep -nF '# Roamed prefs' | head -1 | cut -d: -f1)
     chk "K4 [$sh] it follows the #apps block's fi and precedes # Roamed prefs" eval '[ -n "$a" ] && [ -n "$b" ] && [ -n "$c" ] && [ "$a" -lt "$b" ] && [ "$b" -lt "$c" ]'
@@ -373,7 +374,7 @@ L_FLAT='  for _ksf in "$KS_IN"/*.keys; do [ -e "$_ksf" ] || continue; rm -f "$_k
 L_KID='  case "$_u" in '"''"'|*[!0-9]*) return 1 ;; esac'
 L_AC='[ "$op" = "in" ] && rm -f "$STATE"/.armcred.* 2>/dev/null   # DIA-20260813-09: a new session must re-arm before ARM-PIN may claim PINSET'
 L_WB='    if [ "$_ksr" = 0 ] || [ "$_ksr" = 1 ]; then mv -f "$_kst" "$KS_MAP" 2>>"$LOG" || { _ksd=0; echo "[roamd] IN keystore-map rewrite FAILED -- the map is unchanged (NWP-20261124-24)" >> "$LOG"; }; else _ksd=0; fi'
-L_RIN='        print -r -- "[roamd] IN $(qn "$name") #apps code restored → user0 chooser $(date)" >> "$LOG"'
+L_RIN='            print -r -- "[roamd] IN $(qn "$name") #apps code restored → user0 chooser $(date)" >> "$LOG"'
 L_IOWN='      case "$_ksn" in '"''"'|*[!0-9]*) ;; ??????*) _kso=${_ksn%?????} ;; esac'
 L_IKEEP='    if [ -n "$_kso" ] && [ "$_kso" != "$_ksu" ] && userdir_has_record "$_kso"; then _ksj=$((_ksj + 1)); continue; fi'
 M_P2='      case "$_ksn" in '"''"'|*[!0-9]*) ;; ??????*) _kso=${_ksn%"${_ksn#?????}"} ;; esac'

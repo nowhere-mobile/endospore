@@ -1,6 +1,6 @@
 package com.nowhere.chooser;
 
-/** NWP-20261126-07 / NWP-20261128-20 (h50 #3): the cases for OlderCopy and AppCodeManifest's installer line, run by
+/** NWP-20261126-07 / NWP-20261128-20 / NWP-20261130-07 (h50 #3): the cases for OlderCopy and AppCodeManifest's installer line, run by
  *  core/vendor-common/bin/test-older-copy-java.sh. */
 public final class OlderCopyCases {
     static int bad = 0;
@@ -20,6 +20,15 @@ public final class OlderCopyCases {
 
     static final String V = "com.android.vending";
     static final String OWN = "com.nowhere.chooser";
+    static final String OTHER = "com.other.store";
+    static final String M_PLAY = "vc\t1\ninst\t" + V + "\n";
+    static final String M_OTHER = "vc\t1\ninst\t" + OTHER + "\n";
+    static final String M_NONE = "vc\t1\n";
+
+    static void row(String what, OlderCopy.RowState want, boolean refused, boolean kept, boolean installedNow,
+            String meta, boolean playOnProfile) {
+        eq("C6", what, want, OlderCopy.rowState(refused, kept, installedNow, meta, playOnProfile));
+    }
 
     public static void main(String[] a) {
         int b0 = bad;
@@ -84,6 +93,34 @@ public final class OlderCopyCases {
             eq("C5", "act " + i, java.util.Arrays.toString(m0.acts.get(i)), java.util.Arrays.toString(m1.acts.get(i)));
         eq("C5", "vc value", 42, m1.vc);
         if (bad == b0) System.out.println("ok C5 parseMeta() ignores the inst line");
+
+        b0 = bad;
+        OlderCopy.RowState NORMAL = OlderCopy.RowState.NORMAL, PLAIN = OlderCopy.RowState.NOT_RESTORED, PLAY = OlderCopy.RowState.PLAY;
+        row("refused, kept, Play on the profile, Play's app", PLAY, true, true, false, M_PLAY, true);
+        row("Play Store missing", PLAIN, true, true, false, M_PLAY, false);
+        row("another store's app", PLAIN, true, true, false, M_OTHER, true);
+        row("no installer recorded", PLAIN, true, true, false, M_NONE, true);
+        row("no meta", PLAIN, true, true, false, null, true);
+        row("not refused", NORMAL, false, true, false, M_PLAY, true);
+        row("not refused, not kept", NORMAL, false, false, false, null, false);
+        row("not kept (Off)", NORMAL, true, false, false, M_PLAY, true);
+        row("installed since (Play brought it back)", NORMAL, true, true, true, M_PLAY, true);
+        row("installed since, another store", NORMAL, true, true, true, M_OTHER, false);
+        if (bad == b0) System.out.println("ok C6 rowState() gives the Play state only under both conditions, the plain state for any other refusal, normal otherwise");
+
+        b0 = bad;
+        eq("C7", "the Play line", "Not restored · Play Store has a newer version", OlderCopy.rowLine(PLAY));
+        eq("C7", "the plain line", "Not restored", OlderCopy.rowLine(PLAIN));
+        eq("C7", "a normal row", null, OlderCopy.rowLine(NORMAL));
+        eq("C7", "the button on the Play state", true, OlderCopy.rowButton(PLAY));
+        eq("C7", "no button on the plain state", false, OlderCopy.rowButton(PLAIN));
+        eq("C7", "no button on a normal row", false, OlderCopy.rowButton(NORMAL));
+        eq("C7", "the button's words", "Open in Play Store", OlderCopy.BUTTON);
+        if (bad == b0) System.out.println("ok C7 rowLine() and rowButton() say the decided words, and only the Play state has the button");
+
+        b0 = bad;
+        eq("C8", "the Play page", "market://details?id=com.x.y", OlderCopy.playPageUri("com.x.y"));
+        if (bad == b0) System.out.println("ok C8 playPageUri() is the app's Play page");
 
         if (bad > 0) System.exit(1);
     }

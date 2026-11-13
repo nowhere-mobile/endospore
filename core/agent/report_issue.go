@@ -1432,7 +1432,7 @@ func buildIssueReportWith(name string, deviceScope bool, note string, extra map[
 // reachability test checked its own duplicate and stayed green when a key was removed from the real one.
 // "ota.log" sits AFTER the session logs: on a gate report it is the payload (often the only reason the
 // report exists), so every session log must go before it does.
-var issueTrimOrder = []string{"provision.log", "mediad.log", "roam.log", "login.log", "gate.log", "ota.log", "crashes", "anr", "uiderrors", "prev_boot", "avc"}
+var issueTrimOrder = []string{"provision.log", "mediad.log", "roam.log", "login.log", "gate.log", "ota.log", "crashes", "anr", "gms", "uiderrors", "prev_boot", "avc"}
 
 func trimIssueReport(rep *issueReport) {
 	// Trim least-useful first. "avc" is LAST deliberately (DIA-20260806-04): a denial names the missing
@@ -1445,6 +1445,8 @@ func trimIssueReport(rep *issueReport) {
 	// data-loss report it is the one section that can name what destroyed the data.
 	// NWP-20261128-17: "crashes" sits just before "anr": it is the biggest and most app-specific section, and it is
 	// already a cut of five records.
+	// NWP-20261201-01: "gms" sits just before "uiderrors": it is at most 41 lines, and its parsed values are also in the
+	// status keys, which no trim touches.
 	order := issueTrimOrder
 	for {
 		b, _ := json.Marshal(rep)
@@ -1532,12 +1534,16 @@ func handleReportIssue(conn net.Conn, dest, reqLine string) {
 	// warm-switched session is still live, so the gate can never render session logs (the preview oracle).
 	deviceScope := req.Gate || name == ""
 	rep := buildIssueReportWith(name, deviceScope, req.Note, req.Status, func() string { return fetchUiderrors(dest, name, uid) }, readAnrSeen(dest))
-	mergeCrashes(&rep, req.CrashAccess, req.Crashes, name, deviceScope) // NWP-20261128-17 (Q121): session scope only
-	trimIssueReport(&rep)                                               // the crash section can be about 20 KiB: trim again
+	mergeCrashes(&rep, req.CrashAccess, req.Crashes, name, deviceScope)                                               // NWP-20261128-17 (Q121): session scope only
+	mergeGmsState(&rep, func() string { return fetchGmsState(dest, name, uid) }, deviceScope, nameSpellings(name)...) // NWP-20261201-01: session scope only
+	trimIssueReport(&rep)                                                                                             // the crash section can be about 20 KiB: trim again
 	// After trimIssueReport, so outside the size limit: about 200 bytes against 200 KiB, harmless.
 	mergeSigninFail(rep.Status, dest, deviceScope, time.Now()) // NWP-20261106-07 (Q065): after the chooser's status, gate scope only
 	mergeSigninSummary(rep.Status, uid, deviceScope)           // NWP-20261122-09: session scope only, this session's uid only
 	mergeDaySummary(rep.Status, uid, deviceScope)              // NWP-20261124-12: session scope only, this session's uid only
+	// NWP-20261201-02: session scope only; the fetch waits at most gmsExitsWait.
+	mergeGmsExits(rep.Status, func() string { return fetchGmsExits(dest, name, uid) }, dest, deviceScope)
+	mergeHealth(rep.Status, uid, deviceScope) // NWP-20261201-08: session scope only, this session's uid only
 
 	if req.Preview {
 		// "View what's sent": hand the chooser the EXACT scrubbed bytes to show the user before they consent.

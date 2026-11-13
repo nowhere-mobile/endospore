@@ -175,12 +175,12 @@ elif kind == "acct0":
 elif kind in ("acctg", "acctg0", "acctgodd"):
     c.execute("CREATE TABLE accounts (_id INTEGER PRIMARY KEY, name TEXT, type TEXT)")
     rows = {
-        "acctg": [(7, "zeta.planted@gmail.com", "com.google"), (2, "work@example.org", "com.example.exchange"),
-                  (4, "alpha.planted@gmail.com", "com.google")],
+        "acctg": [(7, "zeta.planted@example.com", "com.google"), (2, "work@example.org", "com.example.exchange"),
+                  (4, "alpha.planted@example.com", "com.google")],
         "acctg0": [],
         "acctgodd": [(1, "a\nb", "com.google"), (2, "", "com.google"), (3, None, "com.google"),
                      (4, "del\x7fx", "com.google"), (5, "tab\tx", "com.google"),
-                     (6, "jos\u00e9@gmail.com", "com.google"), (7, "other\nname", "com.example.exchange")],
+                     (6, "jos\u00e9@example.com", "com.google"), (7, "other\nname", "com.example.exchange")],
     }[kind]
     for r in rows:
         c.execute("INSERT INTO accounts(_id, name, type) VALUES (?,?,?)", r)
@@ -386,11 +386,11 @@ run_suite() {
   echo "== accounts-google =="
   fx acctg "$d/g1.db"; fx acctg0 "$d/g0.db"; fx acctgodd "$d/godd.db"
   out="$("$T" accounts-google "$d/g1.db")"; rc=$?
-  eq "accounts-google: every type counted, Google names in _id order" "$out" "$(printf '3\nalpha.planted@gmail.com\nzeta.planted@gmail.com')"
+  eq "accounts-google: every type counted, Google names in _id order" "$out" "$(printf '3\nalpha.planted@example.com\nzeta.planted@example.com')"
   eq "accounts-google: exits 0" "$rc" 0
   out="$("$T" accounts-google "$d/g0.db")"; rc=$?; eq "accounts-google: no rows prints 0 alone" "$out" 0; eq "accounts-google: no rows exits 0" "$rc" 0
   out="$("$T" accounts-google "$d/godd.db")"; rc=$?
-  eq "accounts-google: newline, empty, NULL, DEL and tab names print ?, UTF-8 passes" "$out" "$(printf '7\n?\n?\n?\n?\n?\njos\303\251@gmail.com')"
+  eq "accounts-google: newline, empty, NULL, DEL and tab names print ?, UTF-8 passes" "$out" "$(printf '7\n?\n?\n?\n?\n?\njos\303\251@example.com')"
   eq "accounts-google: odd names exit 0" "$rc" 0
   out="$("$T" accounts-google "$d/a1.db" 2>/dev/null)"; rc=$?
   eq "accounts-google: no type column prints -1 alone" "$out" -1; eq "accounts-google: no type column exits 6" "$rc" 6

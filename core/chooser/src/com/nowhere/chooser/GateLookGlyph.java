@@ -5,7 +5,8 @@ package com.nowhere.chooser;
  * sign-in fields when the screen turns off ...", second bullet). A glyph in the gate's top-right corner, left of the
  * help "?", shows a sun while the gate is dark and a moon while it is light, as the storefront's toggle does; a tap
  * switches the one device-wide look with no owner passphrase. The decision's two inferences, built as written: the
- * glyph shows the look a tap switches to, and Owner settings › Appearance stays as a second way to set it.
+ * glyph shows the look a tap switches to, and ~~Owner settings › Appearance stays as a second way to set it~~
+ * (superseded 2026-11-06, "Owner settings loses Appearance ...", NWP-20261130-13: this is the only light/dark control).
  *
  * NWP-20261124-15 (docs/product-decisions.md, 2026-11-02, "twenty-four answers to the open-decisions list ...", #11):
  * the owner can make the look owner-only (Owner settings › Appearance, OWNER_ONLY_KEY). While it is, the glyph is

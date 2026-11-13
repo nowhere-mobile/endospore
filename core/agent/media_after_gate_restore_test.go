@@ -334,18 +334,18 @@ func TestMediaRestorePlan_CallSiteStreamsThePlan(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Self-checks: today's call, and the plan called after the restore, must both fail the scan.
-	const call = "skipped = cdcRestore(base, key, mediaRestorePlan(profile, pass, restoredHead, m), dest)"
-	if mediaRestorePlanCalled(strings.Replace(src, call, "skipped = cdcRestore(base, key, m, dest)", 1)) == nil {
+	const call = "skipped = restoreSkippingParked(base, key, profile, mediaRestorePlan(profile, pass, restoredHead, m), dest)"
+	if mediaRestorePlanCalled(strings.Replace(src, call, "skipped = restoreSkippingParked(base, key, profile, m, dest)", 1)) == nil {
 		t.Error("the unsplit call passes the scan")
 	}
-	after := strings.Replace(src, call, "skipped = cdcRestore(base, key, m, dest)\n\t\t\t_ = mediaRestorePlan(profile, pass, restoredHead, m)", 1)
+	after := strings.Replace(src, call, "skipped = restoreSkippingParked(base, key, profile, m, dest)\n\t\t\t_ = mediaRestorePlan(profile, pass, restoredHead, m)", 1)
 	if mediaRestorePlanCalled(after) == nil {
 		t.Error("a plan called after cdcRestore passes the scan")
 	}
 }
 
 func mediaRestorePlanCalled(src string) error {
-	const call = "skipped = cdcRestore(base, key, mediaRestorePlan(profile, pass, restoredHead, m), dest)"
+	const call = "skipped = restoreSkippingParked(base, key, profile, mediaRestorePlan(profile, pass, restoredHead, m), dest)"
 	i := strings.Index(src, `case "restore":`)
 	if i < 0 {
 		return errSeed("no restore case")
@@ -361,7 +361,7 @@ func mediaRestorePlanCalled(src string) error {
 	if strings.Count(rest[:end], call) != 1 {
 		return errSeed("the restore case does not stream the plan before finishRestore: want " + call)
 	}
-	if strings.Contains(src, "skipped = cdcRestore(base, key, m, dest)") {
+	if strings.Contains(src, "skipped = restoreSkippingParked(base, key, profile, m, dest)") {
 		return errSeed("the restore case still streams the full m")
 	}
 	return nil

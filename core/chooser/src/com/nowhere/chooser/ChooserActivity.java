@@ -70,6 +70,9 @@ public class ChooserActivity extends Activity {
     private static int DOT_OFF   = GatePalette.DARK.dotOff;    // a step dot not yet reached
 
     private EditText profileField, passField, confirmField;
+    private EditText ownerVerifyField;                 // NWP-20261201-15: the owner-verify passphrase box; a screen-off empties it
+    private EditText simPinField;                      // NWP-20261201-15: the SIM PIN box; a screen-off empties it
+    private EditText wifiPassField;                    // NWP-20261201-15: the gate's Wi-Fi password box; a screen-off empties it
     private EditText gateCodeField;                    // #57: optional claim code on the create form (managed signup)
     private TextView gateScanLink;                     // #57: "Scan code" -> QrScanActivity
     private static final int REQ_GATE_SCAN = 0x6A57;   // #57: gate create-form QR scan
@@ -157,7 +160,7 @@ public class ChooserActivity extends Activity {
     private TextView forgotLink; // "Forgot your passphrase?" -- locked with the form during any login (Chester)
     private TextView addPhoneLink; // NWP-20260915-09: "Passphrase works on your other phone?" -- shown ONLY after a failed sign-in
     private TextView simUnlockLink; // #162: "SIM locked — enter PIN" -- shown only when a SIM is PIN/PUK-locked
-    private TextView helpIcon;   // #113: circled "?" beside the top-right gear -> the gate help sheet (folds in the old "Using a security key?")
+    private TextView helpIcon;   // #113: circled "?" beside the top-right gear -> the gate's Help (folds in the old "Using a security key?")
     private LookGlyphView lookGlyph; // NWP-20261117-25: the gate's sun/moon, left of the help "?" (a field so lockGateForm can dim it)
     // task_eefa24b6: the locked kiosk disables the notification shade (lockGate omits LOCK_TASK_FEATURE_NOTIFICATIONS),
     // so the content-free "New message"/"Missed call" notice SmsDeliverReceiver posts is invisible. This in-gate
@@ -858,8 +861,8 @@ public class ChooserActivity extends Activity {
         android.widget.LinearLayout.LayoutParams lookLp = new android.widget.LinearLayout.LayoutParams(dp(32), dp(32));
         lookLp.rightMargin = dp(12);
         topRight.addView(lookGlyph, lookLp);
-        // #113: a circled "?" opens the gate help sheet (how to sign in, using a security key, recovery) --
-        // decluttering the footer. Stays inside Lock-Task (a dialog, no new activity).
+        // #113: a circled "?" opens the gate's Help (how to sign in, using a security key, recovery) -- decluttering
+        // the footer. Stays inside Lock-Task (a setContentView swap and dialogs, no new activity).
         helpIcon = new TextView(this);
         helpIcon.setText("?");
         helpIcon.setContentDescription("Help"); // #152: a screen reader otherwise announces the raw "?" glyph
@@ -1398,6 +1401,7 @@ public class ChooserActivity extends Activity {
                     clearSignInFields();
                     buildWarningDismissed = false; // NWP-20261120-03: the next person at the gate sees the notice too
                     closeScreenOffSurfaces(); // NWP-20261118-07: the couldn't-load offer, Reset passphrase, Add this phone
+                    clearScreenOffSecrets(); // NWP-20261201-15: the owner-verify, SIM PIN and Wi-Fi password fields
                     // ACTION_SCREEN_OFF: auto-install a parked OTA (DIA-20260618-06).
                     new Thread(() -> {
                         // NWP-20260901-07: NOT OVER A LIVE SESSION. OTA-APPLY runs the whole otad path and ends
@@ -5483,6 +5487,7 @@ public class ChooserActivity extends Activity {
                 if (isCreate) ensureCreateNightMode(uid); // NWP-20261124-18 (#14): a new profile starts from the gate's look
                 provisionRoamedApps(uid); // reinstall the roamed identity's apps (device-local, for now)
                 applyRoamedPrefs(); // re-apply this profile's roamed timezone + locale (or the baked default)
+                applyRoamedSettings(uid); // NWP-20261130-12 (Q012): replay the curated settings allowlist, before switch-in
                 applyRoamedDozeApps(uid); // NWP-20261002-02: re-apply this profile's own battery-Unrestricted apps
                 ensureRoamedHomeRole(uid); // #131: pin launcher3 as the HOME role holder BEFORE switch-in so the
                                            // roamed user lands on it, not the "Use Launcher as Home" resolver
@@ -5956,6 +5961,21 @@ public class ChooserActivity extends Activity {
             gateSubScreen = null;
             android.util.Log.i("NowhereChooser", "screen off: left reset/add-phone for the sign-in screen (NWP-20261118-07)");
         }
+    }
+
+    /** NWP-20261201-15 (docs/product-decisions.md 2026-11-06, "twenty answers to harvest 60 ...", #3): the 2026-10-29
+     *  screen-off rule, applied to the owner-verify passphrase, SIM PIN and gate Wi-Fi password fields. It empties them
+     *  and closes no screen. A verify, PIN unlock or Wi-Fi join already sent keeps what it read at the tap.
+     *  UI thread (screenOffRx). */
+    private void clearScreenOffSecrets() {
+        boolean held = false;
+        for (EditText f : new EditText[] {ownerVerifyField, simPinField, wifiPassField}) {
+            if (f != null && f.length() > 0) held = true;
+        }
+        if (ownerVerifyField != null) ownerVerifyField.setText("");
+        if (simPinField != null) simPinField.setText("");
+        if (wifiPassField != null) wifiPassField.setText("");
+        if (held) android.util.Log.i("NowhereChooser", "screen off: owner-verify, SIM PIN or Wi-Fi password field cleared (NWP-20261201-15)");
     }
 
     /** Dismiss the soft keyboard while the restore takes over the gate. */
@@ -6541,6 +6561,7 @@ public class ChooserActivity extends Activity {
         LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(MATCH, WRAP); slp.topMargin = dp(10); slp.bottomMargin = dp(24);
         ll.addView(sub, slp);
         final EditText pf = field("device passphrase", true); ll.addView(PassReveal.wrap(pf, MUTED), fieldLp(dp(20)));  // #81 owner verify
+        ownerVerifyField = pf; // NWP-20261201-15: see clearScreenOffSecrets
         final Button go = accentButton("Continue"); ll.addView(go, new LinearLayout.LayoutParams(MATCH, WRAP));
         final TextView msg = new TextView(this); msg.setTextColor(MUTED); msg.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13); msg.setGravity(Gravity.CENTER);
         TextView cancel = new TextView(this);
@@ -7665,15 +7686,15 @@ public class ChooserActivity extends Activity {
         return ownerScroll(ll);
     }
 
-    /** NWP-20261115-16 (docs/product-decisions.md, 2026-10-26): the gate's look, one device-wide setting, changed
-     *  here, behind the owner passphrase, and from the gate's sun/moon (toggleGateLook, NWP-20261117-25). The switch
-     *  writes GatePalette.KEY to the gate's "nowhere_gate" prefs with commit(), so it never claims a look that did not
-     *  reach the disk, and recreate()s on success: onCreate runs applyGateLook() again and rebuilds every view in the
-     *  new palette. The new gate opens at its start screen, so Owner settings needs the passphrase again
-     *  (GateLookCopy.NOTE says so). A failed commit puts the switch back without firing the listener. The second
-     *  switch, "Only the owner can change the look" (NWP-20261124-15, 2026-11-02 #11), writes
-     *  GateLookGlyph.OWNER_ONLY_KEY the same way: while it is on, the gate's sun/moon is hidden and toggleGateLook
-     *  refuses. */
+    /** NWP-20261115-16 (docs/product-decisions.md, 2026-10-26): the gate's look, one device-wide setting.
+     *  NWP-20261130-13 (2026-11-06, "Owner settings loses Appearance ..."): the Light mode switch is gone from here and
+     *  the gate's sun/moon (toggleGateLook, NWP-20261117-25) is the only light/dark control. This screen stays only for
+     *  the switch "Only the owner can change the look" (NWP-20261124-15, 2026-11-02 #11). It writes
+     *  GateLookGlyph.OWNER_ONLY_KEY to the gate's "nowhere_gate" prefs with commit(), so it never claims a state that
+     *  did not reach the disk, and recreate()s on success: onCreate runs again, and the new gate opens at its start
+     *  screen, so Owner settings needs the passphrase again (GateLookCopy.OWNER_ONLY_NOTE says so). A failed commit puts
+     *  the switch back without firing the listener. While the switch is on, the gate's sun/moon is hidden and
+     *  toggleGateLook refuses, so the look stays as it is. */
     private View buildGateLookScreen() {
         LinearLayout ll = ownerColumn(GateLookCopy.ROW);
         TextView intro = new TextView(this);
@@ -7684,41 +7705,7 @@ public class ChooserActivity extends Activity {
         ip.topMargin = dp(24);
         ll.addView(intro, ip);
 
-        final android.widget.Switch lookSw = GateSwitch.style(new android.widget.Switch(this), GatePalette.active());
-        lookSw.setText(GateLookCopy.SWITCH);
-        lookSw.setTextColor(MUTED);
-        lookSw.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
-        LinearLayout.LayoutParams sp = new LinearLayout.LayoutParams(MATCH, WRAP);
-        sp.topMargin = dp(16);
-        ll.addView(lookSw, sp);
-
-        TextView note = new TextView(this);
-        note.setText(GateLookCopy.NOTE);
-        note.setTextColor(MUTED);
-        note.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
-        LinearLayout.LayoutParams np = new LinearLayout.LayoutParams(MATCH, WRAP);
-        np.topMargin = dp(6);
-        ll.addView(note, np);
-
-        // State first, THEN the listener, so loading never writes back.
-        lookSw.setChecked(GatePalette.forLook(getSharedPreferences("nowhere_gate", MODE_PRIVATE).getString(GatePalette.KEY, null)) == GatePalette.LIGHT);
-        lookSw.setOnCheckedChangeListener(new android.widget.CompoundButton.OnCheckedChangeListener() {
-            @Override
-            public void onCheckedChanged(android.widget.CompoundButton b, boolean c) {
-                boolean ok = getSharedPreferences("nowhere_gate", MODE_PRIVATE).edit().putString(GatePalette.KEY, GatePalette.valueFor(c)).commit();
-                if (ok) {
-                    recreate();
-                    return;
-                }
-                // Detach first: setChecked would fire this listener again and write the old value.
-                b.setOnCheckedChangeListener(null);
-                b.setChecked(!c);
-                b.setOnCheckedChangeListener(this);
-                android.widget.Toast.makeText(ChooserActivity.this, GateLookCopy.FAILED, android.widget.Toast.LENGTH_SHORT).show();
-            }
-        });
-
-        // NWP-20261124-15 (2026-11-02 #11): the owner keeps the look to this screen. On, the gate's sun/moon is hidden
+        // NWP-20261124-15 (2026-11-02 #11): the owner holds the look as it is. On, the gate's sun/moon is hidden
         // and toggleGateLook refuses; Profile and nApps read the gate's look (mirrorGateLook), so it holds theirs too.
         final android.widget.Switch ownerSw = GateSwitch.style(new android.widget.Switch(this), GatePalette.active());
         ownerSw.setText(GateLookCopy.OWNER_ONLY);
@@ -7736,7 +7723,7 @@ public class ChooserActivity extends Activity {
         onp.topMargin = dp(6);
         ll.addView(ownerNote, onp);
 
-        // State first, THEN the listener, as the Light mode switch.
+        // State first, THEN the listener, so loading never writes back.
         ownerSw.setChecked(getSharedPreferences("nowhere_gate", MODE_PRIVATE).getBoolean(GateLookGlyph.OWNER_ONLY_KEY, false));
         ownerSw.setOnCheckedChangeListener(new android.widget.CompoundButton.OnCheckedChangeListener() {
             @Override
@@ -7761,11 +7748,10 @@ public class ChooserActivity extends Activity {
 
     /** NWP-20261117-25 (docs/product-decisions.md, 2026-10-29, "three answers — the gate clears its sign-in fields
      *  when the screen turns off ...", second bullet): the gate's sun/moon. Anyone at the gate can tap it; there is no
-     *  owner passphrase. The glyph shows the look a tap switches to, and Owner settings › Appearance stays as a second
-     *  way to set it. The tap writes GatePalette.KEY with commit(), so it never claims a look that did not reach the
-     *  disk, and recreate()s only on success: onCreate reads the look again, so the glyph and every gate screen
-     *  redraw, and the gate reopens at its start screen, as after the Appearance switch. It does nothing while a
-     *  sign-in, resume or sign-out runs (lockGateForm also dims the glyph then), so it never recreates the gate under
+     *  owner passphrase. The glyph shows the look a tap switches to, and it is the only light/dark control
+     *  (NWP-20261130-13, 2026-11-06). The tap writes GatePalette.KEY with commit(), so it never claims a look that did
+     *  not reach the disk, and recreate()s only on success: onCreate reads the look again, so the glyph and every gate
+     *  screen redraw, and the gate reopens at its start screen. It does nothing while a sign-in, resume or sign-out runs (lockGateForm also dims the glyph then), so it never recreates the gate under
      *  an in-flight login. The look tells nothing about any profile. While the owner has made the look owner-only
      *  (GateLookGlyph.OWNER_ONLY_KEY, NWP-20261124-15) the glyph is hidden and this returns without writing, so a
      *  stale or replayed tap does nothing. */
@@ -8013,6 +7999,7 @@ public class ChooserActivity extends Activity {
                 + "carrier — not your profile passphrase.");
 
         final EditText pinF = field("SIM PIN", false);
+        simPinField = pinF; // NWP-20261201-15: see clearScreenOffSecrets
         pinF.setInputType(android.text.InputType.TYPE_CLASS_NUMBER | android.text.InputType.TYPE_NUMBER_VARIATION_PASSWORD);
         ll.addView(PassReveal.wrap(pinF, MUTED), new LinearLayout.LayoutParams(MATCH, WRAP));  // #81 SIM PIN
 
@@ -8945,8 +8932,8 @@ public class ChooserActivity extends Activity {
 
     /** NWP-20261115-15: the owner's gate look (docs/product-decisions.md, 2026-10-26): dark unless the stored value is
      *  exactly "light", never the OS setting. Once per gate start, in onCreate before the first view; StatusLine reads
-     *  the same palette through GatePalette.active(). buildGateLookScreen's Light mode switch writes the key
-     *  (NWP-20261115-16); applyGateBars sets the system bars to match. */
+     *  the same palette through GatePalette.active(). toggleGateLook, the gate's sun/moon, writes the key
+     *  (NWP-20261117-25, NWP-20261130-13); applyGateBars sets the system bars to match. */
     private void applyGateLook() {
         GatePalette p = GatePalette.forLook(getSharedPreferences("nowhere_gate", MODE_PRIVATE).getString(GatePalette.KEY, null));
         GatePalette.use(p);
@@ -9474,6 +9461,7 @@ public class ChooserActivity extends Activity {
         final EditText ssidF = field("network name (SSID)", false);
         ll.addView(ssidF, fieldLp(dp(11)));
         final EditText pwF = field("Wi-Fi password (blank if open)", true);
+        wifiPassField = pwF; // NWP-20261201-15: see clearScreenOffSecrets
         ll.addView(PassReveal.wrap(pwF, MUTED), fieldLp(dp(20)));       // #81 Wi-Fi password
 
         // #51 "Advanced options" (Chester: his office network wouldn't join -- it needs 802.1x enterprise
@@ -10282,22 +10270,41 @@ public class ChooserActivity extends Activity {
     }
 
     // NWP-20261119-16: the gate's Help, opened from the top-right "?" (#113 folded the old "Using a security key?" link
-    // into it). Decision 2026-10-31, Part B: the Help list, and a tap opens that page; Back returns to the list.
-    // NWP-20261122-05 (decision 2026-11-02): the gate has its own pages, GateHelpPages (signing in, the gate's
-    // Settings, Owner settings, a locked phone); Profile › Help reads HelpPages, the session's set. STATIC text, the
-    // same for everyone, reveals nothing about any profile, so blind login holds. Dialogs only, so it stays inside
-    // Lock-Task: no activity, no link. Nothing else is added to the gate (B1: the gate as small as possible).
+    // into it). NWP-20261122-05 (decision 2026-11-02): the gate has its own pages, GateHelpPages (signing in, the gate's
+    // Settings, Owner settings, a locked phone); Profile › Help reads HelpPages, the session's set.
+    // NWP-20261130-11 (chosen 2026-11-06, NWP-20261105-27): the "?" opens the combo screen, GateHelpScreen, and its tiles
+    // open those pages. STATIC text, the same for everyone, reveals nothing about any profile, so blind login holds. A
+    // setContentView swap and dialogs, so it stays inside Lock-Task: no activity, no link. Like Settings, it holds no
+    // typed secret, so a screen-off leaves it open.
     private void showGateHelp() {
-        runOnUiThread(() -> new android.app.AlertDialog.Builder(this)
-                .setTitle(GateHelpPages.indexTitle())
-                .setItems(GateHelpPages.TITLES, (d, i) -> new android.app.AlertDialog.Builder(this)
-                        .setTitle(GateHelpPages.TITLES[i])
-                        .setMessage(GateHelpPages.body(i) + "\n\n" + GateHelpPages.moreLine())
-                        .setNegativeButton("Back", (d2, w) -> showGateHelp())
-                        .setPositiveButton("Got it", (d2, w) -> d2.dismiss())
-                        .show())
-                .setPositiveButton("Got it", (d, w) -> d.dismiss())
-                .show());
+        runOnUiThread(() -> setContentView(GateHelpScreen.home(this, GatePalette.active(), gateHelpNav())));
+    }
+
+    private GateHelpScreen.Nav gateHelpNav() {
+        return new GateHelpScreen.Nav() {
+            @Override public void show(View v) { setContentView(v); }
+            @Override public void close() { setContentView(gateView); }
+            @Override public void openTile(int i) {
+                showGateHelpPage(GateHelpHome.tileTitle(i), GateHelpHome.tileBody(i), GateHelpHome.alsoLabel(i),
+                        GateHelpHome.tileAlso(i));
+            }
+            @Override public void openForgot() {
+                showGateHelpPage(GateHelpHome.FORGOT_TITLE, GateHelpHome.forgotBody(), null, -1);
+            }
+        };
+    }
+
+    /** A Help page, over the combo screen. alsoLabel, when not null, names a button that opens GateHelpPages page alsoPage. */
+    private void showGateHelpPage(String title, String body, String alsoLabel, int alsoPage) {
+        android.app.AlertDialog.Builder b = new android.app.AlertDialog.Builder(this)
+                .setTitle(title)
+                .setMessage(body + "\n\n" + GateHelpPages.moreLine())
+                .setNegativeButton(GateHelpHome.BACK, (d, w) -> d.dismiss());
+        if (alsoLabel != null) {
+            b.setNeutralButton(alsoLabel, (d, w) ->
+                    showGateHelpPage(GateHelpPages.TITLES[alsoPage], GateHelpPages.body(alsoPage), null, -1));
+        }
+        b.show();
     }
 
     // #113: whether the multi-device "Restore from another device" gate link is shown. Off until #91 ships;
@@ -11327,6 +11334,9 @@ public class ChooserActivity extends Activity {
     // NWP-20261118-08 (h48 #8): the plan-expiry notice, posted into the live session (PlanExpiry decides the stage).
     private static final String NOTIF_PLAN_CHANNEL = "nowhere.plan";
     private static final int NOTIF_PLAN_ID = 0x0D24;
+    // NWP-20261201-10: a health check's notice, posted into the live session (HealthNotice decides what it offers).
+    private static final String NOTIF_HEALTH_CHANNEL = "nowhere.health";
+    private static final int NOTIF_HEALTH_ID = 0x0D26; // PrivateDnsWatch holds 0x0D25
     // NWP-20261118-08: the plan check's state, shared by the watcher and the check's own thread, so all of it is atomics.
     private static final java.util.concurrent.atomic.AtomicInteger planSchedUid = new java.util.concurrent.atomic.AtomicInteger(-1);
     private static final java.util.concurrent.atomic.AtomicLong planDueMs = new java.util.concurrent.atomic.AtomicLong(Long.MAX_VALUE);
@@ -11366,6 +11376,8 @@ public class ChooserActivity extends Activity {
             int backNowShownForUid = -1; // "back online -- Back up now" prompt after a drop
             int homeAssertedUid = -1;    // #131: roamed uid we've re-asserted launcher3-HOME for (once per session)
             int smsAssertedUid = -1;     // NWP-20261010-13: roamed uid we've re-asserted Messaging as SMS default for
+            int healthShownForUid = -1;  // NWP-20261201-10: health notice, the user we last posted to (-1 = nothing shown)
+            int healthShownOffer = HealthNotice.NONE; // NWP-20261201-10: what that notice offers (re-posted only on a change)
             final BackNowCycle backNow = new BackNowCycle(); // NWP-20261117-27: the drop -> reconnect -> landed cycle
             int damagedShownForUid = -1; // damaged-media notice (#110): post once per session (damage is sticky)
             int incompleteShownForUid = -1; // short-restore notice (DIA-20260730): post once per session (sticky)
@@ -11395,6 +11407,7 @@ public class ChooserActivity extends Activity {
                     if (offlineShownForUid >= 0) { cancelOfflineNotice(app, offlineShownForUid); cancelReconnectNotice(app, offlineShownForUid); offlineShownForUid = -1; }
                     if (dropShownForUid >= 0) { cancelDropNotice(app, dropShownForUid); dropShownForUid = -1; }
                     if (backNowShownForUid >= 0) { cancelBackNowNotice(app, backNowShownForUid); backNowShownForUid = -1; }
+                    if (healthShownForUid >= 0) { cancelHealthNotice(app, healthShownForUid); healthShownForUid = -1; healthShownOffer = HealthNotice.NONE; }
                     // NWP-20260901-06: clear the update notice with the session. It is addressed to a signed-in
                     // owner; leaving it in a torn-down user's shade would also mean the NEXT session's
                     // post-once latch has nothing to re-post against.
@@ -11561,12 +11574,24 @@ public class ChooserActivity extends Activity {
                         // on every online tick. That is the one thing the drop latch is honestly good for; since
                         // NWP-20261117-27 BackNowCycle holds it, and posts once per announced drop.
                         if (backNow.onOnline(System.currentTimeMillis() / 1000L) == BackNowCycle.POST) {
-                            postBackNowNotice(app, uid);
+                            postBackNowNotice(app, uid, backNow.reconnectAt(), SaveMode.backNowBody(pollDaemon("GET-SAVE-MODE\n"), unmeteredCtx(app)));
                             backNowShownForUid = uid; // cleared once a seal from after the reconnect lands (below)
                         }
                     }
                 }
                 if (tick++ % SLOW_EVERY != 0) continue; // backup + storage stay on the ~30s cadence below
+                { // NWP-20261201-10: a check that fires only ever posts this notice; the user decides what is done.
+                    if (healthShownForUid >= 0 && healthShownForUid != uid) { cancelHealthNotice(app, healthShownForUid); healthShownForUid = -1; healthShownOffer = HealthNotice.NONE; }
+                    int offer = HealthNotice.offer(DaemonSocket.roundTripLines("GET-HEALTH\n", 5000),
+                            pollDaemon("GET-HEALTH-FIX\nplay-push-frozen\n"));
+                    if (offer == HealthNotice.NONE) {
+                        if (healthShownForUid >= 0) { cancelHealthNotice(app, healthShownForUid); healthShownForUid = -1; healthShownOffer = HealthNotice.NONE; }
+                    } else if (offer != HealthNotice.KEEP && (healthShownForUid != uid || offer != healthShownOffer)) {
+                        postHealthNotice(app, uid, offer);
+                        healthShownForUid = uid;
+                        healthShownOffer = offer;
+                    }
+                }
                 String sync = pollDaemon("GET-SYNC-STATUS\n").trim();
                 boolean stale = sync.startsWith("STALE");
                 // #111: a GUARD refusal is not the offline story. The store was reachable and the write was
@@ -11672,6 +11697,9 @@ public class ChooserActivity extends Activity {
                         updMandatory = false;
                     }
                 }
+                // NWP-20261201-05: the network the periodic save's "Only on Wi-Fi" mode reads. Sent on every slow tick, not
+                // only on a change: a daemon restart forgets it, and the daemon ages it out. The reply does not matter.
+                if (unmeteredCtx(app)) pollDaemon("SAVE-NET-UNMETERED\n"); else pollDaemon("SAVE-NET-METERED\n");
                 // #129 P4b: Tier-2 background-prefetch gate. Arm on a suitable network AND (screen-off idle OR
                 // charging), so prefetch never drains the battery mid-use. The network condition is unmetered
                 // Wi-Fi by DEFAULT (never spend cellular/metered data), widened to ANY internet only when the
@@ -12036,6 +12064,57 @@ public class ChooserActivity extends Activity {
         }
     }
 
+    /** NWP-20261201-10: post a health check's notice in roamed user <uid>'s shade. Dismissible, and the watcher re-posts
+     *  only when the offer changes. Both PendingIntents come from the ROAMED user's context, so they fire there. Fix
+     *  broadcasts to HealthFixReceiver; Sign out only opens the Profile screen, whose own button is the sign-out. */
+    private static void postHealthNotice(Context app, int uid, int offer) {
+        try {
+            Context uc = app.createContextAsUser(android.os.UserHandle.of(uid), 0);
+            android.app.NotificationManager nm = uc.getSystemService(android.app.NotificationManager.class);
+            if (nm == null) return;
+            android.app.NotificationChannel ch = new android.app.NotificationChannel(
+                    NOTIF_HEALTH_CHANNEL, "Phone health", android.app.NotificationManager.IMPORTANCE_DEFAULT);
+            ch.setDescription("Tells you about a known fault on this phone and offers a fix");
+            nm.createNotificationChannel(ch);
+            boolean signOut = offer == HealthNotice.FIX_AND_SIGN_OUT;
+            String body = signOut ? HealthNotice.BODY_SIGN_OUT : HealthNotice.BODY;
+            android.app.PendingIntent fix = android.app.PendingIntent.getBroadcast(uc, 0,
+                    new Intent(uc, HealthFixReceiver.class),
+                    android.app.PendingIntent.FLAG_UPDATE_CURRENT | android.app.PendingIntent.FLAG_IMMUTABLE);
+            android.app.Notification.Builder b = new android.app.Notification.Builder(uc, NOTIF_HEALTH_CHANNEL)
+                    .setSmallIcon(R.drawable.ic_backup_warn)
+                    .setContentTitle(HealthNotice.TITLE)
+                    .setContentText(body)
+                    .setStyle(new android.app.Notification.BigTextStyle().bigText(body))
+                    .addAction(new android.app.Notification.Action.Builder(
+                            (android.graphics.drawable.Icon) null, HealthNotice.FIX, fix).build())
+                    .setOnlyAlertOnce(true)
+                    .setShowWhen(false);
+            if (signOut) {
+                android.app.PendingIntent open = android.app.PendingIntent.getActivity(uc, 0,
+                        new Intent().setClassName(uc, HealthNotice.SIGN_OUT_CLASS)
+                                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+                        android.app.PendingIntent.FLAG_UPDATE_CURRENT | android.app.PendingIntent.FLAG_IMMUTABLE);
+                b.addAction(new android.app.Notification.Action.Builder(
+                        (android.graphics.drawable.Icon) null, HealthNotice.SIGN_OUT, open).build());
+            }
+            nm.notify(NOTIF_HEALTH_ID, b.build());
+        } catch (Throwable t) {
+            android.util.Log.w("NowhereChooser", "postHealthNotice", t);
+        }
+    }
+
+    /** NWP-20261201-10: clear a health check's notice from roamed user <uid>'s shade. */
+    private static void cancelHealthNotice(Context app, int uid) {
+        try {
+            Context uc = app.createContextAsUser(android.os.UserHandle.of(uid), 0);
+            android.app.NotificationManager nm = uc.getSystemService(android.app.NotificationManager.class);
+            if (nm != null) nm.cancel(NOTIF_HEALTH_ID);
+        } catch (Throwable t) {
+            android.util.Log.w("NowhereChooser", "cancelHealthNotice", t);
+        }
+    }
+
     /** Post the immediate mid-session network-DROP notice (quiet, ongoing) in roamed user <uid>'s shade.
      *  Reveals only network state (not content / profile existence), so deniability is intact. (DIA-20260713.) */
     private static void postDropNotice(Context app, int uid) {
@@ -12077,16 +12156,17 @@ public class ChooserActivity extends Activity {
     /** Post the "back online — Back up now" prompt (ALERTING once) after a mid-session drop, in roamed user
      *  <uid>'s shade. The action seals the LIVE session IN PLACE (BACKUP) -- it does NOT discard it like the
      *  #49 "Load my saved data" (RELOGIN) path, so the unsynced changes are preserved. Auto-clears when the
-     *  next seal succeeds (watcher). (DIA-20260713.) */
-    private static void postBackNowNotice(Context app, int uid) {
+     *  next seal succeeds (watcher). body: SaveMode.backNowBody's text for this profile and network. (DIA-20260713.) */
+    private static void postBackNowNotice(Context app, int uid, long reconnectAt, String body) {
         try {
             Context uc = app.createContextAsUser(android.os.UserHandle.of(uid), 0);
             android.app.NotificationManager nm = uc.getSystemService(android.app.NotificationManager.class);
             if (nm == null) return;
             createBackNowChannel(nm);
-            String body = "Your recent changes aren't saved to your store yet. Tap Back up now to save them.";
+            Intent tap = new Intent(uc, BackupNowReceiver.class);
+            if (reconnectAt > 0) tap.putExtra(BackupNowReceiver.EXTRA_RECONNECT_AT, reconnectAt);
             android.app.PendingIntent pi = android.app.PendingIntent.getBroadcast(uc, 0,
-                    new Intent(uc, BackupNowReceiver.class),
+                    tap,
                     android.app.PendingIntent.FLAG_UPDATE_CURRENT | android.app.PendingIntent.FLAG_IMMUTABLE);
             android.app.Notification n = new android.app.Notification.Builder(uc, NOTIF_BACKNOW_CHANNEL)
                     .setSmallIcon(R.drawable.ic_backup_warn)
@@ -12134,15 +12214,17 @@ public class ChooserActivity extends Activity {
         }
     }
 
-    /** Put the "Back up now" prompt back after a tap that did not start a save: the same notification, action
+    /** Put the "Back up now" prompt back after a tap that neither started nor joined a save: the same notification, action
      *  included so a second tap is possible, with <body> saying what refused it. Called by BackupNowReceiver. */
-    static void postBackNowRefused(Context uc, String body) {
+    static void postBackNowRefused(Context uc, String body, long reconnectAt) {
         try {
             android.app.NotificationManager nm = uc.getSystemService(android.app.NotificationManager.class);
             if (nm == null) return;
             createBackNowChannel(nm);
+            Intent tap = new Intent(uc, BackupNowReceiver.class);
+            if (reconnectAt > 0) tap.putExtra(BackupNowReceiver.EXTRA_RECONNECT_AT, reconnectAt);
             android.app.PendingIntent pi = android.app.PendingIntent.getBroadcast(uc, 0,
-                    new Intent(uc, BackupNowReceiver.class),
+                    tap,
                     android.app.PendingIntent.FLAG_UPDATE_CURRENT | android.app.PendingIntent.FLAG_IMMUTABLE);
             android.app.Notification n = new android.app.Notification.Builder(uc, NOTIF_BACKNOW_CHANNEL)
                     .setSmallIcon(R.drawable.ic_backup_warn)
@@ -12223,6 +12305,25 @@ public class ChooserActivity extends Activity {
             if (nw == null) return false;
             android.net.NetworkCapabilities nc = cm.getNetworkCapabilities(nw);
             return nc != null && nc.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET);
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /** NWP-20261201-05: the active network has internet and is NOT_METERED, on any transport (Ethernet counts, a metered
+     *  hotspot does not): what "Only on Wi-Fi" means for the periodic save. Not {@link #onWifiCtx}, which tests the Wi-Fi
+     *  transport on purpose. Static for the watcher thread, mirrors {@link #hasInternetCtx}. */
+    static boolean unmeteredCtx(Context ctx) {
+        try {
+            android.net.ConnectivityManager cm =
+                    (android.net.ConnectivityManager) ctx.getSystemService(Context.CONNECTIVITY_SERVICE);
+            if (cm == null) return false;
+            android.net.Network nw = cm.getActiveNetwork();
+            if (nw == null) return false;
+            android.net.NetworkCapabilities nc = cm.getNetworkCapabilities(nw);
+            return nc != null
+                    && nc.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                    && nc.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_NOT_METERED);
         } catch (Throwable t) {
             return false;
         }
@@ -14233,23 +14334,36 @@ public class ChooserActivity extends Activity {
                 + " (NWP-20261119-21)");
     }
 
+    /** NWP-20261130-12: applyRoamedPrefs' GET-PREFS lines for applyRoamedSettings, on the login thread. Null: the read
+     *  failed, so nothing is written and the seal keeps the profile's record. */
+    private java.util.List<String> roamedPrefLines;
+
+    /** NWP-20261130-12 (Q012, #70): the chooser is the one writer of the curated settings at sign-in. */
+    private void applyRoamedSettings(int uid) {
+        SettingsRoamLive.applyAtSignIn(this, uid, roamedPrefLines);
+        roamedPrefLines = null;
+    }
+
     private void applyRoamedPrefs() {
         String tz = null, lastTz = null, loc = null, idle = null, wipe = null, holdlock = null, holdaudio = null,
                 wipesaved = null, raw = "";
+        roamedPrefLines = null;
         try {
             // NWP-20261118-11: a failed read (null) is retried for about 10 s; it is never read as "no saved prefs".
             final long readT0 = android.os.SystemClock.elapsedRealtime();
             java.util.List<String> lines = PrefsRead.read(
                     cap -> DaemonSocket.roundTripLinesOrNull("GET-PREFS\n", cap),
                     android.os.SystemClock::elapsedRealtime, android.os.SystemClock::sleep);
+            roamedPrefLines = lines;
             if (lines == null) {
                 gateTiming("prefs-unread", android.os.SystemClock.elapsedRealtime() - readT0);
                 // No reply after the retries: keep today's defaults. login.log now says so; no pref value is logged.
                 lines = java.util.Collections.emptyList();
             }
-            // The last zone is coarse location: it is parsed below and never logged, so raw drops its line.
+            // The last zone is coarse location: it is parsed below and never logged, so raw drops its line. A sroam= line
+            // can name installed apps (a Quick Settings tile list), so raw drops it too (NWP-20261130-12).
             java.util.List<String> shown = new java.util.ArrayList<>();
-            for (String l : lines) if (!l.startsWith("lasttz=")) shown.add(l);
+            for (String l : lines) if (!l.startsWith("lasttz=") && !l.startsWith(SettingsRoam.PREF_PREFIX)) shown.add(l);
             raw = android.text.TextUtils.join("|", shown);
             for (String l : lines) {
                 if (l.startsWith("tz=")) tz = l.substring(3).trim();

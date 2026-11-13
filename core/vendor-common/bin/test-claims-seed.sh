@@ -95,6 +95,7 @@ agent_sim() {
 stat() { echo "stat \$*" >> "\$ROOT/calls"; echo 4321:8765; }
 chown() { echo "chown \$*" >> "\$ROOT/calls"; [ "\$FAILCHOWN" != 1 ]; }
 restorecon() { echo "restorecon \$*" >> "\$ROOT/calls"; return 0; }
+od_shipped_prep() { return 0; }; od_park_var() { :; }   # NWP-20261130-03
 : > "\$LOG"
 . "$W/pre.sh"
 . "$W/restore.sh"

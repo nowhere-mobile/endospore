@@ -16,7 +16,7 @@ CH="${1:?usage: run.sh <core/chooser dir>}"
 JAVAC="${JAVAC:-javac}"; JAVA="${JAVA:-java}"
 here=$(cd "$(dirname "$0")" && pwd)
 J="$CH/src/com/nowhere/chooser"
-srcs=("$J/TelIngest.java" "$J/MessagingSuppressor.java" "$J/ChooserActivity.java" "$J/SmsDeliverReceiver.java" "$J/SmsRoleRoam.java")
+srcs=("$J/TelIngest.java" "$J/MessagingSuppressor.java" "$J/ChooserActivity.java" "$J/SmsDeliverReceiver.java" "$J/SmsRoleRoam.java" "$J/SenderName.java")
 manifest="$CH/AndroidManifest.xml"
 for f in "${srcs[@]}" "$manifest" "$here/SmsNoticeCases.java"; do
   [ -f "$f" ] || { echo "run.sh: no such file: $f" >&2; exit 2; }
@@ -27,7 +27,7 @@ command -v "$JAVAC" >/dev/null 2>&1 && command -v "$JAVA" >/dev/null 2>&1   || {
 methods="noticeTag noticeRow rowQuery rowState noticeAction noticeActions mmsKey messageTapPackage messageTapAction
   sweepDelay nextIdleResweeps resweepDelay roamedSmsComponents substituteAppName
   isPackageName parseSmsRecord recordUnknown markerText parseMarker smsSignInPlan smsCaptureValue takeOverFromStandIn roleHeldBy smsRoleStep
-  standInState repairStillValid materialiseTarget retryRefusedTarget takeoverStep"
+  standInState repairStillValid materialiseTarget retryRefusedTarget takeoverStep senderTitle lookUpSender"
 consts="ROW_BLIND ROW_GONE NOTICE_CLEAR NOTICE_POLL NOTICE_KEEP GONE_GRACE_MS SMS_REPAIR_DELAY_MS"
 D=$(mktemp -d)
 trap 'rm -rf "$D"' EXIT

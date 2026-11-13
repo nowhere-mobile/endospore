@@ -150,7 +150,9 @@ final class AppClaim {
 
     /** Release {@code pkgs} in {@code userId}. Safe to call for packages that were never held. */
     static Result release(Context ctx, int userId, java.util.List<String> pkgs) {
-        Result r = set(ctx, userId, pkgs, false, null);
+        // NWP-20261130-03: both holds suspend as com.nowhere.chooser, so this call would also lift the data barrier. An app
+        // the barrier holds keeps its receipt line, and the next applier pass releases it once its data is back.
+        Result r = set(ctx, userId, OdDataBarrierHost.withoutHeld(ctx, pkgs), false, null);
         if (r.state == APPLIED) clearReceipt(ctx, userId, r.changed);
         return r;
     }
@@ -173,6 +175,13 @@ final class AppClaim {
                     java.util.Collections.<String>emptyList());
         }
         return release(ctx, userId, held);
+    }
+
+    /** Does this session's receipt hold {@code pkg}? NWP-20261130-03: an unreadable receipt counts as held, so the data
+     *  barrier never lifts a hold it cannot prove is its own alone. */
+    static boolean claimHeld(Context ctx, int userId, String pkg) {
+        java.util.List<String> held = readReceipt(ctx, userId);
+        return held == null || held.contains(pkg);
     }
 
     /** Is {@code pkg} suspended in {@code userId} right now? Read from the framework, not from the receipt. */

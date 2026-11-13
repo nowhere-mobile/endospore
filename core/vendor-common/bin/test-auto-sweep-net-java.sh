@@ -140,7 +140,7 @@ FAIL A4.4 the perl check did not run"
                q{final boolean netRekick = intent != null && intent.getBooleanExtra(EXTRA_NET_REKICK, false);}) {
       push @f, "A4.5 onStartCommand lacks `$w`" if index($s, $w) < 0;
     }
-    if ($s =~ /Thread sw = new Thread\(\(\) -> \{\s*if \(netRekick\) \{((?:(?!snapshotAppSeen|AppHeld\.refresh|reconcilePhantomKeepLines|wakeRestored).)*?)\breturn;\s*\}/s) {
+    if ($s =~ /Thread sw = new Thread\(\(\) -> \{\s*if \(netRekick\) \{((?:(?!snapshotAppSeen|AppHeld\.refresh|reconcilePhantomKeepLines|wakeRestored|if \(resumeSweep\)).)*?)\breturn;\s*\}/s) {
       my $b = $1;
       push @f, "A4.5 the re-kick branch does not run sweepAutoJoined(false)" if index($b, q{sweepAutoJoined(false);}) < 0;
       push @f, "A4.5 the re-kick branch does not call workerDone()" if index($b, q{workerDone();}) < 0;

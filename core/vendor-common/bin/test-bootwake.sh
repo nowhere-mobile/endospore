@@ -77,6 +77,7 @@ n=$(nleft "$RA")
 #   pm unstop --user U <pkg>                           -> sets $ROOT/pk/<pkg> to false
 #   am broadcast --user U -p <pkg> ... -a <ACTION>     -> recorded; the scratch files' modes snapshotted
 STUBS=$(cat <<'EOF'
+vpn_deferred_retry(){ :; }   # NWP-20261130-04: test-vpn-apply-on-install.sh runs the real one in this arm
 timeout(){ shift 3; echo "via-timeout $1 $2" >> "$ROOT/tcalls"; "$@"; }
 pm(){
   case "$1" in

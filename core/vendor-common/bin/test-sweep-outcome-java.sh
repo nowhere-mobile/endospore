@@ -163,6 +163,7 @@ sources() {
   if perl -0e '
       my $c = do { local $/; <STDIN> };
       $c =~ s/if \(SignOutGate\.begun\(\)\) \{.*?\bbreak;\s*\}//s;
+      $c =~ s/if \(SweepHold\.held\(\)\) \{.*?\bbreak;\s*\}//s;
       my $n = () = $c =~ /SweepOutcome\.request\(/g; exit 1 unless $n == 1;
       my $m = index($c, "materializeAndInstall(pkg, true)"); exit 1 if $m < 0;
       $c =~ /String (\w+) = SweepOutcome\.request\(i \+ 1, work\.size\(\), \w+, [^;]*\);\s*if \(\1 != null\) DaemonSocket\.roundTrip\(\1, 5000\);/s

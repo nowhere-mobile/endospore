@@ -44,7 +44,7 @@ open(p, 'w').write(s)
 # G1: the early no-receipt block moved back after the walk (cut here, pasted before the secondary net).
 G1='
 a = s.find("\t\tif oldN > 0 && restoreReceiptDir() != \"\" && !haveRestoreReceipt(rcptRef) {\n")
-e = s.find("\t\t\treturn\n\t\t}\n", a) + len("\t\t\treturn\n\t\t}\n")
+e = s.find("\t\t\t\treturn\n\t\t\t}\n\t\t}\n", a) + len("\t\t\t\treturn\n\t\t\t}\n\t\t}\n")
 mark = "\t\t// Secondary net (defense-in-depth)"
 if a < 0 or s.count(mark) != 1 or s.count("!haveRestoreReceipt(rcptRef)") != 1:
     sys.exit(1)

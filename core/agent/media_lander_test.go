@@ -790,25 +790,27 @@ func TestMediaLander_L9_Order(t *testing.T) {
 	mlWant(t, in, orig, "the input slice")
 }
 
-// L10: digests are written in batches of 32, and all of them by the end.
-func TestMediaLander_L10_TheRosterIsWrittenEvery32(t *testing.T) {
+// L10 (NWP-20261130-17): each landed rel's digest is in the roster before the next fetch starts, and every digest is
+// there at the end. Main's lander wrote them in batches of 32, so the 34th fetch saw 32.
+func TestMediaLander_L10_TheRosterIsWrittenBeforeTheNextFetch(t *testing.T) {
 	var rels []string
 	for i := 0; i < 40; i++ {
 		rels = append(rels, fmt.Sprintf("DCIM/f%02d.jpg", i))
 	}
 	r := mlNew(t, rels, nil)
-	seen := -1
+	var short []string
 	r.hook = func(string) ([]byte, error, bool) {
-		if len(r.fetched) == 34 {
-			seen = len(mlRoster(t, "mlref"))
+		if n := len(mlRoster(t, "mlref")); n != len(r.fetched)-1 {
+			short = append(short, fmt.Sprintf("fetch %d saw %d digest(s)", len(r.fetched), n))
 		}
 		return nil, nil, false
 	}
 	r.land()
-	if seen != 32 {
-		t.Fatalf("the roster held %d digests when the 34th fetch started, want 32", seen)
-	}
+	mlWant(t, short, nil, "the roster at each fetch (every earlier landing written)")
 	mlWant(t, mlRoster(t, "mlref"), mlDigests(mlDK, rels...), "the final roster")
+	if st, err := os.Lstat(landedRosterFile("mlref")); err != nil || st.Mode().Perm() != 0o600 {
+		t.Fatalf("the appended roster: %v, %v", st, err)
+	}
 }
 
 // L11: recordLandedRoster unions, and "" (receipts off) is a no-op that a run survives.

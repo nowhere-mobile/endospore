@@ -40,6 +40,7 @@ final class TelSeen {
                 + clamp(unknown) + " " + clamp(addrNotInserted) + " " + clamp(partsNotInserted);
     }
 
+    /** A live run never sends: sign-in deliveries only (docs/product-decisions.md 2026-11-06, harvest 60 #4). */
     static boolean sends(boolean live, TelSeen s) {
         return !live && s != null && s.any();
     }

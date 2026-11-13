@@ -9,9 +9,11 @@ package main
 // seal and then running its own; runWorkerHeld drops it under the slot, immediately before an out op's request is
 // written, and only for an out op that runs (requestSealStop and dropSealStop below). SUPERSEDED in part (h49 #13,
 // NWP-20261119-03): handleLogout also raises it when the announce it replaces is "manual" (a running Back up now), and
-// its out op then runs as "logoff-pinned"; a "promote" announce is still not asked (h49 #13 leaves it open). A Back up
-// now whose announce a sign-out took while it waited for the slot answers SKIP-STOPPED there and leaves the request
-// for the sign-out's own out op (manualStoppedAtSlot below, NWP-20261126-11).
+// its out op then runs as "logoff-pinned". SUPERSEDED in part (h59 #1, NWP-20261129-23): it raises it over a "promote"
+// announce too (a running "Save to your store" seal), and its out op then runs as plain "logoff". A Back up now whose
+// announce a sign-out took while it waited for the slot answers SKIP-STOPPED there and leaves the request for the
+// sign-out's own out op (manualStoppedAtSlot below, NWP-20261126-11); a promote seal does the same
+// (promoteStoppedAtSlot below, NWP-20261129-23).
 //
 // WHO MAY HONOUR IT. Only a `push` verb run with NOWHERE_SEAL_STOPPABLE=1, and only roamd's out op exports that
 // (roamd runs one op per process, so the out op's _push, acct_seal and appcode_seal see it and nothing else does).
@@ -91,7 +93,7 @@ func sealStopNow() bool {
 
 // requestSealStop creates the stop request in dest ($NOWHERE_STATE): an empty file, mode 0600. handleLogout calls it,
 // after it releases pendingReapMu, when the announce it replaced was "periodic" (or, since h49 #13,
-// NWP-20261119-03, "manual").
+// NWP-20261119-03, "manual"; or, since h59 #1, NWP-20261129-23, "promote").
 func requestSealStop(dest string) error {
 	return os.WriteFile(filepath.Join(dest, sealStopFile), nil, 0o600)
 }
@@ -120,6 +122,21 @@ func manualStoppedAtSlot(intent string) bool {
 	if intent != "manual" {
 		return false
 	}
+	return signOutHoldsAnnounce()
+}
+
+// promoteStoppedAtSlot is manualStoppedAtSlot's rule for a promote seal (h59 #1, "a sign-out saves once";
+// NWP-20261129-23): its intent is "promote" and a sign-out took the announce while it waited for the slot. An announce
+// of "" runs for the reasons above; "promote" is its own announce, and it runs.
+func promoteStoppedAtSlot(intent string) bool {
+	if intent != "promote" {
+		return false
+	}
+	return signOutHoldsAnnounce()
+}
+
+// signOutHoldsAnnounce reports, under pendingReapMu, whether the announce is a sign-out's.
+func signOutHoldsAnnounce() bool {
 	pendingReapMu.Lock()
 	defer pendingReapMu.Unlock()
 	return sealRunKind == "logoff"

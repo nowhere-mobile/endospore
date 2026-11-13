@@ -138,6 +138,25 @@ public class PlayChoiceCases {
     eq("userKeepsOnInstall ABSENT vending", false, PlayChoice.userKeepsOnInstall(ABSENT, VENDING));
     eq("userKeepsOnInstall OFF vending", false, PlayChoice.userKeepsOnInstall(OFF, VENDING));
 
+    // turnsOnAtInstall: a new install of Play Store with Play Off, seen by the broadcast (NWP-20261129-16, h59 #7)
+    eq("turnsOnAtInstall OFF vending, new, broadcast", true, PlayChoice.turnsOnAtInstall(OFF, VENDING, false, true));
+    eq("turnsOnAtInstall ON vending", false, PlayChoice.turnsOnAtInstall(ON, VENDING, false, true));
+    eq("turnsOnAtInstall ABSENT vending (absent is never off)", false, PlayChoice.turnsOnAtInstall(ABSENT, VENDING, false, true));
+    eq("turnsOnAtInstall OFF gms", false, PlayChoice.turnsOnAtInstall(OFF, GMS, false, true));
+    eq("turnsOnAtInstall OFF gsf", false, PlayChoice.turnsOnAtInstall(OFF, GSF, false, true));
+    eq("turnsOnAtInstall OFF another app", false, PlayChoice.turnsOnAtInstall(OFF, "com.example.app", false, true));
+    eq("turnsOnAtInstall OFF vending, an update", false, PlayChoice.turnsOnAtInstall(OFF, VENDING, true, true));
+    eq("turnsOnAtInstall OFF vending, the catch-up", false, PlayChoice.turnsOnAtInstall(OFF, VENDING, false, false));
+
+    // backOnMarks: Play services then GSF, each on this phone with no keep line; never Play Store
+    eq("backOnMarks both on the phone, unkept", Arrays.asList(GMS, GSF), PlayChoice.backOnMarks(p -> true, p -> false));
+    eq("backOnMarks gms kept", Collections.singletonList(GSF), PlayChoice.backOnMarks(p -> true, GMS::equals));
+    eq("backOnMarks gsf kept", Collections.singletonList(GMS), PlayChoice.backOnMarks(p -> true, GSF::equals));
+    eq("backOnMarks gms not on the phone", Collections.singletonList(GSF), PlayChoice.backOnMarks(GSF::equals, p -> false));
+    eq("backOnMarks gsf not on the phone", Collections.singletonList(GMS), PlayChoice.backOnMarks(GMS::equals, p -> false));
+    eq("backOnMarks nothing on the phone", Collections.emptyList(), PlayChoice.backOnMarks(p -> false, p -> false));
+    check("backOnMarks never lists Play Store", !PlayChoice.backOnMarks(p -> true, p -> false).contains(VENDING), "listed");
+
     // offDrops and the reconcile guard
     eq("offDrops is Play Store alone (B1 (i))", Collections.singleton(VENDING), PlayChoice.offDrops());
     eq("blocksVendingReadd OFF", true, PlayChoice.blocksVendingReadd(OFF));

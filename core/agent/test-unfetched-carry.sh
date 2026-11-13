@@ -52,7 +52,7 @@ PY
   cp "$SRC/$src" "$src"
 }
 mut "C1 the call removed" main.go TestUnfetchedCarry_U1_VaultCarriesByteIdentical \
-  'chunks, unfSpans, unfPkg, unfN := sealCarryUnfetched\(profile, oldM, chunks, acct, deferredMap\)' \
+  'chunks, unfSpans, unfPkg, unfN := sealCarryUnfetched\(profile, oldM, chunks, acct, deferredMap, unfList, unfListOK\)' \
   'var unfSpans map[string][][2]int; var unfPkg map[string]int64; unfN := 0'
 mut "C2 the chunks appended after the footer" unfetched_carry.go TestUnfetchedCarry_U1_VaultCarriesByteIdentical \
   'out = chunks\[:len\(chunks\)-1\] //' 'out = chunks //' \
@@ -61,7 +61,7 @@ mut "C3 pkgB not merged" main.go TestUnfetchedCarry_U1_VaultCarriesByteIdentical
   'pkgBytes = mergeCarried\(pkgBytes, unfPkg\)' '_ = unfPkg'
 mut "C4 the spans not merged" main.go TestUnfetchedCarry_U2_ThirdSealCarriesAgain \
   'pkgSpans = mergeCarried\(pkgSpans, unfSpans\)' '_ = unfSpans'
-mut "C5 carried although walked" unfetched_carry.go TestUnfetchedCarry_U3_WalkedCopyWins \
+mut "C5 carried although walked" unfetched_carry.go TestUnfetchedCarry_U3_WalkedIsNotCarriedAndIsRefused \
   'if walked\[p\] \{' 'if false {'
 mut "C6 carriedChunks not counted" main.go TestUnfetchedCarry_U1_LargePackageBeatsTheShrinkGuard \
   'carriedChunks \+= unfN' '_ = unfN'

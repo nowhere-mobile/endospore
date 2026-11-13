@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # test-strict-arg-line.sh [--mutate] -- NWP-20261119-29: ROLLBACK answers ERR for anything but a positive decimal
 # version, and REMOVE-FIDO2-KEY answers ERR when its credID line did not arrive with its LF, so a request whose argument
-# line never arrived neither rolls the head back nor strips every security key. Runs strict_arg_line_test.go; --mutate
-# applies each mutant to main.go in place (restored on exit) and requires a real `--- FAIL`: a mutant that does not
-# apply, or that does not compile, is a failure, never a conviction.
+# line never arrived neither rolls the head back nor strips every security key. NWP-20261129-47: SET-PIN and
+# SET-GATE-ALARM answer ERR when their value line did not arrive with its LF, so a missing line clears nothing and a cut
+# line is not stored as whole. Runs strict_arg_line_test.go; --mutate applies each mutant to main.go in place (restored
+# on exit) and requires a real `--- FAIL`: a mutant that does not apply, or that does not compile, is a failure, never a
+# conviction.
 set -uo pipefail
 cd "$(dirname "$0")" || exit 2
 . ./suite-report.sh
@@ -47,5 +49,11 @@ mutate "S3: the ROLLBACK arm passes the value whatever ReadString's error" \
 mutate "S4: the REMOVE-FIDO2-KEY arm ignores ReadString's error" \
   $'if err != nil {\n\t\t\tfmt.Fprint(os.Stderr, "[logind] remove-fido2-key: refused' \
   $'if false && err != nil {\n\t\t\tfmt.Fprint(os.Stderr, "[logind] remove-fido2-key: refused'
+mutate "S5: the SET-PIN arm ignores ReadString's error" \
+  $'if err != nil {\n\t\t\tfmt.Fprint(os.Stderr, "[logind] set-pin: refused' \
+  $'if false && err != nil {\n\t\t\tfmt.Fprint(os.Stderr, "[logind] set-pin: refused'
+mutate "S6: the SET-GATE-ALARM arm ignores ReadString's error" \
+  $'if rerr != nil {\n\t\t\tgateAlarmRelays.Add(1)' \
+  $'if false && rerr != nil {\n\t\t\tgateAlarmRelays.Add(1)'
 [ "$FAILS" = 0 ] || { echo "== $FAILS mutant(s) not convicted"; exit 1; }
-echo "== 4 mutants convicted"
+echo "== 6 mutants convicted"

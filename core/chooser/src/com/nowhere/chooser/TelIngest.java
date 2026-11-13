@@ -100,6 +100,7 @@ final class TelIngest {
         ensureSmsRead(ctx);      // NWP-20261006-07: so a resent text is found in Messages, not inserted twice.
         ensureReadRestrictedMessages(ctx); // #150: needed to write MMS part data (MmsProvider.openFile restricted-read).
         ensureNotificationListener(ctx); // task_c272758a (force-ours): our listener cancels Bugle's duplicate SMS notice
+        ensureContactsRead(ctx); // NWP-20261201-29: so a text's notice can name its sender from this profile's contacts.
         if (!live) { try { Thread.sleep(SETTLE_MS); } catch (InterruptedException ignored) { return; } }
         int verified = 0;
         // insertedThisRun: SMS/MMS dedup across the 3 passes (#371) -- the in-memory guard, kept for a row this run
@@ -202,9 +203,11 @@ final class TelIngest {
         // NWP-20261129-02: can the session's reader see what this run inserted? Read after the last pass, so a provider
         // still settling at sign-in is not counted hidden. A read that cannot see (OP_READ_SMS ignored answers an empty
         // cursor, clearReadNotices' rule) is unknown, never hidden. A live run (one per text reaching a signed-in
-        // session) sends nothing, since a line per arrival puts each text's time into login.log (telSlowWait's rule);
-        // sign-in and resume deliveries insert through the same deliver() with the same sub_id, and the daemon's
-        // "staged <n> sealed telephony item(s)" line already dates them. Counts only.
+        // session) sends nothing -- docs/product-decisions.md 2026-11-06 "twenty answers to harvest 60" #4: the
+        // read-back line is for sign-in deliveries only, since a line per arrival puts each text's time into login.log,
+        // which in-session reports carry (telSlowWait's rule); sign-in and resume deliveries insert through the same
+        // deliver() with the same sub_id, and the daemon's "staged <n> sealed telephony item(s)" line already dates
+        // them. Counts only.
         if (!live) {
             final boolean canRead = canReadMessages(ctx);
             for (long w : seen.sms) seen.readBack("sms", canRead ? exists(ctx, android.provider.Telephony.Sms.Inbox.CONTENT_URI, w) : null);
@@ -671,14 +674,15 @@ final class TelIngest {
      *  is drawn from its own extras, so it carries the name too. The name stays "Messages" whichever app holds the
      *  SMS role: since 2026-10-11 that is the profile's own choice (SmsRoleRoam), and the tap opens THAT app
      *  (messageTapPackage) -- the sender's thread when it handles VIEW sms:, else its SENDTO smsto: compose screen.
-     *  NWP-20261118-16: every message notice is in one group (MessageGroup.KEY), with a summary of ours. */
+     *  NWP-20261118-16: every message notice is in one group (MessageGroup.KEY), with a summary of ours.
+     *  NWP-20261201-29: the title is the sender's name from this profile's contacts, else the number (SenderName). */
     private static void postRoamedMessageNotice(Context ctx, String tag, String from, String subject, String preview,
                                                 String mediaLabel, long when) {
         try {
             android.app.NotificationManager nm = ctx.getSystemService(android.app.NotificationManager.class);
             if (nm == null) return;
             SmsDeliverReceiver.ensureTelChannel(nm); // HIGH + explicit sound + vibrate -> the roamed session alerts
-            String title = from == null || from.isEmpty() ? "New message" : from;
+            String title = SenderName.senderTitle(from, SenderName.lookUpSender(from, android.os.UserHandle.myUserId()) ? contactName(ctx, from) : null);
             String body = preview == null ? "" : preview.trim();
             if (body.isEmpty() && subject != null) body = subject.trim();
             if (mediaLabel != null) body = body.isEmpty() ? mediaLabel : (body + "  " + mediaLabel);
@@ -1072,6 +1076,35 @@ final class TelIngest {
             }
         } catch (Throwable t) {
             android.util.Log.w("NowhereChooser", "telingest ensureCallLogGrant", t);
+        }
+    }
+
+    /** NWP-20261201-29: ensure the chooser can read THIS roamed user's contacts, so a text's notice can name its sender.
+     *  The profile-owner self-grant of ensureCallLogGrant, READ only. User 0 never holds it, whatever starts a run there. */
+    private static void ensureContactsRead(Context ctx) {
+        if (android.os.UserHandle.myUserId() == 0) return;
+        try {
+            android.app.admin.DevicePolicyManager dpm = ctx.getSystemService(android.app.admin.DevicePolicyManager.class);
+            if (dpm == null) return;
+            android.content.ComponentName admin = new android.content.ComponentName(ctx, AdminReceiver.class);
+            dpm.setPermissionGrantState(admin, ctx.getPackageName(), android.Manifest.permission.READ_CONTACTS,
+                    android.app.admin.DevicePolicyManager.PERMISSION_GRANT_STATE_GRANTED);
+        } catch (Throwable t) {
+            android.util.Log.w("NowhereChooser", "telingest ensureContactsRead", t);
+        }
+    }
+
+    /** NWP-20261201-29: the display name this profile's contacts hold for `from`, or null: no match, no READ_CONTACTS
+     *  (SecurityException), or a provider not ready at sign-in. The log line names the exception's class only and never
+     *  passes the Throwable: a provider's message can quote the lookup URI, and the URI holds the number. */
+    private static String contactName(Context ctx, String from) {
+        try (Cursor c = ctx.getContentResolver().query(
+                Uri.withAppendedPath(android.provider.ContactsContract.PhoneLookup.CONTENT_FILTER_URI, Uri.encode(from)),
+                new String[]{ android.provider.ContactsContract.PhoneLookup.DISPLAY_NAME }, null, null, null)) {
+            return c != null && c.moveToFirst() ? c.getString(0) : null;
+        } catch (Throwable t) {
+            android.util.Log.w("NowhereChooser", "telingest contactName: " + t.getClass().getName());
+            return null;
         }
     }
 

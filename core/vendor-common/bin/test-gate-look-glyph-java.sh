@@ -4,13 +4,15 @@
 # WHY THIS IS COMMITTED. docs/product-decisions.md (2026-10-29, "three answers — the gate clears its sign-in fields
 # when the screen turns off ...", second bullet) puts the gate's light/dark choice on a sun/moon in the gate's
 # top-right corner: a sun while the gate is dark, a moon while it is light, and a tap switches the one device-wide look
-# with no owner passphrase. Owner settings › Appearance stays. GateLookGlyph.java is pure java, compiled as-is with
+# with no owner passphrase. ~~Owner settings › Appearance stays.~~ (Superseded 2026-11-06, "Owner settings loses
+# Appearance ...": NWP-20261130-13 removed its Light mode switch, so this sun/moon is the only light/dark control.)
+# GateLookGlyph.java is pure java, compiled as-is with
 # GatePalette.java and core/chooser/tests/gate-look-glyph/GateLookGlyphCases.java (sun(), next(), description() and
 # the two strings). The PINS check the wiring the cases cannot see: onCreate adds the glyph to the top-right row once,
 # before the help "?", with its sun flag and description from GateLookGlyph and its click to toggleGateLook();
 # toggleGateLook's first statement refuses while a sign-in, resume or sign-out runs, it writes GatePalette.KEY with
 # commit() (never apply()), recreate()s only on a commit that succeeded and shows GateLookCopy.FAILED otherwise; it
-# sits after buildGateLookScreen (test-gate-look-java.sh's M3 and M10 anchor on the first GateLookCopy.FAILED);
+# sits after buildGateLookScreen (test-gate-look-java.sh's M10 anchors on the first GateLookCopy.FAILED);
 # lockGateForm dims the glyph; LookGlyphView holds no colour literal and draws the storefront's moon; and
 # docs/threat-model.md's nowhere_gate.xml row names toggleGateLook.
 #

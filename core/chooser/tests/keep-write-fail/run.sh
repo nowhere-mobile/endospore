@@ -2,12 +2,13 @@
 # run.sh <StoreInstaller.java> <StoreService.java> <napps StoreActivity.java> -- NWP-20261105-03: lift keepAutoImpl verbatim
 # (by signature, brace depth) into a harness StoreInstaller and getAppReply into a harness StoreService, stub what they
 # call (writeAtomic and clearTurnedOff throw on demand, noteAppSeen, APPKEEP_LOCK, ProfileActivity, Context, Log), run
-# KeepWriteFailCases, then source-check that nApps' OK-UNSAVED branch comes before the generic OK branch.
+# KeepWriteFailCases, then source-check that nApps' OK-UNSAVED and OK-OFF branches come before the generic OK branch and
+# (NWP-20261129-38) that getApp reads the Off nApps default before keepAuto and passes it, with no keep line, to getAppReply.
 # $JAVAC / $JAVA / KEEP_WRITE_FAIL_TMP come from core/chooser/test-keep-write-fail-java.sh.
-# getAppReply is OPTIONAL: when StoreService does not name it at all (origin/main), it is stubbed to return null, so
-# its four cases fail and the keepAutoImpl cases still run -- on origin/main this exits 1 with both halves shown, not 2.
-# Exit codes: 1 = a case failed; 2 = keepAutoImpl did not extract, or StoreService names getAppReply but it did not
-# extract by its signature; 3 = compile failure or JVM died with anything but 0/1.
+# getAppReply is OPTIONAL: when StoreService does not name it at all, it is stubbed to return null, so its eight cases
+# fail and the keepAutoImpl cases still run. A StoreService with the older three-parameter form exits 2.
+# Exit codes: 1 = a case or source check failed; 2 = keepAutoImpl or getApp did not extract, or StoreService names
+# getAppReply but it did not extract by its signature; 3 = compile failure or JVM died with anything but 0/1.
 set -euo pipefail
 SI="${1:?usage: run.sh StoreInstaller.java StoreService.java StoreActivity.java}"
 SS="${2:?}"
@@ -61,12 +62,12 @@ PY
 
 KEEP=$(lift "$SI" 'private static boolean keepAutoImpl(Context ctx, String pkg, boolean overPlan, String mode) {') \
   || { echo "EXTRACTION FAILED: keepAutoImpl" >&2; exit 2; }
-REPLY_SIG='static String getAppReply(boolean kept, boolean overPlan, String pkg) {'
+REPLY_SIG='static String getAppReply(boolean kept, boolean overPlan, boolean notKeptByDefault, String pkg) {'
 if grep -qF 'getAppReply' "$SS"; then
   REPLY=$(lift "$SS" "$REPLY_SIG") || { echo "EXTRACTION FAILED: getAppReply" >&2; exit 2; }
 else
-  # origin/main: no getAppReply at all. Stub it to return null so its cases FAIL and the keepAutoImpl cases still run.
-  echo "  NOTE  no getAppReply in $SS -- stubbed to return null, so its four cases fail"
+  # No getAppReply at all. Stub it to return null so its cases FAIL and the keepAutoImpl cases still run.
+  echo "  NOTE  no getAppReply in $SS -- stubbed to return null, so its eight cases fail"
   REPLY="$REPLY_SIG return null; }"
 fi
 [ -n "$KEEP" ] && [ -n "$REPLY" ] || { echo "EXTRACTION FAILED: empty member" >&2; exit 2; }
@@ -128,14 +129,34 @@ rc=0
 "$JAVA" -Djava.io.tmpdir="$D" -Dfile.encoding=UTF-8 -cp "$D/out" com.nowhere.chooser.KeepWriteFailCases "$D" || rc=$?
 [ "$rc" = 0 ] || [ "$rc" = 1 ] || exit 3
 
-# The napps source: the OK-UNSAVED branch must come before the generic OK branch (startsWith("OK") also matches it).
-order=$(python3 -I - "$SA" <<'PY'
+# The napps source: each specific branch must come before the generic OK branch (startsWith("OK") also matches it).
+for word in OK-UNSAVED OK-OFF; do
+  order=$(python3 -I - "$SA" "$word" <<'PY'
 import io, sys
 s = io.open(sys.argv[1], encoding='utf-8').read()
-u = s.find('r.startsWith("OK-UNSAVED")'); g = s.find('r.startsWith("OK"))')
-print('ok' if u >= 0 and g >= 0 and s.count('r.startsWith("OK-UNSAVED")') == 1 and u < g else 'bad')
+b = 'r.startsWith("%s")' % sys.argv[2]
+u = s.find(b); g = s.find('r.startsWith("OK"))')
+print('ok' if u >= 0 and g >= 0 and s.count(b) == 1 and u < g else 'bad')
+PY
+  )
+  if [ "$order" = ok ]; then echo "  ok    napps $word branch comes before the generic OK branch"
+  else echo "  FAIL  napps $word branch missing, repeated or after the generic OK branch"; rc=1; fi
+done
+
+# The getApp source (NWP-20261129-38): the Off default is read before keepAuto, and only an app with no keep line gets
+# the flag. getApp talks to the daemon and the installer, so its tail is checked as text and not run.
+GETAPP=$(lift "$SS" 'public String getApp(String pkg, String label) {') \
+  || { echo "EXTRACTION FAILED: getApp" >&2; exit 2; }
+wired=$(GETAPP_BODY="$GETAPP" python3 -I - <<'PY'
+import os
+s = os.environ['GETAPP_BODY']
+want = ['boolean offDefault = ProfileActivity.APPDEF_OFF.equals(ProfileActivity.cfgStatic(StoreService.this, ProfileActivity.CFG_APPS_NAPPS));',
+        'StoreInstaller.keepAuto(StoreService.this, pkg, overPlan)',
+        'return getAppReply(kept, overPlan, offDefault && !StoreInstaller.keepSetHas(StoreService.this, pkg), pkg);']
+at = [s.find(w) for w in want]
+print('ok' if all(s.count(w) == 1 for w in want) and at == sorted(at) else 'bad')
 PY
 )
-if [ "$order" = ok ]; then echo "  ok    napps OK-UNSAVED branch comes before the generic OK branch"
-else echo "  FAIL  napps OK-UNSAVED branch missing or after the generic OK branch"; rc=1; fi
+if [ "$wired" = ok ]; then echo "  ok    getApp reads the Off default before keepAuto and passes it with no keep line"
+else echo "  FAIL  getApp does not read the Off default before keepAuto, or does not pass it with no keep line"; rc=1; fi
 exit "$rc"

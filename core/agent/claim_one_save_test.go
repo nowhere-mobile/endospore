@@ -33,6 +33,16 @@ func cosFault(t *testing.T, wp string) {
 	})
 }
 
+// cosNoID records every purchase of the test without an id. Since NWP-20261201-18 a recorded purchase's id is a seen
+// key (p:<id>), so with an id the plan-only first write of mutant M4 also adds a key, fails under cosFault, and M4
+// passes. An id-less purchase adds no key, as before h60 #14, so M4's plan write lands and the test convicts it.
+func cosNoID(t *testing.T) {
+	t.Helper()
+	old := newPurchaseID
+	newPurchaseID = func() string { return "" }
+	t.Cleanup(func() { newPurchaseID = old })
+}
+
 // cosFunded saves a wallet holding an earlier funded purchase: a 5 GB x 1 plan and 5 plain tokens to pay for it.
 func cosFunded(t *testing.T, wp string) {
 	t.Helper()
@@ -50,6 +60,7 @@ func cosFunded(t *testing.T, wp string) {
 
 // O1: a batch whose token save fails records no plan. Two saves left plan 10 x 3 with zero tokens.
 func TestClaimOneSave_APlanNeverLandsWithoutItsTokens(t *testing.T) {
+	cosNoID(t)
 	wp := filepath.Join(t.TempDir(), "wallet.json")
 	if err := bumpWalletGeneration(wp); err != nil {
 		t.Fatal(err)
@@ -72,6 +83,7 @@ func TestClaimOneSave_APlanNeverLandsWithoutItsTokens(t *testing.T) {
 // O2: the same fault under an earlier funded purchase leaves the wallet file byte for byte as it was. Two saves
 // queued 10 x 3 behind the 5 x 1 with no token to pay for it.
 func TestClaimOneSave_AFailedBatchLeavesAFundedWalletAsItWas(t *testing.T) {
+	cosNoID(t)
 	wp := filepath.Join(t.TempDir(), "wallet.json")
 	cosFunded(t, wp)
 	before, err := os.ReadFile(wp)
@@ -116,6 +128,9 @@ func TestClaimOneSave_NoFault(t *testing.T) {
 			t.Fatalf("drainClaim = (%d, %v), want (30, nil)", n, err)
 		}
 		w := cbsLoad(t, wp)
+		for i := range w.PlanQueue {
+			w.PlanQueue[i].ID = "" // a minted random id (h60 #14); this test pins the size and term
+		}
 		want := []PlanSpec{{GB: 10, Periods: 3}}
 		if w.PlanGB != 5 || w.PlanPeriods != 1 || !reflect.DeepEqual(w.PlanQueue, want) {
 			t.Fatalf("wallet holds plan %d x %d and queue %v, want 5 x 1 and %v", w.PlanGB, w.PlanPeriods, w.PlanQueue, want)

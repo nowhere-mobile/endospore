@@ -2,9 +2,10 @@ package com.nowhere.chooser;
 
 /**
  * The gate's Help pages (NWP-20261122-05; decision 2026-11-02, docs/product-decisions.md, "Help at the gate covers the
- * gate and Owner settings only ..."). The gate's "?" (ChooserActivity.showGateHelp) reads this class only; Profile ›
- * Help reads HelpPages, the session's own set. The gate covers only what is used at the gate: signing in, the gate's
- * Settings, Owner settings, and a locked phone.
+ * gate and Owner settings only ..."). The gate's "?" (ChooserActivity.showGateHelp) opens the combo screen
+ * (GateHelpScreen, NWP-20261130-11), and its tiles read these pages through GateHelpHome; Profile › Help reads HelpPages,
+ * the session's own set. The gate covers only what is used at the gate: signing in, the gate's Settings, Owner settings,
+ * and a locked phone.
  *
  * B4 (decision 2026-10-31, Part B, unchanged): a page says what a feature is and how to use it, never what it
  * protects; test-help-pages-java.sh refuses the words that would make one. Every step names its control by the label
@@ -54,7 +55,7 @@ final class GateHelpPages {
             "A required update shows Required, install by and a date. After that date it shows overdue.",
             // ChooserActivity: lookGlyph (left of helpIcon "?"), toggleGateLook; GONE while the gate's prefs hold
             // GateLookGlyph.OWNER_ONLY_KEY (buildGateLookScreen: GateLookCopy.OWNER_ONLY, NWP-20261124-15)
-            "The sun or moon left of ? switches between light and dark, unless the owner has kept the look to Owner "
+            "The sun or moon left of ? switches between light and dark, unless the owner has locked the look in Owner "
                     + "settings.",
             // buildOwnerMenu: settingsRow("Report a device issue", ...); ReportIntroCopy.GATE;
             // buildReportScreen: the `where` line
@@ -94,6 +95,9 @@ final class GateHelpPages {
             // ChooserActivity.createOverColdLockText; ProfileActivity.showSecurity "Auto-wipe when left locked"
             "A locked session ends when another sign-in succeeds, when the phone restarts, or after the time set in "
                     + "Profile › Security › Auto-wipe when left locked. Anything it has not saved is lost.",
+            // ProfileActivity: logoffLabel "Log off"; HelpPages page 3 has the same step. The "Lock or log off" tile opens
+            // this page (NWP-20261130-11).
+            "Profile › Log off: sign out. A saved profile saves to your store first.",
         },
     };
 

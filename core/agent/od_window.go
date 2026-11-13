@@ -240,13 +240,15 @@ func endOdLease(pkg string, now time.Time) {
 // resetOdWindow ends every hold at a session boundary: it drops every lease, the anchor and the auto sweep's lease,
 // and bumps the epoch, so whatever the old session still has in flight cannot re-open the window. An AUTO-SWEEP 0
 // the old session's chooser sends late finds no sweep to end (handleAutoSweep floors its count at zero). It also
-// forgets the old profile's seal-hold choice (seal_hold.go): until the new session's is read, the default applies.
+// forgets the old profile's seal-hold choice (seal_hold.go) and its save mode with the gate's last network report
+// (save_mode.go): until the new session's are read, the defaults apply.
 func resetOdWindow() {
 	pendingReapMu.Lock()
 	odLeases = map[string]time.Time{}
 	odMaterializeUntil, sealsHeldSince, holdsEndedAt = time.Time{}, time.Time{}, time.Time{}
 	autoSweepUntil, autoSweepBegan, autoSweepRuns = time.Time{}, time.Time{}, 0
 	sealHoldValue = ""
+	saveModeValue, saveNetUnmetered, saveNetAt = "", false, time.Time{}
 	odWindowEpoch++
 	pendingReapMu.Unlock()
 }

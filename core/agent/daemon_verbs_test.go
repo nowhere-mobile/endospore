@@ -654,11 +654,16 @@ func verbIn(l []string, s string) bool {
 	return false
 }
 
+// chooserVerbsAwaitingArm are verbs the chooser sends before the agent slice that serves them is merged. GET-HEALTH:
+// NWP-20261201-10 reads it and P12a of harvest 62 (the check runner) adds its arm. An entry has no effect once
+// handleLogin has the arm: both TestDaemonVerbs and TestGatePollersNeverWaitOnTheSession then judge the verb in full.
+var chooserVerbsAwaitingArm = map[string]bool{"GET-HEALTH": true}
+
 // senderFiles are the chooser files that touch the daemon socket. A file that starts to and is not here fails.
 var senderFiles = map[string]bool{
-	"AppInstallReceiver.java": true, "BackupNowReceiver.java": true, "ChooserActivity.java": true,
+	"AppInstallReceiver.java": true, "BackupNowReceiver.java": true, "ChooserActivity.java": true, "HealthFixReceiver.java": true,
 	"CredentialService.java": true, "DaemonSocket.java": true, "DiagReportJob.java": true, "DozeAppsMirror.java": true, "GateAlarmActivity.java": true, "GateTrace.java": true,
-	"IdleLogoffReceiver.java": true, "Ingest.java": true, "NfcFido2.java": true, "OtaUpdate.java": true,
+	"IdleLogoffReceiver.java": true, "Ingest.java": true, "NfcFido2.java": true, "OdDataBarrierHost.java": true, "OtaUpdate.java": true,
 	"OtaTimeReceiver.java": true, "OtaWakeReceiver.java": true, "ProfileActivity.java": true, "ReloginReceiver.java": true,
 	"SkipNoticeActivity.java": true, "SmsDeliverReceiver.java": true, "StoreService.java": true, "TelArrival.java": true, "TelIngest.java": true,
 	"UnarchiveService.java": true, "WifiMirror.java": true,
@@ -708,7 +713,7 @@ func TestDaemonVerbs(t *testing.T) {
 			t.Errorf("%s:%d sends %q, which is not a verb-shaped first line", sent[v][0].file, sent[v][0].line, v)
 			continue
 		}
-		if !arms.has(v) {
+		if !arms.has(v) && !chooserVerbsAwaitingArm[v] {
 			for _, s := range sent[v] {
 				t.Errorf("%s:%d sends %s, which has no arm in handleLogin: it falls through to the legacy login, which wipes the session state dir", s.file, s.line, v)
 			}

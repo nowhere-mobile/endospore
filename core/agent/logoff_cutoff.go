@@ -35,12 +35,16 @@ import (
 // cutoff (DIA-20260623-01), hoisted with them (round 7) so the retry tests do not spend it on every sign-out.
 // logoffSync is the flush between the sweep and the seal (NWP-20261017-12), hoisted so a test whose watchdog clock
 // spans it can replace it: sync(2) waits on every dirty page of the HOST, 3.5 s measured on the shared CI VM.
+// sealSync is the same flush before the two background seals, promote and Back up now (NWP-20261108-40). It is not
+// logoffSync because a test holds a sign-out at logoffSync while a Back up now must run to its end. Its readers are
+// goroutines that can outlive their handler, so only the binary-wide test stub (flush_seam_test.go) assigns it.
 var (
 	logoffStallLimit   = 6 * time.Minute  // no sign of life at all -> fail-safe unstick
 	logoffStallHardCap = 90 * time.Minute // absolute backstop for a progress-emitting livelock
 	logoffStallTick    = 15 * time.Second
 	logoffFlushWait    = 2 * time.Second // lets the last app's onStop commit its pending writes before anything stops it
 	logoffSync         = syscall.Sync
+	sealSync           = syscall.Sync
 )
 
 // logoffStallTicker is the #125 watchdog's tick source in handleLogout, hoisted (NWP-20261110-08) so a test can step

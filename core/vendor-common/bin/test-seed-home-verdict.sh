@@ -18,6 +18,9 @@
 # case in seconds instead of hanging the suite. Each run file records the identity of the shell that ran it and the
 # suite asserts it is the shell the case launched. A mutant is convicted only when it fails under EVERY shell found.
 #
+# S-a to S-f read seed_home's rc 0 line from $d/log, not the reply: waited= and db_age= are the record of the page-2 gap
+# in a fresh profile's first sign-in report (NWP-20261129-45), and the reply does not carry them.
+#
 #   bash test-seed-home-verdict.sh            # the behaviour cases
 #   bash test-seed-home-verdict.sh --mutate   # ... plus mutations that must each CONVICT the suite
 set -uo pipefail
@@ -69,19 +72,24 @@ extract() {  # extract <roamd.sh>: seed_home, then the op arm's body (label and 
   sed -n '/^  seed-home)$/,/^    ;;$/p' "$1" | sed '1d;$d'
 }
 
-# run_case <shell> <block-file> <desc: yes|no> <tool: none|rc:out> <ldb: yes|no>
+# run_case <shell> <block-file> <desc: yes|no> <tool: none|rc:out|touch:rc:out> <ldb: yes|no|old> [<stub lines>] [line]
 # -> "<RES>|<am calls>|<aurora calls>|<sleeps>"; "RUNAWAY|rc=<rc>" when the poll did not stop (the stub sleep's 31st
 #    call, or `timeout 30`); "NOPARSE|" when the run file does not parse under <shell> (noted as a harness error)
+# touch:rc:out is a tool that also writes launcher.db, as the real one does; ldb=old is a launcher.db 100 s old. <stub
+# lines> follow the stubs, so a case can replace one or set DB_ON_SLEEP. `line` prints the `[roamd] seed-home: ` lines of
+# $d/log in place of the usual output (a runaway still answers RUNAWAY).
 # The run file's first line records the identity of the shell that runs it, so a runaway still leaves it.
 run_case() {
-  local sh="$1" blk="$2" desc="$3" tool="$4" ldb="$5" d rc
+  local sh="$1" blk="$2" desc="$3" tool="$4" ldb="$5" stubs="${6:-}" mode="${7:-}" d rc t
   d=$(mktemp -d -p "$W") || exit 2
   mkdir -p "$d/user/com.android.launcher3/databases"
   : > "$d/am"; : > "$d/aurora"; : > "$d/sleeps"
   [ "$ldb" = yes ] && : > "$d/user/com.android.launcher3/databases/launcher.db"
+  [ "$ldb" = old ] && : > "$d/user/com.android.launcher3/databases/launcher.db" && touch -d "@$(( $(date +%s) - 100 ))" "$d/user/com.android.launcher3/databases/launcher.db"
   [ "$desc" = yes ] && echo "x" > "$d/desc"
   case "$tool" in
     none) ;;
+    touch:*) t="${tool#touch:}"; printf '#!/bin/sh\necho "%s"\ntouch "$1"\nexit %s\n' "${t#*:}" "${t%%:*}" > "$d/tool"; chmod +x "$d/tool" ;;
     *) printf '#!/bin/sh\n[ -n "%s" ] && echo "%s"\nexit %s\n' "${tool#*:}" "${tool#*:}" "${tool%%:*}" > "$d/tool"; chmod +x "$d/tool" ;;
   esac
   {
@@ -90,9 +98,10 @@ run_case() {
     printf 'd=%s; RES=%s; LOG=%s; uid=10; USERDIR=%s; _sl=0\n' "$(sq "$d")" "$(sq "$d/res")" "$(sq "$d/log")" "$(sq "$d/user")"
     cat <<'STUB'
 am() { echo "$*" >> "$d/am"; }
-sleep() { _sl=$((_sl+1)); if [ "$_sl" -gt 30 ]; then echo RUNAWAY > "$d/runaway"; exit 97; fi; echo "$1" >> "$d/sleeps"; }
+sleep() { _sl=$((_sl+1)); if [ "$_sl" -gt 30 ]; then echo RUNAWAY > "$d/runaway"; exit 97; fi; echo "$1" >> "$d/sleeps"; if [ "$_sl" = "${DB_ON_SLEEP:-}" ]; then : > "$d/user/com.android.launcher3/databases/launcher.db"; fi; }
 seed_aurora_installer() { echo "$1" >> "$d/aurora"; }
 STUB
+    [ -z "$stubs" ] || printf '%s\n' "$stubs"
     sed '/^__ARM__$/,$d' "$blk" | sed -e "s@/system/etc/nowhere/default-home@$d/desc@" -e "s@/system/bin/nowhere_seed_home@$d/tool@"
     sed '1,/^__ARM__$/d' "$blk"
   } > "$d/run.sh"
@@ -100,13 +109,17 @@ STUB
   runsh "$sh" "$d/run.sh"; rc=$?
   notrun "$sh" "$d"
   if [ "$rc" = 124 ] || [ -f "$d/runaway" ]; then echo "RUNAWAY|rc=$rc"; rm -rf "$d"; return; fi
+  if [ "$mode" = line ]; then printf '%s\n' "$(grep -F '[roamd] seed-home: ' "$d/log" 2>/dev/null)"; rm -rf "$d"; return; fi
   printf '%s|%s|%s|%s\n' "$(cat "$d/res" 2>/dev/null)" "$(wc -l < "$d/am" 2>/dev/null || echo 0)" \
     "$(wc -l < "$d/aurora" 2>/dev/null || echo 0)" "$(wc -l < "$d/sleeps" 2>/dev/null || echo 0)"
   rm -rf "$d"
 }
 
+# line_case <shell> <block-file> <ldb> <tool> [<stub lines>] -> seed_home's rc 0 log line (NWP-20261129-45)
+line_case() { run_case "$1" "$2" yes "$4" "$3" "${5:-}" line; }
+
 suite() {  # suite <roamd.sh> <shell> [quiet] -> 0 all ok, 1 a case failed, 2 the harness could not run
-  local f="$1" s="$2" quiet="${3:-}" b p1 p2 nb p=0 x=0 out
+  local f="$1" s="$2" quiet="${3:-}" b p1 p2 nb p=0 x=0 out age
   # every line carries the shell after its case id: "S6 [mksh] ..."
   ok() { p=$((p+1)); [ -n "$quiet" ] || printf '  ok    %s [%s] %s\n' "${1%% *}" "$s" "${1#* }"; }
   no() { x=$((x+1)); [ -n "$quiet" ] || printf '  FAIL  %s [%s] %s\n' "${1%% *}" "$s" "${1#* }"; }
@@ -157,6 +170,34 @@ suite() {  # suite <roamd.sh> <shell> [quiet] -> 0 all ok, 1 a case failed, 2 th
   out=$(run_case "$s" "$nb" no "0:seeded 3" yes)
   stopped S10 "$out" && case "$out" in 'ERR-SEED noverdict|'*) ok "S10 a branch with no verdict -> ERR-SEED noverdict" ;; *) no "S10 got '$out'" ;; esac
 
+  # NWP-20261129-45: the rc 0 line's waited= and db_age=. The upper bound only tells an age from a raw epoch; it is not a
+  # wall-time bound. The tool in S-a writes launcher.db, so a read after it gives about 0.
+  out=$(line_case "$s" "$b" old "touch:0:seeded 3")
+  if stopped S-a "$out"; then
+    age=$(printf '%s\n' "$out" | sed -n 's/.* db_age=\([0-9][0-9]*\)s .*/\1/p')
+    case "$out" in
+      '[roamd] seed-home: seeded 3 (user 10) waited=0s db_age='*'s (NWP-20261129-45)')
+        if [ -n "$age" ] && [ "$age" -ge 100 ] && [ "$age" -lt 3600 ]; then ok "S-a launcher.db 100 s old, the tool writes it -> waited=0s, db_age=${age}s"; else no "S-a db_age is not an age of 100 s or more: '$out'"; fi ;;
+      *) no "S-a got '$out'" ;;
+    esac
+    # S-d: at the reap LOG_SCRUB_SED turns a double-quoted token into "<name>", so the line holds none
+    case "$out" in
+      '') no "S-d the line is empty" ;;
+      *'"'*) no "S-d the line holds a double quote: '$out'" ;;
+      *) ok "S-d the line holds no double quote" ;;
+    esac
+  fi
+  out=$(line_case "$s" "$b" no "0:seeded 3" 'DB_ON_SLEEP=2')
+  stopped S-b "$out" && case "$out" in '[roamd] seed-home: seeded 3 (user 10) waited=2s db_age='*'s (NWP-20261129-45)') ok "S-b launcher.db appears on the 2nd sleep -> waited=2s" ;; *) no "S-b got '$out'" ;; esac
+  out=$(line_case "$s" "$b" yes "0:seeded 3" 'stat() { :; }')
+  stopped S-c "$out" && case "$out" in '[roamd] seed-home: seeded 3 (user 10) waited=0s db_age=-s (NWP-20261129-45)') ok "S-c stat prints nothing -> db_age=-s" ;; *) no "S-c got '$out'" ;; esac
+  out=$(line_case "$s" "$b" yes "0:seeded 3" 'stat() { echo abc; }')
+  stopped S-c2 "$out" && case "$out" in '[roamd] seed-home: seeded 3 (user 10) waited=0s db_age=-s (NWP-20261129-45)') ok "S-c2 stat prints a non-number -> db_age=-s" ;; *) no "S-c2 got '$out'" ;; esac
+  out=$(line_case "$s" "$b" yes "0:seeded 3" 'stat() { echo $(( $(date +%s) + 1000 )); }')
+  stopped S-e "$out" && case "$out" in '[roamd] seed-home: seeded 3 (user 10) waited=0s db_age=-s (NWP-20261129-45)') ok "S-e an mtime in the future -> db_age=-s" ;; *) no "S-e got '$out'" ;; esac
+  out=$(line_case "$s" "$b" yes "0:seeded 3" 'date() { :; }')
+  stopped S-f "$out" && case "$out" in '[roamd] seed-home: seeded 3 (user 10) waited=0s db_age=-s (NWP-20261129-45)') ok "S-f date prints nothing -> db_age=-s" ;; *) no "S-f got '$out'" ;; esac
+
   rm -f "$b" "$p1" "$p2" "$nb"
   if [ -s "$W/harness" ]; then echo "HARNESS ERROR: a run file left no identity or did not parse: $s did not run it" >&2; return 2; fi
   # run_case runs inside $( ), so a case that did not run under $s says so through $W/notrun
@@ -203,6 +244,13 @@ if [ "$MUTATE" = yes ]; then
   mutate 'the poll bound compares a non-number'           's@\[ "\$i" -lt 25 \]@[ "x$i" -lt 25 ]@'
   # unbounded under EVERY shell: the proof, on a host with no mksh, that the bounded stub ends a runaway poll
   mutate 'the poll loses its bound'                       's@ && \[ "\$i" -lt 25 \]@@'
+  mutate 'M-a the waited field dropped'                   's@ waited=\$\{i\}s@@'
+  # the read after the tool sees the mtime the tool just wrote: S-a reads about 0
+  mutate 'M-b db_age read after the tool ran'             's@^(  out=\$\("\$tool" "\$ldb" "\$desc" 2>>"\$LOG"\); rc=\$\?)$@\1; _now=$(date +%s); _mt=$(stat -c %Y "$ldb"); _age=$((_now - _mt))@'
+  mutate 'M-c the raw mtime printed instead of the age'   's@db_age=\$\{_age\}s@db_age=${_mt}s@'
+  mutate 'M-d a non-number stat output not mapped to -'   's@^    case "\$_mt" in ..\|\*\[!0-9\]\*\) ;; \*\) @    case "$_mt" in *) @'
+  mutate 'M-e a negative age not mapped to -'             's@\[ "\$_now" -lt "\$_mt" \] \|\| @@'
+  mutate 'M-f a double quote in the line'                 's@\(NWP-20261129-45\)" >> "\$LOG"@(NWP-20261129-45)\\"" >> "$LOG"@'
   # the runner ignores its shell argument and always runs bash: the identity check must convict it under every non-bash shell
   mutate_runner() {
     local s bad="" want="" cp="$mtmp/suite-runner.sh"

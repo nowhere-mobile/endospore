@@ -398,36 +398,19 @@ func TestAnEmptySignInIsLocalAndNeverSeals(t *testing.T) {
 		}
 	})
 
-	for _, fn := range []string{"syncLoop", "handleRoamOut"} {
+	for _, fn := range []string{"syncLoop"} {
 		t.Run(fn+" tests LOCAL before it seals", func(t *testing.T) {
 			body := stripComments(funcBody(t, string(src), fn))
 			gateExpr := "if localOnlySession(dest) {" // NWP-20261015-24: syncLoop honours both markers
-			if fn == "handleRoamOut" {
-				gateExpr = "if localOnlySession(dest) {" // NWP-20261017-04: the logoff gates honour both markers too
-			}
 			gate := index(body, fn, gateExpr)
 			seal := index(body, fn, `(dest, "out"`)
 			if gate > seal {
 				t.Fatalf("%s seals (body line %d) before it tests .localsession (body line %d) -- a throwaway would be "+
 					"written to the store", fn, seal+1, gate+1)
 			}
-			// The seal must sit OUTSIDE a fall-through from the LOCAL arm: syncLoop skips the cycle, handleRoamOut
-			// puts the seal in the else branch.
+			// The seal must sit OUTSIDE a fall-through from the LOCAL arm: syncLoop skips the cycle.
 			want := "continue"
-			if fn == "handleRoamOut" {
-				want = "} else {"
-			}
-			found := false
-			if fn == "syncLoop" {
-				found = strings.HasPrefix(strings.TrimSpace(body[gate+1]), want) // the LOCAL arm IS the skip
-			} else {
-				for _, l := range body[gate+1 : seal] {
-					if strings.TrimSpace(l) == want {
-						found = true
-					}
-				}
-			}
-			if !found {
+			if !strings.HasPrefix(strings.TrimSpace(body[gate+1]), want) { // the LOCAL arm IS the skip
 				t.Errorf("%s: the LOCAL arm does not end in %q before the seal -- a throwaway falls through to the seal", fn, want)
 			}
 		})

@@ -177,12 +177,20 @@ JBLOCK=$(awk '!on && $0 == "if [ -x /system/bin/nowhere_db_fix ]; then" { on = 1
 JWANT=$(cat <<'EOB'
 if [ -x /system/bin/nowhere_db_fix ]; then
   scrub_db() { # $1=db path, $2..=content tables to empty
-    local _db _rc
+    local _db _rc _nm _sc
     _db="$1"; shift
-    [ -f "$_db" ] || return 0
+    [ -f "$_db" ] || { _ts_absent=$((_ts_absent + 1)); return 0; }
     /system/bin/nowhere_db_fix telscrub "$_db" "$@" >/dev/null 2>&1
     _rc=$?
     [ "$_rc" -eq 0 ] || log -t nowhere_gate "telscrub FAILED rc=$_rc on ${_db#/data/} -- its deleted rows may still be on disk" 2>/dev/null
+    if [ "$_rc" -eq 0 ]; then
+      _ts_ok=$((_ts_ok + 1))
+    else
+      _ts_failed=$((_ts_failed + 1))
+      _nm=${_db##*/}; _nm=${_nm%.db}
+      case "$_db" in */user_de/*) _sc=de ;; *) _sc=ce ;; esac
+      _ts_dbs="${_ts_dbs:+$_ts_dbs,}$_nm.$_sc:$_rc"
+    fi
     return 0
   }
   for _base in /data/user/0 /data/user_de/0; do
@@ -207,10 +215,11 @@ if [ -x /system/bin/nowhere_db_fix ]; then
   done
 else
   # Both editions' .mk lists ship nowhere_db_fix, so reaching here means a build-configuration
-  # regression. The gate has no log file; the Android logger is the only channel it has, and one line
-  # beats the old `command -v sqlite3` behaviour, which skipped this entire janitor on every user
-  # build in perfect silence.
+  # regression. The gate has no log file of its own; this logcat line names the missing tool, the boot line at the
+  # end of this script records telscrub=SKIPPED, and either beats the old `command -v sqlite3` behaviour, which
+  # skipped this entire janitor on every user build in perfect silence.
   log -t nowhere_gate "telscrub SKIPPED: /system/bin/nowhere_db_fix missing on this build" 2>/dev/null
+  _ts=SKIPPED
 fi
 EOB
 )

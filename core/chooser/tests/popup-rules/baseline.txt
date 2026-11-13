@@ -1,0 +1,45 @@
+# Today's breaches of the popup rules in the chooser's dialogs (NWP-20261201-30). test-popup-rules.sh reads this file.
+# This file may only shrink. A dialog moved to the shared sheet or reworded deletes its line here.
+# A breach that is not listed here fails the suite, and so does a line that no longer occurs.
+# Format: <file> TAB <method> TAB <R1|R2|R3> TAB <label or literal> TAB <count>
+# A label is the literal's value. A backslash, a tab, a line break or an unprintable character is written as a backslash escape.
+# R1 is an OK or Cancel button. R2 is a "&". R3 is a destructive verb on the positive button.
+ChooserActivity.java	buildBindSimScreen	R1	Cancel	1
+ChooserActivity.java	buildBindSimScreen	R3	Unbind	1
+ChooserActivity.java	buildReportScreen	R1	Cancel	1
+ChooserActivity.java	confirmInstallOverParked	R1	Cancel	1
+ChooserActivity.java	confirmRepairBindings	R1	Cancel	1
+ChooserActivity.java	confirmSupersedeLoss	R1	Cancel	1
+ChooserActivity.java	offerSnapshotRecovery	R1	Cancel	1
+ChooserActivity.java	pickRestoreDevice	R1	Cancel	1
+ChooserActivity.java	refreshCreditLostNotice	R1	OK	1
+ChooserActivity.java	showCreateOverColdLock	R1	Cancel	1
+ChooserActivity.java	showCreateOverColdLock	R1	OK	1
+ChooserActivity.java	showCreateOverLiveSession	R1	Cancel	1
+ChooserActivity.java	showOtaNotes	R1	OK	1
+ChooserActivity.java	showOtaTimePicker	R1	Cancel	1
+ChooserActivity.java	showSyncIntervalPicker	R1	Cancel	1
+ProfileActivity.java	confirmDeleteSnapshot	R1	Cancel	1
+ProfileActivity.java	confirmDeleteSnapshot	R3	Delete	1
+ProfileActivity.java	confirmGoogleSignOut	R1	Cancel	1
+ProfileActivity.java	confirmPlayOff	R1	Cancel	1
+ProfileActivity.java	confirmRemoveKey	R1	Cancel	1
+ProfileActivity.java	confirmRemoveKey	R3	Remove	1
+ProfileActivity.java	confirmRollback	R1	Cancel	1
+ProfileActivity.java	confirmSignOutAndInstall	R2	Sign out & install	1
+ProfileActivity.java	confirmStopCarrying	R1	Cancel	1
+ProfileActivity.java	confirmStopKeeping	R1	Cancel	1
+ProfileActivity.java	handlePromoteReply	R1	OK	2
+ProfileActivity.java	presetGuard	R1	Cancel	1
+ProfileActivity.java	showIdlePicker	R1	Cancel	1
+ProfileActivity.java	showKeepModeDialog	R1	Cancel	1
+ProfileActivity.java	showLogoffFailedDialog	R1	OK	1
+ProfileActivity.java	showNotice	R1	OK	1
+ProfileActivity.java	showReclaimDialog	R1	Cancel	1
+ProfileActivity.java	showReportIssue	R1	Cancel	1
+ProfileActivity.java	showSealHoldDialog	R1	Cancel	1
+ProfileActivity.java	showSessionPin	R3	Remove	1
+ProfileActivity.java	showSideloadWarning	R1	Cancel	1
+ProfileActivity.java	showStorage	R1	Cancel	1
+ProfileActivity.java	showVpnPicker	R1	Cancel	1
+ProfileActivity.java	showWipePicker	R1	Cancel	1

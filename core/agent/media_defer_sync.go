@@ -31,15 +31,16 @@ import (
 	"time"
 )
 
-// deferredSyncBudget bounds how many bytes ONE cycle may fetch for the deferred tier
-// (NOWHERE_MEDIA_SYNC_BUDGET, default 64 MiB). 0 disables the deferred half entirely.
+// deferredSyncBudget bounds how many bytes ONE cycle may fetch for EACH tier (NOWHERE_MEDIA_SYNC_BUDGET, default
+// 64 MiB). 0 disables the whole mid-session sync.
 //
-// The essential tier needs no budget -- those files are under the deferral floor by definition. The deferred
-// tier is the opposite: a 4K video is exactly the thing the on-demand tier exists NOT to fetch. The bound is
-// per CYCLE, not per session, and the selection is sorted, so what does not fit what is LEFT of a cycle's
-// budget is picked up by a later cycle in the same order: progress is monotonic for every file that fits the
-// budget. A file larger than the whole budget can never fit any cycle; it is skipped (not allowed to end the
-// cycle) and left to the next login, where it restores as an on-demand stub.
+// NWP-20261129-25: the same value bounds the essential tier too, because a file outside the media trees is never
+// deferred at any size (classifyDeferred): a 600 MB audiobook in Audiobooks/ is essential. The deferred tier is the
+// other half: a 4K video is exactly the thing the on-demand tier exists NOT to fetch. The bound is per CYCLE, not
+// per session, and each selection is sorted, so what does not fit what is LEFT of a cycle's budget is picked up by a
+// later cycle in the same order: progress is monotonic for every file that fits the budget. A file larger than the
+// whole budget can never fit any cycle; it is skipped (not allowed to end the cycle) and left to the next login,
+// where a deferred file restores as an on-demand stub and an essential file restores in full.
 func deferredSyncBudget() int64 {
 	if v := strings.TrimSpace(os.Getenv("NOWHERE_MEDIA_SYNC_BUDGET")); v != "" {
 		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n >= 0 {
@@ -47,6 +48,16 @@ func deferredSyncBudget() int64 {
 		}
 	}
 	return 64 << 20
+}
+
+// signOutSeal reports whether this seal is the sign-out's own run: handleLogout's kind, which roamd exports. The
+// reap deletes this session moments later, so the post-seal sync fetches nothing onto it (NWP-20261129-25).
+func signOutSeal() bool {
+	switch os.Getenv("NOWHERE_SEAL_KIND") {
+	case "logoff", "logoff-pinned":
+		return true
+	}
+	return false
 }
 
 // fetchDeferredBytes reassembles one deferred file from its own chunk list.
@@ -107,7 +118,7 @@ func newlyArrivedDeferred(stored, restored map[string]deferredFile, dest string,
 		if isMediaCachePath(rel) || isAppCodeStagePath(rel) || strings.Contains(rel, "/.nowhere-odhold/") {
 			continue // derived caches, install staging and the on-demand hold are never user media
 		}
-		if rel == "" || strings.HasPrefix(rel, "/") || strings.Contains(rel, "..") {
+		if !syncRelOK(rel) {
 			continue
 		}
 		if _, err := os.Lstat(filepath.Join(dest, filepath.FromSlash(rel))); err == nil {

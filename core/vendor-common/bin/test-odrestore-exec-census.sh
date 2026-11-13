@@ -163,6 +163,7 @@ suite() {  # suite <roamd.sh> <sh> [quiet] -> 0 all ok, 1 a case failed, 2 the h
         printf '%s() { echo "%s $*" >> "$C"; }\n' "$t" "$t"
       done
       printf '%s\n' 'od_watched() { shift; "$@" 2>&1; }'
+      printf '%s\n' 'od_fetch_data() { return 0; }; od_listed() { return 1; }; od_block_app() { return 0; }; od_unblock_app() { :; }; od_pending_clear() { :; }; od_block_installed() { :; }; od_shipped_prep() { return 0; }; od_park_var() { :; }; od_unf_path() { echo "$STATE/odfetch.$1/unfetched.$2"; }   # NWP-20261130-03'
       printf '%s\n' 'ks_in_dir() { echo "ks_in_dir" >> "$C"; printf "%s\n" "$KS_IN/$uid"; }'
       printf '%s\n%s\n' "$RG" "$RK"
       printf 'case "$op" in\n%s\nesac\n' "$RA"
@@ -381,11 +382,11 @@ suite() {  # suite <roamd.sh> <sh> [quiet] -> 0 all ok, 1 a case failed, 2 the h
   chk "BB8 op 2 ran no grant for $PKG2" hasnt "$R/sim/both" "$G2I"
   chk "BB8 op 2 logged its 'no code' line" pre "$R/roam.log" "odrestore $PKG2 -> no code for user $UID_ yet"
 
-  say "== [$sh] BB9: the perms file is gone by op 2 -> grant_perms_for returns early, and the -3 cache is still removed =="
+  say "== [$sh] BB9: the perms file is gone by op 2 -> grant_perms_for still runs the INTERNET default, and the -3 cache is still removed =="
   mkroot; code "$R"; pkg2 "$R"
   run_pair "$R" "$TOKB.1.2" "$TOKB.2.2" drop_perms
   chk "BB9 the -3 cache exists after op 1 and is gone after op 2" bb_cache "$R"
-  chk "BB9 op 2's grant_perms_for found no perms file" pre "$R/roam.log" "GRANT ($PKG2) -> 0 perms (no file, user $UID_)"
+  chk "BB9 op 2's grant_perms_for found no perms file" pre "$R/roam.log" "GRANT ($PKG2) -> 0 perms (no file) + 1 INTERNET default(s) (user $UID_)"
 
   [ -z "$HARN" ] || { echo "HARNESS ERROR:$HARN" >&2; return 2; }
   say "[$sh] $p passed, $x failed"

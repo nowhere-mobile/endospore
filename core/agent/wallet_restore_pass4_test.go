@@ -357,7 +357,11 @@ func TestSignOutOfANeverRestoredSession(t *testing.T) {
 		f := walletFailSetup(t)
 		f.failedRoamIn(t)
 		f.appendTwo(t)
+		flushes := flushSeamCalls.Load()
 		out := f.signOut(t, "83")
+		if flushSeamCalls.Load() <= flushes {
+			t.Fatal("the sign-out's flush did not reach the binary-wide stub (flush_seam_test.go)")
+		}
 		// NWP-20261017-02: the landed sign-out then publishes the wallet by value and drops the file, on a goroutine of
 		// its own. That the retry landed is what lets it: a generation without the proof would keep the file.
 		deadline := time.Now().Add(15 * time.Second)

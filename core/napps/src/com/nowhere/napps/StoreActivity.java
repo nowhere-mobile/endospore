@@ -533,6 +533,11 @@ public class StoreActivity extends Activity {
                     // NWP-20261105-03: installed, but the keep line could not be written -- not "added".
                     paintAction(action, grey, pkg, catalogVc, catalogCert);
                     setStatus(label + " installed for this session only — it couldn't be added to this profile's apps, so it won't come back after you sign out.");
+                } else if (r.startsWith("OK-OFF")) {
+                    // NWP-20261129-38: installed, but an Off nApps default wrote no keep line -- not "added". Drafted
+                    // words, for Chester to correct (the way of working of #43).
+                    paintAction(action, grey, pkg, catalogVc, catalogCert);
+                    setStatus(label + " installed for this session only — new apps from nApps start Off on this profile, so it won't come back after you sign out. You can keep it in Profile › Preferences › Your apps.");
                 } else if (r.startsWith("OK")) {
                     paintAction(action, grey, pkg, catalogVc, catalogCert);
                     setStatus(label + " added.");

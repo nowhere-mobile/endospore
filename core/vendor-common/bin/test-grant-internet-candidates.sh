@@ -22,6 +22,10 @@
 # holds. The R cases pin it: a failed list records nothing, even after partial output; the skip path runs no pm; one
 # list read per call; a real app is still recorded and its update skips; and the match is whole-line.
 #
+# The N cases (NWP-20261201-19): a profile with no capture yet has no nowhere-perms, and an install in that session is
+# a form of (1) and (3). The package-filtered call used to return before the INTERNET default, and the sign-out then
+# captured the unset Network as a deny line. Now that call runs the default; a sign-in call with no file still does not.
+#
 #   bash test-grant-internet-candidates.sh            # the table and the cases
 #   bash test-grant-internet-candidates.sh --mutate   # ... plus mutations that must each CONVICT under every shell
 set -uo pipefail
@@ -54,6 +58,7 @@ pm() {
       echo "list $*" >> "$D/calls"
       [ -e "$D/listfail" ] && return 1
       [ -e "$D/listpartial" ] && { echo "package:$(head -1 "$D/real")"; return 1; }
+      [ -e "$D/late" ] && cp "$D/late" "$PFPATH"
       sed "s/^/package:/" "$D/real"
       case " $* " in *" -a "*) sed "s/^/package:/" "$D/ph" ;; *) [ "$(cat "$D/B")" = listed ] && sed "s/^/package:/" "$D/ph" ;; esac
       return 0 ;;
@@ -92,18 +97,18 @@ prep_fn() {
 }
 
 # run <fn> <shell> <A> <B> <perms> <real> <ph> -- the CALLS lines run in one fresh $STATE, as on the device. Sets D.
-# <real> and <ph> are newline-terminated package lists.
+# <real> and <ph> are newline-terminated package lists. <perms> NOFILE leaves nowhere-perms absent; its directory exists.
 run() {
   local fn="$1" sh="$2" va="$3" vb="$4" content="$5" real="$6" ph="$7" pf
   D=$(mktemp -d -p "$W"); pf="$D/root/$PFREL"
   mkdir -p "$D/state" "${pf%/*}"
-  printf '%s' "$content" > "$pf"
+  [ "$content" = NOFILE ] || printf '%s' "$content" > "$pf"
   printf '%s' "$real" > "$D/real"
   printf '%s' "$ph" > "$D/ph"
   echo "$va" > "$D/A"; echo "$vb" > "$D/B"
   : > "$D/granted"
   {
-    printf 'D=%s\nTROOT=%s\nSTATE=%s\nLOG=%s\n' "$D" "$D/root" "$D/state" "$D/log"
+    printf 'D=%s\nTROOT=%s\nSTATE=%s\nLOG=%s\nPFPATH=%s\n' "$D" "$D/root" "$D/state" "$D/log" "$pf"
     printf '%s\n' "$STUBS"
     cat "$fn"
     printf '%s\n' "$CALLS"
@@ -129,6 +134,10 @@ lists_per_step() {
   got="${got% }"
   [ "$got" = "$*" ] || why="$why pm list per call is '$got', want '$*';"
 }
+logged() { local got; got=$(grep -cF -- "$1" "$D/log"); [ "$got" = 1 ] || why="$why want one log line '$1', got $got;"; }
+quiet_after() { local got; got=$(sed -n "/^-- $1\$/,\$p" "$D/calls" | sed 1d); [ -z "$got" ] || why="$why the $1 call ran: $(printf '%s' "$got" | tr '\n' ';');"; }
+no_flags() { local got; got=$(grep -c '^flags ' "$D/calls"); [ "$got" = 0 ] || why="$why want no set-permission-flags, got $got;"; }
+declined_once() { local got; got=$(grep -cxF -- "$1" "$D/state/.declined.$UIDV" 2>/dev/null); [ "$got" = 1 ] || why="$why want $1 once in .declined, got '$got';"; }
 clean() { [ -s "$D/unexpected" ] && why="$why unmodelled: $(tr '\n' ';' < "$D/unexpected");"; [ ! -e "$D/state/.grantok" ] || why="$why .grantok left behind;"; command rm -rf "$D"; }
 
 suite() {  # suite <roamd.sh> <shells> [quiet] -> 0 all ok, 1 a case failed, 2 the harness could not run
@@ -141,7 +150,7 @@ suite() {  # suite <roamd.sh> <shells> [quiet] -> 0 all ok, 1 a case failed, 2 t
   prep_fn "$f" "$fn"; rc=$?
   [ "$rc" = 0 ] || return 2
   NL=$'\n'
-  local signin="step signin${NL}grant_perms_for $UIDV" X=com.x R=com.r
+  local signin="step signin${NL}grant_perms_for $UIDV" X=com.x R=com.r Y=com.y
   local DENY="$X deny:$INET${NL}$X $CAM${NL}$R $CAM$NL" GRANTLINE="$X $CAM${NL}$R $CAM$NL" NOLINE="$R $CAM$NL"
   local INSTALL="install_app $X${NL}step install${NL}grant_perms_for $UIDV $X 0"
 
@@ -217,6 +226,50 @@ suite() {  # suite <roamd.sh> <shells> [quiet] -> 0 all ok, 1 a case failed, 2 t
     why=""; CALLS="$signin" run "$fn" "$sh" ok unlisted "com.foo $CAM${NL}com.foobar $CAM$NL" "com.foobar$NL" "com.foo$NL"
     count 1 "grant com.foo $CAM"; recorded "com.foobar "; clean
     verdict "R5 the record's list match is whole-line"
+
+    # N1: no nowhere-perms, a first-session install reaches the INTERNET default, once, and is recorded.
+    why=""; CALLS="$INSTALL" run "$fn" "$sh" ok unlisted NOFILE "$R$NL" "$X$NL"
+    got=$(inet $X); [ "$got" = granted ] || why="$why INTERNET is $got;"
+    count 1 "grant $X $INET"; recorded "$X "
+    logged "] GRANT ($X) -> 0 perms (no file) + 1 INTERNET default(s) (user $UIDV)"; clean
+    verdict "N1 no file: an install gets the INTERNET default and is recorded"
+
+    # N2: its update's heal (DECLINES 0) reads the record and runs no pm.
+    why=""; CALLS="$INSTALL${NL}step update${NL}grant_perms_for $UIDV $X 0" run "$fn" "$sh" ok unlisted NOFILE "$R$NL" "$X$NL"
+    count 1 "grant $X $INET"; skipped 1 $X; quiet_after update; lists_per_step 1 0; clean
+    verdict "N2 no file: an update's heal skips and runs no pm"
+
+    # N2b: as N2 with DECLINES 1 twice: the .declined marker makes the second call an update, not a first install.
+    why=""; CALLS="install_app $X${NL}step first${NL}grant_perms_for $UIDV $X 1${NL}step second${NL}grant_perms_for $UIDV $X 1" run "$fn" "$sh" ok unlisted NOFILE "$R$NL" "$X$NL"
+    count 1 "grant $X $INET"; skipped 1 $X; quiet_after second; clean
+    verdict "N2b no file: a second DECLINES 1 call is not a first install"
+
+    # N3: the default stays limited to the package of the call.
+    why=""; CALLS="$INSTALL" run "$fn" "$sh" ok unlisted NOFILE "$Y$NL" "$X$NL"
+    count 1 "grant $X $INET"; count 0 "grant $Y $INET"; recorded "$X "; clean
+    verdict "N3 no file: a filtered call grants nothing to another package"
+
+    # N4: a sign-in call with no file is unchanged. It reads no list and grants nothing.
+    why=""; CALLS="$signin" run "$fn" "$sh" ok unlisted NOFILE "$X$NL$R$NL" ""
+    count 0 "grant $X $INET"; count 0 "grant $R $INET"; recorded ""; lists_per_step 0
+    logged "] GRANT -> 0 perms (no file, user $UIDV)"; clean
+    verdict "N4 no file: a sign-in call grants nothing"
+
+    # N5: a first install's declines pass finds nothing to re-flag, and the marker is still written.
+    why=""; CALLS="install_app $X${NL}step first${NL}grant_perms_for $UIDV $X 1" run "$fn" "$sh" ok unlisted NOFILE "$R$NL" "$X$NL"
+    no_flags; declined_once $X; clean
+    verdict "N5 no file, DECLINES 1: no flags call, and the package is marked once"
+
+    # N5b: a file a capture writes during the call does not start the flags pass.
+    why=""; CALLS="printf '%s\n' '$X flags:user-set:$CAM' > \"\$D/late\"${NL}install_app $X${NL}step first${NL}grant_perms_for $UIDV $X 1" run "$fn" "$sh" ok unlisted NOFILE "$R$NL" "$X$NL"
+    no_flags; declined_once $X; clean
+    verdict "N5b no file at the start of the call: a file that appears later starts no flags pass"
+
+    # N6: the -3 list fails on the no-file path: the default has no list to run on, and nothing is recorded.
+    why=""; CALLS="touch \"\$D/listfail\"${NL}$INSTALL" run "$fn" "$sh" ok unlisted NOFILE "$R$NL" "$X$NL"
+    [ -s "$D/state/.granted.$UIDV" ] && why="$why .granted holds '$(tr '\n' ' ' < "$D/state/.granted.$UIDV")';"
+    lists_per_step 1; logged "] GRANT ($X) -> 0 perms (no file) + 0 INTERNET default(s) (user $UIDV)"; clean
+    verdict "N6 no file: a failed list records nothing"
   done
   [ -n "$quiet" ] || printf '  -- %d ok, %d failed\n' "$p" "$x"
   [ "$x" -eq 0 ] && return 0 || return 1
@@ -259,6 +312,18 @@ if [ "$MUTATE" = yes ]; then
     "$G"'s/^      case "\$_g3" in \*"\${NL}\${dpkg}\${NL}"\*)/      case "$_g3" in *"${NL}${dpkg}"*)/'
   mutate "M5 pm's exit status is hidden behind sed" \
     "$G"'s/^    _g3=\$(pm list packages --user "\$uid" -3 2>\/dev\/null) || _g3=""$/    _g3=$(pm list packages --user "$uid" -3 2>\/dev\/null | sed "s\/^package:\/\/")/'
+  mutate 'M-N1 the early return restored for a filtered call (N1)' \
+    "$G"'s/^    _gnofile=1$/    return 0/'
+  mutate 'M-N2 the pkgfilter skip removed from the default loop (N3)' \
+    "$G"'{/^    \[ -n "\$pkgfilter" \] && \[ "\$dpkg" != "\$pkgfilter" \] && continue$/d;}'
+  mutate 'M-N3 the sign-in no-file path runs the default (N4)' \
+    "$G"'{/^    \[ -n "\$pkgfilter" \] || { echo "\[roamd\] GRANT -> 0 perms (no file, user /d;}'
+  mutate 'M-N4 the record skipped on the no-file path (N2)' \
+    "$G"'s/^  if \[ -n "\$_g3" \]; then$/  if [ -n "$_g3" ] \&\& [ "$_gnofile" != 1 ]; then/'
+  mutate 'M-N5 the .declined marker not written on the no-file path (N2b, N5)' \
+    "$G"'s/^      _dok=1; echo "\$pkgfilter" >> "\$_dmark" 2>\/dev\/null /      _dok=1; [ "$_gnofile" = 1 ] || echo "$pkgfilter" >> "$_dmark" 2>\/dev\/null /'
+  mutate 'M-N6 the flags pass not turned off on the no-file path (N5b)' \
+    "$G"'{/^  \[ "\$_gnofile" = 1 \] \&\& _dok=0 /d;}'
   [ -z "${MFAIL:-}" ] || FAILED=1
 fi
 [ -z "${FAILED:-}" ] || exit 1

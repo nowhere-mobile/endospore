@@ -109,6 +109,16 @@ public class CredentialService extends Service {
         } else {
             android.util.Log.w("NowhereChooser", "#151 relay: the gate did not take the next alarm (" + trigger + ") -- it keeps its last copy");
         }
+        // NWP-20261129-39: the first relay after a sign-in says whether the alarm the last sign-out carried is registered
+        // again (AlarmCarry, login.log). AFTER the send above, which a cold lock's teardown waits for. NOT while a sign-out
+        // runs: roamd kicks this relay on every out op, so the sign-out's own seal would judge the alarm against itself, and
+        // a seal in flight at the tap would delete the file before the sign-out's CE push seals it. The gate is a process
+        // static, so the next session starts with it lowered. One send: the file is already consumed, so a lost reply loses
+        // the line, and the reply only goes to logcat.
+        String carry = SignOutGate.begun() ? null : AlarmCarry.verdict(ctx.getFilesDir(), System.currentTimeMillis(), when);
+        if (carry != null) {
+            android.util.Log.i("NowhereChooser", "alarm carry " + carry + " reply=" + DaemonSocket.roundTrip("ALARM-CARRY\n" + carry + "\n", 8000));
+        }
     }
 
     @Override public IBinder onBind(Intent i) { return null; }

@@ -193,8 +193,8 @@ func sealDeltaWalk(roots map[string]string, unders map[string]string, idx map[st
 			met[sealDeltaIdxKey(scope, rel)] = true
 			if e.IsDir() {
 				// The seal's own skips, mirrored: derived media caches and the transient install staging
-				// and Play's download cache (NWP-20261102-01) are never sealed, so counting them would inflate the estimate with bytes no save moves.
-				if strings.HasPrefix(e.Name(), mediaCacheDirName) || isAppCodeStagePath(rel) || isPlayDownloadPath(rel) {
+				// and Play's download cache (NWP-20261102-01) and a fetch stage (NWP-20261130-03) are never sealed, so counting them would inflate the estimate with bytes no save moves.
+				if strings.HasPrefix(e.Name(), mediaCacheDirName) || isAppCodeStagePath(rel) || isPlayDownloadPath(rel) || isOdFetchStagePath(rel) {
 					skipPre = append(skipPre, sealDeltaIdxKey(scope, rel))
 					continue
 				}

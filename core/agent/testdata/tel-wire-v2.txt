@@ -28,6 +28,8 @@ REPLY	err-request	ERR request	ERR			-	-1	0	0
 REPLY	unresolved	UNRESOLVED	UNRESOLVED			-	-1	0	0
 REPLY	removed	REMOVED	REMOVED			-	-1	0	0
 REPLY	owner	OWNER	OWNER			-	-1	0	0
+REPLY	owner-number	OWNER number	OWNER	number		-	-1	0	0
 REPLY	full	FULL	FULL			-	-1	0	0
 REPLY	none	NONE	NONE			-	-1	0	0
+REPLY	none-number	NONE number	NONE	number		-	-1	0	0
 REPLY	unknown-token	MAYBE 1	NONE			-	-1	0	0

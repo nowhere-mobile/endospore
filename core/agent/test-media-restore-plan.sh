@@ -43,8 +43,8 @@ PY
 mut "M1 the split returns m with its full Chunks" media_after_gate.go \
   '\tout\.Chunks = pre ' '\tout.Chunks = m.Chunks '
 mut "M2 the marker is written after cdcRestore" main.go \
-  '\t\t\tskipped = cdcRestore\(base, key, mediaRestorePlan\(profile, pass, restoredHead, m\), dest\)\n' \
-  '\t\t\tskipped = cdcRestore(base, key, m, dest)\n\t\t\t_ = mediaRestorePlan(profile, pass, restoredHead, m)\n'
+  '\t\t\tskipped = restoreSkippingParked\(base, key, profile, mediaRestorePlan\(profile, pass, restoredHead, m\), dest\)\n' \
+  '\t\t\tskipped = restoreSkippingParked(base, key, profile, m, dest)\n\t\t\t_ = mediaRestorePlan(profile, pass, restoredHead, m)\n'
 mut "M3 the failed-marker arm returns the split" media_after_gate.go \
   'whole set restores inline \(NWP-20261125-03\)"\)\n\t\treturn m\n' \
   'whole set restores inline (NWP-20261125-03)")\n\t\tout := m\n\t\tout.Chunks = pre\n\t\treturn out\n'

@@ -281,6 +281,9 @@ func ondemandMedia() bool { return os.Getenv("NOWHERE_ONDEMAND_MEDIA") == "1" }
 // to recognise that shape to drop a switched-off app's held bytes.
 const odHoldDirName = ".nowhere-odhold"
 
+// odFetchStageName (NWP-20261130-03) is fetch-oddata's stage beside the hold; see unfetched_fetch.go.
+const odFetchStageName = ".nowhere-odfetch"
+
 // loadDropList (DIA-20260804-04) reads NOWHERE_DROP_LIST -- a file of PACKAGE NAMES, one per line -- into a
 // set of apps whose data the seal must NOT capture. Same env-var contract as NOWHERE_DEFER_LIST, and written
 // by the same producer (the chooser, at logoff, from the keep-set it already computes).
@@ -654,6 +657,8 @@ type fileScanCache struct {
 	gHits    int                 // groups this walk reused by hash
 	gTotal   int                 // groups this walk flushed
 	gSkipped int                 // small regular files a reused group did not read
+
+	writer sealWriterTally // NWP-20261201-12: what this walk found changed, for the push log line
 }
 
 // groupRec is one line of groupcache.<tag>.
@@ -687,6 +692,10 @@ func groupCachePath(tag string) string {
 func newFileScanCache(dk []byte) *fileScanCache {
 	sc := &fileScanCache{tag: contentCacheTagFor(dk), m: map[string]scanEntry{}, groups: map[string][]string{}}
 	if p := groupCachePath(sc.tag); p != "" {
+		// NWP-20261201-12: sealCacheRefresh rewrites this file once a head commits, so its time is the last seal's.
+		if fi, err := os.Stat(p); err == nil {
+			sc.writer.since = fi.ModTime()
+		}
 		if b, err := os.ReadFile(p); err == nil {
 			for _, line := range strings.Split(string(b), "\n") {
 				if line == "" {
@@ -777,6 +786,7 @@ func (sc *fileScanCache) beginWalk() {
 	sc.mu.Lock()
 	sc.gPending, sc.gUsed = nil, map[string]bool{}
 	sc.gHits, sc.gTotal, sc.gSkipped = 0, 0, 0
+	sc.writer.reset()
 	sc.mu.Unlock()
 }
 
@@ -1071,6 +1081,15 @@ type walkStats struct {
 
 func walkChunks(src string, sc *fileScanCache, threshold int64, forceFull bool, od bool, prevDef map[string]deferredFile,
 	unders map[string]string, pins map[string]bool, tiers map[string]mediaTier, budget int64, emitSeal func([]byte) int, emitCached func(string) int, bump func(int64), acct *pkgAcct) (ranges []scanRange, seen map[string]bool, deferred []scanRange, carried map[string]deferredFile, blind int, dropped int64, st walkStats, discard []scanRange) {
+	return walkChunksExcl(src, sc, threshold, forceFull, od, prevDef, unders, pins, tiers, budget, emitSeal, emitCached, bump, acct, nil)
+}
+
+// walkChunksExcl is walkChunks with excl: the packages this scope's sign-in left unfetched (NWP-20261130-03,
+// sealUnfetchedList). Their directories -- <pkg> and its on-demand hold -- are skipped like a dropped package's, but
+// NOT priced into dropped: the carry re-emits their stored span, so the head does not shrink by them. tarDirToExcl
+// applies the same test; the two seal paths must agree.
+func walkChunksExcl(src string, sc *fileScanCache, threshold int64, forceFull bool, od bool, prevDef map[string]deferredFile,
+	unders map[string]string, pins map[string]bool, tiers map[string]mediaTier, budget int64, emitSeal func([]byte) int, emitCached func(string) int, bump func(int64), acct *pkgAcct, excl map[string]bool) (ranges []scanRange, seen map[string]bool, deferred []scanRange, carried map[string]deferredFile, blind int, dropped int64, st walkStats, discard []scanRange) {
 	seen = map[string]bool{}
 	carried = map[string]deferredFile{}
 	// od is the on-demand media split for THIS scope: the caller ANDs the process-wide switch with
@@ -1136,6 +1155,11 @@ func walkChunks(src string, sc *fileScanCache, threshold int64, forceFull bool, 
 				return
 			}
 		}
+		// NWP-20261201-12: a group the cache did not serve. A group whose chunk is no longer known present misses too:
+		// the safe direction. A forced walk misses every group, so it counts none.
+		if !forceFull {
+			sc.noteWriterGroupMiss(g)
+		}
 		// clean is written before CloseWithError, which is what ends cdcSplit's read, so reading it after the
 		// split returns is ordered behind that write (the tarErr argument in pushProfile's legacy arm).
 		clean := false
@@ -1176,6 +1200,7 @@ func walkChunks(src string, sc *fileScanCache, threshold int64, forceFull bool, 
 		fd := forceDef[filepath.ToSlash(rel)] // #204: explicit on-demand defer -> file-aligned deferred region, any size
 		if info.Mode().IsRegular() && (info.Size() >= threshold || fd) {
 			st.large++
+			sc.noteWriterFile(rel, info) // NWP-20261201-12
 			seen[rel] = true
 			mt, sz, md := info.ModTime().UnixNano(), info.Size(), uint32(info.Mode())
 			// #129: decide this file's offline-media tier. classifyTier layers #108 pin > per-profile override >
@@ -1474,6 +1499,7 @@ func walkChunks(src string, sc *fileScanCache, threshold int64, forceFull bool, 
 			} else if groupTop != "" {
 				groupMixed = true // a loose root entry joins u's group
 			}
+			sc.noteWriterFile(rel, info) // NWP-20261201-12: this arm also takes directories and symlinks; it counts regular files only
 			group = append(group, walkEnt{p, rel, info})
 		}
 	}
@@ -1502,6 +1528,12 @@ func walkChunks(src string, sc *fileScanCache, threshold int64, forceFull bool, 
 				// ACCOUNTS for the shrink, instead of treating any drop at all as a blanket excuse.
 				dropped += subtreeBytes(p)
 				return filepath.SkipDir
+			}
+			if info.IsDir() && dropPkgForRel(rel, excl) {
+				return filepath.SkipDir // NWP-20261130-03: unfetched in this scope -- the carry re-emits its stored span, never the phone's copy
+			}
+			if isOdFetchStagePath(rel) {
+				return filepath.SkipDir // NWP-20261130-03: a killed fetch's stage -- never sealed (unfetched_fetch.go)
 			}
 			if info.IsDir() && isAppCodeStagePath(rel) {
 				// NWP-20260901-17: the chooser's transient APK-install staging -- never sealed. Its real

@@ -132,9 +132,12 @@ public class StoreService extends Service {
                 // #136 over-plan gate, #130 AUTO store default -- an over-plan Get installs for THIS
                 // SESSION ONLY, and the storefront is told so it can say so instead of lying "Added".
                 boolean overPlan = StoreInstaller.overPlanLine(line("GET-ENTITLEMENT\n", READ_CAP_MS));
+                // NWP-20261129-38: an Off nApps default answers kept with no keep line, so read it here. An app that
+                // already has a line (an Update) stays "OK": it comes back at the next sign-in.
+                boolean offDefault = ProfileActivity.APPDEF_OFF.equals(ProfileActivity.cfgStatic(StoreService.this, ProfileActivity.CFG_APPS_NAPPS));
                 boolean kept = StoreInstaller.keepAuto(StoreService.this, pkg, overPlan);
                 StoreInstaller.dropManifestLine(StoreService.this, pkg);
-                return getAppReply(kept, overPlan, pkg);
+                return getAppReply(kept, overPlan, offDefault && !StoreInstaller.keepSetHas(StoreService.this, pkg), pkg);
             } finally {
                 StoreInstaller.IN_FLIGHT.remove(pkg);
                 cancelInstallNotice(pkg);
@@ -329,9 +332,11 @@ public class StoreService extends Service {
 
     /** NWP-20261105-03: getApp's success reply, from what keepAuto answered and whether the over-plan gate refused.
      *  Kept: "OK". Not kept because of the gate: "OK-SESSION-ONLY". Not kept with the gate open: the keep line could
-     *  not be written, "OK-UNSAVED" -- nApps must not say "added" for an app that will be gone at the next sign-in. */
-    static String getAppReply(boolean kept, boolean overPlan, String pkg) {
-        if (kept) return "OK " + pkg;
+     *  not be written, "OK-UNSAVED" -- nApps must not say "added" for an app that will be gone at the next sign-in.
+     *  NWP-20261129-38: keepAuto also answers kept for an Off nApps default, without a line. notKeptByDefault says that
+     *  happened and no line exists: "OK-OFF", because that app is gone at the next sign-in too. */
+    static String getAppReply(boolean kept, boolean overPlan, boolean notKeptByDefault, String pkg) {
+        if (kept) return (notKeptByDefault ? "OK-OFF " : "OK ") + pkg;
         return (overPlan ? "OK-SESSION-ONLY " : "OK-UNSAVED ") + pkg;
     }
 

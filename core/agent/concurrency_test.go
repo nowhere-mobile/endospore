@@ -72,10 +72,14 @@ func TestConcurrentSafeCmd(t *testing.T) {
 		"GET-OS-AGREEMENT",
 		// NWP-20261114-16: asked at the tap; a head read, nothing written (the SEAL-DELTA case).
 		"APP-FETCH-SIZE",
+		// NWP-20261130-03: the launch barrier at a package-added event, two tmpfs reads and a stat; a seal must not delay it.
+		"OD-DATA-PENDING",
 		// NWP-20261118-11: asked before the switch, while GRANT-PERMS can hold sessionMu for the grant op.
 		"GET-PREFS",
 		// NWP-20261117-23: the gate's media and prefetch polls, each a read of one RAM file published by rename.
 		"GET-MEDIA-STATUS", "GET-MEDIA-APP-PROGRESS", "GET-PREFETCH-METERED",
+		// NWP-20261201-03: a file read; the SET-SEAL-HOLD case; and the gate's memory-only network report.
+		"GET-SAVE-MODE", "SET-SAVE-MODE", "SAVE-NET-UNMETERED", "SAVE-NET-METERED",
 		// NWP-20261118-06: the kept storage count; a RAM read and a goSafe start.
 		"STORAGE-COUNT-START", "GET-STORAGE-BREAKDOWN-CACHED",
 		// NWP-20261125-15: one RAM phase under pendingReapMu; the gate calls it while a DELETE may hold sessionMu.

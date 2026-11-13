@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# test-money-recover-log.sh [--mutate] -- runs the cases for the two best-effort money paths (money_recover_log_test.go;
-# NWP-20261027-16): a store read that fails inside maybePayRent or sealWalletBestEffort is recovered AND logged.
+# test-money-recover-log.sh [--mutate] -- runs the cases for the best-effort rent payment (money_recover_log_test.go;
+# NWP-20261027-16): a store read that fails inside maybePayRent is recovered AND logged.
 # --mutate re-runs them against a COPY of the package with each guard broken in turn. Each mutant must be CONVICTED by
 # a real `--- FAIL`; one that fails to apply or to compile is a failure.
 set -uo pipefail
@@ -9,7 +9,7 @@ W=$(mktemp -d) || exit 2
 trap 'rm -rf "$W"' EXIT
 export TMPDIR="$W" GOTMPDIR="$W"
 . ./suite-report.sh
-TESTS='TestBestEffortPanic|TestMaybePayRentLogsAFailedStoreRead|TestSealWalletBestEffortLogsAFailedSeal|TestRentGate|TestTelHandoff'
+TESTS='TestBestEffortPanic|TestMaybePayRentLogsAFailedStoreRead|TestRentGate|TestTelHandoff'
 
 out=$(go test -count=1 -timeout 180s -run "$TESTS" -v . 2>&1); rc=$?
 report_plain_run "$rc" "$out" || exit 1
@@ -37,7 +37,6 @@ PY
 }
 
 mut "P1 maybePayRent recovers silently again" main.go 'defer func\(\) \{ bestEffortPanic\("pay-rent", name, recover\(\)\) \}\(\)' 'defer func() { recover() }()'
-mut "P2 sealWalletBestEffort recovers silently again" main.go 'defer func\(\) \{ bestEffortPanic\("roam-out wallet seal", name, recover\(\)\) \}\(\)' 'defer func() { recover() }()'
-mut "P3 the generic line prints the recovered value" main.go '(skipped: unexpected failure \(details withheld\))\\n", what, name\)' '\1 %v\\n", what, name, r)'
-mut "P4 the FAILED line prints the raw error" main.go 'logSafeStoreErr\(what, e\)' 'e.Error()'
-[ "$fails" -eq 0 ] && echo "== all 4 mutations convicted" || { echo "== $fails mutation(s) not convicted"; exit 1; }
+mut "P2 the generic line prints the recovered value" main.go '(skipped: unexpected failure \(details withheld\))\\n", what, name\)' '\1 %v\\n", what, name, r)'
+mut "P3 the FAILED line prints the raw error" main.go 'logSafeStoreErr\(what, e\)' 'e.Error()'
+[ "$fails" -eq 0 ] && echo "== all 3 mutations convicted" || { echo "== $fails mutation(s) not convicted"; exit 1; }

@@ -138,6 +138,7 @@ reown_ext_appdata() {
   [ -d "$ROOT/data/media/$uid/Android/data/com.nowhere.chooser/$ODHOLD/$PKG" ] && echo held > "$ROOT/sim/ext-at-reown" || echo gone > "$ROOT/sim/ext-at-reown"
 }
 cutoff_prog() { :; }
+od_fetch_data() { return 0; }; od_listed() { return 1; }; od_block_app() { return 0; }; od_unblock_app() { :; }; od_pending_clear() { :; }; od_block_installed() { :; }; od_shipped_prep() { return 0; }; od_park_var() { :; }; od_unf_path() { echo "$STATE/odfetch.$1/unfetched.$2"; }   # NWP-20261130-03
 od_watched() { shift; "$@" 2>&1; }
 pm() {
   echo "pm $*" >> "$ROOT/sim/pm-calls"

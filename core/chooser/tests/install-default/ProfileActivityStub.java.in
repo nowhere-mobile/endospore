@@ -18,11 +18,13 @@ final class ProfileActivity {
   static boolean gos = true;
   static final List<String> playDeps = new ArrayList<>();
   static final List<String> cfgKeys = new ArrayList<>();
+  // NWP-20261129-16: false makes a cfgPutStatic not land (it is journaled, and play keeps its value).
+  static boolean cfgLands = true;
 
   static void reset() {
     mode = "off"; bundled = false; off.clear();
     appDefaultCalls = 0; bundledCalls = 0; offCalls = 0; installerArgs.clear();
-    play = "off"; gos = true; playDeps.clear(); cfgKeys.clear();
+    play = "off"; gos = true; playDeps.clear(); cfgKeys.clear(); cfgLands = true;
   }
 
   static boolean gosStorePresent(android.content.Context ctx) {
@@ -33,7 +35,12 @@ final class ProfileActivity {
     cfgKeys.add(key);
     return PlayChoice.CFG_KEY.equals(key) ? play : "off";
   }
+  static void cfgPutStatic(android.content.Context ctx, String key, String val) {
+    StoreInstaller.journal.add("cfgPut:" + key + "=" + val);
+    if (cfgLands && PlayChoice.CFG_KEY.equals(key)) play = val;
+  }
   static void setPlayDep(android.content.Context ctx, String pkg, boolean on) {
+    StoreInstaller.journal.add("setPlayDep:" + pkg + "," + on);
     playDeps.add(pkg + "," + on);
   }
 
@@ -48,7 +55,10 @@ final class ProfileActivity {
   }
   static java.util.LinkedHashSet<String> explicitlyTurnedOff(android.content.Context ctx) {
     offCalls++;
-    return new LinkedHashSet<>(off);
+    // As the real one: a Play stack line in nowhere-appoff.list is residue, never a choice (NWP-20260830-08).
+    LinkedHashSet<String> out = new LinkedHashSet<>(off);
+    out.removeIf(PlayChoice::isStackMember);
+    return out;
   }
 
 // @@LIFTED@@

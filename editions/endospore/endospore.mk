@@ -105,6 +105,10 @@ PRODUCT_COPY_FILES += \
 PRODUCT_COPY_FILES += \
     vendor/endospore/etc/default-home:$(TARGET_COPY_OUT_SYSTEM)/etc/nowhere/default-home
 
+# NWP-20261130-12 (Q012): the curated per-user settings allowlist that roamd's seal capture and the chooser's apply read.
+PRODUCT_COPY_FILES += \
+    vendor/endospore/etc/settings-roam.list:$(TARGET_COPY_OUT_SYSTEM)/etc/nowhere/settings-roam.list
+
 # App-store catalog (Phase 2, DIA-20260730): the signed JSON manifest of apps Nowhere OFFERS, served to the
 # storefront via the GET-CATALOG daemon verb. Shared core seed (core/vendor-common/etc/catalog.json); the
 # release-signed .sig is baked when present. Baked read-only in /system (rides verified boot).

@@ -44,7 +44,8 @@ interface INowhereStore {
      *  it deliberately does NOT cross this boundary -- a caller-supplied pin was strippable with "".
      *  Replies: "OK <pkg>" (installed + kept, AUTO mode) | "OK-SESSION-ONLY <pkg>" (installed, keep refused
      *  by the #136 over-plan gate -- SAY SO) | "OK-UNSAVED <pkg>" (installed, but its keep line could not be
-     *  written -- it will not come back; SAY SO) | "ERR-BUSY" (this pkg is already installing) | "ERR-PENDING"
+     *  written -- it will not come back; SAY SO) | "OK-OFF <pkg>" (installed; the profile's nApps default is Off,
+     *  so no keep line was written -- SAY SO) | "ERR-BUSY" (this pkg is already installing) | "ERR-PENDING"
      *  (still installing at InstallWait's 10-minute bound -- re-check, do not retry blindly) | "ERR-INSTALL"
      *  | "ERR-CALLER" | the daemon's own verdict (ERR-NOENTRY / ERR-OVERPLAN ... / NONE).
      *

@@ -74,9 +74,35 @@ func TestHandleBackupLogsItsRefusal(t *testing.T) {
 	if got != "BUSY seal-run:periodic" {
 		t.Fatalf("reply %q, want exactly BUSY seal-run:periodic", got)
 	}
-	if !strings.Contains(logged, "manual backup refused BUSY: seal-run:periodic") {
-		t.Errorf("the refusal left no cause in the log; stderr was %q", logged)
+	if !strings.Contains(logged, "manual backup joined the running save: seal-run:periodic, follow-up not needed") {
+		t.Errorf("the join left no cause in the log; stderr was %q", logged)
 	}
+	if strings.Contains(logged, "refused BUSY") {
+		t.Errorf("a tap during a running save was logged as refused; stderr was %q", logged)
+	}
+
+	t.Run("a sign-in in progress is still refused", func(t *testing.T) {
+		pendingReapMu.Lock()
+		oldLogin := loginSettleUntil
+		sealRunKind, sealRunAt, sealInFlight = "", time.Time{}, false
+		loginSettleUntil = time.Now().Add(time.Minute)
+		pendingReapMu.Unlock()
+		t.Cleanup(func() {
+			pendingReapMu.Lock()
+			loginSettleUntil = oldLogin
+			pendingReapMu.Unlock()
+		})
+		var got string
+		logged := captureStderr(t, func() {
+			got = ropReply(t, func(c net.Conn) { handleBackup(c, dest) })
+		})
+		if got != "BUSY login" {
+			t.Fatalf("reply %q, want exactly BUSY login", got)
+		}
+		if !strings.Contains(logged, "manual backup refused BUSY: login") || strings.Contains(logged, "joined") {
+			t.Errorf("a sign-in is a refusal, not a join; stderr was %q", logged)
+		}
+	})
 
 	t.Run("nothing running is not refused", func(t *testing.T) {
 		pendingReapMu.Lock()

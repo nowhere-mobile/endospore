@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-// NWP-20261017-04: the two logoff gates (handleLogout, handleRoamOut) test localOnlySession like every other
+// NWP-20261017-04: the logoff gate (handleLogout) tests localOnlySession like every other
 // seal gate. An offline sign-in carries .localsession AND .offlinesession; if the first is lost, the logoff must
 // still take the throwaway branch, not seal an EMPTY offline session over the real stored head (#72).
 
@@ -75,13 +75,13 @@ func TestLogoutControlWithNoMarkerSeals(t *testing.T) {
 	ackReapAction("REAP", "11")
 }
 
-// handleRoamOut ends in rebootNow (a real setprop), which cannot be stubbed, so its gate is pinned at the source.
-func TestRoamOutGateHonoursBothMarkers(t *testing.T) {
+// handleLogout's gate is also pinned at the source: the first marker test and the .offlinesession clear.
+func TestLogoutGateHonoursBothMarkers(t *testing.T) {
 	src, err := os.ReadFile("main.go")
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, fn := range []string{"handleRoamOut", "handleLogout"} {
+	for _, fn := range []string{"handleLogout"} {
 		body := stripComments(funcBody(t, string(src), fn))
 		first := ""
 		for _, l := range body {

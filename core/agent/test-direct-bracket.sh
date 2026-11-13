@@ -36,6 +36,6 @@ PY
   cp -f "$W/main.go.orig" "$MAIN"
 }
 mut "D1 sealWallet's bracket removed" "$BILL" '(\nfunc sealWallet\(.*?)capWrite\(name, pass, dk, func\(\) \{'
-mut "D2 sealWalletValueDurable's direct-arm bracket removed" "$BILL" '(\nfunc sealWalletValueDurable\(.*?if !capMode\(\) \{.*?)capWrite\(name, pass, dk, func\(\) \{'
+mut "D2 sealWalletValueDurable's direct-arm bracket removed" "$BILL" '(\nfunc sealWalletValuePublish\(.*?if !capMode\(\) \{.*?)capWrite\(name, pass, dk, func\(\) \{'
 mut "D3 the legacy LOGOFF's bracket removed" "$MAIN" '(\nfunc handleLogoff\(.*?)capWrite\(name, pass, nil, func\(\) \{'
 [ "$fails" -eq 0 ] && echo "== all mutations convicted" || { echo "== $fails mutation(s) not convicted"; exit 1; }

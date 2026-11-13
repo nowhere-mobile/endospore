@@ -130,7 +130,8 @@ func proveNoMediaHead(base, profile, pass string) (err error) {
 // noteNoMediaHeadAtLogin is the whole sign-in behaviour for a #media scope that restored nothing: when (and only
 // when) the scope is #media and the head is PROVEN absent, record the empty login roster so the session's seals
 // run the essential carry against an empty restored set (the walked roster still separates this handset's own
-// deletions from another handset's new files). It writes no restore receipt: the #72 gate is unchanged.
+// deletions from another handset's new files). It writes no restore receipt: the #72 gate defers to the carry for
+// such a session (noHeadCarryMayExcuse).
 func noteNoMediaHeadAtLogin(base, profile, pass string) bool {
 	if !isSharedMediaScope(profile) || proveNoMediaHead(base, profile, pass) != nil {
 		return false
@@ -138,6 +139,13 @@ func noteNoMediaHeadAtLogin(base, profile, pass string) bool {
 	writeLoginRosterNone(profileRefV2(profile, pass))
 	fmt.Printf("restore: profile %s has no #media head -> empty login roster recorded (NWP-20261026-08)\n", logProfile(profile))
 	return true
+}
+
+// noHeadCarryMayExcuse reports whether the #72 gate may wait for the carry: only a #media session whose sign-in PROVED
+// there was no head, with the carry on. A real roster without a receipt (a failed or partial restore) never qualifies:
+// that is exactly the session #72 exists to refuse.
+func noHeadCarryMayExcuse(profile, ref string) bool {
+	return mediaEssentialCarryOn(profile) && loginRosterHead(ref) == loginRosterNone
 }
 
 // walkedRosterFile maps a store ref to the WALKED ROSTER: the #media rels THIS session itself walked and

@@ -68,7 +68,7 @@ public final class AlarmRelayCases {
         eq("R5 a null reply: false, no exception", r5, "false");
 
         String pa = new String(Files.readAllBytes(Paths.get(a[1])), StandardCharsets.UTF_8);
-        String cap = body(pa, "private void captureNextAlarm()");
+        String cap = body(pa, "private long captureNextAlarm()");
         has("C6 the logoff relay reads the alarm's owner", cap, "pkg = ac.getShowIntent().getCreatorPackage();");
         has("C7 the logoff relay sends the shared line, owner and user included", cap,
                 "CredentialService.alarmRelayLine(when, CredentialService.myUserId(), pkg)");
@@ -80,7 +80,7 @@ public final class AlarmRelayCases {
         has("C10 relayNextAlarm retries twice through relayLanded", rn,
                 "relayLanded(() -> DaemonSocket.roundTrip(\"SET-GATE-ALARM\\n\" + line + \"\\n\", 8000), 2)");
         eq("C10 exactly one relayLanded call", String.valueOf(rn.split("relayLanded\\(\\(\\) ->", -1).length - 1), "1");
-        eq("C10 exactly one roundTrip call", String.valueOf(rn.split("DaemonSocket\\.roundTrip\\(", -1).length - 1), "1");
+        eq("C10 exactly one SET-GATE-ALARM send", String.valueOf(rn.split("DaemonSocket\\.roundTrip\\(\"SET-GATE-ALARM", -1).length - 1), "1");
         int li = rn.indexOf("\"#151 relayed next alarm");
         int ifi = rn.indexOf("if (landed) {");
         int el = rn.indexOf("} else {");

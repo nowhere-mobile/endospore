@@ -106,7 +106,7 @@ func TestWalletPlanQueue_ASecondPurchaseWaitsItsTurnBehindAFreshJitter(t *testin
 	redeem(t, wp, 50, 3)
 	redeem(t, wp, 10, 3)
 	w := mustLoad(t, wp)
-	if w.PlanGB != 50 || len(w.PlanQueue) != 1 || w.PlanQueue[0] != (PlanSpec{GB: 10, Periods: 3}) {
+	if w.PlanGB != 50 || len(w.PlanQueue) != 1 || w.PlanQueue[0] != (PlanSpec{ID: w.PlanQueue[0].ID, GB: 10, Periods: 3}) {
 		t.Fatalf("plan = %d, queue = %v, want 50 with [10x3] queued", w.PlanGB, w.PlanQueue)
 	}
 	gw := newQueueGateway(t)
@@ -215,7 +215,7 @@ func TestWalletPlanQueue_ADrainedTwiceIsQueuedOnce(t *testing.T) {
 	}
 	redeem(t, wp, 50, 3)
 	w := mustLoad(t, wp)
-	if len(w.PlanQueue) != 2 || w.PlanQueue[1] != (PlanSpec{GB: 50, Periods: 3}) {
+	if len(w.PlanQueue) != 2 || w.PlanQueue[1] != (PlanSpec{ID: w.PlanQueue[1].ID, GB: 50, Periods: 3}) {
 		t.Fatalf("queue = %v, want [10x3 50x3]", w.PlanQueue)
 	}
 	w.BlindTokens = w.BlindTokens[150:] // the first 50 GB landed: its 150 are spent

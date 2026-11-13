@@ -791,13 +791,19 @@ func walletNoDKErr(notRestored bool, v *vault) error {
 	return errors.New("no keyslot opens this profile's vault")
 }
 
+// errEndWalletUnreadable is publishWalletBeforeDiscard's answer when the strict read before its publish failed twice
+// or passed its bound (endStoredWalletRead, h60 #16): NOTHING is published, the caller ends the session anyway and
+// warns that credit added this session is lost (NWP-20261201-27).
+var errEndWalletUnreadable = errors.New("the stored wallet could not be read before the publish")
+
 // publishWalletBeforeDiscard publishes the session's wallet the way an "Add credits" does (handleClaim):
 // sealWalletDurable, which returns only once the bytes have landed. THE WALLET IS THE ONE THING END-UNSAVED SAVES,
 // because it is not this session's DATA, it is money: wallet.json lives in the tmpfs, blind tokens are bearer
 // instruments the gateway cannot re-issue (#218), and every other publisher of it rides a seal (the capFlush fold)
 // that this ending skips. A missing file has nothing to lose. gen is the wallet generation the handler read BEFORE the
 // session's credentials (NWP-20261013-20): the retry below refuses a wallet that is no longer at it. A vault head
-// that no slot this phone holds opens is errWalletNoSlot (walletNoDKErr, NWP-20261114-06).
+// that no slot this phone holds opens is errWalletNoSlot (walletNoDKErr, NWP-20261114-06). A stored copy the strict
+// read cannot read is errEndWalletUnreadable, and nothing is published over it (NWP-20261201-27).
 func publishWalletBeforeDiscard(dest, name, pass string, se []byte, gen string) (err error) {
 	wp := walletPathFor(dest)
 	if _, serr := os.Stat(wp); serr != nil {
@@ -828,13 +834,16 @@ func publishWalletBeforeDiscard(dest, name, pass string, se []byte, gen string) 
 		return rerr
 	}
 	notRestored = false
+	if !endStoredWalletRead(name, pass, func() []byte { return dk }) {
+		return errEndWalletUnreadable
+	}
 	_, err = sealWalletDurable("s3", name, pass, dk, wp)
 	return err
 }
 
 // endUnsavedCreditLost is the success reply of an END-UNSAVED or a RESTART-UNSAVED that went ahead without a wallet
-// publish because the session never read its stored wallet (NWP-20261013-20, decided 2026-10-15 "Allow, warn"): the
-// session ends as with OK, the stored wallet is untouched, and credit added during this session is lost. The chooser
+// publish because the session never read its stored wallet (NWP-20261013-20, decided 2026-10-15 "Allow, warn") or the
+// strict read before the publish could not read it (NWP-20261201-27, h60 #16): the session ends as with OK, the stored wallet is untouched, and credit added during this session is lost. The chooser
 // shows that warning on its ending screen. A distinct word, never OK, so no older reading can pass it for a clean end.
 const endUnsavedCreditLost = "OK-CREDIT-LOST"
 
@@ -901,7 +910,8 @@ func endUnsavedBlocked(uid string) string {
 //	OK-CREDIT-LOST  as OK, but nothing published the wallet: the session never read its stored wallet (its sign-in
 //	                read and the retry here both failed), so credit added this session is lost; the stored wallet is
 //	                untouched (NWP-20261013-20); also a stranded session (a final refusal named locks-changed[-key]
-//	                or unlock-lost[-key]) whose vault head no slot this phone holds opens (#19, Q016, NWP-20261114-06)
+//	                or unlock-lost[-key]) whose vault head no slot this phone holds opens (#19, Q016, NWP-20261114-06);
+//	                also the strict read before the publish could not read the stored wallet (NWP-20261201-27)
 //	ERR-WALLET      the wallet could not be made durable first; nothing was changed
 //	ERR-KEYS        the keystore-push stash could not be removed; nothing was changed
 //	ERR-STATE       the session could not be marked local; the session is kept
@@ -1005,6 +1015,16 @@ func handleEndUnsaved(conn net.Conn, dest string) {
 				"lost and the stored wallet is untouched (NWP-20261013-20)"
 			fmt.Fprintf(os.Stderr, "[logind] end-unsaved user %s: the wallet read failed at sign-in and again now -- "+
 				"ending anyway WITHOUT a wallet publish; credit added this session is lost (%s)\n", uid, endUnsavedCreditLost)
+			reply = okAsConn{conn, endUnsavedCreditLost}
+			creditLost = true
+		} else if errors.Is(err, errEndWalletUnreadable) {
+			// h60 #16: the strict read before the publish failed, so nothing was published. The file stays (walletSaved
+			// false); the stored wallet is untouched.
+			wallet = "the wallet was NOT saved: the stored wallet could not be read (twice), so the credit this session " +
+				"added is lost and the stored wallet is untouched (NWP-20261201-27)"
+			fmt.Fprintf(os.Stderr, "[logind] end-unsaved user %s: the stored wallet could not be read (twice) -- ending "+
+				"anyway WITHOUT a wallet publish; credit added this session is lost (%s, NWP-20261201-27)\n",
+				uid, endUnsavedCreditLost)
 			reply = okAsConn{conn, endUnsavedCreditLost}
 			creditLost = true
 		} else if errors.Is(err, errWalletNoSlot) && final && r.stranded() {
@@ -1345,9 +1365,9 @@ func recoverRestartMarker(dest string) {
 // Same guards as END-UNSAVED (the session's own chooser, sessionMu by TryLock, no seal or teardown running, the RW
 // slot held), licensed by the repeated sweep failure instead of a refusal. It saves the wallet durably first (unless
 // the store says the profile is deleted) and aborts on failure -- except a session that never read its stored wallet,
-// which publishes none and goes ahead with OK-CREDIT-LOST (NWP-20261013-20) and, when it holds credit, leaves the
-// gate's lost-credit notice outside the state tmpfs for after the boot (noteRestartCreditLost, NWP-20261016-47) --
-// drops the #keys stash, marks the session local, replies OK, then reboots. Replies as END-UNSAVED, with ERR-NOTSTUCK
+// or whose strict read before the publish failed (NWP-20261201-27), which publishes none and goes ahead with
+// OK-CREDIT-LOST (NWP-20261013-20) and, when it holds credit, leaves the gate's lost-credit notice outside the state
+// tmpfs for after the boot (noteRestartCreditLost, NWP-20261016-47) -- drops the #keys stash, marks the session local, replies OK, then reboots. Replies as END-UNSAVED, with ERR-NOTSTUCK
 // in place of ERR-NOTREFUSED; nothing changes on any reply but OK and OK-CREDIT-LOST, except the stash (see
 // END-UNSAVED).
 //
@@ -1413,6 +1433,13 @@ func handleRestartUnsaved(conn net.Conn, dest string) {
 				"credit added this session is lost, the stored wallet is untouched)"
 			fmt.Fprintf(os.Stderr, "[logind] restart-unsaved user %s: the wallet read failed at sign-in and again now -- "+
 				"restarting anyway WITHOUT a wallet publish; credit added this session is lost (%s)\n", uid, endUnsavedCreditLost)
+		} else if errors.Is(err, errEndWalletUnreadable) {
+			// h60 #16: as END-UNSAVED -- allowed, never a wallet publish, and the reply says the credit is lost.
+			ok, wallet = endUnsavedCreditLost, "the wallet was NOT saved (the stored wallet could not be read, twice; "+
+				"credit added this session is lost, the stored wallet is untouched, NWP-20261201-27)"
+			fmt.Fprintf(os.Stderr, "[logind] restart-unsaved user %s: the stored wallet could not be read (twice) -- "+
+				"restarting anyway WITHOUT a wallet publish; credit added this session is lost (%s, NWP-20261201-27)\n",
+				uid, endUnsavedCreditLost)
 		} else if err != nil {
 			fmt.Fprintf(os.Stderr, "[logind] restart-unsaved user %s: the wallet could not be saved first (%s) -- nothing done\n", uid, logSafeErrText(err))
 			fmt.Fprint(conn, "ERR-WALLET\n")

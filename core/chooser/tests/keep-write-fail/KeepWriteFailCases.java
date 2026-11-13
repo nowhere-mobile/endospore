@@ -2,7 +2,7 @@ package com.nowhere.chooser;
 
 import java.io.File;
 
-/** NWP-20261105-03: keepAutoImpl's answer when the keep line could not be written, and getAppReply's three replies. */
+/** NWP-20261105-03: keepAutoImpl's answer when the keep line could not be written, and getAppReply's four replies. */
 public class KeepWriteFailCases {
   static int fails = 0;
 
@@ -20,6 +20,11 @@ public class KeepWriteFailCases {
     d.mkdirs();
     StoreInstaller.reset();
     return d;
+  }
+
+  static void reply(String what, String want, boolean kept, boolean overPlan, boolean notKeptByDefault, String pkg) {
+    String got = StoreService.getAppReply(kept, overPlan, notKeptByDefault, pkg);
+    check("getAppReply " + what, want.equals(got), String.valueOf(got));
   }
 
   public static void main(String[] a) throws Exception {
@@ -69,13 +74,15 @@ public class KeepWriteFailCases {
     check("a clean write -> kept, line on disk", r && read(new File(d, "nowhere-appkeep")).equals(P + "\tauto\n"),
         "answered " + r);
 
-    // Expected string first: run.sh stubs an absent getAppReply (origin/main) to return null, which must FAIL, not NPE.
-    check("getAppReply kept", ("OK " + P).equals(StoreService.getAppReply(true, false, P)), StoreService.getAppReply(true, false, P));
-    check("getAppReply kept, over plan flag ignored", ("OK " + P).equals(StoreService.getAppReply(true, true, P)), "");
-    check("getAppReply not kept + over plan", ("OK-SESSION-ONLY " + P).equals(StoreService.getAppReply(false, true, P)),
-        StoreService.getAppReply(false, true, P));
-    check("getAppReply not kept + gate open", ("OK-UNSAVED " + P).equals(StoreService.getAppReply(false, false, P)),
-        StoreService.getAppReply(false, false, P));
+    // reply() takes the expected string first: run.sh stubs an absent getAppReply to return null, which must FAIL, not NPE.
+    reply("kept", "OK " + P, true, false, false, P);
+    reply("kept, over plan flag ignored", "OK " + P, true, true, false, P);
+    reply("kept under an Off default, no line", "OK-OFF " + P, true, false, true, P);
+    reply("kept under an Off default, no line, over plan flag ignored", "OK-OFF " + P, true, true, true, P);
+    reply("not kept + over plan", "OK-SESSION-ONLY " + P, false, true, false, P);
+    reply("not kept + over plan, Off flag ignored", "OK-SESSION-ONLY " + P, false, true, true, P);
+    reply("not kept + gate open", "OK-UNSAVED " + P, false, false, false, P);
+    reply("not kept + gate open, Off flag ignored", "OK-UNSAVED " + P, false, false, true, P);
 
     System.out.println(fails == 0 ? "ALL CASES PASSED" : fails + " CASE(S) FAILED");
     System.exit(fails == 0 ? 0 : 1);

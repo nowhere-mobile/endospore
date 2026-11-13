@@ -301,7 +301,7 @@ func TestUiderrorsWorkerOpIsWired(t *testing.T) {
 	}
 	roamd := string(b)
 	for _, want := range []string{
-		"storagebreakdown|sealdelta|uiderrors|alarmrelay) ;;", "  uiderrors)\n",
+		"storagebreakdown|sealdelta|uiderrors|alarmrelay|", "  uiderrors)\n",
 		`"$AGENT" uiderrorstail "$(cat "$STATE/uiderrors.floor" 2>/dev/null)" "$uid" > "$RES.part"`,
 		`_uefloor=$(uiderrors_floor_take)`, `uiderrors_floor_commit "$_uefloor"`, `"$AGENT" uiderrorsfloor`} {
 		if !strings.Contains(roamd, want) {

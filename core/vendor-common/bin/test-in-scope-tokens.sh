@@ -83,6 +83,7 @@ remap_media_db() { :; }   # NWP-20261124-01: the #de tail calls it before remap_
 insert_deferred_media() { :; }   # NWP-20261130-02: the #media tail calls it after restore_media_tail
 restorecon() { :; }
 restore_media_tail() { echo tail >> "\$ROOT/calls"; }
+od_park_var() { :; }   # NWP-20261130-03
 . "$W/seg-$2.sh"
 if [ "$2" = de ]; then v="\$_derc"; else v="\$_mdrc"; fi
 printf '%s|%s' "\$v" "\$(grep -c '^tail\$' "\$ROOT/calls")"

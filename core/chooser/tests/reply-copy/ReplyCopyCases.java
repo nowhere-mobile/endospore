@@ -95,7 +95,7 @@ public class ReplyCopyCases {
         check(ReplyCopy.flagOf("2") == null, "flagOf(2) is null");
         check(ReplyCopy.flagOf("ERR") == null, "flagOf(ERR) is null");
 
-        final String running = "A save is already running, so this one wasn't started. Try again once it finishes.";
+        final String running = "A save is already running, and this tap joined it.";
         final String signin = "Your sign-in or unlock is still finishing, so the save wasn't started. Try again in a moment.";
         final String userop = "The phone is busy with something you asked for, such as setting up an app, so the save wasn't started. Try again in a moment.";
         final String generic = "The phone is busy, so the save wasn't started. Try again in a moment.";
@@ -112,6 +112,8 @@ public class ReplyCopyCases {
         check(signin.equals(ReplyCopy.backupBusy("BUSY login\nBUSY seal-in-flight")), "backupBusy(multi-line: first line only)");
         check(generic.equals(ReplyCopy.backupBusy("")), "backupBusy(empty)");
         check(generic.equals(ReplyCopy.backupBusy(null)), "backupBusy(null)");
+        for (String b : new String[] {"BUSY seal-in-flight", "BUSY seal-run:periodic", "BUSY login", "BUSY user-op-waiting", "BUSY", "", null})
+            check(!ReplyCopy.backupBusy(b).contains("Try again once it finishes"), "backupBusy(" + b + ") has no retry-once-it-finishes text");
         // NWP-20261026-18: the "Your data" apps line.
         apps(true, 0, true, java.util.List.of(), KEEPS_NONE, false);
         apps(true, 0, false, null, KEEPS_NONE, false);

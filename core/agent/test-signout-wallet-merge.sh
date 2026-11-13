@@ -48,8 +48,8 @@ T2=TestSignOutWalletMerge_PayRentsByValuePublishMergesToo
 mut "S1 the by-value publish merges with no seen-set" billing.go \
   ', w, walletSeen(walletPath, gen))' ', w, nil)' "$T1" "$T2"
 mut "S2 the by-value publish reads no stored copy" billing.go \
-  'walletForPublish(readStoredWallet(base, name, pass, dk), w,' 'walletForPublish(nil, w,' "$T1" "$T2"
+  'if merged := walletForPublish(stored, w,' '_ = stored; if merged := walletForPublish(nil, w,' "$T1" "$T2"
 mut "S3 the by-value publish drops the merge" billing.go \
-  'if merged := walletForPublish(readStoredWallet(base, name, pass, dk), w, walletSeen(walletPath, gen)); merged != nil {' \
-  'if merged := (*Wallet)(nil); merged != nil {' "$T1" "$T2"
+  'if merged := walletForPublish(stored, w, walletSeen(walletPath, gen)); merged != nil {' \
+  '_ = stored; if merged := (*Wallet)(nil); merged != nil {' "$T1" "$T2"
 [ "$fails" -eq 0 ] && echo "== all mutations convicted" || { echo "== $fails mutation(s) not convicted"; exit 1; }

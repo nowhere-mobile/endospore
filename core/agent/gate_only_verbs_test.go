@@ -17,6 +17,7 @@ import (
 // NWP-20261118-15 adds GRANT-PERMS, PREFETCH-ARM, PREFETCH-DISARM, REKEY-ARM, REKEY-DISARM, REKEY-WAIT-WIFI,
 // REKEY-WAIT-NET and REKEY-WAIT-BATTERY: their one sender is user-0 gate code too.
 // NWP-20261125-15 adds RERUN-REAP: only the gate re-runs a teardown after its own deadline.
+// NWP-20261201-03 adds SAVE-NET-UNMETERED and SAVE-NET-METERED: only the gate's slow tick reports the network.
 // session's chooser shares the gate's appId and SELinux domain, so the accept-time pin alone cannot tell the two apart.
 // The seams (ownerPeerUID, the worker, the reap queue) are package-global, so nothing here is parallel.
 
@@ -27,6 +28,7 @@ var gateOnlyVerbs = []string{
 	"GRANT-PERMS", "PREFETCH-ARM", "PREFETCH-DISARM",
 	"REKEY-ARM", "REKEY-DISARM", "REKEY-WAIT-WIFI", "REKEY-WAIT-NET", "REKEY-WAIT-BATTERY",
 	"RERUN-REAP",
+	"SAVE-NET-UNMETERED", "SAVE-NET-METERED",
 }
 
 // gateOnlyGrantTail reads the stubbed grant tail (seed-home, then bootwake) that the GRANT-PERMS fixture installed.
@@ -132,6 +134,24 @@ func gateOnlyFixture(t *testing.T, verb string, plan []abPlan) (f *abInit, rest 
 			t.Helper()
 			if got := nextReapAction(); got != "SWITCH 15" {
 				t.Errorf("%s: the reap queue reads %q, want SWITCH 15", label, got)
+			}
+		}
+	case "SAVE-NET-UNMETERED", "SAVE-NET-METERED":
+		// The opposite of what the verb reports, at a fixed time: a refused verb changes neither. A verb with no request
+		// line gets one stray line.
+		was := verb == "SAVE-NET-METERED"
+		at := time.Date(2026, 11, 8, 12, 0, 0, 0, time.UTC)
+		saveModeState(t)
+		pendingReapMu.Lock()
+		saveNetUnmetered, saveNetAt = was, at
+		pendingReapMu.Unlock()
+		return f, "x\n", func(t *testing.T, label string) {
+			t.Helper()
+			pendingReapMu.Lock()
+			got, gotAt := saveNetUnmetered, saveNetAt
+			pendingReapMu.Unlock()
+			if got != was || !gotAt.Equal(at) {
+				t.Errorf("%s: the network state is %v at %v, want %v at %v", label, got, gotAt, was, at)
 			}
 		}
 	case "RERUN-REAP":
@@ -384,6 +404,13 @@ func TestGateOnlyVerbs_GateAndRootReachTheHandler(t *testing.T) {
 					t.Errorf("%s from peer %d replied %q, want %q", verb, peer, reply, want)
 				}
 				switch verb {
+				case "SAVE-NET-UNMETERED", "SAVE-NET-METERED":
+					pendingReapMu.Lock()
+					got, at := saveNetUnmetered, saveNetAt
+					pendingReapMu.Unlock()
+					if got != (verb == "SAVE-NET-UNMETERED") || time.Since(at) > time.Minute {
+						t.Errorf("%s: the network state is %v at %v", verb, got, at)
+					}
 				case "SIGNIN-SHOWN":
 					if b, err := os.ReadFile(filepath.Join(f.dest, signinFailFile)); err != nil || !strings.HasPrefix(string(b), "slow\t") {
 						t.Errorf("the failure record reads %q (%v), want one starting slow", b, err)

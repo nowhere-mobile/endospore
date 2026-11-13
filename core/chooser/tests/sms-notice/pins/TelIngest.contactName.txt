@@ -1,0 +1,10 @@
+    private static String contactName(Context ctx, String from) {
+        try (Cursor c = ctx.getContentResolver().query(
+                Uri.withAppendedPath(android.provider.ContactsContract.PhoneLookup.CONTENT_FILTER_URI, Uri.encode(from)),
+                new String[]{ android.provider.ContactsContract.PhoneLookup.DISPLAY_NAME }, null, null, null)) {
+            return c != null && c.moveToFirst() ? c.getString(0) : null;
+        } catch (Throwable t) {
+            android.util.Log.w("NowhereChooser", "telingest contactName: " + t.getClass().getName());
+            return null;
+        }
+    }

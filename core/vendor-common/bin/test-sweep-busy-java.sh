@@ -14,7 +14,8 @@
 #   P1  materializeLocked's MATERIALIZE-APP reply arm checks SweepBusy.isBusy first: qDrop(group), matEnd = BUSY.
 #   P2  materializeMember records depBusy from SweepBusy.isBusy(reply), and the dep abort can end BUSY.
 #   P3  sweepAuto's loop calls SweepBusy.step once; its RETRY branch ends `i--; continue;` and counts and sends nothing.
-#   P4  the RETRY wait sleeps at most 1 s per step and checks SignOutGate.begun() each step.
+#   P4  the RETRY wait sleeps at most 1 s per step and checks SignOutGate.begun() and (NWP-20261201-13) SweepHold.held()
+#       each step.
 #   P5  the STOP branch qDrops the apps not started, logs the busy line, and breaks.
 #
 # It needs a JDK, and it FAILS when there is none. javac/java come from PATH, then the build VM's prebuilt JDK 21.
@@ -129,7 +130,7 @@ $mmem" || bad=1
 <<<SPLIT>>>
 $retry" || bad=1
   pin P4 "the RETRY wait sleeps at most 1 s a step and checks SignOutGate.begun() on every step" '
-      $c =~ /for \(long left = w; left > 0 && !SignOutGate\.begun\(\); left -= 1000L\) \{\s*try \{ Thread\.sleep\(Math\.min\(left, 1000L\)\); \}/
+      $c =~ /for \(long left = w; left > 0 && !SignOutGate\.begun\(\) && !SweepHold\.held\(\); left -= 1000L\) \{\s*try \{ Thread\.sleep\(Math\.min\(left, 1000L\)\); \}/
         or exit 1;
       $c =~ /long w = SweepBusy\.waitMs\(busyTries\);\s*busyTries\+\+;\s*busyWaited \+= w;/ or exit 1;
       exit 0;' <<<"$retry" || bad=1
@@ -182,7 +183,7 @@ mut "S4 the retry advances to the next app" "$U" 's/^[ \t]*i--;\n//m' P3 || fail
 mut "S5 BUSY dropped from TOKENS" "$O" 's/, ERROR, BUSY, NEEDS_PLAY, OLDER_COPY \}/, ERROR, NEEDS_PLAY, OLDER_COPY }/' B4 || fails=$((fails+1))
 mut "S6 a busy MATERIALIZE-APP reply read as fetch-failed again" "$U" 's{if \(SweepBusy\.isBusy\(reply\)\) \{(?:\s*//[^\n]*)*\s*qDrop\(group\);\s*matEnd = SweepOutcome\.BUSY;\s*return false;\s*\}\s*}{}' P1 || fails=$((fails+1))
 mut "S7 the dep abort's busy arm removed" "$U" 's/^[ \t]*if \(depBusy\) \{ matEnd = SweepOutcome\.BUSY; return false; \}[^\n]*\n//m' P2 || fails=$((fails+1))
-mut "S8 the wait no longer checks SignOutGate" "$U" 's/left > 0 && !SignOutGate\.begun\(\);/left > 0;/' P4 || fails=$((fails+1))
+mut "S8 the wait no longer checks SignOutGate" "$U" 's/for \(long left = w; left > 0 && !SignOutGate\.begun\(\)/for (long left = w; left > 0/' P4 || fails=$((fails+1))
 mut "S9 the STOP no longer qDrops the rest" "$U" 's/^[ \t]*qDrop\(SignOutGate\.rest\(work, i \+ 1\)\);\n//m' P5 || fails=$((fails+1))
 mut "S10 the schedule flattened to one constant" "$B" 's/return SCHEDULE_MS\[Math\.min\(attempt, SCHEDULE_MS\.length - 1\)\];/return 60_000L;/' B2 || fails=$((fails+1))
 mut "S11 the busy arm no longer qDrops its group" "$U" 's{(SweepBusy\.isBusy\(reply\)\)\s*\{(?:\s*//[^\n]*)*\s*)qDrop\(group\);\s*}{$1}' P1 || fails=$((fails+1))

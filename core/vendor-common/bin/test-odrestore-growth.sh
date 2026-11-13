@@ -116,6 +116,7 @@ suite() {  # suite <roamd.sh> [quiet] -> 0 all ok, 1 a case failed, 2 the harnes
       cat <<'EOF'
 date() { echo DATE; }
 restorecon() { :; }
+od_fetch_data() { return 0; }; od_listed() { return 1; }; od_block_app() { return 0; }; od_unblock_app() { :; }; od_pending_clear() { :; }; od_block_installed() { :; }; od_shipped_prep() { return 0; }; od_park_var() { :; }; od_unf_path() { echo "$STATE/odfetch.$1/unfetched.$2"; }   # NWP-20261130-03
 am() { return 0; }
 pidof() { :; }
 pkg_live_pids() { :; }

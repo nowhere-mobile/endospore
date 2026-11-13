@@ -1,0 +1,10 @@
+<!-- The gate's Help combo screen (NWP-20261130-11): the Forgot your passphrase? card, a key. White; GateHelpTileGrid or GateHelpScreen tints it. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M8,6a6,6 0 1,0 5.7,8H16v3h3v-3h2v-3.9H13.7A6,6 0 0,0 8,6zM8,10a2,2 0 1,1 0,4a2,2 0 0,1 0,-4z"/>
+</vector>

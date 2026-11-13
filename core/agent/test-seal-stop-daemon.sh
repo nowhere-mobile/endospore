@@ -12,6 +12,10 @@
 # under the slot and leaves the request (runWorkerHeld's manualStoppedAtSlot check, seal_stop.go); the sign-out's own
 # out op, a manual under its own announce and a manual after the sign-out ended still run; end to end, a Back up now
 # queued behind a held slot and then a sign-out write exactly one out request, "logoff-pinned".
+# h59 #1 (NWP-20261129-23) widens the run to seal_stop_promote_test.go's TestPromoteStop: LOGOUT raises the request over a
+# "promote" announce too and runs its out op as plain "logoff"; a promote seal queued for the slot when a sign-out takes
+# its announce answers SKIP-STOPPED under the slot and leaves the request (promoteStoppedAtSlot, seal_stop.go); a stopped
+# promote records nothing; end to end, "Save to your store" and then Log off write one sign-out seal.
 # --mutate re-runs them against main.go and seal_stop.go with each rule broken in turn, restoring it on exit (the pristine copy lives in
 # one scratch root, never beside the source). Each mutant must be CONVICTED by a real `--- FAIL`; one that fails to
 # apply or to compile is a failure.
@@ -21,7 +25,7 @@ W=$(mktemp -d) || exit 2
 . ./suite-report.sh
 trap 'for f in main.go seal_stop.go; do [ -f "$W/$f.orig" ] && cp -f "$W/$f.orig" "$f"; done; rm -rf "$W"' EXIT
 export TMPDIR="$W" GOTMPDIR="$W"
-RUN=(go test -count=1 -run 'TestSealStopDaemon|TestManualStop|TestSealKind' -v .)
+RUN=(go test -count=1 -run 'TestSealStopDaemon|TestManualStop|TestSealKind|TestPromoteStop' -v .)
 
 out=$("${RUN[@]}" 2>&1); rc=$?
 report_plain_run "$rc" "$out" || exit 1
@@ -48,12 +52,12 @@ PY
 }
 # The drop block in runWorkerHeld, as one pattern: D3 deletes it, D5 moves it above the abandoned-lane check.
 DROP='\tif op == "out" \{\n\t\t// h47 #1 \(NWP-20261117-04\): drop a sign-out[^\n]*\n(?:\t\t//[^\n]*\n)*\t\tdropSealStop\(dest\)\n\t\}\n'
-# D1/D2 (re-pointed by NWP-20261119-03 at the raise line): each replacement keeps both variables in the condition, and
+# D1/D2 (re-pointed by NWP-20261119-03 at the raise line): each replacement keeps every variable in the condition, and
 # the log label reads stopPeriodic as well, so neither mutant leaves a local unused (Go would refuse to compile it).
 mut "D1 handleLogout raises nothing" main.go \
-  'if stopPeriodic \|\| stopManual \{' 'if false && (stopPeriodic || stopManual) {'
+  'if stopPeriodic \|\| stopManual \|\| stopPromote \{' 'if false && (stopPeriodic || stopManual || stopPromote) {'
 mut "D2 handleLogout raises for the empty announce too" main.go \
-  'if stopPeriodic \|\| stopManual \{' 'if true || stopPeriodic || stopManual {'
+  'if stopPeriodic \|\| stopManual \|\| stopPromote \{' 'if true || stopPeriodic || stopManual || stopPromote {'
 mut "D3 runWorkerHeld does not drop the request before roam.req" main.go \
   "$DROP" ''
 mut "D4 recordSeal records SKIP-STOPPED as a verdict" main.go \
@@ -93,4 +97,18 @@ mut "D16 the helper's intent guard dropped (the sign-out would skip its own seal
   '\tif intent != "manual" \{\n\t\treturn false\n\t\}\n' ''
 mut "D17 the check moved after the drop" main.go \
   "($QCHECK)(.*?)($DROP)" '\2\3\1'
+# h59 #1 (NWP-20261129-23): the queued-promote check in runWorkerHeld, as one pattern, in QCHECK's form.
+PCHECK='\t// h59 #1 \(NWP-20261129-23\)[^\n]*\n(?:\t//[^\n]*\n)*\tif op == "out" && promoteStoppedAtSlot\(intent\) \{\n\t\tfmt\.Fprintf\([^\n]*\n\t\treturn "SKIP-STOPPED"\n\t\}\n'
+mut "D18 the promote raise removed" main.go \
+  'stopPromote := sealRunKind == "promote"' 'stopPromote := false'
+mut "D19 the promote at-slot check removed" main.go \
+  "$PCHECK" ''
+mut "D20 the promote passes intent \"\" again" main.go \
+  'readRoamSessionSE\(dest\), "", "", "promote", nil\)' 'readRoamSessionSE(dest), "", "", "", nil)'
+mut "D21 a replaced promote pins" main.go \
+  'if stopManual \{\n\t\t\toutKind' 'if stopManual || stopPromote {\n\t\t\toutKind'
+mut "D22 the promote helper's intent guard dropped (the sign-out would skip its own seal)" seal_stop.go \
+  '\tif intent != "promote" \{\n\t\treturn false\n\t\}\n' ''
+mut "D23 the promote check moved after the drop" main.go \
+  "($PCHECK)(.*?)($DROP)" '\2\3\1'
 [ "$fails" -eq 0 ] && echo "== all mutations convicted" || { echo "== $fails mutation(s) not convicted"; exit 1; }

@@ -73,11 +73,12 @@ EOF
     printf 'AGENT=$T/agent.sh\n'
     printf 'unset NOWHERE_SEAL_STOPPABLE\n'
     for f in bt_seal_capture nav_seal_capture aod_seal_capture a11y_seal_capture autofill_seal_capture tz_seal_capture \
-             vpn_deferred_retry vpn_seal_capture sync_apply_retry sync_seal_capture ks_stage_drop restorecon chown \
+             vpn_deferred_retry vpn_seal_capture sync_apply_retry sync_seal_capture sroam_seal_capture ks_stage_drop restorecon chown \
              seal_wl_release seal_susp seal_wl_end; do
       printf '%s(){ :; }\n' "$f"
     done
     printf 'pw(){ echo pw; }\n'
+    printf '%s\n' 'od_fetch_data() { return 0; }; od_listed() { return 1; }; od_block_app() { return 0; }; od_unblock_app() { :; }; od_pending_clear() { :; }; od_block_installed() { :; }; od_shipped_prep() { return 0; }; od_park_var() { :; }; od_unf_path() { echo "$STATE/odfetch.$1/unfetched.$2"; }   # NWP-20261130-03'
     printf '_ms(){ echo 0; }\n'   # NWP-20261123-06: the seal split times each scope; dash and mksh abort on $(( - ))
     printf 'am(){ echo "am $1" >> "$T/calls"; }\n'
     printf 'bt_reset(){ echo bt_reset >> "$T/calls"; return 0; }\n'

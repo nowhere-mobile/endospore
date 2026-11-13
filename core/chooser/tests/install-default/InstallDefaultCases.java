@@ -12,6 +12,8 @@ public class InstallDefaultCases {
   static final String P = "org.example.app";
   static final String AURORA = "com.aurora.store";
   static final String VENDING = "com.android.vending";
+  static final String GMS = "com.google.android.gms";
+  static final String GSF = "com.google.android.gsf";
   static final String NAPPS_OUTCOME = "skipped (nApps -- StoreInstaller applied it on the install path)";
   static final String CLEARED = "not kept (this bucket's default is off) -- and the previous install's keep line was cleared";
   static final String PLAIN_OFF = "not kept (this bucket's default is off)";
@@ -52,6 +54,23 @@ public class InstallDefaultCases {
   static List<String> writes() {
     List<String> w = new ArrayList<>();
     for (String j : StoreInstaller.journal) if (j.startsWith("removeKeepLines:") || j.startsWith("keepInMode:")) w.add(j);
+    return w;
+  }
+  /** The outcome of decide's own line, for a call that logs a second line of its own (NWP-20261129-16). */
+  static String lastOutcome() {
+    for (String s : android.util.Log.lines) {
+      int a = s.indexOf(" -> "), b = s.lastIndexOf(" (NWP-20260825-19)");
+      if (a >= 0 && b > a) return s.substring(a + 4, b);
+    }
+    return null;
+  }
+  /** Every write decide made, in order: the flag, the keep lines, the playdep, the Off line. */
+  static List<String> order() {
+    List<String> w = new ArrayList<>();
+    for (String j : StoreInstaller.journal) {
+      if (j.startsWith("cfgPut:") || j.startsWith("keepInMode:") || j.startsWith("removeKeepLines:")
+          || j.startsWith("setPlayDep:") || j.startsWith("clearTurnedOff:")) w.add(j);
+    }
     return w;
   }
   static boolean logHas(String frag) { return android.util.Log.lines.toString().contains(frag); }
@@ -266,15 +285,120 @@ public class InstallDefaultCases {
         check(tag + " -> no playdep", ProfileActivity.playDeps.isEmpty(), "playDeps=" + ProfileActivity.playDeps);
       });
     }
-    for (String pv : new String[] {"off", "0"}) {
-      run("C13 play " + pv + ", vending", () -> {
-        pm.installer.put(VENDING, GOS); ProfileActivity.mode = "off"; ProfileActivity.play = pv;
-        boolean r = AppInstallReceiver.decide(ctx, VENDING, false, "broadcast");
-        String tag = "C13 play.wanted=" + pv + ", vending";
-        check(tag + " -> the bucket default (off -> not kept)", !r && writes().isEmpty(), "r=" + r + " writes=" + writes());
-        check(tag + " -> no playdep", ProfileActivity.playDeps.isEmpty(), "playDeps=" + ProfileActivity.playDeps);
+    run("C13 play absent, vending", () -> {
+      pm.installer.put(VENDING, GOS); ProfileActivity.mode = "off"; ProfileActivity.play = "off";
+      boolean r = AppInstallReceiver.decide(ctx, VENDING, false, "broadcast");
+      String tag = "C13 play.wanted=off, vending";
+      check(tag + " -> the bucket default (off -> not kept)", !r && writes().isEmpty(), "r=" + r + " writes=" + writes());
+      check(tag + " -> no playdep", ProfileActivity.playDeps.isEmpty(), "playDeps=" + ProfileActivity.playDeps);
+      check(tag + " -> the flag not written", order().isEmpty(), "order=" + order());
+    });
+    // NWP-20261129-16 (h59 #7): this arm pinned the defect until the decision. A hand install with Play Off is On.
+    run("C13 play 0, vending", () -> {
+      pm.installer.put(VENDING, GOS); ProfileActivity.mode = "off"; ProfileActivity.play = "0";
+      boolean r = AppInstallReceiver.decide(ctx, VENDING, false, "broadcast");
+      String tag = "C13 play.wanted=0, vending";
+      check(tag + " -> kept", r, "r=" + r);
+      check(tag + " -> play.wanted written 1", "1".equals(ProfileActivity.play), "play=" + ProfileActivity.play);
+      check(tag + " -> keepInMode(vending, false, ondemand)", writes().equals(Arrays.asList("keepInMode:" + VENDING + ",false,ondemand")), "writes=" + writes());
+      check(tag + " -> setPlayDep (vending, true) once", ProfileActivity.playDeps.equals(Collections.singletonList(VENDING + ",true")), "playDeps=" + ProfileActivity.playDeps);
+    });
+
+    // NWP-20261129-16 (h59 #7, docs/product-decisions.md, 2026-11-05): a hand install of Play Store with Play Off turns
+    // Play back On, and the Play rules apply as if the user had switched it on.
+    final String PUT_ON = "cfgPut:play.wanted=1";
+    final String KEEP_V = "keepInMode:" + VENDING + ",false,ondemand";
+    final String KEEP_GMS = "keepInMode:" + GMS + ",false,ondemand";
+    final String KEEP_GSF = "keepInMode:" + GSF + ",false,ondemand";
+    final String DEP_V = "setPlayDep:" + VENDING + ",true";
+    final String CLEAR_V = "clearTurnedOff:[" + VENDING + "]";
+    run("C15a the flip", () -> {
+      pm.installer.put(VENDING, GOS); ProfileActivity.mode = "off"; ProfileActivity.play = "0";
+      ProfileActivity.off.add(VENDING); pm.installed.add(GMS); pm.archived.add(GSF);
+      boolean r = AppInstallReceiver.decide(ctx, VENDING, false, "broadcast");
+      check("C15a -> kept", r, "r=" + r);
+      check("C15a -> the flag, then Play Store, its playdep and Off line, then the services on this phone",
+          order().equals(Arrays.asList(PUT_ON, KEEP_V, DEP_V, CLEAR_V, KEEP_GMS, KEEP_GSF)), "order=" + order());
+      check("C15a -> the outcome is kept, at ondemand", "kept".equals(lastOutcome()) && logHas(" default=ondemand -> "), "lines=" + android.util.Log.lines);
+      check("C15a -> one line names the flip", android.util.Log.lines.size() == 2 && logHas("Google Play back On"), "lines=" + android.util.Log.lines);
+      PlayChoice.State now = PlayChoice.effective(PlayChoice.parse(ProfileActivity.play), true);
+      check("C15a -> the row reads On", "On".equals(PlayChoice.rowText(now, true, true)), "state=" + now);
+      check("C15a -> reconcile no longer blocks the Play Store re-add", !PlayChoice.blocksVendingReadd(now), "state=" + now);
+    });
+    run("C15a nothing else of the stack on this phone", () -> {
+      pm.installer.put(VENDING, GOS); ProfileActivity.mode = "off"; ProfileActivity.play = "0";
+      AppInstallReceiver.decide(ctx, VENDING, false, "broadcast");
+      check("C15a -> no keepInMode for gms or gsf", order().equals(Arrays.asList(PUT_ON, KEEP_V, DEP_V, CLEAR_V)), "order=" + order());
+    });
+    run("C15b the catch-up", () -> {
+      pm.installer.put(VENDING, GOS); ProfileActivity.mode = "off"; ProfileActivity.play = "0"; pm.installed.add(GMS);
+      boolean r = AppInstallReceiver.decide(ctx, VENDING, false, "catch-up");
+      check("C15b catch-up -> no flip, nothing written, nothing logged", !r && order().isEmpty() && "0".equals(ProfileActivity.play) && android.util.Log.lines.isEmpty(),
+          "r=" + r + " order=" + order() + " lines=" + android.util.Log.lines);
+    });
+    run("C15b the catch-up, a bucket that keeps", () -> {
+      pm.installer.put(VENDING, GOS); ProfileActivity.mode = "auto"; ProfileActivity.play = "0";
+      AppInstallReceiver.decide(ctx, VENDING, false, "catch-up");
+      check("C15b catch-up, bucket auto -> kept at the bucket default, no flip and no playdep",
+          order().equals(Arrays.asList("keepInMode:" + VENDING + ",false,auto")) && "0".equals(ProfileActivity.play), "order=" + order());
+    });
+    run("C15c an update", () -> {
+      pm.installer.put(VENDING, GOS); ProfileActivity.mode = "off"; ProfileActivity.play = "0"; pm.installed.add(GMS);
+      boolean r = AppInstallReceiver.decide(ctx, VENDING, true, "broadcast");
+      check("C15c update -> no flip, nothing written", !r && order().isEmpty() && "0".equals(ProfileActivity.play), "r=" + r + " order=" + order());
+      check("C15c update -> today's outcome", "skipped (an update, not a new install)".equals(outcome("C15c")), "lines=" + android.util.Log.lines);
+    });
+    for (String other : new String[] {GMS, GSF, P}) {
+      run("C15d " + other, () -> {
+        pm.installer.put(other, GOS); ProfileActivity.mode = "off"; ProfileActivity.play = "0"; pm.installed.add(GMS);
+        boolean r = AppInstallReceiver.decide(ctx, other, false, "broadcast");
+        check("C15d " + other + " -> no flip, nothing written", !r && order().isEmpty() && "0".equals(ProfileActivity.play), "r=" + r + " order=" + order());
+        check("C15d " + other + " -> today's outcome", PLAIN_OFF.equals(outcome("C15d " + other)), "lines=" + android.util.Log.lines);
       });
     }
+    run("C15d no GrapheneOS App Store", () -> {
+      pm.installer.put(VENDING, GOS); ProfileActivity.mode = "off"; ProfileActivity.play = "0"; ProfileActivity.gos = false;
+      AppInstallReceiver.decide(ctx, VENDING, false, "broadcast");
+      check("C15d stored 0 without the App Store -> no flip, nothing written", order().isEmpty() && "0".equals(ProfileActivity.play), "order=" + order());
+    });
+    run("C15e the write does not land", () -> {
+      pm.installer.put(VENDING, GOS); ProfileActivity.mode = "off"; ProfileActivity.play = "0"; ProfileActivity.cfgLands = false;
+      ProfileActivity.off.add(VENDING); pm.installed.add(GMS);
+      boolean r = AppInstallReceiver.decide(ctx, VENDING, false, "broadcast");
+      check("C15e -> only the attempt, no flip", !r && order().equals(Collections.singletonList(PUT_ON)), "r=" + r + " order=" + order());
+      check("C15e -> today's outcome", PLAIN_OFF.equals(lastOutcome()), "lines=" + android.util.Log.lines);
+      check("C15e -> one line says the flag did not land", android.util.Log.lines.size() == 2 && logHas("W NowhereChooser: Google Play stays Off"), "lines=" + android.util.Log.lines);
+    });
+    run("C15f Play Store already kept", () -> {
+      pm.installer.put(VENDING, GOS); ProfileActivity.mode = "off"; ProfileActivity.play = "0"; StoreInstaller.kept.add(VENDING);
+      boolean r = AppInstallReceiver.decide(ctx, VENDING, false, "broadcast");
+      check("C15f -> nothing written to the keep line", !r && LEFT_ALONE.equals(lastOutcome()), "r=" + r + " lines=" + android.util.Log.lines);
+      check("C15f -> the flag, the Off line, the playdep once", order().equals(Arrays.asList(PUT_ON, CLEAR_V, DEP_V)), "order=" + order());
+    });
+    run("C15f returning with a keep line", () -> {
+      pm.installer.put(VENDING, GOS); ProfileActivity.mode = "off"; ProfileActivity.play = "0";
+      StoreInstaller.kept.add(VENDING); StoreInstaller.gone.add(VENDING);
+      boolean r = AppInstallReceiver.decide(ctx, VENDING, false, "broadcast");
+      check("C15f returning -> rewritten On-demand, one playdep, the Off line", r && RESET.equals(lastOutcome())
+          && order().equals(Arrays.asList(PUT_ON, "removeKeepLines:[" + VENDING + "]", KEEP_V, DEP_V, CLEAR_V)), "r=" + r + " order=" + order());
+    });
+    run("C15g gms kept", () -> {
+      pm.installer.put(VENDING, GOS); ProfileActivity.mode = "off"; ProfileActivity.play = "0";
+      pm.installed.add(GMS); StoreInstaller.kept.add(GMS);
+      AppInstallReceiver.decide(ctx, VENDING, false, "broadcast");
+      check("C15g gms kept -> its line and mode left to reconcile", !order().contains(KEEP_GMS), "order=" + order());
+    });
+    run("C15g gms not on this phone", () -> {
+      pm.installer.put(VENDING, GOS); ProfileActivity.mode = "off"; ProfileActivity.play = "0"; pm.installed.add(GSF);
+      AppInstallReceiver.decide(ctx, VENDING, false, "broadcast");
+      check("C15g gms absent -> no keepInMode for it, gsf still marked", !order().contains(KEEP_GMS) && order().contains(KEEP_GSF), "order=" + order());
+    });
+    run("C15h keepInMode refuses Play Store", () -> {
+      pm.installer.put(VENDING, GOS); ProfileActivity.mode = "off"; ProfileActivity.play = "0"; StoreInstaller.keepInModeAnswer = false;
+      boolean r = AppInstallReceiver.decide(ctx, VENDING, false, "broadcast");
+      check("C15h -> not kept, refused", !r && REFUSED.equals(lastOutcome()), "r=" + r + " lines=" + android.util.Log.lines);
+      check("C15h -> no playdep", ProfileActivity.playDeps.isEmpty(), "playDeps=" + ProfileActivity.playDeps);
+    });
 
     System.out.println(fails == 0 ? "suite passed" : "suite FAILED (" + fails + ")");
     System.exit(fails == 0 ? 0 : 1);

@@ -204,11 +204,11 @@ func TestPushGuard_EveryRefusalInPushProfileNamesAReason(t *testing.T) {
 		}
 		found[why]++
 	}
-	want := map[string]int{"deleted": 1, "unreadable-head": 1, "blind": 1, "stale-base": 2, "no-receipt": 1, "shrink": 2, "apps-vanished": 1,
+	want := map[string]int{"deleted": 1, "unreadable-head": 1, "blind": 1, "stale-base": 2, "no-receipt": 2, "shrink": 2, "apps-vanished": 1,
 		"mounts-unread": 1, "locks-changed": 1, "locks-changed-key": 1, "unlock-lost": 1, "unlock-lost-key": 1,
-		"unfetched-unknown": 1, "unfetched-dropped": 1, "aftergate-no-carry": 1}
-	if refusals != 17 {
-		t.Errorf("pushProfile has %d refusal sites, want 17 -- a new guard needs a reason and a class", refusals)
+		"unfetched-unknown": 1, "unfetched-dropped": 2, "aftergate-no-carry": 1}
+	if refusals != 19 {
+		t.Errorf("pushProfile has %d refusal sites, want 19 -- a new guard needs a reason and a class", refusals)
 	}
 	for k, n := range want {
 		if found[k] != n {

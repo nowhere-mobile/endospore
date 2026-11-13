@@ -335,7 +335,7 @@ func sealDeltaScopeDK(base, scope, pass string, se []byte) (dk []byte) {
 // periodic dispatch that failed after the user took photos said "No new changes since the last save."
 // NOBASE when none has landed: with no baseline the mtime rule would count every restored file, and "your whole
 // profile is unsaved" at first open is the lie this feature exists to prevent.
-// handleLogout and ROAM-OUT record nothing. ROAM-OUT reboots, and a logoff that lands ends the session (the next
+// handleLogout records nothing: a logoff that lands ends the session (the next
 // sign-in's resetSealSignals zeroes the stamp). The logoff arms that record an OK but KEEP the session (the late
 // verdict after the stall unstick, the two superseded returns) leave the baseline at the previous landed seal or
 // at 0: that over-counts or answers NOBASE, both the safe direction.

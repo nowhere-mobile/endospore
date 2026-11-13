@@ -123,7 +123,7 @@ public class Cases {
     return Lifted.mergePlan(Lifted.parseVCard(incoming), haveFrom(Lifted.parseVCard(existing)));
   }
 
-  static final String NAME = "FN:John Smith", TEL = "TEL;TYPE=CELL:+44 7700 900123", MAIL = "EMAIL:j@x.com";
+  static final String NAME = "FN:John Smith", TEL = "TEL;TYPE=CELL:+44 7700 900123", MAIL = "EMAIL:j@x.test";
 
   public static void main(String[] a) {
     String A = card("VERSION:3.0", NAME, TEL, MAIL);

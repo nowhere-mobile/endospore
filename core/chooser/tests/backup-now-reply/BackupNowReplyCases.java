@@ -21,14 +21,23 @@ public class BackupNowReplyCases {
         act(" OK ", BackupNowReply.SAVING);
         act("NONE", BackupNowReply.CLEAR);
         act("LOCAL", BackupNowReply.CLEAR);
-        act("BUSY seal-in-flight", BackupNowReply.PROMPT);
-        act("BUSY", BackupNowReply.PROMPT);
-        act("ERR x", BackupNowReply.PROMPT);
-        act("", BackupNowReply.PROMPT);
-        act(null, BackupNowReply.PROMPT);
 
-        String[] busy = {"BUSY seal-in-flight", "BUSY seal-run:periodic", "BUSY login", "BUSY user-op-waiting",
-                "BUSY something-new", "BUSY"};
+        // NWP-20261201-09: a save already running is joined, never refused.
+        String[] joined = {"BUSY seal-in-flight", "BUSY seal-run:periodic", "BUSY seal-run:manual", "BUSY seal-run:logoff"};
+        for (String j : joined) {
+            act(j, BackupNowReply.SAVING);
+            eq("joined body " + j, null, BackupNowReply.body(j));
+            eq("joins " + j, true, BackupNowReply.joins(j));
+        }
+        String[] refused = {"BUSY login", "BUSY user-op-waiting", "BUSY", "BUSY seal-runx", "BUSY seal-in-flightx", "ERR x", "", null};
+        for (String r : refused) {
+            act(r, BackupNowReply.PROMPT);
+            eq("joins " + (r == null ? "null" : "[" + r + "]"), false, BackupNowReply.joins(r));
+        }
+        for (String r : new String[] {"OK", "NONE", "LOCAL"}) eq("joins " + r, false, BackupNowReply.joins(r));
+        eq("joins reads the first line only", false, BackupNowReply.joins("BUSY login\nBUSY seal-in-flight"));
+
+        String[] busy = {"BUSY login", "BUSY user-op-waiting", "BUSY something-new", "BUSY"};
         for (String b : busy) eq("body " + b, ReplyCopy.backupBusy(b), BackupNowReply.body(b));
         String none = "Couldn't reach the save service, so nothing was saved. Try again in a moment.";
         eq("body null", none, BackupNowReply.body(null));

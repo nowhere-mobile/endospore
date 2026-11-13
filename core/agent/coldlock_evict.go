@@ -63,6 +63,77 @@ var gateAlarmRelays atomic.Int64
 // SET wrote in between.
 var gateAlarmMu sync.Mutex
 
+// gateAlarmReadWait bounds how long GET-GATE-ALARM waits for a cold lock's at-lock relay, from the lock's commit. It
+// stays under the gate's 90 s read of the verb, and it is longer than the commit-to-relay stretch: stopMediad, btpark,
+// the three release* ops, the switch and the relay.
+var gateAlarmReadWait = 60 * time.Second
+
+// atLockRelayWaitStarted runs when a GET-GATE-ALARM starts to wait for the relay. A test hook.
+var atLockRelayWaitStarted = func() {}
+
+// The at-lock relay marker (NWP-20261129-26): set while a committed cold lock's relay has not ended. Its own mutex,
+// because gateAlarmMu is what SET-GATE-ALARM needs to deliver the relay that a reader waits for.
+var (
+	atLockRelayMu    sync.Mutex
+	atLockRelayDone  chan struct{}
+	atLockRelayUntil time.Time
+)
+
+// beginAtLockRelay marks the relay in flight, until gateAlarmReadWait from now.
+func beginAtLockRelay() {
+	atLockRelayMu.Lock()
+	defer atLockRelayMu.Unlock()
+	atLockRelayDone = make(chan struct{})
+	atLockRelayUntil = time.Now().Round(0).Add(gateAlarmReadWait)
+}
+
+// endAtLockRelay ends the mark and frees every waiting reader. A second call does nothing.
+func endAtLockRelay() {
+	atLockRelayMu.Lock()
+	defer atLockRelayMu.Unlock()
+	if atLockRelayDone != nil {
+		close(atLockRelayDone)
+		atLockRelayDone = nil
+	}
+}
+
+// atLockRelayInFlight reports a marked relay inside its bound, with the teardown that set the mark still running: a
+// marker never outlives its teardown, so no later read waits on it.
+func atLockRelayInFlight() bool {
+	atLockRelayMu.Lock()
+	live := atLockRelayDone != nil && time.Now().Round(0).Before(atLockRelayUntil)
+	atLockRelayMu.Unlock()
+	return live && coldLockInFlight()
+}
+
+// waitForAtLockRelay holds a GET-GATE-ALARM back while a relay is in flight, bounded, and returns at once for every
+// other verb. The gate reads the stash once per onResume, and that read clears it, so an answer sent before the relay
+// lands leaves the relayed alarm with no reader: on an offline phone nothing then rings. It holds no lock while it
+// waits: SET-GATE-ALARM takes gateAlarmMu to deliver the relay, and the gate's ACK-REAP takes sessionMu.
+func waitForAtLockRelay(name string) {
+	if name != "GET-GATE-ALARM" || !atLockRelayInFlight() {
+		return
+	}
+	atLockRelayMu.Lock()
+	done, until := atLockRelayDone, atLockRelayUntil
+	atLockRelayMu.Unlock()
+	if done == nil {
+		return // the relay ended between the two reads
+	}
+	atLockRelayWaitStarted()
+	t0 := time.Now().Round(0)
+	bound := time.NewTimer(time.Until(until))
+	defer bound.Stop()
+	how := "relay ended"
+	select {
+	case <-done:
+	case <-bound.C:
+		how = "bound"
+	}
+	fmt.Fprintf(os.Stderr, "[logind] gate alarm read waited %dms for the cold lock's alarm relay (%s)\n",
+		time.Since(t0).Milliseconds(), how)
+}
+
 // sweepMediaAtLock detaches the session's media overlays while the user is still running, so the stop's key
 // removal does not start out FILES_BUSY on them. It runs inside the teardown's RW hold (rwHeld), like btpark. A
 // failure does not stop the lock -- the user is past the point of no return -- but it is said, and dropcaches

@@ -100,13 +100,13 @@ build() { # build <Ingest.java> -> harness compiled into $WORK
     ne("name: different people", normaliseName(vc("John Smith", null, null)), normaliseName(vc("Jane Smith", null, null)));
 
     // THE POINT: the same person, exported by two different tools.
-    VCardEntry fromPhone = vc("John Smith", new String[]{"+44 7700 900123"}, new String[]{"j@x.com"});
-    VCardEntry fromFile  = vc("Smith, John", new String[]{"07700 900123"},  new String[]{"J@X.com"});
+    VCardEntry fromPhone = vc("John Smith", new String[]{"+44 7700 900123"}, new String[]{"j@x.test"});
+    VCardEntry fromFile  = vc("Smith, John", new String[]{"07700 900123"},  new String[]{"J@X.test"});
     eq("same person, two exporters -> ONE key",
        contactIdentityKey(fromPhone, "LEGACY"), contactIdentityKey(fromFile, "LEGACY"));
 
     // Fields two exporters routinely disagree about must not split the identity.
-    VCardEntry withExtras = vc("John Smith", new String[]{"+44 7700 900123"}, new String[]{"j@x.com"});
+    VCardEntry withExtras = vc("John Smith", new String[]{"+44 7700 900123"}, new String[]{"j@x.test"});
     withExtras.org = "Acme Ltd"; withExtras.note = "met at a conference"; withExtras.title = "CTO";
     eq("ORG/NOTE/TITLE do not change identity",
        contactIdentityKey(fromPhone, "LEGACY"), contactIdentityKey(withExtras, "LEGACY"));
@@ -117,8 +117,8 @@ build() { # build <Ingest.java> -> harness compiled into $WORK
 
     // A person reachable only by e-mail still merges on it.
     eq("e-mail alone is a contact point",
-       contactIdentityKey(vc("Ada L", null, new String[]{"ada@x.com"}), "L1"),
-       contactIdentityKey(vc("L, Ada", null, new String[]{"ADA@x.com"}), "L2"));
+       contactIdentityKey(vc("Ada L", null, new String[]{"ada@x.test"}), "L1"),
+       contactIdentityKey(vc("L, Ada", null, new String[]{"ADA@x.test"}), "L2"));
 
     // THE SAFETY RULE. A name with no phone and no e-mail is NOT an identity: two different people called
     // "J Smith" must never collapse into one, because that DROPS one of them.

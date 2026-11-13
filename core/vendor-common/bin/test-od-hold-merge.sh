@@ -121,6 +121,7 @@ reply_runner(){                    # reply_runner <file> <dir> <odsrc> <odn> <od
   {
     printf 'set -u\n'
     printf "odsrc='%s'; odn='%s'; odkept='%s'; pkg=com.whatsapp; RES='%s/res'; LOG='%s/log'\n" "$3" "$4" "$5" "$2" "$2"
+    printf 'od_unblock_app(){ return 0; }\nod_pending_clear(){ :; }\n'
     printf '%s\n' "$REPLY"
   } > "$1"
 }

@@ -110,7 +110,11 @@ pin "TelArrival.parse" "$(body "$TA" 'static Reply parse(String line)' '    ')" 
                 r.kind = "ERR";
                 if (f.length > 2 && "nobody".equals(f[1])) r.vis = f[2];
                 break;
-            case "UNRESOLVED": case "REMOVED": case "FULL": case "OWNER":
+            case "OWNER": case "NONE":
+                r.kind = f[0];
+                if (f.length > 1) r.vis = f[1];
+                break;
+            case "UNRESOLVED": case "REMOVED": case "FULL":
                 r.kind = f[0];
                 if ("FULL".equals(f[0]) && f.length > 1) r.vis = f[1];
                 break;
@@ -269,8 +273,9 @@ pin "SmsDeliverReceiver.settle" "$(body "$SD" 'static int settle(Context ctx, Te
         }
         if ("REMOVED".equals(r.kind)) return SEAL_NONE;
         if (!"OK".equals(r.kind)) { // OWNER (sealed to the device-owner inbox, Slice D) or NONE (no owner key yet):
-            // the SAME content-free unassigned-SIM notice in user 0 -- the gate never reveals whether it was kept.
-            postMessageNotice(asGate(ctx), UNBOUND_LINE, kind, callType, null); // #196
+            // the SAME unassigned-SIM notice in user 0 -- the gate never reveals whether it was kept. The number follows
+            // the owner's opt-in (the reply's "number", h59 #13) and, as on a bound line, gateNotice; the notice does not.
+            postMessageNotice(asGate(ctx), UNBOUND_LINE, kind, callType, gateNotice && "number".equals(r.vis) ? from : null); // #196
             return SEAL_NONE; // no bound owner to count, no live session to kick -- the owner reads it in the inbox
         }
         if (r.partial) { // Q029: kept for some owners, not every one -- the loss notice at the deadline, never the line's own
@@ -1049,10 +1054,10 @@ echo "== each reply has its meaning =="
 if [ "$(count "$ST" 'return SEAL_SEALED;')" = 3 ] && ! has "$ST" 'count'; then ok "OK is kept, whatever its count"; else no "an OK is read by its count again -- OK ... 0 also means queued"; fi
 if ! has "$(body "$TA" 'static Reply parse(String line)' '    ')" 'f[3]'; then ok "the OK count field (f[3]) is never parsed, so no code can read an OK by its count"; else no "the OK count field is parsed -- an OK ... 0 could then be read as nothing kept"; fi
 if has "$ST" 'return r == null || "ERR".equals(r.kind) ? SEAL_FAILED : SEAL_UNKEPT;'; then ok "UNRESOLVED and FULL are answered, not failed; only ERR or no answer is"; else no "an UNRESOLVED or FULL reads as a failure -- an MMS would be downloaded again for the same answer"; fi
-if has "$ST" 'postMessageNotice(asGate(ctx), UNBOUND_LINE, kind, callType, null);'; then ok "the unassigned-SIM notice goes to user 0, with no number"; else no "the unassigned-SIM notice is not posted in user 0"; fi
+if has "$ST" 'postMessageNotice(asGate(ctx), UNBOUND_LINE, kind, callType, gateNotice && "number".equals(r.vis) ? from : null);'; then ok "the unassigned-SIM notice goes to user 0, with the number only when the reply says number"; else no "the unassigned-SIM notice is not posted in user 0, or its number does not follow the reply and gateNotice"; fi
 if has "$ST" 'if (!TelArrival.knownPrivate(iccid) && (r == null || !"private".equals(r.vis))) postLossNotice(ctx, kind, callType, aid);'; then ok "an arrival not kept leaves the loss notice unless its line is known to be Private"; else no "an arrival not kept leaves no trace, or ignores a Private line"; fi
 if has "$ST" 'if ("REMOVED".equals(r.kind)) return SEAL_NONE;'; then ok "REMOVED leaves nothing: the unassign deleted its records and notices"; else no "REMOVED is announced"; fi
-if has "$ST" 'if (gateNotice && !"private".equals(r.vis)) postMessageNotice(ctx, r.label, kind, callType, "number".equals(r.vis) ? from : null);' && [ "$(code "$ST" | grep -F 'gateNotice' | grep -cvF 'boolean gateNotice, String aid) {')" = 1 ]; then ok "gateNotice governs only the labelled notice"; else no "gateNotice governs a notice with no label -- a stranger-session call would leave no trace"; fi
+if has "$ST" 'if (gateNotice && !"private".equals(r.vis)) postMessageNotice(ctx, r.label, kind, callType, "number".equals(r.vis) ? from : null);' && [ "$(code "$ST" | grep -F 'gateNotice' | grep -cvF 'boolean gateNotice, String aid) {')" = 2 ] && [ "$(code "$ST" | grep -cE '^[[:space:]]*postMessageNotice\(asGate\(ctx\), UNBOUND_LINE, ')" = 1 ]; then ok "gateNotice governs the labelled notice and the unassigned notice's number, never the unassigned notice itself"; else no "gateNotice governs a notice with no label -- a stranger-session call would leave no trace"; fi
 
 echo
 echo "== the loss notice: user 0's, one per arrival, and the arrival's only trace =="
@@ -1190,11 +1195,13 @@ if [ "$MUTATE" = yes ]; then
   mutate "an unidentified MMS dropped with no notice"       WapPushDeliverReceiver.java 's/                SmsDeliverReceiver.postLossNotice(app, "mms", 0, aid);//'
   mutate "an unidentified MMS downloaded on subscription -1" WapPushDeliverReceiver.java 's/if (subId == SubscriptionManager.INVALID_SUBSCRIPTION_ID) {/if (false) {/'
   mutate "an UNRESOLVED read as a failure"                  SmsDeliverReceiver.java 's/return r == null || "ERR".equals(r.kind) ? SEAL_FAILED : SEAL_UNKEPT;/return SEAL_FAILED;/'
-  mutate "the unassigned-SIM notice in the caller's user"   SmsDeliverReceiver.java 's/postMessageNotice(asGate(ctx), UNBOUND_LINE, kind, callType, null);/postMessageNotice(ctx, UNBOUND_LINE, kind, callType, null);/'
+  mutate "the unassigned-SIM notice in the caller's user"   SmsDeliverReceiver.java 's/postMessageNotice(asGate(ctx), UNBOUND_LINE, kind, callType, gateNotice/postMessageNotice(ctx, UNBOUND_LINE, kind, callType, gateNotice/'
   mutate "an unkept arrival leaves no trace"                SmsDeliverReceiver.java 's/(r == null || !"private".equals(r.vis))) postLossNotice(ctx, kind, callType, aid);/(r == null || !"private".equals(r.vis))) { }/'
   mutate "a Private line announced"                         SmsDeliverReceiver.java 's/if (!TelArrival.knownPrivate(iccid) \&\& (r == null || !"private".equals(r.vis))) postLossNotice/if (true) postLossNotice/'
   mutate "REMOVED announced"                                SmsDeliverReceiver.java 's/if ("REMOVED".equals(r.kind)) return SEAL_NONE;/if ("REMOVED".equals(r.kind)) { postLossNotice(ctx, kind, callType, aid); return SEAL_NONE; }/'
-  mutate "gateNotice silences the unassigned-SIM notice"    SmsDeliverReceiver.java 's/            postMessageNotice(asGate(ctx), UNBOUND_LINE, kind, callType, null);/            if (gateNotice) postMessageNotice(asGate(ctx), UNBOUND_LINE, kind, callType, null);/'
+  mutate "gateNotice silences the unassigned-SIM notice"    SmsDeliverReceiver.java 's/            postMessageNotice(asGate(ctx), UNBOUND_LINE, kind, callType, gateNotice/            if (gateNotice) postMessageNotice(asGate(ctx), UNBOUND_LINE, kind, callType, gateNotice/'
+  mutate "W1 settle passes null again"                      SmsDeliverReceiver.java 's/UNBOUND_LINE, kind, callType, gateNotice \&\& "number".equals(r.vis) ? from : null);/UNBOUND_LINE, kind, callType, null);/'
+  mutate "W7 the number shown when gateNotice is false"     SmsDeliverReceiver.java 's/UNBOUND_LINE, kind, callType, gateNotice \&\& "number"/UNBOUND_LINE, kind, callType, "number"/'
   # the loss notice
   mutate "the loss notice in the caller's user"             SmsDeliverReceiver.java 's/final Context gate = asGate(ctx);/final Context gate = ctx;/'
   mutate "asGate the caller's own context"                  SmsDeliverReceiver.java 's/try { return ctx.createContextAsUser(android.os.UserHandle.SYSTEM, 0); }/try { return ctx; }/'

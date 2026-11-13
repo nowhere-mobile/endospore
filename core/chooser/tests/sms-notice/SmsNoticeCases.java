@@ -368,8 +368,23 @@ public final class SmsNoticeCases {
             check("components: never disables " + keep + " (a roamed user needs it)", !comps.contains(keep), comps);
         }
 
+        // ---- senderTitle / lookUpSender: a session's message notice names its sender (NWP-20261201-29) ----
+        final String NUM = "+15550100";
+        check("title: a saved contact shows the name", "Alice".equals(Lifted.senderTitle(NUM, "Alice")), Lifted.senderTitle(NUM, "Alice"));
+        check("title: the name is trimmed", "Alice".equals(Lifted.senderTitle(NUM, " Alice ")), Lifted.senderTitle(NUM, " Alice "));
+        check("title: a blank name falls back to the number", NUM.equals(Lifted.senderTitle(NUM, "  ")), Lifted.senderTitle(NUM, "  "));
+        check("title: no name falls back to the number", NUM.equals(Lifted.senderTitle(NUM, null)), Lifted.senderTitle(NUM, null));
+        check("title: an empty number and no name", "New message".equals(Lifted.senderTitle("", null)), Lifted.senderTitle("", null));
+        check("title: no number and no name", "New message".equals(Lifted.senderTitle(null, null)), Lifted.senderTitle(null, null));
+        check("lookup: a number in a roamed user", Lifted.lookUpSender(NUM, 10), "");
+        check("lookup: never in user 0 (the gate)", !Lifted.lookUpSender(NUM, 0), "");
+        check("lookup: not for an empty number", !Lifted.lookUpSender("", 10), "");
+        check("lookup: not for a blank number", !Lifted.lookUpSender("  ", 10), "");
+        check("lookup: not for no number", !Lifted.lookUpSender(null, 10), "");
+
         manifestChecks(args[0], comps);
         drawableChecks(args[0]);
+        messageDrawableChecks(args[0]);
         pinChecks(args[1], args[2]);
         unknownRecordChecks(args[1]);
 
@@ -450,6 +465,32 @@ public final class SmsNoticeCases {
         if (paths.getLength() < 1) return;
         String fill = ((org.w3c.dom.Element) paths.item(0)).getAttributeNS(A, "fillColor");
         check("drawable: ic_notif_call is white (#FFFFFFFF)", "#FFFFFFFF".equals(fill), fill);
+    }
+
+    // NWP-20261201-29: a message notice's small icon is the envelope. It has two paths, and a small icon is flattened to
+    // its alpha, so every path must be opaque white.
+    static void messageDrawableChecks(String manifestPath) throws Exception {
+        final String A = "http://schemas.android.com/apk/res/android";
+        java.io.File f = new java.io.File(new java.io.File(manifestPath).getAbsoluteFile().getParentFile(), "res/drawable/ic_notif_message.xml");
+        check("drawable: ic_notif_message.xml exists", f.isFile(), f);
+        if (!f.isFile()) return;
+        javax.xml.parsers.DocumentBuilderFactory df = javax.xml.parsers.DocumentBuilderFactory.newInstance();
+        df.setNamespaceAware(true);
+        org.w3c.dom.Document d;
+        try {
+            d = df.newDocumentBuilder().parse(f);
+        } catch (Exception e) {
+            check("drawable: ic_notif_message.xml parses", false, e);
+            return;
+        }
+        org.w3c.dom.Element root = d.getDocumentElement();
+        check("drawable: ic_notif_message is a <vector>", "vector".equals(root.getLocalName()), root.getLocalName());
+        org.w3c.dom.NodeList paths = d.getElementsByTagName("path");
+        check("drawable: ic_notif_message has a path", paths.getLength() >= 1, paths.getLength());
+        for (int i = 0; i < paths.getLength(); i++) {
+            String fill = ((org.w3c.dom.Element) paths.item(i)).getAttributeNS(A, "fillColor");
+            check("drawable: ic_notif_message path " + i + " is white (#FFFFFFFF)", "#FFFFFFFF".equals(fill), fill);
+        }
     }
 
     // The wiring, pinned byte for byte: every pins/<Class>.<name>.txt must occur EXACTLY ONCE in <Class>.java. None of

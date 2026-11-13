@@ -16,7 +16,8 @@ package com.nowhere.chooser;
  *       vc \t <versionCode>   tsdk \t <targetSdk>   cert \t <base64 DER>   act \t <flatComponent> \t <label>
  *       inst \t <installer package>
  *     NWP-20261128-20 (h50 #3): captureArchivedMeta writes the inst line (installerToRecord); its reader is
- *     installer(), called by OlderCopy.playCount at the Auto sweep's end. parseMeta ignores it. */
+ *     installer(), called by OlderCopy.playCount at the Auto sweep's end and OlderCopy.rowState for a Your apps row
+ *     (NWP-20261130-07). parseMeta ignores it. */
 final class AppCodeManifest {
     private AppCodeManifest() {}
 

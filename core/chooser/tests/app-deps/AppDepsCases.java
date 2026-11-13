@@ -3,13 +3,16 @@ package com.nowhere.chooser;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.Predicate;
 
 /** NWP-20261118-21: what an on-demand tap fetches first (ProfileActivity's groupFor, groupDeps, appDeps and
- *  isStackMember), compiled with AppDeps ALONE (java.* only). DEFAULTS mirrors ProfileActivity.DEFAULT_GROUPS. */
+ *  isStackMember), compiled with AppDeps ALONE (java.* only). DEFAULTS mirrors ProfileActivity.DEFAULT_GROUPS.
+ *  NWP-20261201-04: the mode the Play stack is held at (AppDeps.stackNeed, cases c1-c9). */
 public class AppDepsCases {
     static final String V = "com.android.vending", G = "com.google.android.gms", F = "com.google.android.gsf";
     static final String YT = "com.google.android.youtube", APP = "org.example.app";
@@ -42,6 +45,35 @@ public class AppDepsCases {
     static boolean member(String pkg, Map<String,String> explicit) {
         return AppDeps.isStackMember(pkg, explicit, DEFAULTS, G);
     }
+
+    static final Predicate<String> LIVE_NO = p -> false, LIVE_YES = p -> true;
+
+    static String need(Map<String,String> keep, Map<String,String> explicit, Set<String> playDeps,
+            Set<String> playSeenYes, Predicate<String> live) {
+        return AppDeps.stackNeed(keep, explicit, DEFAULTS, playDeps, playSeenYes, live, G, F, V,
+                "installed", "auto", "ondemand");
+    }
+
+    /** CONTROL: reconcilePlayStack's need loop as it stood before NWP-20261201-04, with stronger() inlined. */
+    static String mainLoop(Map<String,String> m, Set<String> playClients, Predicate<String> usesPlayServices) {
+        String need = null;
+        for (Map.Entry<String,String> e : m.entrySet()) {
+            String p = e.getKey();
+            if (G.equals(p) || F.equals(p)) continue;
+            String cmode = e.getValue();
+            boolean present = "installed".equals(cmode) || "auto".equals(cmode);
+            boolean demands = V.equals(p)
+                    ? playClients.contains(p)
+                    : playClients.contains(p) || (present && usesPlayServices.test(p));
+            if (!demands) continue;
+            if ("installed".equals(cmode)) need = "installed";
+            else if ("auto".equals(cmode) && !"installed".equals(need)) need = "auto";
+            else if (need == null) need = "ondemand";
+        }
+        return need;
+    }
+
+    static boolean same(String want, String have) { return want == null ? have == null : want.equals(have); }
 
     public static void main(String[] args) {
         List<String> got;
@@ -110,6 +142,41 @@ public class AppDepsCases {
 
         check("every stack member is a stack member", member(V, NONE) && member(G, NONE) && member(F, NONE),
                 "vending=" + member(V, NONE) + " gms=" + member(G, NONE) + " gsf=" + member(F, NONE));
+
+        // NWP-20261201-04: the row's bug. An archived Auto client has no manifest (live false) and no playdeps line.
+        String client = "org.example.client";
+        Map<String,String> archived = map(client, "auto", V, "ondemand", G, "ondemand");
+        String have = need(archived, NONE, set(), set(client), LIVE_NO);
+        check("c1 an archived Auto client with only a playseen yes holds the stack at auto", same("auto", have), have);
+        have = mainLoop(archived, set(), LIVE_NO);
+        check("c1-control main's loop lost that client: the row's bug", have == null, have);
+
+        have = need(archived, NONE, set(), set(), LIVE_NO);
+        check("c2 no record and no group token demands nothing", have == null, have);
+
+        have = need(map(client, "auto", V, "ondemand"), NONE, set(client), set(), LIVE_NO);
+        check("c3 a client in playDeps demands at its own mode", same("auto", have), have);
+
+        have = need(map(client, "installed"), NONE, set(), set(), LIVE_YES);
+        check("c4 an installed client with a live yes and no record demands", same("installed", have), have);
+
+        have = need(map(V, "auto"), NONE, set(), set(V), LIVE_YES);
+        check("c5 an auto-pulled Play Store never demands, so it cannot self-latch", have == null, have);
+
+        LinkedHashMap<String,String> vendingFirst = new LinkedHashMap<>();
+        vendingFirst.put(V, "ondemand");
+        vendingFirst.put(client, "auto");
+        have = need(vendingFirst, NONE, set(V), set(client), LIVE_NO);
+        check("c6 the strongest demander wins over an earlier weaker one", same("auto", have), have);
+
+        have = need(map(client, "ondemand"), NONE, set(), set(), LIVE_YES);
+        check("c7 an on-demand client gets no live read", have == null, have);
+
+        have = need(map(G, "auto", F, "auto", V, "auto"), NONE, set(), set(G, F), LIVE_YES);
+        check("c8 the stack alone demands nothing", have == null, have);
+
+        have = need(map(client, "auto"), map(client, "sandboxed-play"), set(), set(), LIVE_NO);
+        check("c9 an explicit sandboxed-play token demands with no record", same("auto", have), have);
 
         if (fails == 0) System.out.println("PASS " + runs + " cases");
         else { System.out.println("FAILED " + fails + " of " + runs + " cases"); System.exit(1); }

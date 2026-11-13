@@ -1,0 +1,12 @@
+    private static void ensureContactsRead(Context ctx) {
+        if (android.os.UserHandle.myUserId() == 0) return;
+        try {
+            android.app.admin.DevicePolicyManager dpm = ctx.getSystemService(android.app.admin.DevicePolicyManager.class);
+            if (dpm == null) return;
+            android.content.ComponentName admin = new android.content.ComponentName(ctx, AdminReceiver.class);
+            dpm.setPermissionGrantState(admin, ctx.getPackageName(), android.Manifest.permission.READ_CONTACTS,
+                    android.app.admin.DevicePolicyManager.PERMISSION_GRANT_STATE_GRANTED);
+        } catch (Throwable t) {
+            android.util.Log.w("NowhereChooser", "telingest ensureContactsRead", t);
+        }
+    }

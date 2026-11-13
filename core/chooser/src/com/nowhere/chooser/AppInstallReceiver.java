@@ -99,6 +99,7 @@ public class AppInstallReceiver extends BroadcastReceiver {
                     String up = u == null ? null : u.getSchemeSpecificPart();
                     if (up == null || up.isEmpty() || up.equals(context.getPackageName())) return;
                     recaptureCode(context, up, "update");
+                    SettingsRoamLive.reconcile(context); // NWP-20261130-12: a materialise over a placeholder can arrive here
                     return;
                 }
                 if (!Intent.ACTION_PACKAGE_ADDED.equals(intent.getAction())) return;
@@ -106,11 +107,16 @@ public class AppInstallReceiver extends BroadcastReceiver {
                 String pkg = data == null ? null : data.getSchemeSpecificPart();
                 if (pkg == null || pkg.isEmpty() || pkg.equals(context.getPackageName())) return;
                 boolean replacing = intent.getBooleanExtra(Intent.EXTRA_REPLACING, false);
+                UnarchiveService.OLDER_COPY.remove(pkg); // NWP-20261130-07: an install ended the refusal
+                // NWP-20261130-03: FIRST. An app whose data is still out is suspended before decide and the heal, and an
+                // update comes this way too (ADDED with EXTRA_REPLACING). See OdDataBarrier.
+                OdDataBarrierHost.onPackageAdded(context, pkg);
                 decide(context, pkg, replacing, "broadcast");
                 heal(context, pkg, replacing);
                 // NWP-20261010-13: the profile's SMS app may be this one, reinstalled -- it takes its role back.
                 SmsRoleRoam.onMaterialised(context, pkg);
                 if (!replacing) recaptureCode(context, pkg, "new"); // NWP-20261119-10: REPLACED covers an update
+                SettingsRoamLive.reconcile(context); // NWP-20261130-12: a Quick Settings tile that waited for this package
             } catch (Throwable t) {
                 android.util.Log.w("NowhereChooser", "AppInstallReceiver", t);
             } finally {
@@ -223,36 +229,49 @@ public class AppInstallReceiver extends BroadcastReceiver {
                         + ": no code yet -- its install fires the heal again (NWP-20261128-05)");
                 return;
             }
-            new Thread(() -> {
-                for (int attempt = 1; ; attempt++) {
-                    String r = "";
+            // NWP-20261201-20: until this heal ends, a mid-session capture keeps this package's carried permission lines
+            // (PermsCaptureRule). INTERNET can read not-granted until the heal's grant, and a `deny:` line would undo it.
+            PermsCaptureRule.healBegun(pkg);
+            try {
+                new Thread(() -> {
                     try {
-                        r = DaemonSocket.roundTrip("RESTORE-ODDATA\n" + pkg + "\n", 130000).trim();
-                        if (r.startsWith("OK")) UnarchiveService.markOdRestored(context, pkg);
-                    } catch (Throwable t) {
-                        android.util.Log.w("NowhereChooser", "install-heal " + pkg, t);
+                        for (int attempt = 1; ; attempt++) {
+                            String r = "";
+                            try {
+                                r = DaemonSocket.roundTrip("RESTORE-ODDATA\n" + pkg + "\n", 130000).trim();
+                                if (r.startsWith("OK")) UnarchiveService.markOdRestored(context, pkg);
+                                else OdDataBarrierHost.afterReply(context, pkg, r); // NWP-20261130-03: a failed fetch keeps the hold
+                            } catch (Throwable t) {
+                                android.util.Log.w("NowhereChooser", "install-heal " + pkg, t);
+                            }
+                            long delay = HealRetry.delayMs(r, attempt);
+                            android.util.Log.i("NowhereChooser", "install-heal (" + (replacing ? "update" : "new") + ") try "
+                                    + attempt + "/" + HealRetry.MAX_TRIES + ": " + pkg + " -> " + (r.isEmpty() ? "no reply" : r)
+                                    + (delay < 0 ? "" : " -- retry in " + delay / 1000 + " s")
+                                    + " (NWP-20260903-11, NWP-20261128-05)");
+                            if (delay < 0) return;
+                            try {
+                                Thread.sleep(delay);
+                            } catch (InterruptedException e) {
+                                return;
+                            }
+                            String stop = SignOutGate.begun() ? "sign-out begun"
+                                    : !UnarchiveService.hasInstalledCode(context, pkg) ? "no code any more"
+                                    : UnarchiveService.odRestored(context, pkg) ? "already restored" : null;
+                            if (stop != null) {
+                                android.util.Log.i("NowhereChooser", "install-heal stopped before try " + (attempt + 1)
+                                        + ": " + pkg + " -- " + stop + " (NWP-20261128-05)");
+                                return;
+                            }
+                        }
+                    } finally { // NWP-20261201-20: every exit ends the hold
+                        PermsCaptureRule.healEnded(pkg);
                     }
-                    long delay = HealRetry.delayMs(r, attempt);
-                    android.util.Log.i("NowhereChooser", "install-heal (" + (replacing ? "update" : "new") + ") try "
-                            + attempt + "/" + HealRetry.MAX_TRIES + ": " + pkg + " -> " + (r.isEmpty() ? "no reply" : r)
-                            + (delay < 0 ? "" : " -- retry in " + delay / 1000 + " s")
-                            + " (NWP-20260903-11, NWP-20261128-05)");
-                    if (delay < 0) return;
-                    try {
-                        Thread.sleep(delay);
-                    } catch (InterruptedException e) {
-                        return;
-                    }
-                    String stop = SignOutGate.begun() ? "sign-out begun"
-                            : !UnarchiveService.hasInstalledCode(context, pkg) ? "no code any more"
-                            : UnarchiveService.odRestored(context, pkg) ? "already restored" : null;
-                    if (stop != null) {
-                        android.util.Log.i("NowhereChooser", "install-heal stopped before try " + (attempt + 1)
-                                + ": " + pkg + " -- " + stop + " (NWP-20261128-05)");
-                        return;
-                    }
-                }
-            }, "nowhere-install-heal").start();
+                }, "nowhere-install-heal").start();
+            } catch (Throwable t) { // NWP-20261201-20: no thread ran, so its finally never will
+                PermsCaptureRule.healEnded(pkg);
+                throw t;
+            }
         } catch (Throwable t) {
             android.util.Log.w("NowhereChooser", "install-heal " + pkg, t);
         }
@@ -326,6 +345,18 @@ public class AppInstallReceiver extends BroadcastReceiver {
         // Without the GrapheneOS App Store (Diaspore) a roamed flag reads as absent, so it changes nothing there.
         PlayChoice.State play = PlayChoice.effective(PlayChoice.parse(ProfileActivity.cfgStatic(ctx, PlayChoice.CFG_KEY)),
                 ProfileActivity.gosStorePresent(ctx));
+        // NWP-20261129-16 (h59 #7): a hand install of Play Store with Play Off turns Play back On, and the Play rules
+        // apply as if the user had switched it on; PlayChoice.turnsOnAtInstall says why this reads as the user's install.
+        // The flag is read back before the mode: a write that did not land leaves everything below on today's path.
+        boolean backOn = false;
+        if (PlayChoice.turnsOnAtInstall(play, pkg, replacing, "broadcast".equals(via))) {
+            ProfileActivity.cfgPutStatic(ctx, PlayChoice.CFG_KEY, PlayChoice.raw(PlayChoice.State.ON));
+            play = PlayChoice.effective(PlayChoice.parse(ProfileActivity.cfgStatic(ctx, PlayChoice.CFG_KEY)),
+                    ProfileActivity.gosStorePresent(ctx));
+            backOn = play == PlayChoice.State.ON;
+            if (backOn) android.util.Log.i("NowhereChooser", "Google Play back On: Play Store installed by hand while Off (NWP-20261129-16)");
+            else android.util.Log.w("NowhereChooser", "Google Play stays Off: Play Store installed by hand, the flag did not land (NWP-20261129-16)");
+        }
         mode = PlayChoice.keepModeOnInstall(play, pkg, mode);
         // NWP-20260922-01: is this package BACK, rather than new? Chester, 2026-09-21: an app set to
         // on-demand, uninstalled from Settings and installed again came back ON-DEMAND instead of at its
@@ -394,6 +425,37 @@ public class AppInstallReceiver extends BroadcastReceiver {
                 ProfileActivity.setPlayDep(ctx, pkg, true);
             } catch (Throwable t) {
                 android.util.Log.w("NowhereChooser", "install default: setPlayDep " + pkg, t);
+            }
+        }
+        // NWP-20261129-16: the rest of "as if the user had switched it on". turnPlayOff's raw Off line goes, now the keep
+        // line is on disk (clearTurnedOff re-reads that). A keep line this call did not write is the user's keep too. Play
+        // services and GSF that landed while the flag read Off are kept On-demand, as turnPlayOn marks them.
+        if (backOn) {
+            try {
+                StoreInstaller.clearTurnedOff(ctx, java.util.Collections.singleton(PlayChoice.VENDING));
+                if (!wrote && StoreInstaller.keepSetHas(ctx, PlayChoice.VENDING)) {
+                    ProfileActivity.setPlayDep(ctx, PlayChoice.VENDING, true);
+                }
+                // This user only, as ProfileActivity.isOnDevicePkg reads it: an archived placeholder counts.
+                java.util.function.Predicate<String> onDevice = p -> {
+                    try {
+                        pm.getApplicationInfo(p, 0);
+                        return true;
+                    } catch (Throwable notInstalled) {
+                    }
+                    try {
+                        pm.getApplicationInfo(p, android.content.pm.PackageManager.ApplicationInfoFlags.of(
+                                android.content.pm.PackageManager.MATCH_ARCHIVED_PACKAGES));
+                        return true;
+                    } catch (Throwable notThere) {
+                        return false;
+                    }
+                };
+                for (String member : PlayChoice.backOnMarks(onDevice, q -> StoreInstaller.keepSetHas(ctx, q))) {
+                    StoreInstaller.keepInMode(ctx, member, false, PlayChoice.ONDEMAND);
+                }
+            } catch (Throwable t) {
+                android.util.Log.w("NowhereChooser", "install default: Google Play back On", t);
             }
         }
         // The catch-up walks every third-party app on every chooser start, so staying quiet when it had nothing

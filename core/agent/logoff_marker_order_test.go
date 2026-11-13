@@ -11,9 +11,8 @@ import (
 
 // A message arriving while a stored session signs out seals to the inbox with NO "LIVE <uid>" token, so the
 // chooser's SmsDeliverReceiver posts the gate notice. That holds because handleLogout removes `.roamsession`
-// BEFORE it replies OK and before the seal starts: liveSession then answers "no session". (ROAM-OUT is the one
-// verb that keeps the marker through its seal; no chooser code sends it.) A failed logoff re-arms the marker --
-// a different, separately tracked case.
+// BEFORE it replies OK and before the seal starts: liveSession then answers "no session". A failed logoff
+// re-arms the marker -- a different, separately tracked case.
 
 // Drives a real LOGOUT whose worker is held at the cutoff (the seal is in flight), then delivers an SMS for the
 // profile that owns the bound SIM.

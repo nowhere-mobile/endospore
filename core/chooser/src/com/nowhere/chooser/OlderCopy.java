@@ -8,7 +8,8 @@ package com.nowhere.chooser;
  *  an older copy it installs nothing and the sweep does not fetch the app again for the rest of the session. The skip
  *  is per process: UnarchiveService.OLDER_COPY lives in this roamed session's chooser process, in RAM only.
  *  NWP-20261128-20 (h50 #3, slice 2): playCount and endLine, the Auto sweep's end line "1 app needs Play Store to come
- *  back". java.lang and AppCodeManifest (pure java.*) only, so test-older-copy-java.sh compiles the two alone. */
+ *  back". NWP-20261130-07 (h50 #3, slice 3): rowState and its words, what Your apps shows for a refused app.
+ *  java.lang and AppCodeManifest (pure java.*) only, so test-older-copy-java.sh compiles the two alone. */
 final class OlderCopy {
     private OlderCopy() {}
 
@@ -42,5 +43,38 @@ final class OlderCopy {
         if (n <= 0) return null;
         if (n == 1) return "1 app needs Play Store to come back";
         return n + " apps need Play Store to come back";
+    }
+
+    /** NWP-20261130-07: a Your apps row. PLAY has the Play line and the button, NOT_RESTORED the plain line alone. */
+    enum RowState { NORMAL, NOT_RESTORED, PLAY }
+
+    /** The words are drafts for Chester to correct (h50 #3). */
+    static final String LINE_PLAIN = "Not restored";
+    static final String LINE_PLAY = "Not restored · Play Store has a newer version";
+    static final String BUTTON = "Open in Play Store";
+
+    /** NWP-20261130-07: refused is OLDER_COPY's answer. An app the user turned Off goes at the sign-out, so its row says
+     *  nothing (an inference, not stated by Chester); an app with code again, Play's install, is back to normal. PLAY
+     *  needs both of h50 #3's conditions: Play Store on the profile and Play as the app's store (its meta's inst line);
+     *  no meta, or an unknown installer, is the plain state. */
+    static RowState rowState(boolean refused, boolean kept, boolean installedNow, String metaText, boolean playOnProfile) {
+        if (!refused || !kept || installedNow) return RowState.NORMAL;
+        return playOnProfile && PLAY.equals(AppCodeManifest.installer(metaText)) ? RowState.PLAY : RowState.NOT_RESTORED;
+    }
+
+    /** NWP-20261130-07: the row's line, null for a normal row. */
+    static String rowLine(RowState s) {
+        if (s == RowState.PLAY) return LINE_PLAY;
+        return s == RowState.NOT_RESTORED ? LINE_PLAIN : null;
+    }
+
+    /** NWP-20261130-07: only the Play state has the button. */
+    static boolean rowButton(RowState s) {
+        return s == RowState.PLAY;
+    }
+
+    /** NWP-20261130-07: the app's Play page. */
+    static String playPageUri(String pkg) {
+        return "market://details?id=" + pkg;
     }
 }

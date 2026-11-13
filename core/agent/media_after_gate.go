@@ -15,8 +15,9 @@ package main
 //
 // NWP-20261128-03 (slice S3, §5): the seal's side of a split. aftergateActive reads the marker, loadLandedRoster
 // reads what the lander placed (pushProfile reads it once, before its walk), and unlandedBackground names the background rels the seal must carry by span and
-// leave to the lander. isMediaTempName is the one test the three walks use to skip a lander or seed temp. ⚠ S4a-S5
-// must land before any daemon exports the flag: without the lander no background file ever lands.
+// leave to the lander. isMediaTempName is the one test the three walks use to skip a lander or seed temp. mediad
+// starts the lander (S4b, media_lander_run.go). ⚠ S5 must land before any daemon exports the flag: S5 hands the landed
+// paths to the media scan.
 
 import (
 	"errors"
@@ -27,6 +28,8 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+
+	"golang.org/x/sys/unix"
 )
 
 // mediaAfterGateOn is NOWHERE_MEDIA_AFTER_GATE, on only when it is exactly "1". "true", "0" and unset are all
@@ -107,7 +110,60 @@ func loadLandedRoster(ref string, dk []byte) func(rel string) bool {
 // read, add, sorted, temp file + rename in the same directory, 0600. Best effort: a rel whose digest does not reach the
 // file reads as unlanded, so it is walked if present and carried if the user deleted it (§5). A "" file is a no-op.
 func recordLandedRoster(ref string, dk []byte, rels []string) {
+	unionDigestRoster(landedRosterFile(ref), ".landed-", dk, rels)
+}
+
+// appendLandedRoster adds ONE rel's digest to the landed roster by an O_APPEND write of one line (NWP-20261130-17).
+// The lander calls it after each rename and before its next fetch, so a kill of mediad never loses a landing the
+// user may then delete: the restart would fetch that file again and resurrect the deletion (§5). A rewrite of the
+// whole roster per landing would cost O(n) per rel; one line costs one write. readWalkedDigests reads a set of lines,
+// so order and a repeat do not matter. O_NOFOLLOW refuses a link at the roster's path. Best effort, as
+// recordLandedRoster. A "" file is a no-op.
+func appendLandedRoster(ref string, dk []byte, rel string) {
 	f := landedRosterFile(ref)
+	if f == "" {
+		return
+	}
+	if os.MkdirAll(filepath.Dir(f), 0o700) != nil {
+		return
+	}
+	fd, err := os.OpenFile(f, os.O_WRONLY|os.O_APPEND|os.O_CREATE|unix.O_NOFOLLOW, 0o600)
+	if err != nil {
+		return
+	}
+	_, _ = fd.WriteString(walkedDigest(dk, rel) + "\n")
+	_ = fd.Close()
+}
+
+// corruptRosterFile maps a store ref to the CORRUPT ROSTER (§6, NWP-20261130-17): a keyed digest per background rel
+// the lander found corrupt this session, in the landed roster's shape, never a name. Only the lander reads it: a cold
+// lock or a crash restarts mediad inside the session, and §6 retries a corrupt rel at the next sign-in only. It is not
+// the landed roster, because the seal must still carry a corrupt rel. A sign-in ends it: roamd parks this whole
+// directory. "" when receipts are off or ref is empty.
+func corruptRosterFile(ref string) string {
+	d := restoreReceiptDir()
+	if d == "" || ref == "" {
+		return ""
+	}
+	return filepath.Join(d, "bgcorrupt."+ref)
+}
+
+// loadCorruptRoster returns a predicate over the corrupt roster. An absent or unreadable file answers false for every
+// rel: the lander fetches it once more, and a corrupt chunk is then found corrupt again.
+func loadCorruptRoster(ref string, dk []byte) func(rel string) bool {
+	set := readWalkedDigests(corruptRosterFile(ref))
+	return func(rel string) bool { return set[walkedDigest(dk, rel)] }
+}
+
+// recordCorruptRoster unions the digests of rels into the corrupt roster, as recordLandedRoster does. Best effort: a
+// lost digest costs one more fetch after a restart of mediad.
+func recordCorruptRoster(ref string, dk []byte, rels []string) {
+	unionDigestRoster(corruptRosterFile(ref), ".bgcorrupt-", dk, rels)
+}
+
+// unionDigestRoster is the two rosters' writer: read f, add the digests of rels, sorted, temp file (named tmpPrefix*)
+// + rename in the same directory, 0600. A "" f or no rels is a no-op.
+func unionDigestRoster(f, tmpPrefix string, dk []byte, rels []string) {
 	if f == "" || len(rels) == 0 {
 		return
 	}
@@ -123,7 +179,7 @@ func recordLandedRoster(ref string, dk []byte, rels []string) {
 	if os.MkdirAll(filepath.Dir(f), 0o700) != nil {
 		return
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(f), ".landed-")
+	tmp, err := os.CreateTemp(filepath.Dir(f), tmpPrefix)
 	if err != nil {
 		return
 	}

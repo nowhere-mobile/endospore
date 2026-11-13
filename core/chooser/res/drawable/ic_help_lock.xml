@@ -1,0 +1,10 @@
+<!-- The gate's Help combo screen (NWP-20261130-11): the Lock or log off tile, a padlock. White; GateHelpTileGrid or GateHelpScreen tints it. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M6,10h12a1,1 0 0,1 1,1v9a1,1 0 0,1 -1,1H6a1,1 0 0,1 -1,-1v-9a1,1 0 0,1 1,-1zM8,10V7a4,4 0 0,1 8,0v3h-2V7a2,2 0 0,0 -4,0v3z"/>
+</vector>

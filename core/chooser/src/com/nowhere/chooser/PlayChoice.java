@@ -19,6 +19,8 @@ import java.util.function.Predicate;
  *      nothing needs them, and an app that needs Play keeps its mode and meets the PlayNeed refusal at its tap. That
  *      is how B1 (i) reads the decision's "an Off that drops the group". reconcilePlayStack does not put Play Store
  *      back while the flag is off. B2: the Google account leaves through "Sign out of Google", mark first.
+ *      NWP-20261129-16 (2026-11-05, "seventeen answers to harvest 59 ...", #7): a hand install of Play Store turns the
+ *      flag back to "1", and the Play rules apply as if the user had switched it on (turnsOnAtInstall).
  *
  *  ⚠ ABSENT IS NEVER OFF. Every profile made before this slice has no flag, and reading that as off would drop a
  *  working Play Store at the profile's next keep-set edit. Only the literal "0" is off. ProfileActivity.cfgStatic
@@ -126,6 +128,29 @@ final class PlayChoice {
      *  (and Play services with it) while no other app needs Play, instead of dropping it at the next keep-set edit. */
     static boolean userKeepsOnInstall(State s, String pkg) {
         return s == State.ON && VENDING.equals(pkg);
+    }
+
+    /** NWP-20261129-16 (h59 #7): does this install turn Play back On? A new install of Play Store with Play Off, seen by
+     *  the broadcast, and nothing else. The catch-up walk is NOT a hand install: right after turnPlayOff, Play Store is
+     *  still installed until the next save, and a chooser restart's catch-up must not turn Play back On.
+     *
+     *  ⚠ AN INFERENCE, NOT A PROOF OF WHO PRESSED INSTALL. Nowhere's own paths never install Play Store while Play is
+     *  Off (no keep line, so no restore, no placeholder and no group dep; blocksVendingReadd), so a non-replacing
+     *  PACKAGE_ADDED of Play Store with Play Off is the user's install, from the App Store directly or as a dependency
+     *  of an app the user installed. */
+    static boolean turnsOnAtInstall(State s, String pkg, boolean replacing, boolean broadcast) {
+        return s == State.OFF && VENDING.equals(pkg) && !replacing && broadcast;
+    }
+
+    /** What that install marks On-demand besides Play Store: Play services then GSF, each on this phone and with no keep
+     *  line. They can land before Play Store, when the flag still read Off and they stayed at the bucket default. One
+     *  with a keep line keeps its mode: reconcilePlayStack owns it. Never Play Store: decide's branches keep that one. */
+    static List<String> backOnMarks(Predicate<String> onDevice, Predicate<String> kept) {
+        List<String> out = new ArrayList<>();
+        for (String p : new String[] {GMS, GSF}) {
+            if (onDevice.test(p) && !kept.test(p)) out.add(p);
+        }
+        return out;
     }
 
     private static final Set<String> OFF_DROPS = Collections.singleton(VENDING);

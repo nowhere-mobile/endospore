@@ -87,6 +87,18 @@ is REFUSED cred uiderrors ""        "cred lane refuses uiderrors (no credential,
 is ALLOWED ro  alarmrelay ""        "ro lane accepts alarmrelay (NWP-20261108-02: a cold lock behind an abandoned RW op still relays)"
 is REFUSED ro  alarmrelay "x"       "ro lane refuses a passphrase on alarmrelay (it needs only the uid)"
 is REFUSED cred alarmrelay ""       "cred lane refuses alarmrelay (no credential, so it is not that lane's)"
+is ALLOWED ro  playrestart ""       "ro lane accepts playrestart (NWP-20261201-10: a health notice's Fix)"
+is REFUSED ro  playrestart "x"      "ro lane refuses a passphrase on playrestart (it needs only the uid)"
+is REFUSED cred playrestart ""      "cred lane refuses playrestart (no credential, so it is not that lane's)"
+is ALLOWED ro  gmsstate ""          "ro lane accepts gmsstate (NWP-20261201-01: the issue report's Play services dumps)"
+is REFUSED ro  gmsstate "x"         "ro lane refuses a passphrase on gmsstate (it needs only the uid)"
+is REFUSED cred gmsstate ""         "cred lane refuses gmsstate (no credential, so it is not that lane's)"
+is ALLOWED ro  gmsexits ""          "ro lane accepts gmsexits (NWP-20261201-02: the issue report's Play services exit records)"
+is REFUSED ro  gmsexits "x"         "ro lane refuses a passphrase on gmsexits (it needs only the uid)"
+is REFUSED cred gmsexits ""         "cred lane refuses gmsexits (no credential, so it is not that lane's)"
+is ALLOWED ro  healthprobe ""       "ro lane accepts healthprobe (NWP-20261201-08: the health checks' one dumpsys read)"
+is REFUSED ro  healthprobe "x"      "ro lane refuses a passphrase on healthprobe (it needs only the uid)"
+is REFUSED cred healthprobe ""      "cred lane refuses healthprobe (no credential, so it is not that lane's)"
 
 echo "== $t no credential reaches the RO lane: not the passphrase, not the chip secret (NWP-20261110-17) =="
 # Line 5 carries the session's SE secret, which opens a TIED profile's vault, #de and #sys exactly as the
@@ -148,13 +160,21 @@ if [ "$MUTATE" = yes ]; then
   mutate "cred lane pointed at the SHARED req file" \
          's@REQ="\$STATE/roamcred.req"@REQ="$STATE/roam.req"@'
   mutate "ro lane opened to armcred" \
-         's@^    storagebreakdown|sealdelta|uiderrors|alarmrelay) ;;@    storagebreakdown|sealdelta|uiderrors|alarmrelay|armcred) ;;@'
+         's@^    storagebreakdown|sealdelta|uiderrors|alarmrelay@&|armcred@'
   mutate "ro lane closed to uiderrors (every issue report says NOT collected: ERR-LANE)" \
-         's@^    storagebreakdown|sealdelta|uiderrors|alarmrelay) ;;@    storagebreakdown|sealdelta|alarmrelay) ;;@'
+         's@^    storagebreakdown|sealdelta|uiderrors|alarmrelay@    storagebreakdown|sealdelta|alarmrelay@'
   mutate "ro lane closed to alarmrelay (a cold lock behind an abandoned op relays no alarm: ERR-LANE)" \
-         's@^    storagebreakdown|sealdelta|uiderrors|alarmrelay) ;;@    storagebreakdown|sealdelta|uiderrors) ;;@'
+         's@^    storagebreakdown|sealdelta|uiderrors|alarmrelay@    storagebreakdown|sealdelta|uiderrors@'
+  mutate "ro lane closed to playrestart (a health notice's Fix answers ERR-LANE and restarts nothing)" \
+         's@^\(    storagebreakdown|sealdelta|uiderrors|alarmrelay.*\)|playrestart@\1@'
+  mutate "ro lane closed to gmsstate (every issue report says NOT collected: ERR-LANE)" \
+         's@^\(    storagebreakdown|sealdelta|uiderrors|alarmrelay.*\)|gmsstate@\1@'
+  mutate "ro lane closed to gmsexits (every session report says not-collected-lane: ERR-LANE)" \
+         's@^\(    storagebreakdown|sealdelta|uiderrors|alarmrelay.*\)|gmsexits@\1@'
+  mutate "ro lane closed to healthprobe (every health check is unmeasured: ERR-LANE)" \
+         's@^\(    storagebreakdown|sealdelta|uiderrors|alarmrelay.*\)|healthprobe@\1@'
   mutate "userdir_recheck's guard comment drops alarmrelay from the read-only lane's ops" \
-         's@ops (sealdelta, storagebreakdown, uiderrors, alarmrelay) are arms@ops (sealdelta, storagebreakdown, uiderrors) are arms@' static
+         's@ops (sealdelta, storagebreakdown, uiderrors, alarmrelay@ops (sealdelta, storagebreakdown, uiderrors@' static
   mutate "S1 ro lane's chip-secret refusal deleted (the secret rides into storagebreakdown's environment)" \
          '/^  if \[ -n "\$sesec" \]; then$/,/^  fi$/d'
   mutate "S2 ro lane's chip-secret refusal tests \$pass twice instead of \$sesec" \

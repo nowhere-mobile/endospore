@@ -42,6 +42,8 @@ endospore-accountsdb-close-ce.sh	services.jar	need	nowhere: closed the CE accoun
 endospore-ams-stopped-user-snapshot.sh	services.jar	need	starting -- stopped-user snapshot dropped (NWP-20261005-22)
 endospore-settings-locglobals-root.sh	SettingsProvider.apk	need	nowhere: allowed root to write protected setting
 endospore-settings-locglobals-root.sh	SettingsProvider.apk	control	allowed shell to access protected setting
+carrierconfig2-sms-to-mms.sh	CarrierConfig2.apk	need	nowhere: sms-to-mms thresholds (NWP-20261130-15)
+carrierconfig2-sms-to-mms.sh	CarrierConfig2.apk	control	missing CSettingsDir
 endospore-ams-account-reload.sh	-	exempt	every literal it inserts is a Log tag message or a shell verb with no Nowhere-only token (roam #732 is not a work id), so none meets marker rule (b); its tell is the logcat line in the register
 keyguard-roaming-noocclude.sh	services.jar	need	nowhere: in-call lock exemption on (NWP-20261013-08)
 keyguard-roaming-noocclude.sh	services.jar	control	Duplicate startWrite call?

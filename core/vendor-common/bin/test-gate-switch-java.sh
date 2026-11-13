@@ -122,7 +122,7 @@ suite() {
   case "$rc" in 0) ;; 1) fails=1 ;; 3) echo "  the class or the cases did not compile" >&2; nocompile=1 ;; *) return 2 ;; esac
 
   # W1/W2 every Switch the two activities build goes through GateSwitch.style(..., GatePalette.active()).
-  wrapped "$act" W1 8 || fails=1
+  wrapped "$act" W1 7 || fails=1
   wrapped "$prof" W2 6 || fails=1
 
   # S0 GateSwitch.java exists and declares style once.
@@ -198,6 +198,6 @@ mut 'M4 setThumbTintList removed' gs 's/\n[ \t]*sw\.setThumbTintList\(.*?\);//s'
 mut 'M5 LIGHT switchThumbOff lightened below 3:1' cls 's/(switchThumbOff\s*= light \? )0xFF6E7781/${1}0xFF9AA3AD/' 'contrast switchThumbOff'
 mut 'M6 switchThumbOn equals switchThumbOff' cls 's/(switchThumbOn\s*= light \? )0xFF087658/${1}0xFF6E7781/' 'thumb on differs'
 mut 'M7 a colour literal in GateSwitch' gs 's/p\.fieldLn, p\.switchThumbOn/0xFFCDD6E0, p.switchThumbOn/' 'S4'
-mut 'M8 a site styled from DARK, not active()' act 's/(lookSw = GateSwitch\.style\(new android\.widget\.Switch\(this\), )GatePalette\.active\(\)/${1}GatePalette.DARK/' 'W1'
+mut 'M8 a site styled from DARK, not active()' act 's/(ownerSw = GateSwitch\.style\(new android\.widget\.Switch\(this\), )GatePalette\.active\(\)/${1}GatePalette.DARK/' 'W1'
 [ "$fails" = 0 ] || { echo "FAILED: $fails mutant(s) not convicted"; exit 1; }
 echo "all mutants convicted"

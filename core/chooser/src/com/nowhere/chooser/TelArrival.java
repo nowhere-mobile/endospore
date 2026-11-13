@@ -153,8 +153,8 @@ final class TelArrival {
 
     /** One reply of the v2 wire, parsed. kind is the first token: OK, NONE, OWNER, UNRESOLVED, REMOVED, FULL or ERR;
      *  an unknown token reads as NONE. OWNER (Slice D) is an unbound SIM's arrival sealed to the device-owner inbox;
-     *  settle treats it like NONE at the gate -- the same content-free notice -- so neither reveals whether it was
-     *  kept. For ERR, vis is set only by "ERR nobody <vis>". */
+     *  settle treats it like NONE at the gate -- the same notice -- so neither reveals whether it was kept. Either may
+     *  carry vis "number", the owner's opt-in. For ERR, vis is set only by "ERR nobody <vis>". */
     static final class Reply {
         String kind = "NONE", vis = "", label = "";
         int liveUid = -1;
@@ -185,7 +185,11 @@ final class TelArrival {
                 r.kind = "ERR";
                 if (f.length > 2 && "nobody".equals(f[1])) r.vis = f[2];
                 break;
-            case "UNRESOLVED": case "REMOVED": case "FULL": case "OWNER":
+            case "OWNER": case "NONE":
+                r.kind = f[0];
+                if (f.length > 1) r.vis = f[1];
+                break;
+            case "UNRESOLVED": case "REMOVED": case "FULL":
                 r.kind = f[0];
                 if ("FULL".equals(f[0]) && f.length > 1) r.vis = f[1];
                 break;

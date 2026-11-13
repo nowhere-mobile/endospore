@@ -354,6 +354,10 @@ func TestTrimOrderReachesEverySection(t *testing.T) {
 	}
 	for _, scope := range []bool{false, true} {
 		rep := buildIssueReport("", scope, "", nil, nil)
+		mergeGmsState(&rep, func() string { return "OK 0\n--\n" }, scope) // NWP-20261201-01: a section buildIssueReport does not add
+		if _, got := rep.Logs["gms"]; got == scope {
+			t.Errorf("scope=%v: gms section present=%v -- the session scope collects it and the gate scope does not", scope, got)
+		}
 		for key := range rep.Logs {
 			found := false
 			for _, o := range issueTrimOrder { // THE list, not a copy

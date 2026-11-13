@@ -640,6 +640,10 @@ func refusedStoreConfigCaller(conn net.Conn, name string) bool {
 //     for a connection (net: no network at all).
 //   - REKEY-WAIT-BATTERY: the same watcher. A roamed caller stopped an armed re-key and made the Tie screen say it
 //     waits for battery (battery: under 20% and not charging).
+//   - SAVE-NET-UNMETERED: the gate's slow tick while a session is live (NWP-20261201-03). A roamed caller claimed an
+//     unmetered network and started an Only on Wi-Fi profile's periodic save on mobile data.
+//   - SAVE-NET-METERED: the same tick. A roamed caller claimed a metered network and held an Only on Wi-Fi profile's
+//     periodic saves back while the phone was on Wi-Fi.
 //
 // The rule is gateCallerOK (user 0, root included), NOT ownerCallerOK: the pinned appId is trust-on-first-use and can
 // miss the gate, and these senders DROP the reply, so a gate wrongly refused would silently stop the reap and the boot
@@ -668,6 +672,8 @@ func gateOnlyCmd(name string) bool {
 		return true
 	case "GRANT-PERMS", "PREFETCH-ARM", "PREFETCH-DISARM",
 		"REKEY-ARM", "REKEY-DISARM", "REKEY-WAIT-WIFI", "REKEY-WAIT-NET", "REKEY-WAIT-BATTERY":
+		return true
+	case "SAVE-NET-UNMETERED", "SAVE-NET-METERED":
 		return true
 	}
 	return false

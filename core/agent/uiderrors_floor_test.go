@@ -86,7 +86,7 @@ func fileFuncBody(t *testing.T, file, name string) string {
 func TestUiderrorsFloor_DroppedWhereASessionEndsAndOnlyThere(t *testing.T) {
 	const call = "forgetUiderrorsFloor(dest)"
 	for _, c := range []struct{ file, fn string }{
-		{"main.go", "handleRoamInOffline"}, {"main.go", "handleRoamOut"}, {"main.go", "handleDelete"}, {"main.go", "handleRollback"},
+		{"main.go", "handleRoamInOffline"}, {"main.go", "handleDelete"}, {"main.go", "handleRollback"},
 		{"coldlock_evict.go", "handleClaimColdLock"}, {"roamsession_marker.go", "clearMarkerOfGoneUser"},
 	} {
 		if !strings.Contains(fileFuncBody(t, c.file, c.fn), call) {

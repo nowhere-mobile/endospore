@@ -1,8 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.nowhere.chooser"
-    android:versionCode="622"
-    android:versionName="8.57">
+    android:versionCode="646"
+    android:versionName="8.81">
   <uses-sdk android:minSdkVersion="24" android:targetSdkVersion="34"/>
   <!-- #747 (DIA-20260818-08): the storefront UI now lives in its OWN package (nApps) so it appears in
        Settings > Apps as its own app. It cannot talk to the login daemon: the daemon pins the first peer's
@@ -179,9 +179,10 @@
   <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
   <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC"/>
   <!-- "Your data -> Export a copy" (DIA-20260628-09 P2): read the roamed session's contacts + calendar to
-       write standard vCard/iCal files into Downloads. DANGEROUS runtime perms, declared here but NOT pre-granted
-       (no default-permissions entry): the export requests them on demand, so the kiosk never holds standing
-       access to your contacts; you grant it only when you choose to export. -->
+       write standard vCard/iCal files into Downloads. DANGEROUS runtime perms with no default-permissions entry.
+       The roamed user's chooser self-grants READ_CONTACTS as that user's profile owner, to name a text's sender
+       (TelIngest, NWP-20261201-29) and in Ingest; the export requests what it still lacks. User 0 never holds it,
+       so the kiosk has no standing access to your contacts. -->
   <uses-permission android:name="android.permission.READ_CONTACTS"/>
   <uses-permission android:name="android.permission.READ_CALENDAR"/>
   <!-- Web-import ingestion (NWP-20260827-18): write the staged vcf/ics of a web-created profile into the
@@ -371,6 +372,18 @@
          an idle cold lock committed (COLD-LOCK-ABORT answered COMMITTED). Full screen and opaque; it finishes when the
          daemon's switch to the gate stops it; any other stop raises it again (ColdLockCoverRule). No noHistory: that
          flag finishes it when Home covers it. Excluded from recents, and the cold lock's user stop removes it. -->
+    <!-- NWP-20261130-03: the "Try again" button of an app suspended until its data lands. The platform's suspension dialog
+         resolves this action only on the suspending package and only when the activity requires the permission below. -->
+    <activity android:name=".OdDataRetryActivity" android:exported="true"
+              android:permission="android.permission.SEND_SHOW_SUSPENDED_APP_DETAILS"
+              android:theme="@android:style/Theme.NoDisplay"
+              android:excludeFromRecents="true"
+              android:noHistory="true">
+      <intent-filter>
+        <action android:name="android.intent.action.SHOW_SUSPENDED_APP_DETAILS"/>
+        <category android:name="android.intent.category.DEFAULT"/>
+      </intent-filter>
+    </activity>
     <activity android:name=".ColdLockCoverActivity" android:exported="false"
               android:theme="@android:style/Theme.Material.NoActionBar.Fullscreen"
               android:excludeFromRecents="true"
@@ -493,6 +506,9 @@
          daemon (RELOGIN) to discard the offline session and queue an auto online re-login at the gate. Not
          exported; only our own notification PendingIntent. -->
     <receiver android:name=".ReloginReceiver" android:exported="false"/>
+    <!-- NWP-20261201-10: a health notice's Fix button fires this IN the roamed user; it asks the daemon to run the rule's
+         Fix (HEALTH-FIX). Not exported; only our own notification PendingIntent. -->
+    <receiver android:name=".HealthFixReceiver" android:exported="false"/>
     <receiver android:name=".BackupNowReceiver" android:exported="false"/>
     <!-- NWP-20260908-21: fired by nowhere_roamd.sh IN THE ROAMED USER after a #media push materialised
          another handset new media, so MediaStore learns about files it did not mediate. Nothing else in
@@ -511,6 +527,9 @@
          extra-free broadcast here (NOWHERE-1073) and this re-runs capturePerms in the live session. Not exported; no
          intent-filter: it is reached only by name. -->
     <receiver android:name=".PermsCaptureReceiver" android:exported="false"/>
+    <!-- NWP-20261130-03 (RF-013): the user-0 watcher relays a session's package-added event here by name, so a session whose
+         chooser process is dead still suspends an app whose data is out. No intent-filter: it is reached only by name. -->
+    <receiver android:name=".OdDataAddedReceiver" android:exported="false"/>
     <!-- NWP-20261028-08: roamd releases a session's hotspot here by explicit component; no intent-filter. -->
     <receiver android:name=".HotspotReceiver" android:exported="false"/>
     <!-- #204 on-demand apps: the OS routes ACTION_UNARCHIVE_PACKAGE to the installer of record (us) IN THE

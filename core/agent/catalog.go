@@ -152,10 +152,11 @@ var fetchAppStageBase = "/data/nowhere/fetchapp" // ON DISK (APKs are large), da
 // (curate-catalog.py, trim-fdroid-index.py, publish-nowhere-app.py), so a body past it could never match the
 // sha256 anyway: the bound only stops the download early. Vars so tests can shrink them.
 var (
-	fetchAppBudget               = 7 * time.Minute  // all of one FETCH-APP's downloads
-	fetchAppStall                = 30 * time.Second // no body byte for this long ends a download
-	fetchAppMaxBytes       int64 = 1 << 30          // the bound when an entry states no size
-	fetchAppStageAllowance       = 60 * time.Second // after the downloads: stageapp + the reply
+	fetchAppBudget                = 7 * time.Minute  // all of one FETCH-APP's downloads
+	fetchAppStall                 = 30 * time.Second // no body byte for this long ends a download
+	fetchAppMaxBytes        int64 = 1 << 30          // the bound when an entry states no size
+	fetchAppStageAllowance        = 60 * time.Second // after the downloads: stageapp + the reply
+	fetchAppOdDataAllowance       = 9 * time.Minute  // a parked package's data fetch inside stageapp (NWP-20261130-03)
 )
 
 // errFetchStall is the cancel cause of a download that went fetchAppStall without a byte.
@@ -577,6 +578,11 @@ func handleFetchApp(conn net.Conn, dest, arg string) {
 		os.RemoveAll(stage)
 		endReply("ERR-STAGE")
 		return
+	}
+	// NWP-20261130-03: stageapp fetches a parked package's data before it stages the APK, so the reply can come well after
+	// the downloads' deadline. The chooser's own FETCH-APP cap still bounds the wait.
+	if odBarrierNeeded(dest, uid, pkg) {
+		conn.SetDeadline(time.Now().Add(fetchAppOdDataAllowance))
 	}
 	// Privileged move into the roamed user's chooser .appcode (pkg on the srcUnit slot), mirroring materializeapp.
 	out := triggerRoamWorkerKind(dest, "stageapp", name, pass, uid, readRoamSessionSE(dest), "", pkg, "", nil)

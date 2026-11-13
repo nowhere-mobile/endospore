@@ -114,13 +114,14 @@ GET-OTA-TIME ChooserActivity:onResume 1 # same arm, always one line
 GET-OTA-TIME ChooserActivity:showOtaTimePicker 1 # same arm, always one line
 FETCH-APP UnarchiveService:tapUpdateLocked 1 # sends no progress opt-in, so core/agent catalog.go handleFetchApp writes exactly one line
 REPORT-ISSUE DiagReportJob:sendScheduled 1 # the scheduled send (preview false) gets one OK <ticket> / ERR-... line; core/agent report_issue.go handleReportIssue writes more only for the preview
+RESTORE-ODDATA OdDataBarrierHost:retry 1 # one name, as AppInstallReceiver:heal below
 RESTORE-ODDATA AppInstallReceiver:heal 1 # the one-name form answers one line (core/agent app_code.go handleRestoreOdData, len(pkgs) == 1); only a list of 2+ names answers per-package lines and END
 RESTORE-ODDATA ChooserActivity:installRoamedAppCode 1 # same: one name, one line
 RESTORE-ODDATA UnarchiveService:restoreOnlyLocked 1 # same: one name, one line; the list goes through restoreOnlyListLocked (NWP-20261128-16)
 RESTORE-ODDATA UnarchiveService:materializeLocked 1 # same: one name, one line
 RESTORE-ODDATA UnarchiveService:materializeMember 1 # same: one name, one line'
 # Every verb read through a MULTI helper.
-export KNOWN_MULTI='FETCH-APP FETCH-ICON GET-APPS GET-BINDINGS GET-CATALOG GET-DOZE-APPS GET-INGEST GET-LOGOFF-REFUSAL
+export KNOWN_MULTI='FETCH-APP FETCH-ICON GET-APPS GET-BINDINGS GET-CATALOG GET-DOZE-APPS GET-HEALTH GET-INGEST GET-LOGOFF-REFUSAL
 GET-MEDIA-APP-PROGRESS GET-MEDIA-STATUS GET-OTA-TIME GET-OWNER-INBOX GET-PREFS GET-RELOGIN GET-SEAL-BLIND
 GET-SNAPSHOTS GET-STORAGE-BREAKDOWN GET-STORAGE-BREAKDOWN-CACHED GET-STORE GET-TELINGEST GET-WIFI-MIRROR GRANT-PERMS LIST-FIDO2
 LIST-MEDIA-APPS LIST-UNITS OTA-NOTES OTA-STATUS READ-OWNER-ITEM REPORT-ISSUE RESTORE-ODDATA

@@ -12,10 +12,9 @@
 # the chown leaves the gate unable to read or delete its own staging. Each is silent on a device. Other suites reach this
 # block only to get past it (test-signin-keystore-staging.sh), so nothing ran its branches.
 #
-# This suite runs the REAL block, extracted from its first line to the first `      fi` after the failure arm's rm, with
-# /data/ re-rooted into a case dir, in a child of each shell found among bash, sh, dash and mksh (the device's
-# /system/bin/sh). $AGENT is a script, so its real exit status reaches the block's && chain; the other helpers are
-# shell functions. What the agent's restore does is the agent's own tests' job.
+# This suite runs the REAL block, extracted from its first line to its `_innet=apps` line, with /data/ re-rooted into a
+# case dir, in a child of each shell found among bash, sh, dash and mksh (the device's /system/bin/sh). $AGENT is a
+# script, so its real exit status reaches _aprc; the other helpers are shell functions. What the agent's restore does is the agent's own tests' job.
 #
 #   A1  a stale .appcode/old.app/base.apk is gone and the agent sees an empty .appcode. A1 runs inside A2, A3, A4, A6 and
 #       A7. It cannot run in A5: a file under a CHOOSER0 that is missing does not exist.
@@ -25,8 +24,8 @@
 #   A5  CHOOSER0 is missing: no agent call, no .appcode
 #   A6  mkdir is refused: no agent call, no .appcode
 #   A7  the agent exits 5 (store unreachable) after a partial tree that holds manifest.tsv: as A2. The manifest is what
-#       makes this case pin the exit status. The sign-in still lands with no app code; whether it should is a separate
-#       question with the maintainer, so this pins today's fate only.
+#       makes this case pin the exit status. _aprc is 5 and _innet is apps after the block, so the arm's verdict ends the
+#       sign-in as BLANK NET (NWP-20261201-16; test-in-scope-net-blank.sh F runs that verdict).
 #
 # The mutants edit the EXTRACTED block, not a copy of roamd, because M2 removes an extraction anchor: on a copy it would
 # only ever reach EXTRACTION FAILED. --mutate also proves the refusals: an anchor missing or doubled, a /data path the
@@ -52,9 +51,9 @@ SHELLS=""; for s in bash sh dash mksh; do command -v "$s" >/dev/null 2>&1 && SHE
 PRINT_SHIM='command -v print >/dev/null 2>&1 || print() { _pn=1; while [ $# -gt 0 ]; do case "$1" in -rn|-nr) _pn=0; shift ;; -r) shift ;; --) shift; break ;; *) break ;; esac; done; if [ "$_pn" = 1 ]; then printf "%s\n" "$*"; else printf "%s" "$*"; fi; }'
 sq() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
 
-ANCHOR_FIRST='      CHOOSER0="/data/user/0/com.nowhere.chooser/files"'
-ANCHOR_RM='        rm -rf "$APPCODE"'
-ANCHOR_END='      fi'
+ANCHOR_FIRST='          CHOOSER0="/data/user/0/com.nowhere.chooser/files"'
+ANCHOR_RM='            rm -rf "$APPCODE"'
+ANCHOR_END='          if [ "$_aprc" = 5 ]; then _innet=apps; fi'
 FILES='data/user/0/com.nowhere.chooser/files'
 SUCCESS='[roamd] IN "zqprofile" #apps code restored → user0 chooser '
 
@@ -73,7 +72,7 @@ extract_block() {
   [ "$(printf '%s\n' "$raw" | tail -n 1)" = "$ANCHOR_END" ] || { echo "EXTRACTION FAILED: no '$ANCHOR_END' after the failure arm's rm in $f" >&2; exit 2; }
   # Only the forms the block uses are rewritten, so the check below can still find any other /data path.
   printf '%s\n' "$raw" | sed -E 's#([" ])/data/#\1$ROOT/data/#g' > "$out"
-  c=$(grep -cxF -- '      CHOOSER0="$ROOT/'"$FILES"'"' "$out")
+  c=$(grep -cxF -- '          CHOOSER0="$ROOT/'"$FILES"'"' "$out")
   [ "$c" = 1 ] || { echo "RE-ROOT INCOMPLETE: the first line was not rewritten in $f" >&2; exit 2; }
   # The block runs a real rm -rf: this check comes before any child starts.
   live=$(sed -E -e 's/^[[:space:]]*#.*$//' -e 's/[[:space:]]#.*$//' -e 's#\$ROOT/data/##g' "$out")
@@ -115,7 +114,7 @@ AGENT
     printf 'set -u\n'
     printf 'ROOT=%s; MKDIR_MODE=%s\n' "$(sq "$root")" "$(sq "$md")"
     cat <<'STUB'
-name=zqprofile; pass=zqpass; uid=11
+name=zqprofile; pass=zqpass; uid=11; _innet=""
 LOG="$ROOT/log"; AGENT="$ROOT/agent"
 stat() { for _a in "$@"; do :; done; if [ "$_a" = "$ROOT/data/user/0/com.nowhere.chooser/files" ]; then echo 10077; else echo 0; fi; }
 chown() { printf '%s\n' "$*" >> "$ROOT/chown.argv"; }
@@ -127,6 +126,7 @@ qn() { printf '"%s"' "$1"; }
 pw() { printf 'pw-%s' "$1"; }
 STUB
     cat "$block"
+    printf 'printf "%%s\\n" "${_aprc-unset}" > "$ROOT/aprc"; printf "%%s\\n" "$_innet" > "$ROOT/innet"\n'
     printf ': > "$ROOT/reached"\n'
   } > "$root/case.sh"
   "$sh" "$root/case.sh" > "$root/child.out" 2>&1 </dev/null; rc=$?
@@ -202,6 +202,8 @@ cases() {
 
   go A7 fail5 real yes || return 2
   stale_gone A7 saw; agent_ran_once A7; nothing_left A7
+  chk "A7 [$sh] _aprc is 5 after the block (got '$(cat "$R/aprc")')" [ "$(cat "$R/aprc")" = 5 ]
+  chk "A7 [$sh] _innet is apps after the block (got '$(cat "$R/innet")')" [ "$(cat "$R/innet")" = apps ]
 
   printf '  -- [%s] %d passed, %d failed\n' "$sh" "$p" "$x"
   [ "$x" = 0 ]
@@ -213,25 +215,24 @@ edit() {
 import sys
 m, src, dst = sys.argv[1:]
 s = open(src, 'rb').read()
-FIRST = b'      CHOOSER0="/data/user/0/com.nowhere.chooser/files"\n'
-FAIL_RM = b'        rm -rf "$APPCODE"\n'
-CALL = b'&& NOWHERE_PHASE=appcode "$AGENT" restore s3 "${name}#apps" "$(pw "$pass")" "$APPCODE" >> "$LOG" 2>&1 \\\n'
-APPCODE_LINE = b'      APPCODE="$CHOOSER0/.appcode"\n'
+FIRST = b'          CHOOSER0="/data/user/0/com.nowhere.chooser/files"\n'
+FAIL_RM = b'            rm -rf "$APPCODE"\n'
+APPCODE_LINE = b'          APPCODE="$CHOOSER0/.appcode"\n'
 R = {
   # Mutants of the block.
-  'M1': (b'\n      rm -rf "$APPCODE"\n', b'\n'),
+  'M1': (b'\n          rm -rf "$APPCODE"\n', b'\n'),
   'M2': (b'\n' + FAIL_RM, b'\n'),
-  'M3': (b' \\\n         && [ -f "$APPCODE/manifest.tsv" ]; then', b'; then'),
+  'M3': (b' && [ -f "$APPCODE/manifest.tsv" ]; then', b'; then'),
   'M4': (b'stat -c %u "$CHOOSER0"', b'stat -c %u "$APPCODE"'),
-  'M5': (b'\n        restorecon -R -D "$APPCODE" 2>>"$LOG"\n', b'\n'),
+  'M5': (b'\n            restorecon -R -D "$APPCODE" 2>>"$LOG"\n', b'\n'),
   'M6': (b'if [ -d "$CHOOSER0" ] && mkdir', b'if mkdir'),
-  'M7': (CALL, CALL[:-3].replace(b'&& NOWHERE', b'&& { NOWHERE') + b'; :; } \\\n'),
+  'M7': (b'\n            _aprc=$?\n', b'\n            _aprc=0\n'),
   # Edits of a copy of roamd, which the suite must refuse.
   'X1': (b'\n' + FIRST, b'\n'),
   'X2': (b'\n' + FAIL_RM, b'\n'),
   'X3': (b'\n' + FIRST, b'\n' + FIRST + FIRST),
   'X4': (b'\n' + FAIL_RM, b'\n' + FAIL_RM + FAIL_RM),
-  'X5': (b'\n' + APPCODE_LINE, b'\n' + APPCODE_LINE + b'      X=/data/leak\n'),
+  'X5': (b'\n' + APPCODE_LINE, b'\n' + APPCODE_LINE + b'          X=/data/leak\n'),
 }
 a, b = R[m]
 if s.count(a) != 1:

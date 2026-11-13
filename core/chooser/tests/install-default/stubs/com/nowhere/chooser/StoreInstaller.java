@@ -30,4 +30,7 @@ final class StoreInstaller {
     journal.add("keepInMode:" + pkg + "," + overPlan + "," + mode);
     return keepInModeAnswer;
   }
+  static void clearTurnedOff(Context ctx, java.util.Collection<String> pkgs) {
+    journal.add("clearTurnedOff:" + new TreeSet<>(pkgs));
+  }
 }

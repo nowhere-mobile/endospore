@@ -234,6 +234,7 @@ suite() {  # suite <roamd.sh> [quiet] -> 0 all ok, 1 a case failed, 2 the harnes
       dt_boot() { DT_BOOT=stub; }     # NWP-20261027-05: the device-toggles suite runs the real one
       dr_boot() { DR_BOOT=stub; }     # NWP-20261028-07: the data-roaming suite runs the real one
       hs_release() { HS_VERDICT="OK RELEASED"; }   # NWP-20261028-10: the hotspot suite runs the real one
+      bootsweep_plog_line() { BS_PLOG=" stub"; }   # NWP-20261201-36: test-bootsweep-plog.sh runs the real one
       # stat -c %u answers 1000 (system) unless sim/owner says "<path> <uid>". chown, chmod and restorecon fail
       # for a path listed in sim/ownfail, sim/chmodfail and sim/rcfail respectively, and each leaves a line in
       # sim/calls whether or not it fails. (A test host cannot chown, nor relabel.)
@@ -305,10 +306,11 @@ suite() {  # suite <roamd.sh> [quiet] -> 0 all ok, 1 a case failed, 2 the harnes
         esac
       }
       pw() { printf '%s\n' "$ROOT/sim/pw"; }
+      od_fetch_data() { return 0; }; od_listed() { return 1; }; od_block_app() { return 0; }; od_unblock_app() { :; }; od_pending_clear() { :; }; od_block_installed() { :; }; od_shipped_prep() { return 0; }; od_park_var() { :; }; od_unf_path() { echo "$STATE/odfetch.$1/unfetched.$2"; }   # NWP-20261130-03
       _ms() { echo 0; }
       _sum0=0; _sumt=0   # set above the `in` arm in the script (NWP-20261130-08); this harness runs the arm alone under set -u
       for t in stop_mediad usb_host relabel_launcher remap_media_db insert_deferred_media remap_per_pkg _tlog _ssum acct_restore remap_tree reown_ext_appdata \
-               keystore_push keystore_restore ks_signin_reset hold_ondemand od_parked_report reap_stale_ondemand reap_orphan_provisioned restorecon \n               uiderrors_floor_take uiderrors_floor_commit tz_surface; do  # NWP-20261010-06: the report's sign-in floor
+               keystore_push keystore_restore ks_signin_reset hold_ondemand od_parked_report reap_stale_ondemand reap_orphan_provisioned restorecon \n               uiderrors_floor_take uiderrors_floor_commit tz_surface sroam_surface; do  # NWP-20261010-06: the report's sign-in floor
         eval "$t() { :; }"
       done
       in_scope_tokens() { printf '+de +media'; }   # NWP-20261113-15: the IN line's scope tokens

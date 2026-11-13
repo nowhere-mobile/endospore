@@ -25,8 +25,12 @@
 #   P4  reconcilePlayStack derives playOff from PlayChoice.blocksVendingReadd(playState()) and guards exactly the two
 #       Play Store re-adds with it (the user-kept m.put and the auto-pulled applyStackMember); gms/gsf are not guarded.
 #   P5  AppInstallReceiver.decide reads the flag through PlayChoice.effective(..., ProfileActivity.gosStorePresent(ctx))
-#       and passes its default through PlayChoice.keepModeOnInstall after appDefaultForInstaller and before its first branch, and records a Play Store keep with setPlayDep only when it wrote the keep line.
+#       and passes its default through PlayChoice.keepModeOnInstall after appDefaultForInstaller and before its first branch, and records a Play Store keep with setPlayDep only when it wrote the keep line. Its second setPlayDep is the back-On one (P7).
 #   P6  PlayChoice's package and mode literals equal ProfileActivity's VENDING_PKG / GMS_PKG / GSF_PKG / MODE_ONDEMAND.
+#   P7  NWP-20261129-16 (docs/product-decisions.md, 2026-11-05, "seventeen answers to harvest 59 ...", #7): decide asks
+#       PlayChoice.turnsOnAtInstall with `replacing` and "broadcast".equals(via), writes State.ON and reads it back before
+#       keepModeOnInstall; the Off line, the guarded setPlayDep and the backOnMarks keeps run only under backOn, after the
+#       branches; the on-this-phone test reads archived packages for this user and never MATCH_ANY_USER.
 #
 # What it does NOT prove: the handset run (the row on an Endospore device, the App Store opening, Off dropping Play
 # Store at the next save and the Google account leaving with its mark). That is the backlog row's CLOSES WHEN.
@@ -266,7 +270,7 @@ pin('P5 decide reads the flag through effective(gosStorePresent) and passes its 
     'default=%d state=%d keepMode=%d firstBranch=%d' % (d_def, d_st, d_km, d_first))
 d_dep = pos(dec, 'if(wrote&&PlayChoice.userKeepsOnInstall(play,pkg)){try{ProfileActivity.setPlayDep(ctx,pkg,true);}')
 pin('P5 decide records a Play Store keep with setPlayDep only after it wrote the keep line',
-    d_dep > d_first and dec.count('setPlayDep(') == 1, 'setPlayDep at %d' % d_dep)
+    d_dep > d_first and dec.count('setPlayDep(') == 2, 'setPlayDep at %d, x%d' % (d_dep, dec.count('setPlayDep(')))
 
 # P6
 def lit(src, name):
@@ -275,6 +279,40 @@ def lit(src, name):
 for pa, pc in (('VENDING_PKG', 'VENDING'), ('GMS_PKG', 'GMS'), ('GSF_PKG', 'GSF'), ('MODE_ONDEMAND', 'ONDEMAND')):
     a, c = lit(act, pa), lit(cls, pc)
     pin('P6 PlayChoice.%s equals ProfileActivity.%s' % (pc, pa), a is not None and a == c, '%r vs %r' % (a, c))
+
+# P7
+b_at = pos(dec, 'if(PlayChoice.turnsOnAtInstall(play,pkg,replacing,"broadcast".equals(via))){')
+b_put = pos(dec, 'ProfileActivity.cfgPutStatic(ctx,PlayChoice.CFG_KEY,PlayChoice.raw(PlayChoice.State.ON));')
+# dec.find from b_put: the first read of the flag holds the same text
+b_read = dec.find('play=PlayChoice.effective(PlayChoice.parse(ProfileActivity.cfgStatic(ctx,PlayChoice.CFG_KEY)),'
+                  'ProfileActivity.gosStorePresent(ctx));', b_put) if b_put >= 0 else -1
+b_on = dec.find('backOn=play==PlayChoice.State.ON;', b_read) if b_read >= 0 else -1
+pin('P7 decide asks turnsOnAtInstall(play, pkg, replacing, "broadcast".equals(via)) once, after the first read of the flag',
+    0 <= d_st < b_at and dec.count('turnsOnAtInstall(') == 1, 'state=%d ask=%d x%d' % (d_st, b_at, dec.count('turnsOnAtInstall(')))
+pin('P7 the write of State.ON and its read-back come before keepModeOnInstall, and backOn is what the read-back says',
+    0 <= b_at < b_put < b_read < b_on < d_km < d_first and dec.count('cfgPutStatic(') == 1,
+    'ask=%d put=%d read=%d backOn=%d keepMode=%d firstBranch=%d' % (b_at, b_put, b_read, b_on, d_km, d_first))
+b_blk = method(dec, 'if(backOn){')
+b_blk_at = pos(dec, 'if(backOn){')
+pin('P7 one if (backOn) block, after the branches and the wrote playdep',
+    b_blk is not None and 0 <= pos(dec, 'outcome=wrote?"kept":"refusedbykeepInMode";') < b_blk_at and d_dep < b_blk_at,
+    'block at %d, wrote playdep at %d' % (b_blk_at, d_dep))
+for need, why in [
+    ('StoreInstaller.clearTurnedOff(ctx,java.util.Collections.singleton(PlayChoice.VENDING));', 'clearTurnedOff retires Play Store alone'),
+    ('if(!wrote&&StoreInstaller.keepSetHas(ctx,PlayChoice.VENDING)){ProfileActivity.setPlayDep(ctx,PlayChoice.VENDING,true);}',
+     'setPlayDep only for a keep line this call did not write'),
+    ('PlayChoice.backOnMarks(onDevice,', 'the marks come from backOnMarks'),
+    ('StoreInstaller.keepInMode(ctx,member,false,PlayChoice.ONDEMAND);', 'each mark is kept On-demand'),
+]:
+    pin('P7 under backOn: ' + why, b_blk is not None and b_blk.count(need) == 1, 'want exactly one ' + need)
+pin('P7 clearTurnedOff and backOnMarks are called only there',
+    dec.count('clearTurnedOff(') == 1 and dec.count('backOnMarks(') == 1,
+    'clearTurnedOff x%d backOnMarks x%d' % (dec.count('clearTurnedOff('), dec.count('backOnMarks(')))
+d_a0 = pos(dec, 'pm.getApplicationInfo(p,0);')
+d_a1 = pos(dec, 'pm.getApplicationInfo(p,android.content.pm.PackageManager.ApplicationInfoFlags.of('
+                'android.content.pm.PackageManager.MATCH_ARCHIVED_PACKAGES));')
+pin('P7 the on-this-phone test asks with flags 0, then MATCH_ARCHIVED_PACKAGES through ApplicationInfoFlags, and never MATCH_ANY_USER',
+    0 <= d_a0 < d_a1 and 'MATCH_ANY_USER' not in dec, 'flags0=%d archived=%d' % (d_a0, d_a1))
 
 sys.exit(1 if fails else 0)
 PY
@@ -372,6 +410,14 @@ mut 'M17 the tap uses the reading taken when the row was drawn' act 's/        p
 mut 'M17b no refresh when the window gets the focus back' act 's/has -> \{ if \(has\) paintPlayRow\(sub\); \}/has -> { }/'
 mut 'M17c the focus listener never added' act 's/v\.getViewTreeObserver\(\)\.addOnWindowFocusChangeListener\(onFocus\);/ /'
 mut 'M17d the not-installed tap stays OPEN_STORE after the install' cls 's/return vendingInstalled \? Tap\.CONFIRM_OFF : Tap\.OPEN_STORE;/return vendingKept \&\& vendingInstalled ? Tap.CONFIRM_OFF : Tap.OPEN_STORE;/'
+# NWP-20261129-16 (h59 #7): a hand install of Play Store with Play Off turns Play back On.
+mut 'N1 turnsOnAtInstall always false' cls 's/return s == State\.OFF && VENDING\.equals\(pkg\) && !replacing && broadcast;/return false;/'
+mut 'N2 turnsOnAtInstall fires on the catch-up' cls 's/(VENDING\.equals\(pkg\) && !replacing) && broadcast;/$1;/'
+mut 'N3 turnsOnAtInstall fires on an update' cls 's/(VENDING\.equals\(pkg\)) && !replacing( && broadcast;)/$1$2/'
+mut 'N4 turnsOnAtInstall fires for gms' cls 's/s == State\.OFF && VENDING\.equals\(pkg\) && !replacing/s == State.OFF \&\& isStackMember(pkg) \&\& !replacing/'
+mut 'N9 backOnMarks lists VENDING' cls 's/new String\[\] \{GMS, GSF\}/new String[] {VENDING, GMS, GSF}/'
+mut 'M18 decide passes true for the broadcast path' air 's/"broadcast"\.equals\(via\)/true/'
+mut 'M18b the on-this-phone test reads every user' air 's/(PackageManager\.)MATCH_ARCHIVED_PACKAGES/$1MATCH_ANY_USER/'
 mut 'probe: the reconcile guard reformatted (must pass)' act 's/if \(!playOff && !m\.containsKey\(VENDING_PKG\)/if ( !playOff\n                    \&\& !m.containsKey(VENDING_PKG)/' pass
 mut 'probe: a comment naming removeAccount in turnPlayOff (must pass)' act 's/(    private void turnPlayOff\(\) \{\n)/$1        \/\/ never removeAccount( here\n/' pass
 [ "$fails" = 0 ] || { echo "FAILED: $fails mutant(s) not convicted"; exit 1; }

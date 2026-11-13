@@ -1030,9 +1030,9 @@ func TestEveryWalletWriterTakesTheWalletLock(t *testing.T) {
 		"bumpWalletGeneration": true}
 	underCallerLock := map[string]bool{"recordPlan": true, "appendTokens": true, "putWalletBytes": true,
 		// NWP-20261125-12: recordPlanMode holds recordPlan's body (recordPlan is now its wrapper); since NWP-20261128-24
-		// its callers are recordPlan and tests, and drainClaimMode saves through recordClaimBatch.
+		// its callers are recordPlan and tests, and drainClaimOutcome saves through recordClaimBatch.
 		"recordPlanMode": true,
-		// NWP-20261128-24: one claim batch's plan and tokens in one save; its caller, drainClaimMode, holds the lock.
+		// NWP-20261128-24: one claim batch's plan and tokens in one save; its caller, drainClaimOutcome, holds the lock.
 		"recordClaimBatch": true,
 		// NWP-20261013-20 (pass 5): a staged landing's proof and undo, run by writeRestoredWallet and the locked retry.
 		"proveWalletLanding": true, "undoWalletLanding": true,
@@ -1099,7 +1099,7 @@ func TestEveryWalletWriterTakesTheWalletLock(t *testing.T) {
 		}
 	}
 	// The control: the guard must find the writers that exist today, or it is not looking at anything.
-	for _, w := range []string{"capFlush", "leaseRefsGen", "payRentGenRule", "claimTokens", "drainClaimMode", "writeRestoredWallet", "finishStagedClaim",
+	for _, w := range []string{"capFlush", "leaseRefsGen", "payRentGenRule", "claimTokens", "drainClaimOutcome", "writeRestoredWallet", "finishStagedClaim",
 		"removeWallet", "walletBuyCLI", "wipeSessionStateWallet"} {
 		if !writers[w] {
 			t.Errorf("the guard did not see %s write the wallet -- it has stopped recognising wallet writes", w)

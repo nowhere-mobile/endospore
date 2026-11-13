@@ -73,7 +73,7 @@ final class ReplyCopy {
         String first = reply == null ? "" : reply.split("\n", 2)[0].trim();
         String why = first.startsWith("BUSY ") ? first.substring(5).trim() : "";
         if (why.equals("seal-in-flight") || why.startsWith("seal-run:"))
-            return "A save is already running, so this one wasn't started. Try again once it finishes.";
+            return "A save is already running, and this tap joined it.";
         if (why.equals("login"))
             return "Your sign-in or unlock is still finishing, so the save wasn't started. Try again in a moment.";
         if (why.equals("user-op-waiting"))

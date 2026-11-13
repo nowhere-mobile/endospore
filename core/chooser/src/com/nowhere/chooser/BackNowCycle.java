@@ -45,6 +45,11 @@ final class BackNowCycle {
         return POST;
     }
 
+    /** Unix seconds of the online tick that posted the prompt; 0 when no prompt is posted. */
+    long reconnectAt() {
+        return reconnectAt;
+    }
+
     /** True while a posted prompt waits for a seal from after the reconnect. */
     boolean awaitingLanded() {
         return armed && posted;

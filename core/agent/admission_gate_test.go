@@ -243,7 +243,7 @@ func TestAdmissionGateHasOneCaller(t *testing.T) {
 	if want := []string{"handleFetchApp", "keepHeadroomReply"}; strings.Join(callers, " ") != strings.Join(want, " ") {
 		t.Errorf("installHeadroom is called from %v, want exactly %v", callers, want)
 	}
-	for _, n := range []string{"pushProfile", "handleBackup", "handleLogoff", "handleLogout", "handleRoamOut",
+	for _, n := range []string{"pushProfile", "handleBackup", "handleLogoff", "handleLogout",
 		"handlePromote", "handlePromote2", "handleSealDelta", "handleSealDeltaWalk", "handleDelete",
 		"handleDeleteSnapshot", "handleMaterializeApp", "restoreAppCode"} {
 		body, ok := funcs[n]

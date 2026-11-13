@@ -162,10 +162,10 @@ var goStmtAllowed = map[string]struct {
 	n   int
 	why string
 }{
-	"incremental_seal.go walkChunks": {3, "the seal walk's tar pipe writers, inside pushProfile (the `push` worker)"},
-	"main.go pushProfile":            {3, "the `push` worker: progress ticker, upload workers, the tar pipe writer"},
-	"main.go cdcRestore":             {3, "the `restore` worker: chunk dispatcher, fetchers (they recover into the result, NWP-20261013-05), ordered writer"},
-	"media_heal.go healFetchOrdered": {2, "restore-app / media heal, both worker verbs; the fetchers recover into the result"},
+	"incremental_seal.go walkChunksExcl": {3, "the seal walk's tar pipe writers, inside pushProfile (the `push` worker)"},
+	"main.go pushProfile":                {3, "the `push` worker: progress ticker, upload workers, the tar pipe writer"},
+	"main.go cdcRestoreProg":             {3, "the `restore` worker: chunk dispatcher, fetchers (they recover into the result, NWP-20261013-05), ordered writer"},
+	"media_heal.go healFetchOrdered":     {2, "restore-app / media heal, both worker verbs; the fetchers recover into the result"},
 }
 
 // TestEveryGoroutineGoesThroughGoSafe is the class pin: an AST walk of every non-test file finds every `go`

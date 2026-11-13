@@ -2,7 +2,8 @@
 # test-app-deps-java.sh [--mutate] -- NWP-20261118-21: what an on-demand tap materialises BEFORE the app itself
 # (ProfileActivity's groupFor, groupDeps, appDeps and isStackMember; UnarchiveService.pendingDeps consumes appDeps).
 # Runs core/chooser/tests/app-deps: the chooser's pure AppDeps, compiled against its cases ALONE and EXECUTED, plus
-# source checks that ProfileActivity answers through it.
+# source checks that ProfileActivity answers through it. NWP-20261201-04: also AppDeps.stackNeed, the mode the Play
+# stack is held at, and that reconcilePlayStack gets it through playStackNeed.
 #
 # It needs a JDK, and it FAILS when there is none: a Java suite that skips without one would read green on a runner
 # that never ran it. javac/java come from PATH, then the build VM's prebuilt JDK 21.
@@ -46,6 +47,14 @@ b=$(body appDeps)
 if [[ $b =~ AppDeps\.appDeps\([^\;]*GMS_PKG,[[:space:]]*GSF_PKG,[[:space:]]*VENDING_PKG\) ]]; then
   echo "ok   s2 appDeps passes GMS_PKG, GSF_PKG, VENDING_PKG in that order"
 else echo "FAIL s2 appDeps must pass GMS_PKG, GSF_PKG, VENDING_PKG to AppDeps.appDeps in that order"; bad=1; fi
+b=$(body playStackNeed)
+r=$(awk '/private void reconcilePlayStack\(/ {f=1} f{print} f&&/^    }$/{exit}' "$ROOT/$CH/ProfileActivity.java")
+if [[ $b == *"AppDeps.stackNeed("* && $b != *"for (String"* && $r != *"boolean demands"* && $r == *"playStackNeed(this, m, playClients)"* ]]; then
+  echo "ok   s3 reconcilePlayStack answers through playStackNeed and AppDeps.stackNeed"
+else echo "FAIL s3 playStackNeed must call AppDeps.stackNeed with no String loop, and reconcilePlayStack must call it and hold no demand loop"; bad=1; fi
+if [[ $b =~ AppDeps\.stackNeed\([^\;]*GMS_PKG,[[:space:]]*GSF_PKG,[[:space:]]*VENDING_PKG ]]; then
+  echo "ok   s4 playStackNeed passes GMS_PKG, GSF_PKG, VENDING_PKG in that order"
+else echo "FAIL s4 playStackNeed must pass GMS_PKG, GSF_PKG, VENDING_PKG to AppDeps.stackNeed in that order"; bad=1; fi
 [ "$bad" -eq 0 ] || { echo "FAILED"; exit 1; }
 [ "$MUTATE" = yes ] || exit 0
 
@@ -91,4 +100,17 @@ mut "D9 the dedupe removed" \
   "no duplicates when a stack member shares the client's group" || fails=$((fails+1))
 mut "D10 the stack member compares with the entry's own group" 's/String g = defaults\.get\(gms\);/String g = groupOf(gms, explicit, defaults);/' \
   "the entry never appears in its own list" || fails=$((fails+1))
+mut "D11 playSeenYes dropped from the recorded set" 's/recorded\.addAll\(playSeenYes\);\n\s*//' \
+  "c1 an archived Auto client with only a playseen yes holds the stack at auto" || fails=$((fails+1))
+mut "D12 vending demands from playSeenYes" 's/\? playDeps\.contains\(p\)/? playDeps.contains(p) || playSeenYes.contains(p)/' \
+  "c5 an auto-pulled Play Store never demands, so it cannot self-latch" || fails=$((fails+1))
+mut "D13 the gms and gsf skip removed" 's/if \(gms\.equals\(p\) \|\| gsf\.equals\(p\)\) continue;[^\n]*\n\s*//' \
+  "c8 the stack alone demands nothing" || fails=$((fails+1))
+mut "D14 the installed-or-auto guard on the live term removed" 's/\(installed\.equals\(mode\) \|\| auto\.equals\(mode\)\) && liveUses/liveUses/' \
+  "c7 an on-demand client gets no live read" || fails=$((fails+1))
+mut "D15 the strength comparison inverted" 's/modeRank\(mode, installed, auto\) > modeRank\(need/modeRank(mode, installed, auto) < modeRank(need/' \
+  "c6 the strongest demander wins over an earlier weaker one" || fails=$((fails+1))
+mut "D16 the first demander's mode returned" \
+  's/(if \(!demands\) continue;\n\s*)if \(modeRank\(mode, installed, auto\) > modeRank\(need, installed, auto\)\) \{\n\s*need = ([^\n]*)\n\s*\}/$1if (mode != null) return $2/' \
+  "c6 the strongest demander wins over an earlier weaker one" || fails=$((fails+1))
 [ "$fails" -eq 0 ] && echo "== all mutations convicted" || { echo "== $fails mutation(s) not convicted"; exit 1; }

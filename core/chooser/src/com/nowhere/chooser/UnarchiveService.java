@@ -53,6 +53,8 @@ public class UnarchiveService extends Service {
     static final String EXTRA_WAKE = "nowhere.unarchive.wake";
     // NWP-20261112-11 (Q042): with EXTRA_SWEEP. BY_HAND: "Install pending apps now" -- the sweep runs on any network.
     static final String EXTRA_BY_HAND = "nowhere.unarchive.byhand";
+    // NWP-20261201-13: with EXTRA_SWEEP. RESUME: the landing card's Resume -- only the sweep, and the Wi-Fi rule applies.
+    static final String EXTRA_RESUME = "nowhere.unarchive.resume";
     // NET_REKICK: the gate's re-kick when the network rule turns to yes mid-session -- only the sweep, nothing else.
     static final String EXTRA_NET_REKICK = "nowhere.unarchive.netrekick";
 
@@ -105,6 +107,10 @@ public class UnarchiveService extends Service {
      *  sweep does not fetch them again. RAM only, in this session's chooser process; never written to disk. A process
      *  restart forgets it: the cost is one more download, refused again before the install. */
     static final java.util.Set<String> OLDER_COPY = java.util.concurrent.ConcurrentHashMap.newKeySet();
+    /** NWP-20261130-07 (h50 #3): the app whose Play page opens once an archived Play Store is back (openPlayPage set it,
+     *  launchApp takes it). A market:// intent cannot reach an archived Play Store. RAM only. */
+    static final java.util.concurrent.atomic.AtomicReference<String> PLAY_PAGE_AFTER =
+            new java.util.concurrent.atomic.AtomicReference<>();
 
     /** #130 regression fix (DIA-20260813-12, device-proven on lynx 2026081212 within minutes of the flash): this
      *  is a MULTI-START service now -- a tap and the sweep are separate onStartCommand calls sharing ONE service
@@ -215,12 +221,15 @@ public class UnarchiveService extends Service {
         final boolean sweep = intent != null && intent.getBooleanExtra(EXTRA_SWEEP, false);
         final boolean byHand = intent != null && intent.getBooleanExtra(EXTRA_BY_HAND, false);
         final boolean netRekick = intent != null && intent.getBooleanExtra(EXTRA_NET_REKICK, false);
+        final boolean resumeSweep = intent != null && intent.getBooleanExtra(EXTRA_RESUME, false);
         final String[] restoredOk = intent != null ? intent.getStringArrayExtra(EXTRA_WAKE) : null;
         startForegroundNotice(); // MUST be immediate (within the FGS start window), before any network work
         if (sweep) {
             // #130: the auto background-materialise sweep -- no tap, no unarchiveId, no card, no launch.
             ACTIVE.incrementAndGet();
             fetchWakeAcquire(); // NWP-20260901-32: paired with workerDone()
+            // NWP-20261201-13: "Install pending apps now" is the user asking for every app now: it ends a pause or a stop.
+            if (byHand) SweepHold.clear();
             Thread sw = new Thread(() -> {
                 if (netRekick) {
                     // NWP-20261112-11 (Q042): the gate's re-kick once the network allows the sweep. Only the sweep:
@@ -228,6 +237,15 @@ public class UnarchiveService extends Service {
                     // the switch-landing, and that start already ran them.
                     try { sweepAutoJoined(false); }
                     catch (Throwable t) { android.util.Log.w("NowhereChooser", "#130 auto sweep (re-kick)", t); }
+                    finally { workerDone(); }
+                    return;
+                }
+                if (resumeSweep) {
+                    // NWP-20261201-13: the card's Resume. Only the sweep, as the re-kick above, and not by hand. SweepHold
+                    // keeps the card for the next pass, this thread's or the one a join hands to the running sweep.
+                    SweepHold.resume();
+                    try { sweepAutoJoined(false); }
+                    catch (Throwable t) { android.util.Log.w("NowhereChooser", "#130 auto sweep (resume)", t); }
                     finally { workerDone(); }
                     return;
                 }
@@ -278,6 +296,13 @@ public class UnarchiveService extends Service {
                         sn.start();
                     } catch (Throwable t) { android.util.Log.w("NowhereChooser", "skip notice start", t); }
                 }
+                // NWP-20261201-06 (h62 #2 (2)): the Play-stack reconcile runs once at every sign-in. Synchronous and before
+                // the sweep, so a Play Store raised to Auto is materialised by this same sweep. Only on the switch-landing:
+                // a by-hand start is not a sign-in, and the re-kick above returned before this point.
+                if (!byHand) {
+                    try { ProfileActivity.reconcilePlayStackAtSignIn(this); }
+                    catch (Throwable t) { android.util.Log.w("NowhereChooser", "play stack sign-in", t); }
+                }
                 try { wakeRestored(restoredOk); }
                 catch (Throwable t) { android.util.Log.w("NowhereChooser", "wake restored", t); }
                 try { sweepAutoJoined(byHand); }
@@ -322,6 +347,7 @@ public class UnarchiveService extends Service {
                 // NWP-20261122-11: the install ended, whether it worked or failed: forget the tap.
                 if (!TapMemory.remove(tapFile, tapSerial, pkg)) android.util.Log.w("NowhereChooser", "tap memory remove failed (NWP-20261122-11)");
                 if (mine) LIVE_TAPS.remove(pkg);
+                if (OlderCopy.PLAY.equals(pkg)) PLAY_PAGE_AFTER.set(null); // NWP-20261130-07: a failed install opened no page
                 if (!ok && unarchiveId >= 0) {
                     try {
                         // NWP-20261013-33: with no validated network say so, and the platform renders its own
@@ -819,6 +845,8 @@ public class UnarchiveService extends Service {
         try (java.io.FileWriter w = new java.io.FileWriter(new File(ctx.getFilesDir(), "nowhere-od-restored"), true)) {
             w.write(pkg + "\n");
         } catch (Throwable ignore) {}
+        // NWP-20261130-03: an app suspended until its data landed opens now, before any launch below this call.
+        OdDataBarrierHost.afterReply(ctx, pkg, "OK");
         // NWP-20261010-13: the profile's SMS app may have been waiting for exactly this app to materialise.
         SmsRoleRoam.onMaterialised(ctx, pkg);
     }
@@ -1131,6 +1159,13 @@ public class UnarchiveService extends Service {
             // sweep: the busy tap and the rest keep their lines, and the next sweep runs them first again.
             android.util.Log.i("NowhereChooser", "#130 sweep: worker lane busy on a remembered tap -- the sweep stops,"
                     + " the remembered taps and the Auto apps wait for the next sweep (h51 #1)");
+            repauseResumed(); // NWP-20261201-13: a Resume this pass was to continue goes back to paused
+            return;
+        }
+        // NWP-20261201-13: a paused or stopped sweep starts no Auto app, whoever kicks it in this process (a network
+        // re-kick, a joined rerun, a landing kick). After the remembered taps: a remembered tap is the user's request.
+        if (!byHand && SweepHold.held()) {
+            android.util.Log.i("NowhereChooser", "#130 sweep: held (" + SweepHold.word() + ") -- no Auto app started");
             return;
         }
         StoreInstaller.foldAppFirst(this); // NWP-20261012-06: before the order is read; a no-op once folded
@@ -1160,7 +1195,14 @@ public class UnarchiveService extends Service {
         // sweep fetches for minutes before its first tick. The card still starts before the first MATERIALIZE-APP.
         boolean landing = Boolean.TRUE.equals(LANDING.get());
         LANDING.remove();
+        // NWP-20261201-13: a Resume continues its card, so it shows no new one.
+        long resumed = SweepHold.takeResumed();
         long card = 0;
+        if (resumed != 0L) {
+            card = resumed;
+            cardResumed(card);
+            landing = false;
+        }
         try {
             File stamp = new File(getNoBackupFilesDir(), "landing-line-shown");
             String serial = landingSerial();
@@ -1176,11 +1218,14 @@ public class UnarchiveService extends Service {
         } catch (Throwable t) { android.util.Log.w("NowhereChooser", "landing line", t); }
         // NWP-20261012-04: BOTH lists. A profile whose only outstanding app is an installed one with an unconfirmed
         // restore (Chester's App store case) has an empty work list, and returning on that alone never retries it.
+        // NWP-20261201-13: a Resume that waits for Wi-Fi closes its card, which would otherwise stay open.
+        if (card != 0 && work.isEmpty() && retry.isEmpty()) cardEnded(card);
         if (work.isEmpty() && retry.isEmpty()) { android.util.Log.i("NowhereChooser", "#130 sweep: nothing to materialise"); return; }
         // NWP-20260822-12: the sweep's whole set joins the SHARED queue up front. It no longer composes a count
         // over work.size() -- that denominator was invisible to a concurrent tap and vice versa.
         qEnqueue(work);
         int done = 0, failed = 0;
+        boolean cut = false; // NWP-20261201-13: Pause or Stop left apps not started
         // NWP-20261005-01: hold the periodic seal back for the WHOLE sweep, not just one app. RESTORE-ODDATA closes
         // the per-app window, and a seal that starts in the install gap before the next app holds the worker for up
         // to 47 minutes (frankel, NW-47c7b5845145: 16 of 24 apps in seven hours). The daemon caps the hold and lets
@@ -1199,6 +1244,7 @@ public class UnarchiveService extends Service {
             // decision is re-read under it, so a tap that landed meanwhile wins.
             for (int c = 0; c < retry.size(); c += OdRestoreList.CHUNK) {
                 if (SignOutGate.begun()) break; // NWP-20261109-06 (Q116): a sign-out stops the sweep; never queued
+                if (SweepHold.held()) break; // NWP-20261201-13: Pause or Stop; the chunk in flight has finished
                 java.util.List<String> chunk = retry.subList(c, Math.min(c + OdRestoreList.CHUNK, retry.size()));
                 MAT_LOCK.lock();
                 try {
@@ -1231,7 +1277,19 @@ public class UnarchiveService extends Service {
                             + " app(s) not started (Q116)");
                     break;
                 }
+                if (SweepHold.held()) {
+                    // NWP-20261201-13: Pause or Stop, the sign-out stop's shape, and the app in flight has finished. The
+                    // apps not started leave the queue and keep their placeholders and Auto mode.
+                    qDrop(SignOutGate.rest(work, i));
+                    String held = SweepOutcome.request(i + 1, work.size(), SweepOutcome.STOPPED, 0);
+                    if (held != null) DaemonSocket.roundTrip(held, 5000);
+                    android.util.Log.i("NowhereChooser", "#130 sweep: " + SweepHold.word() + " -- " + (work.size() - i)
+                            + " app(s) not started");
+                    cut = true;
+                    break;
+                }
                 String pkg = work.get(i);
+                cardStarted(card, pkg); // NWP-20261201-34: before the lock: the sweep chose this app and waits only for a tap
                 boolean ok = false;
                 String end; // assigned in the try and in the catch: a catch that sets nothing does not compile
                 if (busyTries == 0) appT0 = android.os.SystemClock.elapsedRealtime(); // the ms cover its retries too
@@ -1251,7 +1309,7 @@ public class UnarchiveService extends Service {
                     busyWaited += w;
                     android.util.Log.i("NowhereChooser", "#130 sweep " + pkg + ": worker lane busy, retry " + busyTries
                             + " in " + (w / 1000) + " s");
-                    for (long left = w; left > 0 && !SignOutGate.begun(); left -= 1000L) {
+                    for (long left = w; left > 0 && !SignOutGate.begun() && !SweepHold.held(); left -= 1000L) {
                         try { Thread.sleep(Math.min(left, 1000L)); }
                         catch (InterruptedException ie) { Thread.currentThread().interrupt(); break; }
                     }
@@ -1288,7 +1346,12 @@ public class UnarchiveService extends Service {
         }
         android.util.Log.i("NowhereChooser", "#130 sweep done: " + done + "/" + work.size() + " materialised"
                 + (failed > 0 ? " (" + failed + " failed -- tap still works)" : ""));
-        LandingLine.Sweep.end(card); // NWP-20261126-05: recorded before the broadcast, as each outcome is
+        // NWP-20261201-13: only a pass that left apps not started is paused or stopped: one that finished every app ends.
+        // CONTINUE: a by-hand start ended the pause before this point, and the next pass takes the card, so it stays open.
+        SweepHold.Close close = SweepHold.close(card, cut);
+        if (close == SweepHold.Close.PAUSE) LandingLine.Sweep.pause(card);
+        else if (close == SweepHold.Close.STOP) LandingLine.Sweep.stop(card);
+        else if (close == SweepHold.Close.END) LandingLine.Sweep.end(card); // NWP-20261126-05: recorded before the broadcast, as each outcome is
         try { sendBroadcast(new Intent(ACTION_SWEEP_DONE).setPackage(getPackageName())); } // NWP-20261117-40
         catch (Throwable t) { android.util.Log.w("NowhereChooser", "#130 sweep done: tell Your apps", t); }
         // NWP-20261126-12: the sweep's counts to the session's day summary (DIAG-EVENT, NWP-20261124-12). Numbers only;
@@ -1484,6 +1547,7 @@ public class UnarchiveService extends Service {
         qEnqueue(group);
         for (String dep : deps) {
             qStart(dep);
+            cardDepStarted(dep);
             boolean dok = materializeMember(dep);
             android.util.Log.i("NowhereChooser", "app dep " + dep + " -> " + dok);
             // DIA-20260803-03: FAIL FAST. Installing the entry point when a dependency did not land leaves the user
@@ -1779,6 +1843,21 @@ public class UnarchiveService extends Service {
         return out;
     }
 
+    /** NWP-20261201-13: a card's end or resume outside the loop. Recorded first and broadcast after, as each outcome is,
+     *  with no extras: the card reads the record. */
+    private void cardEnded(long card) { LandingLine.Sweep.end(card); tellCard(); }
+    private void cardResumed(long card) { LandingLine.Sweep.resume(card); tellCard(); }
+    /** NWP-20261201-13: a sweep that stops on a busy remembered tap puts a waiting Resume back to paused, so its card
+     *  offers Resume again. */
+    private void repauseResumed() {
+        long waiting = SweepHold.takeResumed();
+        if (waiting != 0L) { SweepHold.pause(waiting); LandingLine.Sweep.pause(waiting); tellCard(); }
+    }
+    private void tellCard() {
+        try { sendBroadcast(new Intent(LandingNoticeActivity.ACTION_APP).setPackage(getPackageName())); }
+        catch (Throwable t) { android.util.Log.w("NowhereChooser", "#130 sweep: tell the landing card", t); }
+    }
+
     /** NWP-20261130-09: the landing card ticks a dep off. Recorded first and broadcast after, as each outcome is. The
      *  package rides this package-local broadcast only. */
     private void cardDepLanded(String dep) {
@@ -1786,6 +1865,23 @@ public class UnarchiveService extends Service {
         try {
             sendBroadcast(new Intent(LandingNoticeActivity.ACTION_APP).setPackage(getPackageName())
                     .putExtra(LandingNoticeActivity.EXTRA_PKG, dep).putExtra(LandingNoticeActivity.EXTRA_OK, true));
+        } catch (Throwable t) { android.util.Log.w("NowhereChooser", "#130 sweep: tell the landing card", t); }
+    }
+
+    /** NWP-20261201-34: the landing card shows this app as installing. Recorded first and broadcast after, with no
+     *  extras. A retry that finds the same installing row changes nothing and sends nothing. */
+    private void cardStarted(long card, String pkg) {
+        if (!LandingLine.Sweep.started(card, pkg)) return;
+        try {
+            sendBroadcast(new Intent(LandingNoticeActivity.ACTION_STARTED).setPackage(getPackageName()));
+        } catch (Throwable t) { android.util.Log.w("NowhereChooser", "#130 sweep: tell the landing card", t); }
+    }
+
+    /** NWP-20261201-34: the same for a dep the group fetches first. It takes no sweep id, as cardDepLanded. */
+    private void cardDepStarted(String dep) {
+        if (!LandingLine.Sweep.depStarted(dep)) return;
+        try {
+            sendBroadcast(new Intent(LandingNoticeActivity.ACTION_STARTED).setPackage(getPackageName()));
         } catch (Throwable t) { android.util.Log.w("NowhereChooser", "#130 sweep: tell the landing card", t); }
     }
 
@@ -2031,7 +2127,12 @@ public class UnarchiveService extends Service {
      *  a BAL denial just no-ops -- the app is still installed, so a manual tap opens it. */
     private void launchApp(String pkg) {
         try {
-            Intent li = getPackageManager().getLaunchIntentForPackage(pkg);
+            Intent li = null;
+            if (OlderCopy.PLAY.equals(pkg)) { // NWP-20261130-07: Play Store came back for an app's page
+                String page = PLAY_PAGE_AFTER.getAndSet(null);
+                if (page != null) li = playPageIntent(page);
+            }
+            if (li == null) li = getPackageManager().getLaunchIntentForPackage(pkg);
             if (li == null) {
                 android.util.Log.w("NowhereChooser", "no launch intent for " + pkg);
                 return;
@@ -2042,6 +2143,13 @@ public class UnarchiveService extends Service {
         } catch (Throwable t) {
             android.util.Log.w("NowhereChooser", "auto-launch " + pkg, t);
         }
+    }
+
+    /** NWP-20261130-07 (h50 #3): pkg's page in Play Store, and in no other app that takes market:// links. */
+    static Intent playPageIntent(String pkg) {
+        return new Intent(Intent.ACTION_VIEW, android.net.Uri.parse(OlderCopy.playPageUri(pkg)))
+                .setPackage(OlderCopy.PLAY)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
     }
 
     private void rmTree(File f) {

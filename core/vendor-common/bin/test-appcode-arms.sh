@@ -88,6 +88,7 @@ run_case() {
     AGENT="$ROOT/agent"; USERDIR="$ROOT/user/12"; uid=12; name=x; pass=y; srcunit="$PKGN"
     pw() { printf "%s" "$1"; }
     stat() { echo 4242; }; restorecon() { :; }
+    od_fetch_data() { return 0; }; od_listed() { return 1; }; od_block_app() { return 0; }; od_unblock_app() { :; }; od_pending_clear() { :; }; od_block_installed() { :; }; od_shipped_prep() { return 0; }; od_park_var() { :; }; od_unf_path() { echo "$STATE/odfetch.$1/unfetched.$2"; }   # NWP-20261130-03
     chown() { echo "chown $*" >> "$ROOT/chown.log"; }
     case "$CP_MODE" in
       splitfail) cp() { case "$1" in *split_config.apk) return 1 ;; esac; command cp "$@"; } ;;

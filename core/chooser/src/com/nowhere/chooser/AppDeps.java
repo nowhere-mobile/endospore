@@ -2,16 +2,19 @@ package com.nowhere.chooser;
 
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.Predicate;
 
 /**
  * What an on-demand tap materialises BEFORE the app itself (group-materialise, DIA-20260802,
  * docs/ondemand-sandboxed-play-group.md), lifted out of ProfileActivity so a JDK can run it. java.* only.
  * ProfileActivity reads the keep-set's explicit {@code group:} tokens, DEFAULT_GROUPS, the deferred keep-set and
- * nowhere-playdeps; this decides. NWP-20261118-21.
+ * nowhere-playdeps; this decides. NWP-20261118-21. stackNeed answers the keep-set side of the same question: how
+ * eagerly the kept clients need the sandboxed-Play stack. NWP-20261201-04.
  */
 final class AppDeps {
     private AppDeps() {}
@@ -60,5 +63,45 @@ final class AppDeps {
                 if (!s.equals(entry) && deferred.contains(s)) deps.add(s); // #130: auto deps too
         }
         return new ArrayList<>(deps);
+    }
+
+    /**
+     * The mode the sandboxed-Play stack must be held at: the strongest mode among the kept packages that demand it
+     * (installed > auto > ondemand; any other non-null value counts as ondemand), or null when none does. For each
+     * package in keep's iteration order:
+     * gms and gsf never demand. vending demands ONLY when it is in playDeps, the USER kept it: never from playSeenYes
+     * and never from being auto-pulled, because reconcile writes an auto-pulled vending at this answer and it would
+     * self-latch. Any other package demands when appDeps over the whole stack is non-empty, with
+     * recorded = playDeps + playSeenYes. A recorded answer is ARCHIVE-SAFE: it needs no manifest, so an archived
+     * placeholder still demands, and a playseen yes counts at any version, as playDependent trusts it, which fails
+     * toward KEEPING the stack (docs/product-decisions.md, 2026-11-09, #2). Failing that, an installed or auto package
+     * demands if liveUses answers true (an installed package is not archived); liveUses is asked last, so a recorded
+     * client costs no PackageManager read.
+     */
+    static String stackNeed(Map<String,String> keep, Map<String,String> explicit, Map<String,String> defaults,
+            Set<String> playDeps, Set<String> playSeenYes, Predicate<String> liveUses,
+            String gms, String gsf, String vending, String installed, String auto, String ondemand) {
+        Set<String> recorded = new HashSet<>(playDeps);
+        recorded.addAll(playSeenYes);
+        List<String> stack = List.of(gms, gsf, vending);
+        String need = null;
+        for (Map.Entry<String,String> e : keep.entrySet()) {
+            String p = e.getKey();
+            if (gms.equals(p) || gsf.equals(p)) continue; // providers are never demand sources
+            String mode = e.getValue();
+            boolean demands = vending.equals(p)
+                    ? playDeps.contains(p)
+                    : !appDeps(p, explicit, defaults, stack, recorded, gms, gsf, vending).isEmpty()
+                            || ((installed.equals(mode) || auto.equals(mode)) && liveUses.test(p));
+            if (!demands) continue;
+            if (modeRank(mode, installed, auto) > modeRank(need, installed, auto)) {
+                need = installed.equals(mode) ? installed : auto.equals(mode) ? auto : ondemand;
+            }
+        }
+        return need;
+    }
+
+    private static int modeRank(String m, String installed, String auto) {
+        return installed.equals(m) ? 3 : auto.equals(m) ? 2 : m != null ? 1 : 0;
     }
 }

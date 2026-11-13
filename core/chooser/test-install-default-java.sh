@@ -17,6 +17,8 @@
 # NWP-20261122-06 added the Play choice (PlayChoice, copied in by run.sh as-is): with play.wanted=1 Play Store, Play
 # services and GSF are kept On-demand whatever the bucket says, and a Play Store keep is recorded in nowhere-playdeps;
 # without the GrapheneOS App Store (Diaspore) the flag changes nothing.
+# NWP-20261129-16 (docs/product-decisions.md, 2026-11-05, "seventeen answers to harvest 59 ...", #7): a hand install of
+# Play Store with play.wanted=0 turns Play back On (C13's "0" arm and C15; M1-M9 did not move).
 # What it does NOT prove: the device run on that row (install from Aurora, set On-demand, uninstall in Settings, reinstall
 # in the same session; Your apps shows it Off, the bucket default).
 #
@@ -89,4 +91,11 @@ mut "M6 the replacing branch removed" 's/        if \(replacing\) \{\n          
 mut "M7 decide ignores the Play choice" 's/mode = PlayChoice\.keepModeOnInstall\(play, pkg, mode\);/;/' || fails=$((fails+1))
 mut "M8 the user keep of Play Store not recorded" 's/ProfileActivity\.setPlayDep\(ctx, pkg, true\);/;/' || fails=$((fails+1))
 mut "M9 decide acts on the flag without the GrapheneOS App Store" 's/ProfileActivity\.gosStorePresent\(ctx\)\);/true);/' || fails=$((fails+1))
+# NWP-20261129-16: the back-On flip.
+mut "N5 the read-back removed" 's/\n {12}play = PlayChoice\.effective\(PlayChoice\.parse\(ProfileActivity\.cfgStatic\(ctx, PlayChoice\.CFG_KEY\)\),\n\s*ProfileActivity\.gosStorePresent\(ctx\)\);/\n            play = PlayChoice.State.ON;/' || fails=$((fails+1))
+mut "N6 the flag written after keepModeOnInstall" 's/( {8}boolean backOn = false;\n.*?)( {8}mode = PlayChoice\.keepModeOnInstall\(play, pkg, mode\);\n)/$2$1/s' || fails=$((fails+1))
+mut "N7 the keepSetHas guard of the back-On playdep removed" 's/if \(!wrote && StoreInstaller\.keepSetHas\(ctx, PlayChoice\.VENDING\)\) \{/if (!wrote) {/' || fails=$((fails+1))
+mut "N8 clearTurnedOff dropped" 's/StoreInstaller\.clearTurnedOff\(ctx, java\.util\.Collections\.singleton\(PlayChoice\.VENDING\)\);/;/' || fails=$((fails+1))
+mut "N10 the marks dropped" 's/StoreInstaller\.keepInMode\(ctx, member, false, PlayChoice\.ONDEMAND\);/;/' || fails=$((fails+1))
+mut "N11 the on-this-phone test misses an archived package" 's/android\.content\.pm\.PackageManager\.MATCH_ARCHIVED_PACKAGES/0L/' || fails=$((fails+1))
 [ "$fails" -eq 0 ] && echo "== all mutations convicted" || { echo "== $fails mutation(s) not convicted"; exit 1; }

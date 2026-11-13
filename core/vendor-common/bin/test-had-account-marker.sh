@@ -144,7 +144,7 @@ is absent  no  1   pre   "pce=no -> a stale marker is cleared"
 echo "== NWP-20261104-05: the arrival record (count + mark hashes) in the user's CE dir =="
 # The reference hashes come from the HOST's printf + sha256sum, never from roamd's own helper.
 href(){ printf 'nowhere-acct-mark-v1:%s' "$1" | sha256sum | cut -d' ' -f1; }
-N1="alpha.planted@gmail.com"; N2="zeta.planted@gmail.com"
+N1="alpha.planted@example.com"; N2="zeta.planted@example.com"
 H1=$(href "$N1"); H2=$(href "$N2")
 for SH in "${SHELLS[@]}"; do
   t="[$(basename "$SH")]"

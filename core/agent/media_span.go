@@ -57,8 +57,8 @@ func fetchEssSpan(base string, key []byte, m chunkManifest, r essRegion) (frag [
 
 // materializeCarried brings another handset's new media into THIS session, instead of at the next login.
 //
-// It runs AFTER the head is published, on exactly the rels the carry selected -- "in the account head, never
-// in this session's login roster, absent locally". The carry already re-emitted those spans by hash, so the
+// It runs AFTER the head is put (in cap mode capFlush commits it later), on exactly the rels the carry selected --
+// "in the account head, never in this session's login roster, absent locally". The carry already re-emitted those spans by hash, so the
 // account head is correct either way; this only decides whether the bytes are on the phone now or after a
 // sign-out and back in, which Chester's answer to that suggestion was that it "is mostly not going to be an
 // option".
@@ -67,15 +67,23 @@ func fetchEssSpan(base string, key []byte, m chunkManifest, r essRegion) (frag [
 // mid-session would overwrite whatever this session did with the copy the head happens to hold. Per-rel is
 // not an optimization here, it is the only safe shape -- and it is why fetchEssSpan had to exist.
 //
-// BEST EFFORT, ALWAYS. A failure costs that one rel and nothing else: the head is already committed, the file
-// stays in it, and the next cycle tries again. Nothing here can fail a seal or a logoff.
-func materializeCarried(base string, key []byte, m chunkManifest, rels []string, dest string) ([]string, int64) {
+// BEST EFFORT, ALWAYS. A failure costs that one rel and nothing else: the carry has already put the file in the
+// head, it stays there, and the next cycle tries again. Nothing here can fail a seal or a logoff. At most budget
+// bytes land in one pass (NWP-20261129-25).
+func materializeCarried(base string, key []byte, m chunkManifest, rels []string, dest string, budget int64) ([]string, int64) {
 	var wrote []string
 	var total int64
 	waiting := 0
+	oversize := 0
 	defer func() { reportAppExtWaiting(waiting) }()
+	defer func() {
+		if oversize > 0 {
+			fmt.Printf("  media-sync: %d essential file(s) larger than the per-cycle budget (%d B) wait for the next login\n",
+				oversize, budget)
+		}
+	}()
 	for _, rel := range rels {
-		if rel == "" || strings.HasPrefix(rel, "/") || strings.Contains(rel, "..") {
+		if !syncRelOK(rel) {
 			continue // a rel out of our own manifest, but the write is the wrong place to start trusting it
 		}
 		r, ok := m.Ess[rel]
@@ -89,6 +97,18 @@ func materializeCarried(base string, key []byte, m chunkManifest, rels []string,
 		if _, _, _, _, err := appExtOwner(dest, target); errors.Is(err, errAppExtNotHere) {
 			waiting++ // NWP-20261011-47: no package dir to own it; it lands at the next login
 			continue
+		}
+		// NWP-20261129-25: the deferred tier's two rules (NWP-20261026-14). A file bigger than the WHOLE budget can
+		// never fit a cycle, so it must not end the cycle; it lands at the next login. A count only: a rel under
+		// Android/data names a package. What fits the budget but not what is left of it waits, in rel order.
+		if r.Size > budget {
+			oversize++
+			continue
+		}
+		if total+r.Size > budget {
+			fmt.Printf("  media-sync: essential budget spent at %d B -- %q and any after it wait for the next cycle\n",
+				total, rel)
+			break
 		}
 		frag, err := fetchEssSpan(base, key, m, r)
 		if err != nil {
@@ -117,6 +137,19 @@ func materializeCarried(base string, key []byte, m chunkManifest, rels []string,
 		total += int64(len(data))
 	}
 	return wrote, total
+}
+
+// syncRelOK: a ".." inside a name is an ordinary file name, a ".." segment is the traversal (NWP-20261129-49).
+func syncRelOK(rel string) bool {
+	if rel == "" || strings.HasPrefix(rel, "/") {
+		return false
+	}
+	for _, seg := range strings.Split(rel, "/") {
+		if seg == ".." {
+			return false
+		}
+	}
+	return true
 }
 
 // reportAppExtWaiting is the one line a materialize pass prints for the app-external rels it left for the next

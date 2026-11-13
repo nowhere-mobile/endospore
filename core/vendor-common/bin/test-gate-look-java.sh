@@ -1,26 +1,30 @@
 #!/usr/bin/env bash
-# test-gate-look-java.sh [--mutate] -- the gate's Light mode switch, and the call and alarm screens drawn from the
-# palette, under javac (NWP-20261115-16).
+# test-gate-look-java.sh [--mutate] -- the gate's owner-only look switch, the absent Light mode switch, and the call
+# and alarm screens drawn from the palette, under javac (NWP-20261115-16, NWP-20261130-13).
 #
 # WHY THIS IS COMMITTED. docs/product-decisions.md (2026-10-26) gives the gate a light mode: one device-wide setting,
 # changed only in Owner settings behind the owner passphrase, persisted with the gate's other user-0 settings, and it
 # includes the incoming-call and gate-alarm screens. NWP-20261115-15 built GatePalette and the read; this slice builds
 # the write. GateLookCopy.java is pure java, compiled as-is with core/chooser/tests/gate-look/GateLookCases.java, which
-# pins its six strings byte for byte. The PINS check the wiring the cases cannot see: the Appearance row in
-# buildOwnerMenu after Mobile data and before Device passphrase; buildGateLookScreen sets the switch state before its
-# listener, writes GatePalette.KEY with commit() (never apply()), recreate()s only on a commit that succeeded, puts the
-# switch back without the listener on a failure, and ends with the Back row and ownerScroll (the one-way-door guard);
-# applyGateBars returns at once for a dark palette; applyGateLook ends with applyGateBars; IncomingCallActivity and
+# pins its strings byte for byte. The PINS check the wiring the cases cannot see: the Appearance row in buildOwnerMenu
+# after Mobile data and before Device passphrase; buildGateLookScreen ends with the Back row and ownerScroll (the
+# one-way-door guard); applyGateBars returns at once for a dark palette; applyGateLook ends with applyGateBars; IncomingCallActivity and
 # GateAlarmActivity hold no colour literal, read the look first in buildUi and draw every role from it; and
 # docs/threat-model.md's nowhere_gate.xml row names gate_look.
 #
 # NWP-20261124-15 (docs/product-decisions.md, 2026-11-02, "twenty-four answers ...", #11): a second switch on the same
-# screen, "Only the owner can change the look", makes the look owner-only. The cases pin its two strings (C8, C9). L5
-# and L6 now read the Light switch's listener alone, since the screen holds two. L13 pins the second switch's words and
-# its place (below the Light switch's note, above the Back row); L14 its state, read from GateLookGlyph.OWNER_ONLY_KEY
+# screen, "Only the owner can change the look", makes the look owner-only. The cases pin its two strings (C8, C9). L13
+# pins the second switch's words and its place (below the intro, above the Back row); L14 its state, read from GateLookGlyph.OWNER_ONLY_KEY
 # before its listener is set; L15 its write of OWNER_ONLY_KEY with commit() (never apply()) and recreate() only on
 # success; L16 its revert without the listener and GateLookCopy.FAILED on a failed commit. L12 also wants
 # gate_look_owner_only in the threat-model row.
+#
+# NWP-20261130-13 (docs/product-decisions.md, 2026-11-06, "Owner settings loses Appearance ..."): the Light mode switch
+# is gone, so its pins L3-L6 are gone with it. The gate's sun/moon is the only light/dark control. The Appearance entry
+# and its screen stay only because they hold the owner-only switch (2026-11-02 #11), which the slice must keep reachable.
+# C10 pins that GateLookCopy holds none of the switch's words. L17 pins that the screen holds one switch, ownerSw, and
+# no reference to gate_look. L18 pins that toggleGateLook is the one writer of gate_look in the chooser, with no
+# remove() anywhere, so the stored value stays. L19 pins that the threat-model row no longer names the removed writer.
 #
 # ⚠ IT FAILS WHEN THERE IS NO JAVAC, IT NEVER SKIPS. javac comes from PATH, else from the build host's JDK below.
 #
@@ -37,6 +41,7 @@ SRCDIR="$root/core/chooser/src/com/nowhere/chooser"
 ACT="$SRCDIR/ChooserActivity.java"
 CPY="$SRCDIR/GateLookCopy.java"
 INC="$SRCDIR/IncomingCallActivity.java"
+PROF="$SRCDIR/ProfileActivity.java"
 ALM="$SRCDIR/GateAlarmActivity.java"
 TM="$root/docs/threat-model.md"
 CASES="$root/core/chooser/tests/gate-look/GateLookCases.java"
@@ -109,6 +114,8 @@ nth() {
 
 # NOWHERE-1222's colour-literal pattern (test-gate-palette-java.sh).
 FORBIDDEN='0[xX][0-9A-Fa-f]{8}|parseColor\(|Color\.(BLACK|WHITE|GRAY|DKGRAY|LTGRAY|RED|GREEN|BLUE|YELLOW|CYAN|MAGENTA)\b'
+# NWP-20261130-13: a call that changes the stored look.
+LOOK_WRITE='(putString|remove)\((GatePalette\.KEY|"gate_look")'
 READ_LOOK='pal = GatePalette.forLook(getSharedPreferences("nowhere_gate", MODE_PRIVATE).getString(GatePalette.KEY, null));'
 BARS_CALL='ChooserActivity.applyGateBars(getWindow(), pal);'
 INC_ROLES='root.setBackgroundColor(pal.callBg);|statusView.setTextColor(pal.callLabel);|numberView.setTextColor(pal.callInk);|timerView.setTextColor(pal.callTimer);|bigBtn("Decline", pal.decline,|bigBtn("Answer", pal.answer,|bigBtn("Mute", pal.neutralBtn,|bigBtn("Speaker", pal.neutralBtn,|bigBtn("Hang up", pal.decline,|b.setTextColor(pal.onBtn);'
@@ -147,10 +154,11 @@ screen() {
 }
 
 # suite <ChooserActivity.java> <GateLookCopy.java> <IncomingCallActivity.java> <GateAlarmActivity.java> <threat-model.md>
+#       <ProfileActivity.java>
 # -> 0 pass, 1 a case or a pin failed, 2 a source is missing, 3 the class did not compile. Only 1 convicts a mutant.
 suite() {
-  local f="$1" cpy="$2" inc="$3" alm="$4" tm="$5" rc x b lb ob ln lmd lpass lset llis l1 l2 l3 l4 last prev next n fails=0
-  for x in "$f" "$cpy" "$inc" "$alm" "$tm" "$CASES"; do [ -f "$x" ] || { echo "  missing $x" >&2; return 2; }; done
+  local f="$1" cpy="$2" inc="$3" alm="$4" tm="$5" prof="$6" rc x b ob ln lmd lpass lset llis l1 l2 l3 l4 last prev next n fails=0
+  for x in "$f" "$cpy" "$inc" "$alm" "$tm" "$prof" "$CASES"; do [ -f "$x" ] || { echo "  missing $x" >&2; return 2; }; done
   cases "$cpy"; rc=$?
   case "$rc" in 0) ;; 1) fails=1 ;; 3) echo "  the class or the cases did not compile" >&2; return 3 ;; *) return 2 ;; esac
 
@@ -169,45 +177,22 @@ suite() {
   b=$(nocomment "$(body "$f" 'private View buildGateLookScreen() {')")
   if [ -z "$b" ]; then echo "--- FAIL L2: no buildGateLookScreen() in $f" >&2; fails=1
   else
-    for x in 'ownerColumn(GateLookCopy.ROW)' 'setText(GateLookCopy.INTRO)' 'setText(GateLookCopy.SWITCH)' 'setText(GateLookCopy.NOTE)'; do
+    for x in 'ownerColumn(GateLookCopy.ROW)' 'setText(GateLookCopy.INTRO)'; do
       one "$b" "$x" L2 >/dev/null || fails=1
     done
-    # L3 the state before the listener, so loading never writes back.
-    if lset=$(one "$b" 'lookSw.setChecked(GatePalette.forLook(getSharedPreferences("nowhere_gate", MODE_PRIVATE).getString(GatePalette.KEY, null)) == GatePalette.LIGHT);' L3) \
-       && llis=$(one "$b" 'lookSw.setOnCheckedChangeListener(new ' L3); then
-      [ "$lset" -lt "$llis" ] || { echo "--- FAIL L3: setChecked at $lset is not before the listener at $llis" >&2; fails=1; }
-    else fails=1
-    fi
-    # The two listeners: the Light switch's (L4-L6) and the owner-only switch's (L15, L16).
-    lb=$(listener "$b" lookSw); ob=$(listener "$b" ownerSw)
-    [ -n "$lb" ] || { echo "--- FAIL L3: no listener on lookSw" >&2; fails=1; }
+    # L17 no Light mode switch: the one switch here is the owner-only one, and nothing here touches gate_look.
+    none_re "$b" 'lookSw|GatePalette\.KEY|GateLookCopy\.(SWITCH|NOTE)|putString\(' 'L17 the light switch in buildGateLookScreen' || fails=1
+    one "$b" 'new android.widget.Switch(' L17 >/dev/null || fails=1
+    ob=$(listener "$b" ownerSw)
     [ -n "$ob" ] || { echo "--- FAIL L14: no listener on ownerSw" >&2; fails=1; }
-    # L4 commit(), never apply().
-    one "$lb" 'boolean ok = getSharedPreferences("nowhere_gate", MODE_PRIVATE).edit().putString(GatePalette.KEY, GatePalette.valueFor(c)).commit();' L4 >/dev/null || fails=1
-    none_re "$b" '\.apply\(\)' 'L4 apply() in buildGateLookScreen' || fails=1
-    n=$(printf '%s\n' "$lb" | grep -c 'OWNER_ONLY_KEY' || true)
-    [ "$n" = 0 ] || { echo "--- FAIL L4: the Light switch's listener writes GateLookGlyph.OWNER_ONLY_KEY" >&2; fails=1; }
-    # L5 recreate() only on the true branch of the commit.
-    if ln=$(one "$lb" 'recreate();' L5); then
-      prev=$(nth "$lb" $((ln - 1))); next=$(nth "$lb" $((ln + 1)))
-      [ "$prev" = 'if (ok) {' ] && [ "$next" = 'return;' ] || {
-        echo "--- FAIL L5: recreate() is not alone in 'if (ok) { ... return; }': before '$prev', after '$next'" >&2; fails=1; }
-    else fails=1
-    fi
-    # L6 a failed commit puts the switch back without firing the listener, then says so.
-    if l1=$(one "$lb" 'b.setOnCheckedChangeListener(null);' L6) && l2=$(one "$lb" 'b.setChecked(!c);' L6) \
-       && l3=$(one "$lb" 'b.setOnCheckedChangeListener(this);' L6); then
-      [ "$l1" -lt "$l2" ] && [ "$l2" -lt "$l3" ] || { echo "--- FAIL L6: the revert is out of order ($l1 $l2 $l3)" >&2; fails=1; }
-    else fails=1
-    fi
-    one "$lb" 'GateLookCopy.FAILED' L6 >/dev/null || fails=1
-    # L13 the owner-only switch's words, below the Light switch's note and above the Back row.
+    none_re "$b" '\.apply\(\)' 'L15 apply() in buildGateLookScreen' || fails=1
+    # L13 the owner-only switch's words, below the intro and above the Back row.
     one "$b" 'ownerSw.setText(GateLookCopy.OWNER_ONLY);' L13 >/dev/null || fails=1
     one "$b" 'setText(GateLookCopy.OWNER_ONLY_NOTE)' L13 >/dev/null || fails=1
-    if l1=$(one "$b" 'll.addView(note, np);' L13) && l2=$(one "$b" 'll.addView(ownerSw, op);' L13) \
+    if l1=$(one "$b" 'll.addView(intro, ip);' L13) && l2=$(one "$b" 'll.addView(ownerSw, op);' L13) \
        && l3=$(one "$b" 'll.addView(ownerNote, onp);' L13) && l4=$(one "$b" 'll.addView(ownerBack(' L13); then
       [ "$l1" -lt "$l2" ] && [ "$l2" -lt "$l3" ] && [ "$l3" -lt "$l4" ] || {
-        echo "--- FAIL L13: order: Light note at $l1, owner-only switch at $l2, its note at $l3, Back at $l4" >&2; fails=1; }
+        echo "--- FAIL L13: order: intro at $l1, owner-only switch at $l2, its note at $l3, Back at $l4" >&2; fails=1; }
     else fails=1
     fi
     # L14 the owner-only state, from OWNER_ONLY_KEY, before its listener.
@@ -274,33 +259,50 @@ suite() {
     done
   fi
 
+  # L18 the sun/moon is the chooser's one writer of gate_look, and nothing removes the stored value.
+  b=$(nocomment "$(cat "$f")")
+  n=$(printf '%s\n' "$b" | grep -cE "$LOOK_WRITE" || true)
+  [ "$n" = 1 ] || { echo "--- FAIL L18: $n lines change gate_look in ChooserActivity, want 1" >&2; fails=1; }
+  b=$(nocomment "$(body "$f" 'private void toggleGateLook() {')")
+  one "$b" 'boolean ok = getSharedPreferences("nowhere_gate", MODE_PRIVATE).edit().putString(GatePalette.KEY, GateLookGlyph.next(stored)).commit();' L18 >/dev/null || fails=1
+  b=$(grep -nE "$LOOK_WRITE" "$prof" || true)
+  x=$(grep -rnE --include='*.java' --exclude=ChooserActivity.java --exclude=ProfileActivity.java "$LOOK_WRITE" "$SRCDIR" || true)
+  [ -z "$b$x" ] || { echo "--- FAIL L18: another class changes gate_look: $b$x" >&2; fails=1; }
+
+  # L19 the threat-model row does not name the removed writer. (L12 has already refused a row count that is not 1.)
+  b=$(grep -F '| `shared_prefs/nowhere_gate.xml` |' "$tm" || true)
+  for x in 'Light mode' 'by the owner in Owner settings'; do
+    case "$b" in *"$x"*) echo "--- FAIL L19: the nowhere_gate.xml row still holds $x" >&2; fails=1 ;; esac
+  done
+
   [ "$fails" = 0 ] || return 1
   echo "  pins ok"
 }
 
 echo "== $ACT"
-suite "$ACT" "$CPY" "$INC" "$ALM" "$TM" || { echo "FAILED"; exit 1; }
+suite "$ACT" "$CPY" "$INC" "$ALM" "$TM" "$PROF" || { echo "FAILED"; exit 1; }
 [ "$MUTATE" = yes ] || exit 0
 
 echo "== mutations (each must be CONVICTED: rc 1 with a --- FAIL line)"
 fails=0
-# mut <label> <target: act|copy|inc|alarm|tm> <perl-expr> [<substring the failure output must hold>]
+# mut <label> <target: act|copy|inc|alarm|tm|prof> <perl-expr> [<substring the failure output must hold>]
 mut() {
   local label="$1" target="$2" expr="$3" expect="${4:-}" d rc src copy
   d=$(mktemp -d -p "$W")
   cp "$ACT" "$d/ChooserActivity.java"; cp "$CPY" "$d/GateLookCopy.java"; cp "$INC" "$d/IncomingCallActivity.java"
-  cp "$ALM" "$d/GateAlarmActivity.java"; cp "$TM" "$d/threat-model.md"
+  cp "$ALM" "$d/GateAlarmActivity.java"; cp "$TM" "$d/threat-model.md"; cp "$PROF" "$d/ProfileActivity.java"
   case "$target" in
     act) src="$ACT"; copy="$d/ChooserActivity.java" ;;
     copy) src="$CPY"; copy="$d/GateLookCopy.java" ;;
     inc) src="$INC"; copy="$d/IncomingCallActivity.java" ;;
     alarm) src="$ALM"; copy="$d/GateAlarmActivity.java" ;;
     tm) src="$TM"; copy="$d/threat-model.md" ;;
+    prof) src="$PROF"; copy="$d/ProfileActivity.java" ;;
   esac
   perl -0pi -e "$expr" "$copy"
   if cmp -s "$copy" "$src"; then echo "  INERT     $label"; fails=$((fails+1)); return; fi
   suite "$d/ChooserActivity.java" "$d/GateLookCopy.java" "$d/IncomingCallActivity.java" "$d/GateAlarmActivity.java" \
-    "$d/threat-model.md" >"$d/out" 2>&1; rc=$?
+    "$d/threat-model.md" "$d/ProfileActivity.java" >"$d/out" 2>&1; rc=$?
   if [ "$rc" = 1 ] && grep -q -- '--- FAIL' "$d/out" && { [ -z "$expect" ] || grep -qF -- "$expect" "$d/out"; }; then
     echo "  CONVICTED $label"
     grep -m1 -- '--- FAIL' "$d/out" | sed 's/^/      /'
@@ -309,14 +311,11 @@ mut() {
   fi
 }
 mut 'M1 the Appearance row removed' act 's/\n[ \t]*ll\.addView\(settingsRow\(GateLookCopy\.ROW[^\n]*//' 'L1'
-mut 'M2 apply() for commit()' act 's/GatePalette\.valueFor\(c\)\)\.commit\(\);/GatePalette.valueFor(c)).apply();/' 'L4'
-mut 'M3 recreate() also on a failed commit' act 's/(\n[^\n]*GateLookCopy\.FAILED[^\n]*)/$1\n                recreate();/' 'L5'
-mut 'M4 the listener set before setChecked' act 's/(\n[ \t]*lookSw\.setChecked\([^\n]*)(\n[ \t]*lookSw\.setOnCheckedChangeListener\(new .*?\n        \}\);)/$2$1/s' 'L3'
 mut 'M5 applyGateBars without its dark early return' act 's/\n[ \t]*if \(!p\.lightBars\) return;//' 'L8'
 mut "M6 GateAlarmActivity's Dismiss back to its literal" alarm 's/bigBtn\("Dismiss", pal\.answer,/bigBtn("Dismiss", 0xFF2FA84F,/' 'L10'
 mut "M7 IncomingCallActivity's buildUi with no look read" inc 's/\n[ \t]*pal = GatePalette\.forLook\([^\n]*//' 'L10'
 mut 'M8 gate_look dropped from the threat-model row' tm 's/^(\| `shared_prefs\/nowhere_gate\.xml` \|[^\n]*)$/my $r = $1; $r =~ s{`gate_look`}{}g; $r/me' 'L12'
-mut 'M9 a GateLookCopy string changed' copy "s/for this phone's gate/for this phone/" 'C2'
+mut 'M9 a GateLookCopy string changed' copy "s/Who can change this phone's look/Who can change the look/" 'C2'
 mut 'M10 the Back row removed from buildGateLookScreen' act 's/(GateLookCopy\.FAILED.*?)\n[ \t]*ll\.addView\(ownerBack\([^\n]*/$1/s' 'L7'
 mut 'M11 applyGateLook without applyGateBars' act 's/\n[ \t]*applyGateBars\(getWindow\(\), p\);//' 'L9'
 mut 'M12 (G3) the owner-only switch writes with apply()' act 's/putBoolean\(GateLookGlyph\.OWNER_ONLY_KEY, c\)\.commit\(\);/putBoolean(GateLookGlyph.OWNER_ONLY_KEY, c).apply();/' 'L15'
@@ -326,5 +325,12 @@ mut 'M15 recreate() also on a failed owner-only commit' act 's/(ownerSw\.setOnCh
 mut 'M16 the owner-only revert removed' act 's/(ownerSw\.setOnCheckedChangeListener\(new .*?)\n[ \t]*b\.setChecked\(!c\);/$1/s' 'L16'
 mut 'M17 gate_look_owner_only dropped from the threat-model row' tm 's/^(\| `shared_prefs\/nowhere_gate\.xml` \|[^\n]*)$/my $r = $1; $r =~ s{`gate_look_owner_only`}{}g; $r/me' 'L12'
 mut 'M18 the OWNER_ONLY string changed' copy 's/Only the owner can change the look/Only the owner changes the look/' 'C8'
+mut 'M19 a Light mode switch back on the Appearance screen' act 's/(private View buildGateLookScreen\(\) \{.*?ll\.addView\(intro, ip\);)/$1\n        final android.widget.Switch lookSw = GateSwitch.style(new android.widget.Switch(this), GatePalette.active());\n        ll.addView(lookSw, ip);/s' 'L17'
+mut 'M20 the owner-only listener also writes gate_look' act 's/(boolean ok = [^\n]*putBoolean\(GateLookGlyph\.OWNER_ONLY_KEY, c\)\.commit\(\);)/$1\n                getSharedPreferences("nowhere_gate", MODE_PRIVATE).edit().putString(GatePalette.KEY, "dark").commit();/' 'L18'
+mut 'M21 the sun/moon no longer writes gate_look' act 's/boolean ok = [^\n]*putString\(GatePalette\.KEY, GateLookGlyph\.next\(stored\)\)\.commit\(\);/boolean ok = true;/' 'L18'
+mut 'M22 the Light mode string back in GateLookCopy' copy 's/(static final String FAILED)/static final String SWITCH = "Light mode";\n    $1/' 'C10'
+mut 'M23 Light mode back in the threat-model row' tm 's/^(\| `shared_prefs\/nowhere_gate\.xml` \|)/$1 Light mode/m' 'L19'
+mut 'M24 ProfileActivity writes gate_look' prof 's/(\n[^\n]*\bclass ProfileActivity\b[^\n]*\{)/$1\n    private void x() { getSharedPreferences("nowhere_gate", MODE_PRIVATE).edit().putString(GatePalette.KEY, "light").commit(); }/' 'L18'
+mut 'M25 the gate start clears the stored look' act 's/(\n[ \t]*private void applyGateLook\(\) \{)/$1\n        getSharedPreferences("nowhere_gate", MODE_PRIVATE).edit().remove(GatePalette.KEY).commit();/' 'L18'
 [ "$fails" = 0 ] || { echo "FAILED: $fails mutant(s) not convicted"; exit 1; }
 echo "all mutants convicted"

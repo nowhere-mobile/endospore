@@ -162,11 +162,14 @@ func deriveKeyForget() {
 // phone at rest at the gate held the last profiles' names, passphrases and root keys. The whole map goes, so a
 // same-boot sign-in of any profile recomputes one Argon2 pass per scope (the accepted cost, the work #80's memo
 // saved). Like the cold lock it drops live references only: Go does not zero freed memory. why is a fixed literal at
-// every call site -- never a name, uid or ref -- so the line is the same for every profile.
+// every call site -- never a name, uid or ref -- so the line is the same for every profile. It also forgets the two
+// billing latches (h60 #18), which are keyed by the holder key; the landed sign-out's call is the one that runs after
+// the sign-out renewal, because the reap's own forget can land while that renewal is still running.
 func forgetSessionKeys(why string) {
 	deriveKeyForget()
 	fmt.Fprintf(os.Stderr, "[logind] KDF cache forgotten (%s) (dn-1106 #1)\n", why)
-	resetStorageCount() // NWP-20261118-06: the session's last storage count is RAM only
+	resetStorageCount()    // NWP-20261118-06: the session's last storage count is RAM only
+	forgetBillingLatches() // h60 #18 (NWP-20261201-37): the billing latches are keyed by the holder key
 }
 
 // headKey resolves the ref a profile's head CURRENTLY lives at: v2 if present (migrated or new), else the
@@ -3058,10 +3061,24 @@ var (
 // protects the seal -- it holds even if a future caller here gets it wrong.
 func laneFor(op string) workerLane {
 	switch op {
-	case "storagebreakdown", "sealdelta", "uiderrors", "alarmrelay":
+	case "storagebreakdown", "sealdelta", "uiderrors", "alarmrelay", "gmsexits":
 		// uiderrors: NWP-20261010-06, one framework file read. alarmrelay: NWP-20261108-02 (Q183), one
 		// `am startservice` of the session's own service; it rides here so a cold lock taken behind an abandoned RW
-		// op still relays the next alarm.
+		// op still relays the next alarm. gmsexits: NWP-20261201-02, one `dumpsys activity exit-info`, uid only.
+		return laneRO
+	case "playrestart":
+		// NWP-20261201-10: a health notice's Fix, one `am force-stop` of Play services in the session's user.
+		return laneRO
+	case "gmsstate":
+		// NWP-20261201-01: two read-only activity-manager dumps for an issue report. Its own arm because
+		// test-alarmrelay-lane.sh pins the case line above byte for byte.
+		return laneRO
+	case "healthprobe":
+		// NWP-20261201-08: the health checks' one `dumpsys activity oom` read. Its own arm because
+		// test-alarmrelay-lane.sh pins the case line above byte for byte.
+		return laneRO
+	case "odblock":
+		// NWP-20261130-03: the launch barrier of a just-installed unfetched app must not wait behind a seal.
 		return laneRO
 	case "armcred", "rekey":
 		// #147: the keyguard arm (login, screen-off, cold-lock ladder, and the cold-lock abort's rekey unwind,
@@ -3099,6 +3116,21 @@ func workerWaitCap(op string) time.Duration {
 		// NWP-20261010-06: reads the tail of one framework file for an issue report, whose preview the user is
 		// waiting on. A busy answer costs the report one honest "not collected" line, never the report.
 		return 10 * time.Second
+	case "playrestart":
+		// NWP-20261201-10: a tap on a health notice's Fix, whose receiver waits 20 s; on a busy lane the user can tap again.
+		return 10 * time.Second
+	case "gmsstate":
+		// NWP-20261201-01: two activity-manager dumps for an issue report, whose preview the user is waiting on. A busy
+		// answer costs the report one honest "not collected" line, never the report.
+		return 10 * time.Second
+	case "gmsexits":
+		// NWP-20261201-02: one dumpsys for an issue report, whose preview the user is waiting on. Inside gmsExitsWait,
+		// so a busy lane answers "not-collected-lane" before the report's own wait ends.
+		return 10 * time.Second
+	case "healthprobe":
+		// NWP-20261201-08: a periodic check nobody waits for. A busy answer is one unmeasured check, and the next
+		// tick measures again.
+		return 10 * time.Second
 	case "logscrub":
 		// NWP-20261027-02: a failed sign-in's log scrub is housekeeping nobody waits for; if the lane stays busy
 		// that long the next reap or boot scrubs instead.
@@ -3111,6 +3143,10 @@ func workerWaitCap(op string) time.Duration {
 		// NWP-20261108-02: asked by the cold-lock teardown while it holds the RW slot. A storage walk can hold the
 		// RO slot for minutes; a busy answer only keeps the gate's last periodic relay, which relayAlarmAtLock logs.
 		return 3 * time.Second
+	case "odblock":
+		// NWP-20261130-03: a storage walk can hold the RO slot for minutes. On a busy answer odLaunchBarrier tries again in
+		// the background while odrestore waits for the RW lane; whichever lane comes free first blocks the app.
+		return 20 * time.Second
 	case "evictcheck":
 		// NWP-20261004-01: a cache drop and two reads. Its caller is the gate's EVICT-RECHECK, which simply asks
 		// again a minute later on a busy answer, so waiting behind a login's restore buys nothing.
@@ -5119,6 +5155,7 @@ func capFlush(n uint64) {
 				if promoted != nil && len(w.PlanQueue) > 0 {
 					w.PlanGB, w.PlanPeriods, w.PlanKeep, w.PlanQueue, w.ActivateAfter = promoted.PlanGB, promoted.PlanPeriods, promoted.PlanKeep, promoted.PlanQueue, promoted.ActivateAfter
 					w.PlanConvert = promoted.PlanConvert
+					w.PlanID = promoted.PlanID
 				}
 			}
 			// NWP-20260906-03: A LEASE THAT BOUGHT NOTHING MAY NOT WRITE PaidThrough. recordCoverage assigns
@@ -7552,7 +7589,10 @@ func pushProfile(base, profile, pass, src string) {
 	//   stale-base -- only when the media carry cannot excuse it. mediaCarryRan is set only under
 	//     mediaEssentialCarryOn(profile), so a profile without it is refused here; one with it keeps the
 	//     guard after the walk, where its "allowed" arm still applies.
-	//   no-receipt -- unconditional.
+	//   no-receipt -- with one exemption: a #media session whose sign-in PROVED there was no head, with the carry on
+	//     (noHeadCarryMayExcuse). It goes on to the walk and is refused there unless the carry folds the stored head
+	//     in. The cost: such a session walks and uploads before a carry decline refuses it, so the #120 orphans apply
+	//     to that rare decline only.
 	// WHAT CHANGES: each early refusal now leases and uploads nothing. For an input that trips one of these
 	// AND `blind`, the reported reason is now stale-base/no-receipt, not blind. All three are final, so
 	// END-UNSAVED is offered either way; the blind dialog is not shown for such an input, since dropping the
@@ -7560,6 +7600,7 @@ func pushProfile(base, profile, pass, src string) {
 	// THE (c) TRADE -- guards that stay after the walk because each needs its result: blind (sealBlind),
 	// shrink and apps-vanished (the new chunk counts), and the carry-excused stale-base.
 	// NOWHERE_SEAL_FORCE=1 overrides all of them, as before.
+	noReceiptDeferred := false // NWP-20261201-11: refused after the carry, not here (noHeadCarryMayExcuse)
 	if os.Getenv("NOWHERE_SEAL_FORCE") != "1" {
 		oldN := len(oldM.Chunks)
 		if !mediaEssentialCarryOn(profile) && oldN > 0 && restoreReceiptDir() != "" && haveRestoreReceipt(rcptRef) {
@@ -7577,10 +7618,15 @@ func pushProfile(base, profile, pass, src string) {
 			}
 		}
 		if oldN > 0 && restoreReceiptDir() != "" && !haveRestoreReceipt(rcptRef) {
-			sealRefusedWhy = "no-receipt"
-			fmt.Printf("push: profile %s SEAL REFUSED -- no restore-completion receipt for a non-empty head (%d chunks); refusing to overwrite good data with a partial/incomplete session (set NOWHERE_SEAL_FORCE=1 to override)\n", logProfile(profile), oldN)
-			sealRefused = true // #111: a refusal is NOT success -- main exits exitSealRefused after the defers run
-			return
+			if noHeadCarryMayExcuse(profile, rcptRef) {
+				noReceiptDeferred = true
+				fmt.Printf("push: profile %s no restore receipt, but this session's sign-in proved there was no #media head: the seal goes on and is refused after the walk unless the carry folds the stored head in (NWP-20261201-11)\n", logProfile(profile))
+			} else {
+				sealRefusedWhy = "no-receipt"
+				fmt.Printf("push: profile %s SEAL REFUSED -- no restore-completion receipt for a non-empty head (%d chunks); refusing to overwrite good data with a partial/incomplete session (set NOWHERE_SEAL_FORCE=1 to override)\n", logProfile(profile), oldN)
+				sealRefused = true // #111: a refusal is NOT success -- main exits exitSealRefused after the defers run
+				return
+			}
 		}
 	}
 	oldSizes := map[string]int64{}
@@ -7664,6 +7710,11 @@ func pushProfile(base, profile, pass, src string) {
 	if isSharedMediaScope(profile) {
 		landedPre = loadLandedRoster(rcptRef, dk)
 	}
+	// NWP-20261130-03: this scope's unfetched list (bare vault and #de only), read ONCE, so the walk's exclusion, the
+	// carry and the guard below all judge the same set: a fetch that lands mid-seal cannot make the walk skip a package
+	// and the carry or the guard then forget it. walkExcl is the list minus the drop set: an Off app is a deletion,
+	// priced by the walk's drop branch, never excluded as unfetched.
+	unfList, unfListOK, walkExcl := sealUnfetchedList(profile)
 	if incrementalSeal() {
 		// Incremental (#69): walk files, chunk file-aligned, and skip re-reading unchanged large files via the
 		// scan cache. A periodic full re-hash self-heals a content change that kept an identical mtime+size.
@@ -7719,8 +7770,8 @@ func pushProfile(base, profile, pass, src string) {
 		}
 		thr := effThreshold
 		walkT0 := time.Now()
-		ranges, seen, deferredR, carriedDef, sealBlind, sealDropped, sealStats, sealDiscard = walkChunks(src, sc, thr, forceFull, ondemandMedia() && sealScopeDefers(profile), oldM.Deferred,
-			unders, pins, tiers, budget, sealChunk, cachedChunk, func(n int64) { atomic.AddInt64(&doneBytes, n) }, acct)
+		ranges, seen, deferredR, carriedDef, sealBlind, sealDropped, sealStats, sealDiscard = walkChunksExcl(src, sc, thr, forceFull, ondemandMedia() && sealScopeDefers(profile), oldM.Deferred,
+			unders, pins, tiers, budget, sealChunk, cachedChunk, func(n int64) { atomic.AddInt64(&doneBytes, n) }, acct, walkExcl)
 		if sealAfterWalkHook != nil {
 			sealAfterWalkHook()
 		}
@@ -7736,6 +7787,7 @@ func pushProfile(base, profile, pass, src string) {
 		}
 		fmt.Printf("push: profile %s group cache: %d of %d group(s) reused, %d small file(s) not read, walk %s%s\n",
 			logProfile(profile), gHits, gTotal, gSkipped, time.Since(walkT0).Round(time.Millisecond), full)
+		fmt.Printf("push: profile %s changed since the last seal: %s\n", logProfile(profile), sealWriterLine(sc.sealWriterStats(), forceFull))
 		// NWP-20261123-04: a #media walk equal to the last landed seal's, over the same head, ends here -- no carry,
 		// no manifest, no lease, no head write (media_nochange.go has every condition).
 		if isSharedMediaScope(profile) {
@@ -7756,7 +7808,7 @@ func pushProfile(base, profile, pass, src string) {
 		// split returns is ordered behind that write. sealDropped rides the same ordering: without plumbing
 		// it out of the legacy path too, a drop-caused shrink HERE would meet a bare guard and be REFUSED --
 		// the incremental walk is not the only one that runs.
-		go func() { sealDropped, tarErr = tarDirTo(src, pw); pw.CloseWithError(tarErr) }()
+		go func() { sealDropped, tarErr = tarDirToExcl(src, pw, walkExcl); pw.CloseWithError(tarErr) }()
 		cdcSplit(pr, func(c []byte) { sealChunk(c) })
 		if tarErr != nil {
 			fail(tarErr.Error())
@@ -8077,6 +8129,16 @@ func pushProfile(base, profile, pass, src string) {
 		sealRefused = true // #111: a refusal is NOT success -- main exits exitSealRefused after the defers run
 		return
 	}
+	// NWP-20261201-11: THE DEFERRED NO-RECEIPT REFUSAL. This session proved there was no #media head at sign-in and holds
+	// no receipt; it reached the walk only on the promise that the carry folds in the head that exists now. It covers
+	// every decline: the bootstrap case, NOWHERE_SEAL_FULL, no chunks.
+	if noReceiptDeferred && !mediaCarryRan {
+		sealRefusedWhy = "no-receipt"
+		fmt.Printf("push: profile %s SEAL REFUSED -- no restore receipt and the carry did not run, so the stored head (%d chunks) would be overwritten by a session that never held it; the stored head stands (set NOWHERE_SEAL_FORCE=1 to override) (NWP-20261201-11)\n",
+			logProfile(profile), len(oldM.Chunks))
+		sealRefused = true // #111: a refusal is NOT success -- main exits exitSealRefused after the defers run
+		return
+	}
 	landRels := relsWithout(carryRels, unlanded) // the post-seal sync never lands what the lander owns
 	if len(carryRels) > 0 {
 		// ⚠ THE CARRIED REGIONS GO BEFORE THE TAR FOOTER, NOT AFTER THE END OF THE LIST. walkChunks closes the
@@ -8104,8 +8166,9 @@ func pushProfile(base, profile, pass, src string) {
 
 	// NWP-20261129-03: an unfetched package's stored chunks go forward by hash (unfetched_carry.go), before the sizes
 	// loop so a carried chunk is sized from oldSizes. The shrink guard counts them through carriedChunks. The guard
-	// block's "belongs to the fetch slice" sentence below predates this carry.
-	chunks, unfSpans, unfPkg, unfN := sealCarryUnfetched(profile, oldM, chunks, acct, deferredMap)
+	// block's "belongs to the fetch slice" sentence below predates this carry. NWP-20261130-03: the list is the one the
+	// walk excluded by (unfList above).
+	chunks, unfSpans, unfPkg, unfN := sealCarryUnfetched(profile, oldM, chunks, acct, deferredMap, unfList, unfListOK)
 	carriedChunks += unfN
 
 	// Per-chunk sealed sizes for the manifest (#85): freshly-sealed chunks come from sizeOf; unchanged ones are
@@ -8390,7 +8453,8 @@ func pushProfile(base, profile, pass, src string) {
 		// PER PHASE -- the precise complement of the shrink-count net below. An empty/new head (oldN==0, e.g. a
 		// freshly created vault, or a legacy non-CDC head restored atomically) has nothing to protect, so it's
 		// exempt and the first real seal proceeds (and records the receipt). Inert off-device (no state dir ->
-		// restoreReceiptDir()==""), so host CLI / tests are unchanged.
+		// restoreReceiptDir()==""), so host CLI / tests are unchanged. One exemption (NWP-20261201-11): a #media session
+		// whose sign-in proved there was no head passes when the carry folds the stored head in (noHeadCarryMayExcuse).
 		// NWP-20260907-13: EXISTENCE IS NOT ENOUGH FOR TWO HANDSETS, and this is the shape expectRef
 		// structurally cannot see. That guard samples the head at the START of this push and compares at
 		// the PUT, so it catches a head that moved DURING a seal -- about one round trip. The common
@@ -8743,15 +8807,17 @@ func pushProfile(base, profile, pass, src string) {
 		// an empty copy over it" half of the 2026-10-26 #2 guards (docs/product-decisions.md): once a sign-in skips
 		// an On-demand or Auto app's CE/DE data, this seal walks a tree without that app's hold, and publishing it
 		// would drop the app's messages and settings from the ACCOUNT. The verdict reads the stored head's Pkg
-		// index (unfetched_guard.go). The carry half needs a per-package span index that vault and #de heads do
-		// not carry (grouped small files span packages); it belongs to the fetch slice.
+		// index (unfetched_guard.go). ~~The carry half needs a per-package span index that vault and #de heads do
+		// not carry (grouped small files span packages); it belongs to the fetch slice.~~ (Superseded by NWP-20261127-01
+		// and NWP-20261129-03: the span index and the carry, unfetched_carry.go.) NWP-20261130-03: the sign-in restore
+		// now writes the list, one per scope (unfetched_fetch.go), and the guard reads the set pushProfile read once.
 		//
 		// No list means today's behaviour, byte for byte. An unreadable list, or a listed package with no Pkg
 		// index for this seal (NOWHERE_SEAL_FULL=1 has no per-file boundaries), is "not measured", never "nothing
 		// dropped". The log carries a count or nothing, never a package name (NWP-20261119-02). Both reasons are
 		// RETRY class (end_unsaved.go refusalReasonFinal).
 		if strings.IndexByte(profile, '#') < 0 || strings.HasSuffix(profile, "#de") {
-			unf, unfOK := loadUnfetchedList()
+			unf, unfOK := unfList, unfListOK
 			if !unfOK || (len(unf) > 0 && len(pkgBytes) == 0) {
 				fmt.Printf("push: profile %s SEAL REFUSED -- cannot tell which unfetched packages this seal carries (NWP-20261124-06): the unfetched list could not be read, or this seal built no per-package index; the stored head is intact\n", logProfile(profile))
 				sealRefusedWhy = "unfetched-unknown"
@@ -8769,6 +8835,13 @@ func pushProfile(base, profile, pass, src string) {
 				}
 				if n := unfetchedDropped(oldM.Pkg, wasRels, pkgBytes, nowRels, unf, loadDropList()); n > 0 {
 					fmt.Printf("push: profile %s SEAL REFUSED -- %d unfetched package(s) the stored head carries are absent from this seal (NWP-20261124-06); the stored head is intact\n", logProfile(profile), n)
+					sealRefusedWhy = "unfetched-dropped"
+					sealRefused = true // #111: a refusal is NOT success -- main exits exitSealRefused after the defers run
+					return
+				}
+				// NWP-20261130-03: and each one goes forward by its stored span, never by a copy the phone holds.
+				if n := unfetchedNotCarried(oldM.Pkg, unfSpans, unf, loadDropList()); n > 0 {
+					fmt.Printf("push: profile %s SEAL REFUSED -- %d unfetched package(s) the stored head carries would not go forward by their stored span (NWP-20261130-03); the stored head is intact\n", logProfile(profile), n)
 					sealRefusedWhy = "unfetched-dropped"
 					sealRefused = true // #111: a refusal is NOT success -- main exits exitSealRefused after the defers run
 					return
@@ -8918,35 +8991,45 @@ func pushProfile(base, profile, pass, src string) {
 	// only lands here at the next login restore. Chester on being told that was the fix: "signing out and in
 	// back is mostly not practical". So fetch them now.
 	//
-	// AFTER the publish, deliberately. The head is committed by this point, so a fetch that fails costs one
-	// rel and cannot touch the seal's outcome -- and on #media a refusal is not cheap, it fails the WHOLE
-	// logoff. Best effort, every cycle, and the next cycle retries whatever missed.
+	// AFTER the head is put, deliberately: a fetch that fails costs one rel and cannot touch the seal's outcome --
+	// and on #media a refusal is not cheap, it fails the WHOLE logoff. Best effort, every cycle, and the next cycle
+	// retries whatever missed.
+	//
+	// NWP-20261129-25: IN CAP MODE THE HEAD IS NOT COMMITTED YET. The deferred capFlush commits it after this block,
+	// so a long fetch, or a kill for memory, comes first. So each tier is bounded by the per-cycle budget, and the
+	// sign-out's own seal fetches nothing: the reap deletes this session moments later. A skipped oversize file keeps
+	// the no-change record removed while it waits, as an oversize deferred arrival already does.
 	//
 	// NWP-20261026-01: only the rels the walk NEVER visited land. A carried rel it visited but could not read is
 	// still here or was deleted after its stat; fetching it from the store would undo that deletion.
 	if mediaCarryRan {
-		var landed []string
-		var landedB int64
-		if len(carryRels) > 0 {
-			w, nb := materializeCarried(base, dk, oldM, carriedToLand(landRels, seen), src)
-			landed, landedB = append(landed, w...), landedB+nb
-		}
-		// NWP-20260908-22: and the DEFERRED tier -- the half a camera photo lands in. Budgeted, because
-		// these are by definition the files the on-demand tier exists not to fetch; what does not fit
-		// waits for the next cycle, in the same sorted order, so progress is monotonic.
-		if budget := deferredSyncBudget(); budget > 0 && len(oldM.Deferred) > 0 {
-			arrivals := newlyArrivedDeferred(oldM.Deferred, restoredDef, src, walkedHere)
-			if len(arrivals) > 0 {
-				w, nb := materializeDeferredArrivals(base, dk, oldM, arrivals, src, budget)
+		if signOutSeal() {
+			fmt.Printf("push: profile %s media-sync: skipped at sign-out -- nothing is fetched onto a session that is ending (NWP-20261129-25)\n",
+				logProfile(profile))
+		} else if budget := deferredSyncBudget(); budget > 0 {
+			var landed []string
+			var landedB int64
+			if len(carryRels) > 0 {
+				w, nb := materializeCarried(base, dk, oldM, carriedToLand(landRels, seen), src, budget)
 				landed, landedB = append(landed, w...), landedB+nb
-				fmt.Printf("push: profile %s media-sync: %d deferred rel(s) arrived from another handset, landed %d\n",
-					logProfile(profile), len(arrivals), len(w))
 			}
-		}
-		if len(landed) > 0 {
-			writeMediaSyncList(landed)
-			fmt.Printf("push: profile %s media-sync: landed %d file(s), %d B -- roamd scans them into MediaStore next\n",
-				logProfile(profile), len(landed), landedB)
+			// NWP-20260908-22: and the DEFERRED tier -- the half a camera photo lands in. Budgeted, because
+			// these are by definition the files the on-demand tier exists not to fetch; what does not fit
+			// waits for the next cycle, in the same sorted order, so progress is monotonic.
+			if len(oldM.Deferred) > 0 {
+				arrivals := newlyArrivedDeferred(oldM.Deferred, restoredDef, src, walkedHere)
+				if len(arrivals) > 0 {
+					w, nb := materializeDeferredArrivals(base, dk, oldM, arrivals, src, budget)
+					landed, landedB = append(landed, w...), landedB+nb
+					fmt.Printf("push: profile %s media-sync: %d deferred rel(s) arrived from another handset, landed %d\n",
+						logProfile(profile), len(arrivals), len(w))
+				}
+			}
+			if len(landed) > 0 {
+				writeMediaSyncList(landed)
+				fmt.Printf("push: profile %s media-sync: landed %d file(s), %d B -- roamd scans them into MediaStore next\n",
+					logProfile(profile), len(landed), landedB)
+			}
 		}
 	}
 	// NWP-20261123-04: after putHead and the materialise, so the record names the head this seal put (the vault
@@ -8978,6 +9061,11 @@ func uploadWorkers() int {
 // from writeTarEntry, SHARED with the incremental chunker (incremental_seal.go) so the two seal paths produce
 // byte-identical tars. Live-user churn (grow/shrink/vanish) is handled there.
 func tarDirTo(dir string, w io.Writer) (int64, error) {
+	return tarDirToExcl(dir, w, nil)
+}
+
+// tarDirToExcl is tarDirTo with walkChunksExcl's exclusion of this scope's unfetched packages (NWP-20261130-03).
+func tarDirToExcl(dir string, w io.Writer, excl map[string]bool) (int64, error) {
 	tw := tar.NewWriter(w)
 	blind := 0
 	var dropped int64
@@ -9006,6 +9094,12 @@ func tarDirTo(dir string, w io.Writer) (int64, error) {
 		if info.IsDir() && dropPkgForRel(rel, dropPkgs) {
 			dropped += subtreeBytes(p) // priced for the shrink guard, same as the incremental walk
 			return filepath.SkipDir    // DIA-20260804-04: the user switched this app Off -> its data is not carried
+		}
+		if info.IsDir() && dropPkgForRel(rel, excl) {
+			return filepath.SkipDir // NWP-20261130-03: unfetched in this scope -- not priced, same as walkChunksExcl
+		}
+		if info.IsDir() && isOdFetchStagePath(rel) {
+			return filepath.SkipDir // NWP-20261130-03: a killed fetch's stage -- same as walkChunksExcl
 		}
 		if info.IsDir() && isAppCodeStagePath(rel) {
 			return filepath.SkipDir // NWP-20260901-17: transient install staging -- see isAppCodeStagePath
@@ -9476,7 +9570,8 @@ type chunkManifest struct {
 	// (NWP-20261127-01, pkg_span.go): its file-aligned large files and its own small-file groups, a held package
 	// (com.nowhere.chooser/.nowhere-odhold/<pkg>) included. Written only by an incremental seal of the bare vault or
 	// #de. A head without it (every head before this build, a full-tar seal, any other scope) restores exactly as
-	// today, and a reader treats absence as "nothing carryable". pkgSpanChunks is the reader; nothing calls it yet.
+	// today, and a reader treats absence as "nothing carryable". pkgSpanChunks is the reader; ~~nothing calls it yet~~
+	// (superseded: the seal's carry, NWP-20261129-03, and the sign-in skip, NWP-20261130-03, call it).
 	PkgSpan map[string][][2]int `json:"pspan,omitempty"`
 }
 
@@ -9848,6 +9943,13 @@ var restoreCapPrefetchOn = capMode
 // check(), but per-entry write failures are soft-skipped, and the caller must know how many so it can decide
 // whether this restore earned a completion receipt.
 func cdcRestore(base string, key []byte, m chunkManifest, dest string) int {
+	return cdcRestoreProg(base, key, m, dest, 0, 0, nil)
+}
+
+// cdcRestoreProg is cdcRestore reporting its byte progress as off + its own ladder out of total, when total > 0 and m
+// has Sizes: one restore split in passes (restoreSkippingParked, NWP-20261130-03) then reports one ladder. A non-nil
+// cancelled is asked before each chunk is written; true cuts the stream there (fetch-oddata's sign-out check).
+func cdcRestoreProg(base string, key []byte, m chunkManifest, dest string, off, ladder int64, cancelled func() bool) int {
 	total := len(m.Chunks)
 	// NWP-20260901-19: report BYTES, not chunk indices. This loop used to writeProg(i+1, total) -- chunk
 	// counts -- and every reader that renders the value as a size then lied: the OTA download screen showed
@@ -9859,8 +9961,19 @@ func cdcRestore(base string, key []byte, m chunkManifest, dest string) int {
 	// fraction is the same either way. A legacy manifest without Sizes falls back to chunk counts, which the
 	// gate renders fine and the OTA screen cannot meet (the OS payload is always freshly published with Sizes).
 	cumBytes, sumBytes := chunkByteProgress(m)
+	if cumBytes != nil && ladder > 0 {
+		for i := range cumBytes {
+			cumBytes[i] += off
+		}
+		sumBytes = ladder
+		if last := cumBytes[len(cumBytes)-1]; last > sumBytes {
+			sumBytes = last
+		}
+	} else {
+		off = 0
+	}
 	if cumBytes != nil {
-		writeProg(0, int(sumBytes))
+		writeProg(int(off), int(sumBytes))
 	} else {
 		writeProg(0, total)
 	}
@@ -9951,6 +10064,10 @@ func cdcRestore(base string, key []byte, m chunkManifest, dest string) int {
 			<-sem // release the window: the launcher may start one more fetch
 			if res.err != nil {
 				e = res.err
+				break
+			}
+			if cancelled != nil && cancelled() {
+				e = errOdFetchCancelled // close(done) below stops the launcher: no fetch starts after this
 				break
 			}
 			if _, e = pw.Write(res.data); e != nil {
@@ -10422,6 +10539,8 @@ func loginDaemon() {
 	goSafeLoop("rekey loop", func() { rekeyLoop(dest) })        // NWP-20261008-03: a tied profile's photos, files and apps re-keyed to the chip, in batches
 	// NWP-20261107-12 (Q037): every 5 minutes, and only while a reap is queued, roamd re-checks the users/<uid> a timeout kept.
 	goSafeLoop("userdir-recheck loop", func() { userdirRecheckLoop(dest) })
+	// NWP-20261201-08: every 5 minutes of a session, the fixed health-check rules (health_check.go). A check only reads.
+	goSafeLoop("health-check loop", func() { healthLoop(dest) })
 	// NWP-20260824-03: the accept loop has NOT been serial since #197 was fixed -- handleLogin is dispatched
 	// per-connection just below, and the real gate is sessionMu plus concurrentSafeCmd -- except for the telephony
 	// verbs, which telCmd hands to handleTelCmd before sessionMu and which serialize on telMu (NWP-20260927-09,
@@ -10494,6 +10613,10 @@ var sessionMu sync.Mutex
 // mis-classification only ever over-serializes, never races.
 func concurrentSafeCmd(name string) bool {
 	switch name {
+	// HEALTH-FIX and GET-HEALTH-FIX (NWP-20261201-10) read the session marker, take only the read-only worker slot and
+	// keep their RAM state under their own mutex; a Fix must not wait behind a seal.
+	case "HEALTH-FIX", "GET-HEALTH-FIX":
+		return true
 	// POLL-REAP + ACK-REAP are the no-reboot teardown handshake and touch ONLY the in-memory queue (guarded
 	// by pendingReapMu) -- never the state dir, store or passphrase. They were serialised on sessionMu by
 	// oversight, and that cost a user-visible strand (#141, Chester 2026-08-15): a DELETE holds sessionMu for
@@ -10608,11 +10731,20 @@ func concurrentSafeCmd(name string) bool {
 		// TELINGEST-SEEN (NWP-20261129-02): one validated line of counts to stderr (login.log), no store, no session
 		// files. It is sent from a session whose seals hold sessionMu for minutes.
 		"TELINGEST-SEEN",
+		// ALARM-CARRY (NWP-20261129-39): one validated line to stderr (login.log), no store, no session files. A relay
+		// sends it during a seal or a sign-in, so serialised it would wait behind the work it reports on.
+		"ALARM-CARRY",
 		// SET-SEAL-HOLD (NWP-20261011-01): writes one state file and the in-memory choice under its own sealHoldMu
 		// (then pendingReapMu) -- the SET-GATE-ALARM case. Serialised, it waited behind the very materialise whose hold
 		// it sets, the chooser gave up after two 90 s reads and said "next sign-in", and the queued handler applied the
 		// value later anyway.
 		"SET-SEAL-HOLD",
+		// SET-SAVE-MODE (NWP-20261201-03): the SET-SEAL-HOLD case -- one state file and the in-memory mode under its own
+		// saveModeMu (then pendingReapMu). Serialised, a change made during a materialise would wait behind it.
+		"SET-SAVE-MODE",
+		// SAVE-NET-UNMETERED, SAVE-NET-METERED (NWP-20261201-03): the gate's ~30 s network report, memory only, under
+		// pendingReapMu. Serialised behind a materialise it would age past saveNetFresh and hold a Wi-Fi-only save.
+		"SAVE-NET-UNMETERED", "SAVE-NET-METERED",
 		// APPLY-LOCATION (NWP-20261016-45): the SET-SEAL-HOLD case one switch over -- serialised, a Location services
 		// tap during a materialise waited past the chooser's read. It writes nothing of this daemon's: it reads the
 		// session marker and hands roamd a locapply, which the RW slot orders against every other worker op and which
@@ -10655,6 +10787,9 @@ func concurrentSafeCmd(name string) bool {
 		// -- the GET-STORAGE-BREAKDOWN precedent (also allowlisted, also store-touching). Serialized it would
 		// queue the delta screen's first paint behind a whole materialise.
 		"SEAL-DELTA",
+		// OD-DATA-PENDING (NWP-20261130-03): the chooser's launch barrier, asked at a package-added event. Two tmpfs list
+		// reads and one stat, nothing written. Serialized, it would wait behind a seal or a login and leave the app open.
+		"OD-DATA-PENDING",
 		// APP-FETCH-SIZE (NWP-20261114-16): one name#apps head read through resolveKeySession, nothing written under
 		// dest -- the SEAL-DELTA head read. The chooser asks it at the tap, before MATERIALIZE-APP. Serialized, the
 		// tap's question would wait behind a periodic seal or a materialise for minutes, and the prompt could not show.
@@ -10684,8 +10819,13 @@ func concurrentSafeCmd(name string) bool {
 		// timed out: the icon rings and the media notice blinked off, and an empty GET-PREFETCH-METERED re-kicked the
 		// Auto sweep on mobile data.
 		"GET-MEDIA-STATUS", "GET-MEDIA-APP-PROGRESS", "GET-PREFETCH-METERED",
+		// GET-SAVE-MODE (NWP-20261201-03): the same kind of read -- save-mode.out is written at sign-in, before the switch,
+		// and mid-session only by SET-SAVE-MODE, by rename.
+		"GET-SAVE-MODE",
 		// NWP-20260922-05: a pure read of the same marker GET-SESSION-TYPE stats, plus one getsockopt.
 		"GET-SESSION-NAME",
+		// NWP-20261201-08: a RAM read of the health checks' last results, the same marker, and one getsockopt.
+		"GET-HEALTH",
 		// GET-INGEST (NWP-20260827-18): a pure /data/media read -- no store, no gateway, no passphrase, no
 		// session state. The ingest kick fires right after login, exactly when a materialise or a fresh
 		// profile's first seal may hold sessionMu for minutes -- serialised, the chooser's bounded fetch
@@ -10786,6 +10926,7 @@ func handleLogin(conn net.Conn, dest string) {
 	if refusedGateOnlyCaller(conn, name) {
 		return
 	}
+	waitForAtLockRelay(name) // NWP-20261129-26: a GET-GATE-ALARM waits here, before sessionMu, for a committed cold lock's relay
 	// NWP-20261124-12: the session's day summary; both verbs answer only the live session's own user and never wait on sessionMu.
 	if name == "DIAG-SUMMARY" {
 		handleDiagSummary(conn, r, dest)
@@ -11219,17 +11360,14 @@ func handleLogin(conn net.Conn, dest string) {
 		handleRoamInOffline(conn, dest, strings.TrimRight(rname, "\r\n"), strings.TrimRight(rpass, "\r\n"), strings.TrimRight(ruid, "\r\n"))
 		return
 	}
-	if name == "ROAM-OUT" {
-		handleRoamOut(conn, dest) // seal the live user's data, then REBOOT to wipe+gate ("secure logoff")
-		return
-	}
 	if name == "LOGOUT" {
 		captureWifiMirror(dest)  // #98: read the session's private Wi-Fi store BEFORE the user stops
 		handleLogout(conn, dest) // reboot-free: seal, then queue the in-place reap for the user-0 chooser to do
 		return
 	}
 	if name == "BACKUP" {
-		handleBackup(conn, dest) // "Back up now": seal the live session to the store in place (no reap, no reboot)
+		// NWP-20261201-07: readBackupAfter takes the optional AFTER line, the back-online notice's reconnect stamp.
+		handleBackup(conn, dest, readBackupAfter(conn, r)) // "Back up now": seal the live session to the store in place (no reap, no reboot)
 		return
 	}
 	if name == "EXPORT" {
@@ -11282,6 +11420,10 @@ func handleLogin(conn net.Conn, dest string) {
 		handleTelIngestSeen(conn, r) // NWP-20261129-02: a delivery run's read-back counts (telingest_seen.go)
 		return
 	}
+	if name == "ALARM-CARRY" {
+		handleAlarmCarry(conn, r) // NWP-20261129-39: the alarm a sign-out carried, against this session's (alarm_carry.go)
+		return
+	}
 	if name == "MATERIALIZE-APP" {
 		// #204 on-demand apps: the chooser's unarchive receiver tapped an archived placeholder. Fetch just that
 		// package's DEFERRED APK bytes from the live profile's name#apps scope into the user-0 chooser's
@@ -11314,6 +11456,14 @@ func handleLogin(conn net.Conn, dest string) {
 		conn.SetDeadline(time.Now().Add(odRestoreConnWindow))
 		pl, _ := r.ReadString('\n')
 		handleRestoreOdData(conn, dest, strings.TrimRight(pl, "\r\n"))
+		return
+	}
+	if name == "OD-DATA-PENDING" {
+		// NWP-20261130-03: is this package's data still out? AppInstallReceiver asks at a package-added event and suspends
+		// the app on any answer but NO. See handleOdDataPending.
+		conn.SetDeadline(time.Now().Add(5 * time.Second))
+		pl, _ := r.ReadString('\n')
+		handleOdDataPending(conn, dest, strings.TrimRight(pl, "\r\n"))
 		return
 	}
 	if name == "GET-CATALOG" {
@@ -11671,6 +11821,19 @@ func handleLogin(conn net.Conn, dest string) {
 		}
 		return
 	}
+	if name == "HEALTH-FIX" {
+		handleHealthFix(conn, r, dest) // NWP-20261201-10: a health notice's Fix button
+		return
+	}
+	if name == "GET-HEALTH-FIX" {
+		handleGetHealthFix(conn, r, dest) // NWP-20261201-10: the gate's watcher, seconds since this session's last Fix
+		return
+	}
+	if name == "GET-HEALTH" {
+		// NWP-20261201-08: the last health-check results, for the gate. The contract is in health_check.go.
+		handleGetHealth(conn, dest)
+		return
+	}
 	if name == "GET-OFFLINE" {
 		// #49: is the LIVE session an offline-started one (a saved profile signed into while the store was
 		// unreachable)? The gate's status watcher polls this to post the "signed in offline" notice and, once
@@ -11735,17 +11898,19 @@ func handleLogin(conn net.Conn, dest string) {
 	if name == "CLAIM" {
 		// "CLAIM\n<code>\n" -- "Add credits": redeem a paid claim code into the live session's roaming wallet
 		// (zero-knowledge blind tokens). Drains the WHOLE claim (the device doesn't know the purchased count).
-		// Reply "OK <n>" | "OK <n> UNSAVED" | "NONE" (no session) | "ERR-NOCODE" | "ERR". There is no LOCAL
-		// reply: a throwaway is credited into its local wallet and answered a PLAIN OK (the credit rides the
-		// Save-to-store promote). UNSAVED means a STORED session whose wallet seal failed all three attempts,
-		// i.e. the #218 case where the tokens exist only on this device.
+		// Reply "OK <n>" | "OK <n> UNSAVED" | "PARTIAL <n>" | "PARTIAL <n> UNSAVED" | "NONE" (no session) | "ERR-NOCODE"
+		// | "ERR". There is no LOCAL reply: a throwaway is credited into its local wallet and answered a PLAIN OK or
+		// PARTIAL (the credit rides the Save-to-store promote). UNSAVED means a STORED session whose wallet seal failed
+		// all three attempts, i.e. the #218 case where the tokens exist only on this device. PARTIAL means n tokens
+		// landed and the drain stopped before the gateway proved the code empty, so the code may hold more; the agent
+		// tried to keep it in pending_claims (NWP-20261201-21).
 		c, _ := r.ReadString('\n')
 		handleClaim(conn, dest, strings.TrimRight(c, "\r\n"), false)
 		return
 	}
 	if name == "CLAIM2" {
 		// "CLAIM2\n<code>\n<convert|keep>\n" -- CLAIM plus the customer's answer at an upgrade (NWP-20261031-10;
-		// decided 2026-10-20, docs/product-decisions.md). Same replies as CLAIM; any other mode is ERR-ARGS with
+		// decided 2026-10-20, docs/product-decisions.md). Same replies as CLAIM, PARTIAL included; any other mode is ERR-ARGS with
 		// nothing drained. The answer is stored with the purchase and sent on ITS activation lease as plan_change
 		// "keep" or "convert" (h51 #5, NWP-20261125-12); plain CLAIM stores no answer and sends none.
 		c, _ := r.ReadString('\n')
@@ -11894,7 +12059,22 @@ func handleLogin(conn net.Conn, dest string) {
 		// Dismiss on our screen cannot silence a different user's app, so SILENCE-GATE-ALARM below does.
 		// Replies (NWP-20261028-05): "OK" (stored, or cleared, or a held clear) | "ERR" (not stored / not cleared:
 		// the sender's "may not ring" warning keys on it). A failed write of the owner file alone stays OK.
-		ml, _ := r.ReadString('\n')
+		// NWP-20261129-47: the time line counts only when it arrives with its LF. A client that wrote the verb and then
+		// closed or stalled used to read as a clear, which deleted the gate's only ring for a stopped session and
+		// answered OK, so the sender's "may not ring" warning never showed; a cut epoch was stored as if whole. Both are
+		// refused now, with gate-alarm and gate-alarm-src untouched. The relay still counts: it arrived, and a cold-lock
+		// teardown must not wait out its bound for it. fields=0 marks this refusal in gate.log: any line that arrived
+		// has at least one field. A terminated "0" or empty line keeps its meaning (the clear, or the held clear below).
+		// A request cut by handleLogin's 60s loginConnDeadline takes the same branch, but its reply write then fails too;
+		// EOF is the testable form (strict_arg_line_test.go).
+		ml, rerr := r.ReadString('\n')
+		if rerr != nil {
+			gateAlarmRelays.Add(1)
+			gateLog("relay-err", "fields", 0)
+			fmt.Fprint(os.Stderr, "[logind] set-gate-alarm: refused -- the time line did not arrive\n")
+			fmt.Fprint(conn, "ERR\n")
+			return
+		}
 		ms := strings.TrimSpace(ml)
 		fl := strings.Split(ms, "\t")
 		when := strings.TrimSpace(fl[0])
@@ -12132,6 +12312,7 @@ func handleLogin(conn net.Conn, dest string) {
 	if name == "GET-GATE-ALARM" {
 		// #151: the gate reads AND CLEARS the stashed next-alarm time (one-shot, so a later onResume doesn't
 		// re-schedule the same alarm), then schedules a user-0 alarm at that time. "0" = nothing pending.
+		// NWP-20261129-26: a read during a committed cold lock's at-lock relay has already waited for it (waitForAtLockRelay, above sessionMu).
 		p := filepath.Join(dest, "gate-alarm")
 		var b []byte
 		var err error
@@ -12450,7 +12631,18 @@ func handleLogin(conn net.Conn, dest string) {
 		// active unlock secret, so freezing it eliminates any mid-session desync between the live keyguard
 		// credential and what cold-lock expects (the class of bug that locks a user out). Replies OK |
 		// ERR-FLOOR | ERR-NOTSTORED | ERR-NOSESSION | ERR.
-		pl, _ := r.ReadString('\n')
+		// NWP-20261129-47: the PIN line counts only when it arrives with its LF. A client that wrote the verb and then
+		// closed or stalled used to read as an empty PIN, which clears the stored PIN past the "Remove PIN?"
+		// confirmation; a cut line armed a PIN nobody typed at the next sign-in. Both are refused now, before the
+		// session read and the vault op, and the log line prints nothing of what arrived. A terminated empty line keeps
+		// the clear meaning. A request cut by handleLogin's 60s loginConnDeadline takes the same branch, but its reply
+		// write then fails too; EOF is the testable form (strict_arg_line_test.go).
+		pl, err := r.ReadString('\n')
+		if err != nil {
+			fmt.Fprint(os.Stderr, "[logind] set-pin: refused -- the PIN line did not arrive\n")
+			fmt.Fprint(conn, "ERR\n")
+			return
+		}
 		pin := strings.TrimRight(pl, "\r\n")
 		nm, ps, _ := readRoamSession(dest)
 		if nm == "" {
@@ -13130,9 +13322,9 @@ func handleLogin(conn net.Conn, dest string) {
 	}
 	if name == "GET-MEDIA-STATUS" {
 		// #90: on-access media fetch progress for the chooser's "Loading your media" notification. mediad (a
-		// separate agent process) publishes media.progress to the shared RAM state tmpfs, up to three lines:
-		// "LOADING <done> <total> <nfiles> <name>", "DAMAGED <nfiles> <name>" (#110) and "INCOMPLETE <napps> <app>"
-		// (DIA-20260730). We relay the file whole, or IDLE when it is absent or empty.
+		// separate agent process) publishes media.progress to the shared RAM state tmpfs, up to four lines:
+		// "LOADING <done> <total> <nfiles> <name>", "DAMAGED <nfiles> <name>" (#110), "INCOMPLETE <napps> <app>"
+		// (DIA-20260730) and "RESTORING <done> <total> <left>" (NWP-20261201-14). We relay the file whole, or IDLE when it is absent or empty.
 		b, err := os.ReadFile(filepath.Join(dest, mediaProgressFile))
 		line := strings.TrimRight(string(b), "\r\n")
 		if err != nil || line == "" {
@@ -13339,6 +13531,11 @@ func handleLogin(conn net.Conn, dest string) {
 		fmt.Fprint(conn, metered+"\n")
 		return
 	}
+	if name == "GET-SAVE-MODE" {
+		// NWP-20261201-03: "GET-SAVE-MODE\n" -> always|wifi|off for the live session, always with none (save_mode.go).
+		fmt.Fprint(conn, saveModeReply(dest)+"\n")
+		return
+	}
 	if name == "SET-PREFETCH-METERED" {
 		// NWP-20261005-08: "SET-PREFETCH-METERED\n<0|1>\n" -- the profile screen's "download over mobile data"
 		// switch, sent alongside its own write of nowhere-prefetch-metered (the copy that roams). Recorded for the
@@ -13369,6 +13566,23 @@ func handleLogin(conn net.Conn, dest string) {
 			fmt.Fprintf(os.Stderr, "[logind] materialisation may hold periodic seals back %s (NWP-20261011-01)\n", text)
 		}
 		fmt.Fprint(conn, reply+"\n")
+		return
+	}
+	if name == "SET-SAVE-MODE" {
+		// NWP-20261201-03: "SET-SAVE-MODE\n<always|wifi|off>\n<user id>\n" -- the Profile screen's save mode, sent
+		// alongside its own write of nowhere-save-mode (the copy that roams). Recorded for the LIVE session and applied at
+		// once, so the next periodic decision uses it; an unknown value is Always (save_mode.go). Concurrent-safe (see
+		// concurrentSafeCmd): it never waits on sessionMu.
+		v, _ := r.ReadString('\n')
+		u, _ := r.ReadString('\n')
+		fmt.Fprint(conn, handleSetSaveMode(dest, v, u)+"\n")
+		return
+	}
+	if name == "SAVE-NET-UNMETERED" || name == "SAVE-NET-METERED" {
+		// NWP-20261201-03: "SAVE-NET-UNMETERED\n" or "SAVE-NET-METERED\n" -- the gate's slow tick while a session is live;
+		// METERED means metered OR no network. Gate-only (gateOnlyCmd); it touches only memory.
+		recordSaveNet(name == "SAVE-NET-UNMETERED")
+		fmt.Fprint(conn, "OK\n")
 		return
 	}
 	if name == "RECOVER" {
@@ -14034,7 +14248,8 @@ func createThrottle(conn net.Conn) bool {
 // After a success the staged claim is published to the new profile's own head BY VALUE -- the fold went up
 // before the lease settled, and the file after it is the authoritative copy -- and only then removed
 // (finishStagedClaim). wallet.json is not where it belongs: the sign-in that follows hands wallet.json over and
-// restores from that head.
+// restores from that head. While the stored copy cannot be read nothing is published, and the profile's next successful
+// bare-vault save retries (h60 #17, retryStagedClaimAfterSave).
 //
 // NWP-20261120-06 (Q167): the reply is zero or more "PROGRESS create <done> 20" lines, then the verdict line. A
 // fresh create and a re-create over a deleted name both start at 0 and end at 20 before OK; only the purge's ticks
@@ -14080,7 +14295,7 @@ func createAndReply(conn net.Conn, dest, name, pass string) {
 	}()
 	if ok {
 		if haveStaged {
-			finishStagedClaim(name, pass, staged)
+			finishStagedClaim(name, pass, staged, false)
 		}
 		// NWP-20260924-04: another profile's enrolment must not take pending telephony.
 		wipeAfterCreate(dest, live)
@@ -14133,37 +14348,95 @@ func createStagingPath(name, pass string) string {
 // finishStagedClaim publishes a successful create's staged claim to the new profile's head by value and then
 // removes the staged file. A publish that fails leaves the file in place, logged: the head still carries the
 // fold, which can only under-count (tokens the create's lease handed back after the fold), and the file is the
-// only other copy. NWP-20261013-20 (pass 5): the generation and its restore proof are read under the lock with the
+// only other copy. (That sentence is superseded by h60 #17 below, NWP-20261201-23: a later save now reads the file.)
+// NWP-20261013-20 (pass 5): the generation and its restore proof are read under the lock with the
 // copy, and the publish is judged by them -- a staged claim whose proof did not stand (createAndReply proves the new
 // profile's wallet head empty first) is not published, and stays.
-func finishStagedClaim(name, pass, walletPath string) {
+//
+// h60 #17 (decided 2026-11-06, dn-1031 #1 applied to this publisher): while the stored copy cannot be read nothing is
+// published and the file stays, because the fail-soft read inside sealWalletValueDurable would publish the staged set
+// alone over the stored tokens. The next successful bare-vault save retries (retryStagedClaimAfterSave). A stored copy
+// that was read is merged HERE, so a failed second read inside the publish cannot send the staged set alone either.
+// retry is that later save: the stored head may hold the session's own credit by then, and a publish with no union
+// drops it, so a retry whose stored copy exists refuses while the staged seen-set is unusable; it also sets the log
+// prefix. published is true only when the publish returned and the staged file was removed.
+func finishStagedClaim(name, pass, walletPath string, retry bool) (published bool) {
+	logPrefix := "[logind] create:"
+	if retry {
+		logPrefix = "[agent] save:"
+	}
 	unlock := lockWallet(walletPath)
 	defer unlock()
 	data, err := os.ReadFile(walletPath)
 	if err != nil {
-		return
+		return false
 	}
 	gen := walletGeneration(walletPath)
 	proven := walletRestoreLanded(walletPath, gen)
-	var w Wallet
-	if json.Unmarshal(data, &w) != nil {
-		return
+	seen := walletSeen(walletPath, gen)
+	var staged Wallet
+	if json.Unmarshal(data, &staged) != nil {
+		return false
 	}
 	dk := resolveDK("s3", name, pass, nil)
 	if dk == nil {
-		fmt.Fprintf(os.Stderr, "[logind] create: the new profile's key does not resolve -- its staged claim stays (NWP-20261010-04)\n")
-		return
+		fmt.Fprintf(os.Stderr, "%s the new profile's key does not resolve -- its staged claim stays (NWP-20261010-04)\n", logPrefix)
+		return false
 	}
 	unlock() // sealWalletValueDurable opens a bracket whose flush takes this wallet's lock
-	if _, err := sealWalletValueDurable("s3", name, pass, dk, walletPath, &w, data, gen, proven); err != nil {
+	stored, readable := storedWalletForPublish("s3", name, pass, dk)
+	if !readable {
+		fmt.Fprintf(os.Stderr, "%s the stored wallet could not be read -- the staged claim was not published and stays for a later save (h60 #17)\n", logPrefix)
+		return false
+	}
+	if retry && stored != nil && seen == nil {
+		fmt.Fprintf(os.Stderr, "%s the staged claim's seen-set cannot be read, so a merge could drop the session's credit -- it stays (h60 #17)\n", logPrefix)
+		return false
+	}
+	toPublish := &staged
+	if stored != nil {
+		toPublish = walletForPublish(stored, &staged, seen)
+	}
+	if _, err := sealWalletValueDurable("s3", name, pass, dk, walletPath, toPublish, data, gen, proven); err != nil {
+		if retry {
+			fmt.Fprintf(os.Stderr, "[agent] save: the publish failed (%s) -- the staged claim stays (h60 #17)\n", logSafeErrText(err))
+			return false
+		}
 		fmt.Fprintf(os.Stderr, "[logind] create: the staged claim was not published (%s) -- it stays (NWP-20261010-04)\n", logSafeErrText(err))
-		return
+		return false
 	}
 	relock := lockWallet(walletPath)
 	defer relock()
-	if cur, _ := os.ReadFile(walletPath); string(cur) == string(data) {
-		os.Remove(walletPath)
+	if cur, _ := os.ReadFile(walletPath); string(cur) != string(data) {
+		return false
 	}
+	return os.Remove(walletPath) == nil
+}
+
+// retryStagedClaimAfterSave publishes a create's staged claim that finishStagedClaim could not, after the profile's
+// own seal landed (h60 #17, NWP-20261201-23). Only the bare vault's save retries; the #apps and other scoped pushes
+// return before any store request, and so does a profile with nothing staged. A store failure panics (fail) and main
+// turns a panic into a failed exit, so it is recovered here and its value is not printed (it can name a store URL):
+// this runs after a seal that landed, and its result never changes push's exit.
+func retryStagedClaimAfterSave(profile, pass string) (published bool) {
+	if strings.Contains(profile, "#") {
+		return false
+	}
+	staged := createStagingPath(profile, pass)
+	if _, err := os.Stat(staged); err != nil {
+		return false
+	}
+	defer func() {
+		if recover() != nil {
+			published = false
+		}
+		if published {
+			fmt.Fprintf(os.Stderr, "[agent] save: a create's staged claim was published by this save (h60 #17)\n")
+		} else {
+			fmt.Fprintf(os.Stderr, "[agent] save: a create's staged claim is still staged (h60 #17)\n")
+		}
+	}()
+	return finishStagedClaim(profile, pass, staged, true)
 }
 
 // handleCreateCode (#57) is CREATE with a purchase claim code: redeem the code first, so createVault's capFlush
@@ -15208,6 +15481,12 @@ func runWorkerHeld(lane workerLane, dest, op, name, pass, uid, seSecret, kind, s
 		fmt.Fprintf(os.Stderr, "[logind] Back up now SKIP-STOPPED under the slot: a sign-out took the announce while it waited (h49 #13)\n")
 		return "SKIP-STOPPED"
 	}
+	// h59 #1 (NWP-20261129-23): the same rule for a promote seal that queued for the slot and lost its announce to a
+	// sign-out: it runs nothing, before the clears and the drop, so the sign-out's own seal saves once.
+	if op == "out" && promoteStoppedAtSlot(intent) {
+		fmt.Fprintf(os.Stderr, "[logind] promote seal SKIP-STOPPED under the slot: a sign-out took the announce while it waited (h59 #1)\n")
+		return "SKIP-STOPPED"
+	}
 	if op == "out" {
 		// NWP-20260904-09 review: a seal attempt starts with an EMPTY credit-reason stash, so the reasons its
 		// verdict is joined to are the ones its own scopes wrote (stashCreditReason). Under the slot, so no
@@ -15624,6 +15903,9 @@ func handleRoamIn(conn net.Conn, dest, name, pass, uid, seSecret, srcUnit string
 		// to its evict-recheck. Not inside markRoamSession: RESUME and the rotations call it and continue one session.
 		resetSealSignals()
 		recordAnrSeen(dest) // NWP-20261020-05: this session's anr floor, taken where it begins (not at resume/rotate/promote)
+		// NWP-20261129-07: and the departed session's shrink-intent markers, on the same rule. They outlive it on the
+		// boot-lifetime tmpfs under names this profile's next session shares, so one left armed would allow a drastic shrink.
+		forgetShrinkIntents(dest)
 		// #123: a fresh sign-in SUPERSEDES any parked cold-locked session (the user chose a new profile over
 		// "Welcome back"). Drop its resume marker so the gate's #73 orphan-sweep REAPS the abandoned user when it
 		// next parks -- instead of keeping it (the stale marker made reapOrphanSecondaryUsers protect it, so it
@@ -15835,6 +16117,8 @@ func handleRoamInOffline(conn net.Conn, dest, name, pass, uid string) {
 	// top of the function: a sign-in refused before its marker must leave a parked cold-locked session's signals to its
 	// evict-recheck. Not inside markRoamSession: RESUME and the rotations call it and continue one session.
 	resetSealSignals()
+	// NWP-20261129-07: and the departed session's shrink-intent markers, on the same rule (see handleRoamIn).
+	forgetShrinkIntents(dest)
 	// NWP-20261013-20: the parked session's throwaway mark, read BEFORE this session marks its own on the next line --
 	// the #123 supersede below judges the parked session's wallet by it (noteSupersededColdLockCredit).
 	parkedLocal := isLocalSession(dest)
@@ -16136,45 +16420,6 @@ func wifiAdoptCount(ln string, err error) (int, bool) {
 	return n, true
 }
 
-// handleRoamOut seals the live roamed user's /data/user/N back to the store (creds+uid from the roam
-// session marker), then clears the marker. The chooser stops+removes the user after we reply.
-func handleRoamOut(conn net.Conn, dest string) {
-	rgen := walletGeneration(walletPathFor(dest)) // NWP-20261013-20: BEFORE the session read -- see logoffWalletRetry
-	name, pass, uid := readRoamSession(dest)
-	if name == "" || uid == "" {
-		fmt.Fprint(conn, "OK\n") // no live roam session -> nothing to seal
-		return
-	}
-	if localOnlySession(dest) { // NWP-20261017-04: an offline sign-in whose .localsession was lost must not seal either
-		// #4 (DIA-20260626-04): a throwaway is never sealed -> reboot wipes the local user, nothing to push.
-		local, offline := isLocalSession(dest), isOfflineSession(dest)
-		clearLocalSession(dest)
-		clearOfflineSession(dest)
-		fmt.Fprintf(os.Stderr, "[logind] roam-out %q user %s: LOCAL/throwaway -> reboot WITHOUT seal (local=%d offline=%d)\n", name, uid, b2i(local), b2i(offline))
-	} else {
-		// NWP-20261013-20 (decided 2026-10-15, "Retry, then warn"): as LOGOUT -- a session whose generation has no
-		// wallet restore proof reads its stored wallet once more before its seal; landed, the seal and the wallet seal
-		// below publish it, else nothing publishes it and the notice is recorded. The reboot below clears the state
-		// tmpfs, so the gate will not see that notice; the log line is the record (no chooser sends ROAM-OUT).
-		if logoffWalletRetry(dest, name, pass, seFromHex(readRoamSessionSE(dest)), rgen) {
-			noteCreditLost(dest)
-		}
-		setSealRun("logoff")                                                                 // NWP-20260901-25: announce even the UI-less seal -- SEAL-STATUS must not say DONE under it
-		out := triggerRoamWorker(dest, "out", name, pass, uid, readRoamSessionSE(dest), nil) // logoff: no progress UI (we reboot after)
-		clearSealRunIf("logoff")
-		fmt.Fprintf(os.Stderr, "[logind] roam-out %q user %s (%s)\n", name, uid, out)
-		sealWalletBestEffort(dest, name, pass) // roam any token-wallet changes before the wipe (B.3)
-	}
-	os.Remove(filepath.Join(dest, ".roamsession"))
-	forgetUiderrorsFloor(dest) // NWP-20261010-06: the session is over
-	fmt.Fprint(conn, "OK\n")
-	// Data is sealed -> reboot to WIPE the ephemeral roamed user and bring the gate back up. The chooser
-	// can't reboot from a secondary user (PowerManager.reboot is blocked there); this root daemon can, via
-	// sys.powerctl. Brief pause so the OK reply reaches the chooser before init tears us down.
-	time.Sleep(500 * time.Millisecond)
-	rebootNow("logoff: boot wipe of the ephemeral user uid=" + uid)
-}
-
 // handlePromote (#4, DIA-20260626-04): "Save to your store" -- turn the live LOCAL/throwaway session into a
 // real roaming profile WITHOUT interrupting it. Create the store vault for the session's own (name,pass) (the
 // recovery code), drop the .localsession marker so the sync + logoff persist it from here, then seal the live
@@ -16370,23 +16615,23 @@ func promoteToStore(conn net.Conn, dest, name, pass, uid string) {
 		defer func() { recover() }()
 		promoteStart := setSealRun("promote") // NWP-20260901-25
 		defer clearSealRunIf("promote")
-		syscall.Sync() // flush lazy app writes before the first seal (same reason as logout)
-		out := triggerRoamWorker(dest, "out", name, pass, uid, readRoamSessionSE(dest), nil)
+		sealSync() // flush lazy app writes before the first seal (same reason as logout)
+		// h59 #1 (NWP-20261129-23): no new branch here: recordSeal and noteSealLanded already ignore SKIP-STOPPED.
+		out := triggerRoamWorkerKind(dest, "out", name, pass, uid, readRoamSessionSE(dest), "", "", "promote", nil)
 		recordSeal(out)
 		noteSealLanded(promoteStart, out)
 		fmt.Fprintf(os.Stderr, "[logind] promote seal %q user %s -> %s\n", name, uid, sealVerdictLog(out))
 	})
 }
 
-// handleLogout is the reboot-free logoff: seal the live roamed user (same final push as ROAM-OUT), clear
+// handleLogout is the reboot-free logoff: seal the live roamed user, clear
 // the session, then hand the in-place teardown to the USER-0 CHOOSER (the device owner). The su:s0 worker
 // CANNOT do the AM user-lifecycle ops -- switch-user/stop-user hit the device-owner wall (Failed
 // transaction) -- and this confined daemon can't run am at all; only the chooser, as device owner, can.
 // We can't push to the chooser (the accept loop is serial, so a parked connection would deadlock it), so
 // the chooser POLLS: we record a pending-reap uid that its next POLL-REAP picks up, and it stops+removes
 // the ephemeral user (deleting /data/user|user_de|media/N; FBE key destruction == the reboot-wipe). If no
-// chooser is polling (its process died), an 8s fallback reboots -- still wipes the ephemeral user. ROAM-OUT
-// (reboot) stays as the "secure logoff" that also clears all in-RAM state.
+// chooser is polling (its process died), an 8s fallback reboots -- still wipes the ephemeral user.
 var pendingReapMu sync.Mutex
 var pendingSwitchUID string // phase 1: chooser switches to the gate (fast, before the seal)
 var pendingReapUID string   // phase 2a: chooser removes the user (after the seal) -- LOGOFF (crypto-shred)
@@ -17064,6 +17309,7 @@ func handleLogout(conn net.Conn, dest string) {
 	sealInFlight = true
 	stopPeriodic := sealRunKind == "periodic"     // h47 #1: read BEFORE the announce below replaces it
 	stopManual := sealRunKind == "manual"         // h49 #13: the same, for a running Back up now
+	stopPromote := sealRunKind == "promote"       // h59 #1: the same, for a running promote seal
 	sealRunKind, sealRunAt = "logoff", time.Now() // NWP-20260901-25 (same lock as the flags around it)
 	markSealStarted()                             // NWP-20260901-27
 	sealFail = false                              // #86: fresh logoff -> clear any prior FAILED status
@@ -17079,23 +17325,28 @@ func handleLogout(conn net.Conn, dest string) {
 	// seal below wait out that whole seal and then run a second one. So ask it to stop: the push run by roamd's out op
 	// stops at its next chunk boundary and roamd answers SKIP-STOPPED (seal_stop.go). Everything below is unchanged and
 	// still waits for the slot; the sign-out's own out op drops the request just before it runs (runWorkerHeld). A
-	// failed raise is logged and gives today's two seals; it never refuses the sign-out. A manual or promote seal is
-	// not asked. SUPERSEDED in part (h49 #13, NWP-20261119-03): a manual seal is asked too, and the sign-out's out op
-	// then runs as "logoff-pinned", so the one save it makes is pinned in place of the Back up now it stopped; a
-	// promote seal is still not asked (h49 #13 leaves it open). h49 #13 RESIDUALS: a manual still QUEUED for the slot
-	// when this sign-out takes its announce answers SKIP-STOPPED under the slot and leaves the request for this
-	// sign-out's own out op (manualStoppedAtSlot, NWP-20261126-11), so it saves once; the sign-out pins whenever it
-	// replaced a manual announce, also when the raise failed and the manual landed whole (two pinned saves, the safe
-	// direction); a retry after a failed pinned sign-out finds no manual announce and seals as "logoff"; ROAM-OUT over
-	// a running manual is not handled (endManualSealRun).
+	// failed raise is logged and gives today's two seals; it never refuses the sign-out. Part 2 asked only a
+	// periodic. SUPERSEDED in part (h49 #13, NWP-20261119-03): a manual seal is asked too, and the sign-out's out op then
+	// runs as "logoff-pinned", so the one save it makes is pinned in place of the Back up now it stopped. SUPERSEDED in
+	// part (h59 #1, NWP-20261129-23): a promote seal is asked too, and the sign-out's out op runs as plain "logoff",
+	// because only a replaced Back up now pins; a promote still QUEUED for the slot answers SKIP-STOPPED there and leaves
+	// the request for this sign-out's own out op (promoteStoppedAtSlot).
+	// h49 #13 RESIDUALS: a manual still QUEUED for the slot when this sign-out takes its announce answers SKIP-STOPPED
+	// under the slot and leaves the request for this sign-out's own out op (manualStoppedAtSlot, NWP-20261126-11), so it
+	// saves once; the sign-out pins whenever it replaced a manual announce, also when the raise failed and the manual
+	// landed whole (two pinned saves, the safe direction); a retry after a failed pinned sign-out finds no manual announce
+	// and seals as "logoff".
 	// h47 #1 RESIDUALS: a periodic already in its pointer pass finishes (part 1's rule), so the sign-out's seal
 	// runs whole, cheap through the blob and content caches; a raise landing between a periodic's supersede check and
 	// its drop is dropped by that periodic's own out op, which then runs whole as today; a periodic the daemon
 	// abandoned before the sign-out (its ERR-TIMEOUT cleared the announce) is not asked.
-	if stopPeriodic || stopManual {
+	if stopPeriodic || stopManual || stopPromote {
 		which, tag := "manual", "h49 #13"
-		if stopPeriodic {
+		switch {
+		case stopPeriodic:
 			which, tag = "periodic", "h47 #1"
+		case stopPromote:
+			which, tag = "promote", "h59 #1"
 		}
 		if err := requestSealStop(dest); err != nil {
 			fmt.Fprintf(os.Stderr, "[logind] logout user %s: could not ask the running %s seal to stop (%s): %v\n", uid, which, tag, err)
@@ -17308,7 +17559,8 @@ func handleLogout(conn net.Conn, dest string) {
 		flushSync()
 		// NWP-20261010-10 (round 3): kind "logoff" on roam.req line 6. roamd honours the #154 .btlogoff marker on THIS
 		// run only, so a marker left by a failed sign-out (or written late by a sweep that timed out) can never make a
-		// periodic seal wipe a live user's Bluetooth. The agent reads the kind only to pin "manual" snapshots.
+		// periodic seal wipe a live user's Bluetooth. The agent reads the kind to pin "manual" snapshots and to skip the
+		// post-seal media sync (signOutSeal, NWP-20261129-25).
 		// h49 #13 (NWP-20261119-03): a sign-out that replaced a running Back up now runs as "logoff-pinned". roamd
 		// treats it as "logoff" in every logoff-only step (the .btlogoff marker); the agent's sealKind() pins it.
 		outKind := "logoff"
@@ -17385,6 +17637,24 @@ func handleLogout(conn net.Conn, dest string) {
 			// replaces it here.
 			fmt.Fprintf(os.Stderr, "[logind] logout seal %q user %s FAILED (%s) -> staying signed in, NOT reaping\n", name, uid, sealVerdictLog(out))
 			return
+		}
+		// NWP-20261201-22 (h60 #16; the rule of 2026-10-22 #4): the seal landed, and the last wallet publish runs after the
+		// switch is queued, where a notice would reach only a later gate. So the stored wallet is read here, strictly and
+		// within a bound. Unreadable, the publish is refused (the note, sealLogoutWalletAndDrop) and the file kept, and a
+		// session holding credit is told at THIS gate: the closure below records the notice before it queues the switch.
+		if _, serr := os.Stat(walletPathFor(dest)); serr == nil && walletRestoreLanded(walletPathFor(dest), lgen) {
+			readable := endStoredWalletRead(name, pass, func() []byte { dk, _ := logoutWalletDK(name, pass, seFromHex(seSecret)); return dk })
+			if !readable {
+				held := walletHoldsCredit(walletPathFor(dest))
+				fmt.Fprintf(os.Stderr, "[logind] sign-out user %s: the stored wallet could not be read before the switch (twice) -- "+
+					"signing out WITHOUT a wallet publish; the stored wallet is untouched (credit held this session: %v) (NWP-20261201-22)\n", uid, held)
+				setLogoutWalletUnreadable(lgen, true)
+				if held {
+					logoffCreditLost = true
+				}
+			} else {
+				setLogoutWalletUnreadable(lgen, false)
+			}
 		}
 		// NWP-20261014-66: the verdict is decided in one critical section released from a defer (this goroutine runs under
 		// goSafe, and a panic must not leave pendingReapMu held); each arm then acts outside it, exactly as before.
@@ -18831,6 +19101,8 @@ func coldLockTeardown(dest, name, pass, uid string, bell <-chan struct{}) bool {
 		}
 		inPlaceCommits()
 	}
+	// NWP-20261129-26: the gate reads the alarm stash once, at onResume, which can now come before the relay below lands, so GET-GATE-ALARM waits from here until endAtLockRelay.
+	beginAtLockRelay()
 	os.Remove(filepath.Join(dest, ".roamsession")) // stop the sync (a cold-locked CE is unreadable)
 	// #81: purge the unlock material -- a COLD device holds neither the key hmac NOR the PIN, so the cold
 	// credential is uncomputable without what the user re-supplies at resume. This is what makes the cold
@@ -18900,6 +19172,7 @@ func coldLockTeardown(dest, name, pass, uid string, bell <-chan struct{}) bool {
 	// The sweep runs inside the RW hold, like btpark above; the alarm rides the read-only lane with its own capped
 	// slot wait (NWP-20261108-02), so an abandoned RW op cannot make it answer busy. See coldlock_evict.go.
 	coldLockRelayAlarm(dest, name, pass, uid)
+	endAtLockRelay()
 	coldLockSweepMedia(dest, name, pass, uid)
 	// Flags BEFORE release: the LOCK is published while this teardown still holds the slot, so the next op in the
 	// queue sees it. The chooser takes it only once it has acked the SWITCH above (nextReapAction).
@@ -19373,9 +19646,9 @@ func telHandoffPanic(kind, name string, r any) {
 		"the sealed items stay for the next resume or sign-in\n", kind, name)
 }
 
-// bestEffortPanic is telHandoffPanic's sibling for the two best-effort money paths, the periodic rent payment and the
-// roam-out wallet seal (NWP-20261027-16). Both still swallow the panic -- billing must never crash the seal loop, and a
-// roam-out must reach its reboot -- but no longer silently: a store read that failed after its retries (checkRead's
+// bestEffortPanic is telHandoffPanic's sibling for the best-effort periodic rent payment (NWP-20261027-16). It still
+// swallows the panic -- billing must never crash the seal loop -- but no longer silently: a store read that failed
+// after its retries (checkRead's
 // storeReadErr) prints one FAILED line through logSafeStoreErr, the profile name %q-quoted so log_scrub redacts it,
 // with no ref and no key. Any other value gets one generic line that never prints the value, which can name a blob
 // key. what is a fixed label, never data. Nothing is retried here.
@@ -20184,16 +20457,18 @@ func handleTestStore(conn net.Conn, ep, rg, bk, ak, sk string) {
 // Mirrors handleTestStore but uses the daemon's loaded store client and bucket (no client-supplied creds), so a
 // device with a saved store can show live status without re-entering the secret. A bounded BucketExists.
 func handlePingStore(conn net.Conn) {
-	// #59: a MANAGED device (GATEWAY_URL) reads/writes via gateway caps and may hold no S3 creds at all --
-	// the direct-S3 BucketExists below can only FAIL there, so the Store banner said "unreachable" while
-	// login/seal worked fine (Chester, 2026-07-04). Ping what the device actually uses: one /quote GET.
-	// Reply "OK MANAGED" so the banner can name the gateway rather than an S3 provider.
-	if gw := os.Getenv("GATEWAY_URL"); gw != "" {
+	// #59: a MANAGED device (capMode: a gateway and no keys, as GET-STORE's managed= line says) reads/writes via
+	// gateway caps and holds no S3 creds -- the direct-S3 BucketExists below can only FAIL there, so the Store
+	// banner said "unreachable" while login/seal worked fine (Chester, 2026-07-04). Ping what the device actually
+	// uses: one /quote GET. Reply "OK MANAGED" so the banner can name the gateway rather than an S3 provider.
+	// NWP-20261129-41: a self-hosted store keeps its S3 probe whatever GATEWAY_URL holds (a billing gateway, a
+	// discovered config, a ring conf), so the banner speaks of the store the phone saves to.
+	if capMode() {
 		// NWP-20260905-02: gwUI, the only VALUE change in this slice. This is byte-identical in shape to
 		// handleSetStoreManaged above -- one /quote behind the Store screen's connection banner, failing to
 		// ERR-NET -- and that sibling has been 10s with reviewed reasoning since it was written. The user
 		// sees "unreachable" 20s sooner; nothing else observes it.
-		if _, err := newGatewayClient(gw, gwUI).quote(); err == nil {
+		if _, err := newGatewayClient(os.Getenv("GATEWAY_URL"), gwUI).quote(); err == nil {
 			fmt.Fprint(conn, "OK MANAGED\n")
 		} else {
 			fmt.Fprintf(os.Stderr, "[logind] ping-store gateway: %v\n", err)
@@ -20774,22 +21049,6 @@ func handleSeedSsaid(conn net.Conn, dest string, r *bufio.Reader) {
 	fmt.Fprintf(conn, "%s\n", out)
 }
 
-// sealWalletBestEffort roams the live session's token wallet to the store if present, so mint/spend changes
-// survive the power-off wipe even when no lease re-sealed it this session. Best-effort: a failure is logged
-// (bestEffortPanic, and sealWallet's own error), never retried here (NWP-20261027-16).
-func sealWalletBestEffort(dest, name, pass string) {
-	defer func() { bestEffortPanic("roam-out wallet seal", name, recover()) }()
-	wpath := walletPathFor(dest)
-	if _, err := os.Stat(wpath); err != nil {
-		return // no wallet this session
-	}
-	if dk := resolveDK("s3", name, pass, seFromSession(dest)); dk != nil {
-		if _, err := sealWallet("s3", name, pass, dk, wpath); err != nil {
-			fmt.Fprintf(os.Stderr, "[logind] roam-out wallet seal %q: %s\n", name, logSafeStoreErr("roam-out wallet seal", err))
-		}
-	}
-}
-
 // syncLoopSleep is syncLoop's wait before each cycle (sleepUntilWall), a variable so a test can drive one cycle of the
 // real loop and end it (NWP-20261013-20: the periodic wallet retry is convicted by behaviour, not only a source pin).
 var syncLoopSleep = sleepUntilWall
@@ -20802,7 +21061,8 @@ var syncLoopSleep = sleepUntilWall
 // Supersedes the Arc-1 diaspore_sync.sh, which keyed off the tmpfs .session marker + pushed the
 // working-set dir -- both wrong for the Arc-2 per-user model (it skipped every cycle).
 func syncLoop(dest string) {
-	var holdWake time.Duration // NWP-20261011-01: set by a cycle a hold deferred (holdWakeLocked)
+	var saveHold, saveHoldUID string // NWP-20261201-03: the save-mode hold last logged, and the session it was for
+	var holdWake time.Duration       // NWP-20261011-01: set by a cycle a hold deferred (holdWakeLocked)
 	for {
 		// Re-read each cycle so a gate -> Settings change to the cadence applies live, without a reboot.
 		// NWP-20260824-10: WALL clock, not monotonic. time.Sleep freezes across system suspend, so on a
@@ -20878,6 +21138,9 @@ func syncLoop(dest string) {
 		// and the on-demand materialise window, so every one of them wedged too: on an amnesiac device whose
 		// /data is wiped at power-off, a permanently dead periodic seal is silent DATA LOSS. Shipped in 0.5.15
 		// and caught only because a tapped app hung at "downloading Play services" (NW-229bbe8d6682).
+		// NWP-20261201-03: the profile's save mode, re-read before every decision like the seal-hold choice below
+		// (save_mode.go).
+		refreshSaveMode(dest, uid)
 		// NWP-20261011-01: the profile's seal-hold choice, re-read before every decision so a change applies to the
 		// next one (seal_hold.go) -- read and applied as one step under sealHoldMu, so a SET-SEAL-HOLD landing in
 		// between is never reverted.
@@ -20903,6 +21166,24 @@ func syncLoop(dest string) {
 		}
 		if odCap != "" && reason == "" {
 			fmt.Fprintf(os.Stderr, "[logind] periodic seal runs inside a live materialise window: %s (NWP-20261011-01)\n", odCap)
+		}
+		// NWP-20261201-03: a save-mode hold is the user's choice, not a fault, so it does not count in sealDeferCount and
+		// is logged once per change. It holds the SAVE and nothing else. It can last the whole session, and the two calls
+		// below run only at the end of a cycle: without them a long Off session stops renewing the managed-store lease
+		// (the gateway GC then reaps the profile's chunks; see maybePayRent) and a dead mediad is never revived. A DELETE
+		// or a rotation in flight has always deferred them, and still does.
+		if uid != saveHoldUID {
+			saveHold, saveHoldUID = "", uid // every sign-in mints a new user: a new session logs its own hold
+		}
+		var saveHoldLine string
+		saveHold, saveHoldLine = saveModeHoldStep(saveHold, reason)
+		logSaveHold(saveHoldLine)
+		if reason == saveHoldOff || reason == saveHoldWifi {
+			if saveHoldUpkeepAllowed() {
+				kickMediad(dest)
+				maybePayRent(dest, name, pass, wgen)
+			}
+			continue
 		}
 		if reason != "" {
 			// Logged, because a SKIPPED cycle is otherwise completely invisible: sealStatus is written only by
@@ -21041,7 +21322,10 @@ func handleGetEntitlement(conn net.Conn, dest string) {
 // credit goes into its local wallet and rides the promote when the user saves it to the store (the
 // throwaway -> Save-to-store flow). Needs a live session + a configured gateway. New credit is spendable
 // at once; the chooser follows a STORED top-up with a BACKUP so it also roams. mode is the customer's answer at
-// redemption ("keep", "convert" or ""), stored with the purchase (h51 #5).
+// redemption ("keep", "convert" or ""), stored with the purchase (h51 #5). A drain cut short before the gateway proved
+// the code empty answers "PARTIAL <n>[ UNSAVED]" where a complete one answers "OK <n>[ UNSAVED]", and the code is kept in
+// the wallet's pending_claims for a later drain (NWP-20261201-21; decided 2026-11-06, h60 #15). A keep that fails still
+// answers PARTIAL: the gateway holds the rest, and redeeming the code again finishes it.
 func handleClaimMode(conn net.Conn, dest, code, mode string) {
 	gw := strings.TrimRight(os.Getenv("GATEWAY_URL"), "/")
 	if gw == "" {
@@ -21066,7 +21350,7 @@ func handleClaimMode(conn net.Conn, dest, code, mode string) {
 		fmt.Fprint(conn, "ERR-RESTARTING\n")
 		return
 	}
-	n, err := drainClaimMode(newGatewayClient(gw, gwDefault), capWalletPath(), code, mode)
+	n, partial, err := drainClaimOutcome(newGatewayClient(gw, gwDefault), capWalletPath(), code, mode)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[logind] claim -> %s\n", logSafeErrText(err))
 		if errors.Is(err, errWalletBusy) {
@@ -21082,7 +21366,28 @@ func handleClaimMode(conn net.Conn, dest, code, mode string) {
 		fmt.Fprint(conn, "ERR-NOCODE\n") // unknown code or already fully spent
 		return
 	}
-	fmt.Fprintf(os.Stderr, "[logind] add-credits: +%d token(s)\n", n)
+	// NWP-20261201-21: the keep comes BEFORE the seal below, so one publish carries the tokens and the kept code. The
+	// code is a paid bearer code: this line prints the count and one fixed outcome, never the code and never the error.
+	reply := "OK"
+	if partial {
+		reply = "PARTIAL"
+		if claimBeforeKeep != nil {
+			claimBeforeKeep()
+		}
+		kept := "was kept"
+		switch kerr := keepPendingClaim(capWalletPath(), code); {
+		case kerr == nil:
+		case errors.Is(kerr, errWalletBusy):
+			kept = "could not be kept (busy)"
+		case errors.Is(kerr, errPendingClaimLockUnavailable):
+			kept = "could not be kept (lock unavailable)"
+		default:
+			kept = "could not be kept (error)"
+		}
+		fmt.Fprintf(os.Stderr, "[logind] add-credits: +%d token(s), partial -- the code %s\n", n, kept)
+	} else {
+		fmt.Fprintf(os.Stderr, "[logind] add-credits: +%d token(s)\n", n)
+	}
 	// #218 (DIA-20260728, money-loss found on odtest4): the wallet lives in $NOWHERE_STATE, which is a TMPFS --
 	// it dies on every reap/power-off. Blind tokens are BEARER secrets: if that copy dies before the wallet is
 	// sealed, the credit is unrecoverable (the gateway cannot re-issue -- unlinkability is the point). We used to
@@ -21092,6 +21397,7 @@ func handleClaimMode(conn net.Conn, dest, code, mode string) {
 	// retry a couple of times over a transient network blip. On failure we still report OK (the tokens ARE in the
 	// live wallet and spendable this session) but append UNSAVED so the caller can warn, and log it loudly.
 	// Reply stays "OK <n> [UNSAVED]" -- the existing chooser matches on the OK prefix, so this is back-compatible.
+	// PARTIAL follows the same seal outcome.
 	saved := false
 	cgen := walletGeneration(walletPathFor(dest)) // NWP-20261013-20: BEFORE the session read -- see retryWalletRestore
 	name, pass, _ := readRoamSession(dest)
@@ -21101,9 +21407,9 @@ func handleClaimMode(conn net.Conn, dest, code, mode string) {
 		saved = true // throwaway: nothing to roam yet, credit rides the Save-to-store promote
 	}
 	if saved {
-		fmt.Fprintf(conn, "OK %d\n", n)
+		fmt.Fprintf(conn, "%s %d\n", reply, n)
 	} else {
-		fmt.Fprintf(conn, "OK %d UNSAVED\n", n)
+		fmt.Fprintf(conn, "%s %d UNSAVED\n", reply, n)
 	}
 }
 
@@ -21114,6 +21420,9 @@ func handleClaim(conn net.Conn, dest, code string, keep bool) {
 
 // claimSealSleep is the pause between handleClaim's wallet seal attempts, a variable so a test can count it.
 var claimSealSleep = time.Sleep
+
+// claimBeforeKeep is a test seam, nil in production: called just before handleClaimMode keeps a partial drain's code.
+var claimBeforeKeep func()
 
 // sealClaimedWallet is handleClaim's durable wallet seal after a drain of n tokens (#218): up to three attempts over a
 // transient failure, and none after a refusal no attempt can change (NWP-20261013-20). Reports whether it landed. gen is
@@ -21133,7 +21442,7 @@ func sealClaimedWallet(dest, name, pass string, n int, gen string) (saved bool) 
 				// saved=true on the first attempt, logged "credit is durable", and replied a clean OK.
 				// The UNSAVED branch below, which is the entire point of the #218 fix, could not be
 				// reached. A power-off before the next flush destroyed the tokens exactly as before.
-				if _, err := sealWalletDurable("s3", name, pass, dk, wp); err == nil {
+				if _, err := sealWalletDurableStrict("s3", name, pass, dk, wp); err == nil {
 					saved = true
 					break
 				} else if errors.Is(err, errWalletNotRestored) {
@@ -21216,7 +21525,7 @@ func backupBusyReason(now time.Time, sealBusy bool, loginWin time.Time, userWait
 	return ""
 }
 
-func handleBackup(conn net.Conn, dest string) {
+func handleBackup(conn net.Conn, dest string, stamp ...int64) {
 	// h46 #1 (late_work.go): no seal while the sign-in's late work runs; bounded by lateWorkBound, after which the seal
 	// goes ahead and the job is abandoned (removing data is never deferred past the bound). No worker lane held.
 	waitLateWork("backup")
@@ -21229,6 +21538,10 @@ func handleBackup(conn net.Conn, dest string) {
 	if localOnlySession(dest) {
 		fmt.Fprint(conn, "LOCAL\n") // a throwaway lives only on this phone -> never sealed to the store
 		return
+	}
+	var after int64 // the reconnect stamp from the notice's tap (NWP-20261201-07); 0 for every other caller
+	if len(stamp) > 0 {
+		after = stamp[0]
 	}
 	pendingReapMu.Lock()
 	// B5/DIA-20260727-01 deferred here during an on-demand materialise window too. SUPERSEDED by NWP-20261011-01:
@@ -21249,6 +21562,7 @@ func handleBackup(conn net.Conn, dest string) {
 	// second save start for no reason they could see: the exact #145 complaint.
 	why := backupBusyReason(time.Now(), sealInFlight, loginSettleUntil, userOpWaiting.Load(), sealRunKind, sealRunAt)
 	busy := why != ""
+	followUp, queueSave := backupJoinLocked(why, after) // NWP-20261201-07 (same lock, so six taps arm one waiter)
 	var manualStart int64
 	if !busy {
 		sealInFlight = true                           // claim the progress channel BEFORE replying so the screen's first SEAL-STATUS poll
@@ -21266,7 +21580,15 @@ func handleBackup(conn net.Conn, dest string) {
 	if busy {
 		// NWP-20261015-36: the one fact that explains the tap. The chooser only Log.i's the reply, which a user
 		// build's issue report does not carry, so this line in login.log is the only record of what held the slot.
-		fmt.Fprintf(os.Stderr, "[logind] manual backup refused BUSY: %s\n", why)
+		// NWP-20261201-07: a tap during a running save JOINS it (backup_join.go), with the same reply.
+		if joinsRunningSave(why) {
+			fmt.Fprintf(os.Stderr, "[logind] manual backup joined the running save: %s, follow-up %s\n", why, followUp)
+			if queueSave {
+				goSafe("queued-backup", func() { runQueuedSave(dest, uid, after) })
+			}
+		} else {
+			fmt.Fprintf(os.Stderr, "[logind] manual backup refused BUSY: %s\n", why)
+		}
 		// The reason rides on the reply (a closed vocabulary: no spaces, no profile name) because the chooser renders
 		// it (ReplyCopy.backupBusy). The dispatcher's TryLock refusal (another writer holds sessionMu) still answers
 		// a bare BUSY, which the chooser reads as the generic text.
@@ -21287,7 +21609,7 @@ func handleBackup(conn net.Conn, dest string) {
 			endManualSealRun()
 		}()
 		time.Sleep(500 * time.Millisecond)
-		syscall.Sync() // flush lazily-persisted app state (SharedPreferences/SQLite) before sealing (cf. logout)
+		sealSync() // flush lazily-persisted app state (SharedPreferences/SQLite) before sealing (cf. logout)
 		// #145 S6 (NWP-20260901-30): the frames streaming through here carry the per-scope byte
 		// composition the seal otherwise discards. onProg runs on the trigger's single poll goroutine, so
 		// the closure map needs no lock of its own.
@@ -21324,9 +21646,7 @@ func relayManualProg(comp map[string]int64, p string) {
 // endManualSealRun releases the manual seal's announce and progress channel, ONLY while the announce is still
 // "manual" (h49 #13, NWP-20261119-03). A sign-out that stopped this seal took both: clearing sealInFlight under it
 // ended the sign-out's stall watchdog and made POLL-REAP stop reporting SEALING while its seal still ran. Every
-// sign-out end path clears sealInFlight itself. ACCEPTED: ROAM-OUT sets the announce to "logoff" without
-// sealInFlight, so a ROAM-OUT over a running manual leaves sealInFlight true here; ROAM-OUT reboots after its seal,
-// and no chooser sends it.
+// sign-out end path clears sealInFlight itself.
 func endManualSealRun() {
 	pendingReapMu.Lock()
 	defer pendingReapMu.Unlock()
@@ -21898,6 +22218,13 @@ func main() {
 		fmt.Printf("ota-check: UPTODATE (latest %s)\n", latest)
 		os.Exit(1) // nothing newer
 
+	case "healthoom": // healthoom <uid> -- NWP-20261201-08, run by the roamd RO worker; one line, exit 0 always
+		uid := ""
+		if len(os.Args) > 2 {
+			uid = os.Args[2]
+		}
+		fmt.Println(healthOomLine(os.Stdin, uid))
+		return
 	case "uiderrorstail": // uiderrorstail <floor> <uid> -- NWP-20261010-06, run by the roamd RO worker for REPORT-ISSUE
 		// The worker half of the issue report's uiderrors section: the login daemon's domain cannot read
 		// /data/system, the worker's can (report_issue.go says why that is not widened). The reply format is
@@ -21907,6 +22234,26 @@ func main() {
 			floor, uid = os.Args[2], os.Args[3]
 		}
 		fmt.Print(uiderrorsTail(uiderrorsPath, uiderrorsTailBytes, floor, uid))
+		return
+	case "gmsstate": // gmsstate <uid> -- NWP-20261201-01, run by the roamd RO worker for REPORT-ISSUE
+		// Filters the two activity-manager dumps on stdin down to this user's two gms processes (report_gms.go). The
+		// reply is the protocol and the daemon parses it; exit 0 always, so roamd forwards every outcome verbatim.
+		uid := ""
+		if len(os.Args) > 2 {
+			uid = os.Args[2]
+		}
+		dump, _ := io.ReadAll(io.LimitReader(os.Stdin, gmsMaxDumpBytes))
+		fmt.Print(parseGmsState(string(dump), uid))
+		return
+	case "gmsexits": // gmsexits <uid> -- NWP-20261201-02, run by the roamd RO worker for REPORT-ISSUE
+		// stdin is roamd's clock line, the dump and its exit status. An over-long dump loses that status line, so it
+		// answers an honest ERR-DUMP. Exit 0 always, so roamd forwards every outcome verbatim.
+		uid := ""
+		if len(os.Args) > 2 {
+			uid = os.Args[2]
+		}
+		dump, _ := io.ReadAll(io.LimitReader(os.Stdin, 2<<20))
+		fmt.Print(parseGmsExits(string(dump), uid))
 		return
 	case "uiderrorsfloor": // uiderrorsfloor -- NWP-20261010-06, run by roamd's `in` op: the file's size at sign-in
 		f, err := uiderrorsFloor(uiderrorsPath)
@@ -22062,7 +22409,10 @@ func main() {
 			// pre-gate chunks (mediaRestorePlan). Everything below keeps the FULL m: the receipt and the roster name the
 			// head, and the pre-gate pass's skipped is what earns them. ⚠ S3 (the seal's carry under a split) must land
 			// before any daemon exports the flag: without it the next seal drops every background file not yet landed.
-			skipped = cdcRestore(base, key, mediaRestorePlan(profile, pass, restoredHead, m), dest)
+			// NWP-20261130-03: and the bare vault and #de skip the spans of packages the session parks, listing them
+			// in this scope's unfetched list (unfetched_fetch.go); off, restoreSkippingParked is cdcRestore. The two
+			// never both apply: mediaRestorePlan changes only #media.
+			skipped = restoreSkippingParked(base, key, profile, mediaRestorePlan(profile, pass, restoredHead, m), dest)
 			// NWP-20260923-02: the vault and #de no longer defer, so fetch whatever their head still carries
 			// deferred, before roamd reowns the tree (media_heal.go). Never counted in `skipped`: a file the
 			// heal cannot write stays deferred in the head and is carried, so the receipt is still earned.
@@ -22149,6 +22499,8 @@ func main() {
 			stashRefusalReasons(os.Args[3], sealRefusalReasons(sealRefused, sealRefusedWhy, sealFenceHit, sealStaleHit))
 			os.Exit(exitSealRefused)
 		}
+		// h60 #17: only a seal that landed gets here, and the retry's result never changes the exit code.
+		retryStagedClaimAfterSave(os.Args[3], os.Args[4])
 
 	case "restore-app": // restore-app <store> <scope> <pass> <pkg> <destDir>  (#204 on-demand: materialise ONE
 		// on-demand app's DEFERRED APK bytes from the FULL app-code scope (e.g. "alice#apps", used verbatim like
@@ -22170,6 +22522,10 @@ func main() {
 			os.Exit(1)
 		}
 		fmt.Printf("restore-app: %q -> %s (%d apk)\n", pkg, dest, n)
+
+	case "fetch-oddata": // fetch-oddata <store> <name> <pass> <pkg> <ceRoot> <deRoot>  (NWP-20261130-03: place ONE
+		// unfetched On-demand/Auto app's CE and DE data, by the spans this sign-in skipped, into its on-demand hold)
+		runFetchOdData(os.Args[2:8])
 
 	case "mediad": // mediad <store> <name> <pass> <userDir> <cacheDir>  (#84 P3: on-demand deferred-media FUSE daemon)
 		runMediad(os.Args[2:])

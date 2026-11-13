@@ -46,7 +46,9 @@ func TestCredLaneMembershipIsExactlyTwoOps(t *testing.T) {
 		}
 	}
 	ro := []string{"storagebreakdown", "sealdelta", "uiderrors",
-		"alarmrelay"} // NWP-20261108-02 (Q183): one `am startservice`, uid only, must not queue behind an abandoned RW op
+		"alarmrelay", // NWP-20261108-02 (Q183): one `am startservice`, uid only, must not queue behind an abandoned RW op
+		"gmsstate",   // NWP-20261201-01: two read-only activity-manager dumps for an issue report
+		"gmsexits"}   // NWP-20261201-02: one `dumpsys activity exit-info`, uid only, for an issue report
 	for _, op := range ro {
 		if got := laneFor(op); got.svc != laneRO.svc {
 			t.Errorf("laneFor(%q).svc = %q, want the RO lane -- this test is not about them, but moving "+

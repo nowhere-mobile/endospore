@@ -202,7 +202,7 @@ func TestMediaSyncSkippedLineIsScrubbed(t *testing.T) {
 	m := chunkManifest{Ess: map[string]essRegion{mlpRel: {S: 0, E: 1}}} // Chunks empty: fetchEssSpan refuses it
 	var wrote []string
 	out := captureStdout(t, func() {
-		wrote, _ = materializeCarried("", nil, m, []string{mlpRel}, t.TempDir())
+		wrote, _ = materializeCarried("", nil, m, []string{mlpRel}, t.TempDir(), deferredSyncBudget())
 	})
 	if len(wrote) != 0 {
 		t.Fatalf("wrote %v", wrote)

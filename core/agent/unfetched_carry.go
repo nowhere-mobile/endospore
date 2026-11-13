@@ -14,7 +14,8 @@ package main
 // this one runs only for the bare vault and #de, mediaEssentialCarryOn is true only for #media, and carryEssential is
 // on only for #apps (roamd pins NOWHERE_CARRY_ESSENTIAL=0 on every other push, conf_flags_scoped_test.go).
 //
-// Nothing writes the list yet, so the carry is inert until the fetch slice does.
+// ~~Nothing writes the list yet, so the carry is inert until the fetch slice does.~~ (Superseded by NWP-20261130-03: the
+// sign-in's vault and #de restores write one list per scope, unfetched_fetch.go.)
 
 import (
 	"fmt"
@@ -74,15 +75,15 @@ func carryUnfetched(oldM chunkManifest, chunks []string, walked map[string]bool,
 // sealCarryUnfetched is pushProfile's call: the gate and the log line around carryUnfetched. The gate is the guard's
 // scope, a seal with per-file boundaries (under NOWHERE_SEAL_FULL the footer shares a chunk with file bytes and the walk
 // records nothing), and a readable, non-empty list. An unreadable list carries nothing: the guard refuses that seal
-// as unfetched-unknown.
-func sealCarryUnfetched(profile string, oldM chunkManifest, chunks []string, acct *pkgAcct, deferredMap map[string]deferredFile) ([]string, map[string][][2]int, map[string]int64, int) {
+// as unfetched-unknown. NWP-20261130-03: unf and ok are the list pushProfile read once (sealUnfetchedList), the same
+// set the walk excluded by.
+func sealCarryUnfetched(profile string, oldM chunkManifest, chunks []string, acct *pkgAcct, deferredMap map[string]deferredFile, unf map[string]bool, ok bool) ([]string, map[string][][2]int, map[string]int64, int) {
 	if strings.IndexByte(profile, '#') >= 0 && !strings.HasSuffix(profile, "#de") {
 		return chunks, nil, nil, 0
 	}
 	if !incrementalSeal() || len(chunks) == 0 {
 		return chunks, nil, nil, 0
 	}
-	unf, ok := loadUnfetchedList()
 	if !ok || len(unf) == 0 {
 		return chunks, nil, nil, 0
 	}

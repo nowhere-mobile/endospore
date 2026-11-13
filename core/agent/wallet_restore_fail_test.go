@@ -1248,12 +1248,9 @@ func TestTheWalletRetryAndProofCallSites(t *testing.T) {
 	order("promoteToStore", `proveNoStoredWallet("s3", name, pass, wp, walletGeneration(wp))`, `createVault("s3", name, pass)`)
 	// pass 4: every other retry entry point captures its generation before it reads the session (and so before any
 	// store read), and hands that generation to the retry.
-	order("handleRoamOut", "rgen := walletGeneration(walletPathFor(dest))", "name, pass, uid := readRoamSession(dest)")
-	order("handleRoamOut", "if logoffWalletRetry(dest, name, pass, seFromHex(readRoamSessionSE(dest)), rgen) {\n\t\t\tnoteCreditLost(dest)",
-		"out := triggerRoamWorker(dest, \"out\", name, pass, uid, readRoamSessionSE(dest), nil)")
 	order("handleClaimMode", "cgen := walletGeneration(walletPathFor(dest))", "name, pass, _ := readRoamSession(dest)")
 	order("handleClaimMode", "name, pass, _ := readRoamSession(dest)", "saved = sealClaimedWallet(dest, name, pass, n, cgen)")
-	order("sealClaimedWallet", `retryWalletRestore("s3", name, pass, dk, wp, gen)`, `sealWalletDurable("s3", name, pass, dk, wp)`)
+	order("sealClaimedWallet", `retryWalletRestore("s3", name, pass, dk, wp, gen)`, `sealWalletDurableStrict("s3", name, pass, dk, wp)`)
 	eu, err := os.ReadFile("end_unsaved.go")
 	if err != nil {
 		t.Fatal(err)

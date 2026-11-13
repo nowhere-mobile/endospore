@@ -164,14 +164,16 @@ func ownerItemID(path string) string {
 // sealUnboundToOwner seals an unbound arrival to the device owner and returns the wire reply and the log verdict.
 // Caller holds telMu. The seal uses only the owner public half; it never derives a key or takes ownerKeyMu.
 //
-//	OWNER  sealed to the owner inbox; the gate posts a content-free unassigned-SIM notice
+//	OWNER  sealed to the owner inbox; the gate posts the unassigned-SIM notice
 //	FULL   the owner inbox is at its hard budget; nothing kept, the gate posts "may not have been saved"
 //	NONE   no owner key yet (device not verified since it landed): an accepted loss, as before this slice
+//
+// OWNER and NONE carry "number" when the owner's opt-in is on (unboundNoticeReply).
 func sealUnboundToOwner(a *arrivalReq) (reply, verdict string) {
 	pub, ok := ownerPubForSeal()
 	if !ok {
 		telClassNote(telClassOwnerNoKey)
-		return "NONE\n", telVerdictUnbound
+		return unboundNoticeReply("NONE"), telVerdictUnbound
 	}
 	it := a.it
 	// An MMS over the per-item cap keeps sender, subject and time without its media, as the bound path does
@@ -209,7 +211,17 @@ func sealUnboundToOwner(a *arrivalReq) (reply, verdict string) {
 		telClassNote(telClassOwnerFull) // ENOSPC on the tmpfs behaves as a full store: no record, a loss notice
 		return "FULL\n", telVerdictOwnerFull
 	}
-	return "OWNER\n", telVerdictOwner
+	return unboundNoticeReply("OWNER"), telVerdictOwner
+}
+
+// unboundNoticeReply is an OWNER or NONE reply: the word alone, or the word and "number" when the owner's opt-in
+// (noticeNumberGet) shows the caller's number on the gate notice (h59 #13). OWNER and NONE carry the same token, so the
+// notice never tells a kept arrival from an unkept one.
+func unboundNoticeReply(word string) string {
+	if noticeNumberGet() == "1" {
+		return word + " number\n"
+	}
+	return word + "\n"
 }
 
 // mustMarshalLen marshals an item for a size check; a marshal error yields an over-cap length so the item is refused.

@@ -307,7 +307,7 @@ func TestAStagedClaimWhoseProofDidNotStandStaysStaged(t *testing.T) {
 	if walletRestoreLanded(staged, walletGeneration(staged)) {
 		t.Fatal("fixture: the staged claim's generation is proven")
 	}
-	out := captureStderr(t, func() { finishStagedClaim(walletFailName, walletFailPass, staged) })
+	out := captureStderr(t, func() { finishStagedClaim(walletFailName, walletFailPass, staged, false) })
 	if w, err := loadWallet(staged); err != nil || w.balance() != 2 {
 		t.Fatalf("the unproven staged claim did not stay (%v, %v); stderr:\n%s", w, err, out)
 	}

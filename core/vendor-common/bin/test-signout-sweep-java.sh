@@ -9,7 +9,8 @@
 #      `if (LogoutAck.lockLanding(reply)) {` branch (NWP-20261111-08, Q067) lowers it before its return, and nothing
 #      else in doLogoffImpl lowers it.
 #   S3 each of sweepAuto's two loops checks SignOutGate.begun() before its restore-only chunk (restoreOnlyLocked /
-#      restoreOnlyListLocked, NWP-20261128-16) / materializeAndInstall.
+#      restoreOnlyListLocked, NWP-20261128-16) / materializeAndInstall. NWP-20261201-13: the chunk loop's SweepHold
+#      line follows it; test-sweep-hold-java.sh owns that line.
 #   S4 the materialise loop's stop takes the not-started apps off the queue: qDrop(SignOutGate.rest(work, i)).
 #   S5 AUTO-SWEEP 0 is still sent from sweepAuto's finally.
 #
@@ -95,7 +96,7 @@ sources() {
   fi
   if perl -0e '
       my $c = do { local $/; <STDIN> };
-      exit 1 unless $c =~ /for \(int c = 0; c < retry\.size\(\); c \+= OdRestoreList\.CHUNK\) \{\s*if \(SignOutGate\.begun\(\)\) break;\s*java\.util\.List<String> chunk = [^;]*;\s*MAT_LOCK\.lock\(\);.*?restoreOnlyListLocked\(keep\)/s;
+      exit 1 unless $c =~ /for \(int c = 0; c < retry\.size\(\); c \+= OdRestoreList\.CHUNK\) \{\s*if \(SignOutGate\.begun\(\)\) break;\s*if \(SweepHold\.held\(\)\) break;\s*java\.util\.List<String> chunk = [^;]*;\s*MAT_LOCK\.lock\(\);.*?restoreOnlyListLocked\(keep\)/s;
       exit 1 if $c =~ /for \(String pkg : work\)/;
       exit 1 unless $c =~ /for \(int i = 0; i < work\.size\(\); i\+\+\) \{\s*if \(SignOutGate\.begun\(\)\) \{(?:(?!materializeAndInstall).)*?\bbreak;\s*\}\s*String pkg = work\.get\(i\);.*?materializeAndInstall\(pkg, true\)/s;
       exit 0;' <<<"$sweep"; then

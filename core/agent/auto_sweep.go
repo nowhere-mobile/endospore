@@ -94,11 +94,15 @@ func sweepDeferReason(now, until, began time.Time, lastSealStart int64, maxGap t
 }
 
 // periodicSealDeferReason is syncLoop's whole decision for one PERIODIC cycle: the shared guards first, then the
-// auto-sweep hold. Periodic only -- a manual "Back up now" calls syncDeferReason alone and the logoff seal consults
-// neither, so a sweep never holds them back. The caller holds pendingReapMu.
+// profile's save mode (save_mode.go), then the auto-sweep hold. Periodic only -- a manual "Back up now" calls
+// syncDeferReason alone and the logoff seal consults neither, so neither a save mode nor a sweep holds them back. The
+// caller holds pendingReapMu.
 func periodicSealDeferReason(now time.Time, sealBusy bool) string {
 	if r := syncDeferReason(now, sealBusy, odWindowNow(now), loginSettleUntil, userOpWaiting.Load()); r != "" {
 		return r
+	}
+	if r := saveModeDeferReason(saveModeValue, saveNetUnmetered, saveNetAt, now); r != "" {
+		return r // NWP-20261201-03: the profile's save mode; periodic only
 	}
 	// NWP-20261011-01: counted from the anchor shared with the materialise window, so a sweep and taps that
 	// overlap hold seals back for at most one autoSweepMaxSealGap between them, not one each.

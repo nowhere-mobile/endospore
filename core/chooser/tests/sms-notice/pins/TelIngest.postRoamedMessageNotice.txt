@@ -4,7 +4,7 @@
             android.app.NotificationManager nm = ctx.getSystemService(android.app.NotificationManager.class);
             if (nm == null) return;
             SmsDeliverReceiver.ensureTelChannel(nm); // HIGH + explicit sound + vibrate -> the roamed session alerts
-            String title = from == null || from.isEmpty() ? "New message" : from;
+            String title = SenderName.senderTitle(from, SenderName.lookUpSender(from, android.os.UserHandle.myUserId()) ? contactName(ctx, from) : null);
             String body = preview == null ? "" : preview.trim();
             if (body.isEmpty() && subject != null) body = subject.trim();
             if (mediaLabel != null) body = body.isEmpty() ? mediaLabel : (body + "  " + mediaLabel);

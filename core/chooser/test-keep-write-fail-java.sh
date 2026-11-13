@@ -11,11 +11,19 @@
 # stubs what they call, and runs KeepWriteFailCases, then source-checks the nApps branch order (startsWith("OK") would
 # swallow OK-UNSAVED if it came first).
 #
-# On origin/main this suite FAILS with exit 1, both halves shown: getAppReply does not exist, so run.sh stubs it to
-# return null and its four cases fail; keepAutoImpl answers true for a failed write, so the write-throws and
-# read-throws cases fail; and the nApps branch-order check finds no OK-UNSAVED branch. Its mutants:
+# NWP-20261129-38: keepAutoImpl also answers true for an Off nApps default and writes no line (pinned here: "APPDEF_OFF
+# -> kept, no write"), so a Get on a profile whose nApps default is Off (the Zero preset) still said "<app> added.", and
+# nothing else keeps that app. getApp now reads the default and getAppReply answers "OK-OFF" when the app has no keep
+# line; nApps words it. An app already kept still answers "OK". run.sh adds source checks on the OK-OFF branch order and
+# on getApp's wiring, because getApp itself talks to the daemon and cannot run here.
+#
+# Against the sources before NWP-20261129-38 this suite exits 2: getAppReply has three parameters, so its four-parameter
+# signature does not extract. Before NWP-20261105-03 getAppReply did not exist; run.sh stubs that case to return null,
+# so its cases fail. Its mutants:
 #   K1 the catch back to `return true`   K2 `wrote = true` moved above writeAtomic
 #   K3 getAppReply maps not-kept-not-overPlan to OK-SESSION-ONLY   K4 the nApps OK-UNSAVED branch after the generic OK
+#   K5 getAppReply answers OK under an Off default   K6 the nApps OK-OFF branch after the generic OK
+#   K7 getApp passes false for the flag   K8 getApp drops the keepSetHas term
 # What it does NOT prove: the wording on a device.
 #
 # ⚠ IT FAILS WHEN THERE IS NO JAVAC, IT NEVER SKIPS (exit 2), like the other javac suites.
@@ -86,5 +94,9 @@ fails=0
 mut "K1 the catch back to return true" si 's/( {16}\/\/ is the over-plan gate.s, in the caller[^\n]*\n) {16}return wrote;/$1                return true;/' || fails=$((fails+1))
 mut "K2 wrote = true moved above writeAtomic" si 's/( {16})(writeAtomic\(f, sb\.toString\(\)\);)\n {16}wrote = true;/$1wrote = true;\n$1$2/' || fails=$((fails+1))
 mut "K3 getAppReply maps not-kept-not-overPlan to OK-SESSION-ONLY" ss 's/\(overPlan \? "OK-SESSION-ONLY " : "OK-UNSAVED "\)/"OK-SESSION-ONLY "/' || fails=$((fails+1))
-mut "K4 the napps OK-UNSAVED branch moved after the generic OK" sa 's/( {16}\} else if \(r\.startsWith\("OK-UNSAVED"\)\) \{\n.*?\n)( {16}\} else if \(r\.startsWith\("OK"\)\) \{\n.*?\n)/$2$1/s' 2 || fails=$((fails+1))
+mut "K4 the napps OK-UNSAVED branch moved after the generic OK" sa 's/( {16}\} else if \(r\.startsWith\("OK-UNSAVED"\)\) \{\n.*?\n)( {16}\} else if \(r\.startsWith\("OK-OFF"\)\) \{\n.*?\n)( {16}\} else if \(r\.startsWith\("OK"\)\) \{\n.*?\n)/$2$3$1/s' 4 || fails=$((fails+1))
+mut "K5 getAppReply answers OK under an Off default" ss 's/\(notKeptByDefault \? "OK-OFF " : "OK "\)/"OK "/' || fails=$((fails+1))
+mut "K6 the napps OK-OFF branch moved after the generic OK" sa 's/( {16}\} else if \(r\.startsWith\("OK-OFF"\)\) \{\n.*?\n)( {16}\} else if \(r\.startsWith\("OK"\)\) \{\n.*?\n)/$2$1/s' 2 || fails=$((fails+1))
+mut "K7 getApp passes false for the flag" ss 's/getAppReply\(kept, overPlan, offDefault && !StoreInstaller\.keepSetHas\(StoreService\.this, pkg\), pkg\)/getAppReply(kept, overPlan, false, pkg)/' || fails=$((fails+1))
+mut "K8 getApp drops the keepSetHas term" ss 's/offDefault && !StoreInstaller\.keepSetHas\(StoreService\.this, pkg\), pkg\)/offDefault, pkg)/' || fails=$((fails+1))
 [ "$fails" -eq 0 ] && echo "== all mutations convicted" || { echo "== $fails mutation(s) not convicted"; exit 1; }

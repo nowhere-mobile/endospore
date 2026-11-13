@@ -19,10 +19,10 @@
 #   P8 presetGuard only switches on PresetPicker.guardAction, and its WRITE_ONLY arm saves no Custom;
 #   P9 showConfirm adds the Privacy level card once, only under PresetPicker.cardShown(local, offline), after the
 #      Update card and before the menu, built from its own views (no sectionCard);
-#   P10 showPresetPicker lists PresetPicker.dropdownRows and picks from dropdownNames;
-#   P11 pickPreset shows countLine(changeCount(...)) before it opens showPresetPreview;
+#   P10 showPresetPicker shows PresetSheet.picker over dropdownNames and goes to pickPreset;
+#   P11 pickPreset shows PresetSheet.count before it opens showPresetPreview;
 #   P12 applyPreset returns to Profile home (showConfirm), never to Preferences;
-#   P13 the preview's consent links and its Apply line, byte for byte.
+#   P13 the preview's consent links and its "Apply " + picked button, byte for byte.
 #
 # ⚠ IT FAILS WHEN THERE IS NO JAVAC, IT NEVER SKIPS. javac comes from PATH, else from the build host's JDK below;
 # the version is printed first so the log proves which compiler ran.
@@ -42,6 +42,7 @@ root=$(cd "$here/../../.." && pwd)
 SRC="$root/core/chooser/src/com/nowhere/chooser"
 SUT="$SRC/PresetPicker.java"
 PA="$SRC/ProfileActivity.java"
+PS="$SRC/PresetSheet.java"
 CASES="$root/core/chooser/tests/preset-picker/PresetPickerCases.java"
 HOST_JDK=/mnt/build/lineage/prebuilts/jdk/jdk21/linux-x86/bin
 
@@ -55,7 +56,7 @@ else
   exit 2
 fi
 "$JAVAC" -version || { echo "FAIL: $JAVAC does not run" >&2; exit 2; }
-for f in "$CASES" "$PA" "$SRC/ProfilePresets.java" "$SRC/WipeChoice.java" "$SRC/WipeOnSave.java" "$SRC/SettingsText.java"; do
+for f in "$CASES" "$PA" "$PS" "$SRC/ProfilePresets.java" "$SRC/WipeChoice.java" "$SRC/WipeOnSave.java" "$SRC/SettingsText.java"; do
   [ -f "$f" ] || { echo "FAIL: missing $f" >&2; exit 2; }
 done
 
@@ -219,17 +220,16 @@ pins() {
 
   # P10: the dropdown.
   b=$(meth "$paf" showPresetPicker)
-  { has "$b" "PresetPicker.dropdownRows(saved)" && has "$b" "PresetPicker.dropdownNames(saved)" && has "$b" "pickPreset(names.get(which))" \
-    && has "$b" "presetSavedCustom() != null"; } \
-    || { echo "  FAIL  P10 showPresetPicker does not list dropdownRows and pick from dropdownNames" >&2; bad=1; }
+  { has "$b" "PresetSheet.picker(saved, presetShown(), savedValues)" && has "$b" "PresetPicker.dropdownNames(saved)" && has "$b" "pickPreset(names.get(i))" \
+    && has "$b" "presetSavedCustom()"; } \
+    || { echo "  FAIL  P10 showPresetPicker does not show PresetSheet.picker over dropdownNames and go to pickPreset" >&2; bad=1; }
 
   # P11: the count before the preview.
   b=$(meth "$paf" pickPreset)
-  g=$(first_line "$b" "PresetPicker.countLine(PresetPicker.changeCount(cur, c.valuesToApply))")
+  g=$(first_line "$b" "PresetSheet.count(picked, PresetPicker.changeCount(cur, c.valuesToApply))")
   w=$(first_line "$b" "showPresetPreview(picked, cur, c)")
-  if [ -z "$g" ] || [ -z "$w" ] || [ "$g" -gt "$w" ] || [ "$(count "$b" "showPresetPreview(")" -ne 1 ] \
-     || ! has "$b" ".setPositiveButton(PresetPicker.CONTINUE, (d, w) -> showPresetPreview(picked, cur, c))"; then
-    echo "  FAIL  P11 pickPreset does not show countLine before Continue opens showPresetPreview" >&2; bad=1
+  if [ -z "$g" ] || [ -z "$w" ] || [ "$g" -gt "$w" ] || [ "$(count "$b" "showPresetPreview(")" -ne 1 ]; then
+    echo "  FAIL  P11 pickPreset does not show PresetSheet.count before it opens showPresetPreview" >&2; bad=1
   fi
 
   # P12: Apply returns to Profile home, where the card redraws.
@@ -238,33 +238,23 @@ pins() {
     || { echo "  FAIL  P12 applyPreset does not return to Profile home (showConfirm) on both exits" >&2; bad=1; }
 
   # P13: the preview's links and Apply, unchanged.
-  b=$(meth "$paf" showPresetPreview | awk '/java\.util\.List<String> links = PresetPicker\.links\(picked\);/ { f = 1 } f { print } f && /setPositiveButton\("Apply"/ { exit }')
+  b=$(meth "$paf" showPresetPreview | awk '/java\.util\.List<String> links = PresetPicker\.links\(picked\);/ { f = 1 } f { print } f && /new Runnable\[\] \{ \(\) -> applyPreset\(picked, cur, c\), null \},/ { exit }')
   want=$(cat <<'PIN'
         java.util.List<String> links = PresetPicker.links(picked);
+        boolean[] linkOffered = new boolean[links.size()];
         for (int i = 0; i < links.size(); i++) {
             final boolean tie = i == 0;
             boolean offered = tie ? !"LOCAL".equals(sessionType)
                     : locOffered(sessionType, offlineSession, locServicesAvailable());
-            TextView t = presetLine(links.get(i), offered ? ACCENT : MUTED);
-            if (offered) {
-                t.setPaintFlags(t.getPaintFlags() | android.graphics.Paint.UNDERLINE_TEXT_FLAG);
-                t.setOnClickListener(v -> {
-                    if (dlg[0] != null) dlg[0].dismiss();
-                    if (tie) showPhoneTie();
-                    else showLocationServices();
-                });
-            }
-            body.addView(t);
+            linkOffered[i] = offered;
         }
-        android.widget.ScrollView sc = new android.widget.ScrollView(this);
-        sc.addView(body);
-        dlg[0] = new android.app.AlertDialog.Builder(this)
-                .setTitle(picked)
-                .setView(sc)
-                .setPositiveButton("Apply", (d, w) -> applyPreset(picked, cur, c))
+        SheetDialog.confirm(this, PresetSheet.preview(picked, lines, links, linkOffered),
+                new Runnable[] { () -> applyPreset(picked, cur, c), null },
 PIN
 )
   [ "$b" = "$want" ] || { echo "  FAIL  P13 the preview's consent links or its Apply line changed" >&2; bad=1; }
+  has "$(code "$PS")" 'new PopupSheet.Button("Apply " + picked, PopupSheet.Style.GREEN_FILLED)' \
+    || { echo "  FAIL  P13 PresetSheet.preview's green button is not \"Apply \" + picked" >&2; bad=1; }
   [ "$bad" -eq 0 ]
 }
 
@@ -325,7 +315,7 @@ mut "M15 the idle Save runs without the guard"   pa    's/presetGuard\(PresetPic
 mut "M16 applyPreset does not tell the gate"     pa    's/\n *if \(prefs\) sendLivePrefs\(\);//' || fails=$((fails+1))
 mut "M17 the card shown for a throwaway"        class 's/return !local \|\| offline;/return true;/' || fails=$((fails+1))
 mut "M18 the card hidden offline"                class 's/return !local \|\| offline;/return !local;/' || fails=$((fails+1))
-mut "M19 the count step skipped"                 pa    's/(\n *)new android\.app\.AlertDialog\.Builder\(this\)\n *\.setTitle\(picked\)\n *\.setMessage\(PresetPicker\.countLine\(.*?\.show\(\);/${1}showPresetPreview(picked, cur, c);/s' || fails=$((fails+1))
+mut "M19 the count step skipped"                 pa    's/(\n *)SheetDialog\.confirm\(this, PresetSheet\.count\(.*?, null\);/${1}showPresetPreview(picked, cur, c);/s' || fails=$((fails+1))
 mut "M20 scalePos off by one"                    class 's/return SCALE\.indexOf\(shown\);/return SCALE.indexOf(shown) + 1;/' || fails=$((fails+1))
 mut "M21 Custom placed on the scale"             class 's/(static final List<String> SCALE = Collections\.unmodifiableList\(new ArrayList<>\()ProfilePresets\.PRESETS\)\);/${1}Arrays.asList("Unshielded", "Standard", "Hardened", "Isolated", "Zero", "Custom")));/' || fails=$((fails+1))
 mut "M22 the card unguarded on Profile home"     pa    's/if \(PresetPicker\.cardShown\(local, offline\)\) addPrivacyLevelCard\(ll\);/addPrivacyLevelCard(ll);/' || fails=$((fails+1))

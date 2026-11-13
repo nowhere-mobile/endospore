@@ -2,6 +2,8 @@
 # test-logout-wait.sh [--mutate] -- runs the LOGOUT wait cases (logout_wait_test.go; NWP-20261106-04, Q116);
 # --mutate re-runs them against main.go / logout_wait.go broken in turn, restoring both on exit. Each mutant must be
 # CONVICTED by a real `--- FAIL`; one that fails to apply or to compile is a failure.
+# Since NWP-20261129-51 W1, W2 and W5 step lockSessionForLogout's ticker and clock by hand (logoutWaitTicker,
+# logoutWaitNow) and read a recording conn, so no load can fail them; M1 waits out W5's 30 s hang guard to convict.
 set -uo pipefail
 cd "$(dirname "$0")"
 . ./suite-report.sh
@@ -34,15 +36,15 @@ PY
   cp -f "$W/$f.orig" "$f"
 }
 BLK='\t\tif name == "LOGOUT" {\n\t\t\tlockSessionForLogout(conn, dest)\n\t\t} else {\n\t\t\tsessionMu.Lock()\n\t\t}\n'
-TICK='\t\tcase <-tk.C:\n\t\t\tconn.SetDeadline(time.Now().Add(loginConnDeadline))\n'
+TICK='\t\tcase <-tc:\n\t\t\tconn.SetDeadline(time.Now().Add(loginConnDeadline))\n'
 mut "M1 LOGOUT back to the blocking sessionMu.Lock()" main.go \
   "s.replace('\t\t\tlockSessionForLogout(conn, dest)\n', '\t\t\tsessionMu.Lock()\n', 1) if s.count('\t\t\tlockSessionForLogout(conn, dest)\n') == 1 else None"
 mut "M2 WAIT written before logoutWaitFirst" logout_wait.go \
-  "s.replace('case <-tk.C:\n\t\t\tconn.SetDeadline(time.Now().Add(loginConnDeadline))\n\t\t\tif waited := time.Since(start); waited >= logoutWaitFirst {', 'case <-tk.C:\n\t\t\tconn.SetDeadline(time.Now().Add(loginConnDeadline))\n\t\t\tif waited := time.Since(start); waited >= 0 {', 1) if s.count('case <-tk.C:') == 1 else None"
+  "s.replace('case <-tc:\n\t\t\tconn.SetDeadline(time.Now().Add(loginConnDeadline))\n\t\t\tif waited := logoutWaitNow().Sub(start); waited >= logoutWaitFirst {', 'case <-tc:\n\t\t\tconn.SetDeadline(time.Now().Add(loginConnDeadline))\n\t\t\tif waited := logoutWaitNow().Sub(start); waited >= 0 {', 1) if s.count('case <-tc:') == 1 else None"
 mut "M3 every serialized verb goes through lockSessionForLogout" main.go \
   "s.replace('$BLK', '\t\tlockSessionForLogout(conn, dest)\n', 1) if s.count('$BLK') == 1 else None"
 mut "M4 WAIT without the seconds" logout_wait.go \
   "s.replace('\"WAIT %d\\\\n\", int(waited/time.Second))', '\"WAIT\\\\n\")', 1) if s.count('\"WAIT %d\\\\n\", int(waited/time.Second))') == 1 else None"
 mut "M5 the per-tick deadline re-arm removed" logout_wait.go \
-  "s.replace('$TICK', '\t\tcase <-tk.C:\n', 1) if s.count('$TICK') == 1 else None"
+  "s.replace('$TICK', '\t\tcase <-tc:\n', 1) if s.count('$TICK') == 1 else None"
 [ "$fails" -eq 0 ] && echo "== all mutations convicted" || { echo "== $fails mutation(s) not convicted"; exit 1; }

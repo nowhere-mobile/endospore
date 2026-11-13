@@ -86,8 +86,8 @@ sources() {
   [ -n "$whole" ] || { echo "FAIL P0 UnarchiveService.java not read"; return 1; }
   pin P1 "onStartCommand runs sweepAutoJoined(false) in the netRekick branch and sweepAutoJoined(byHand) after the snapshot and wakeRestored, and no sweepAuto( itself" '
       exit 1 if $c =~ /\bsweepAuto\(/;
-      my $n = () = $c =~ /\bsweepAutoJoined\(/g; exit 1 unless $n == 2;
-      $c =~ /if \(netRekick\) \{((?:(?!snapshotAppSeen|wakeRestored).)*?)\breturn;\s*\}/s or exit 1;
+      my $n = () = $c =~ /\bsweepAutoJoined\(/g; exit 1 unless $n == 3;
+      $c =~ /if \(netRekick\) \{((?:(?!snapshotAppSeen|wakeRestored|if \(resumeSweep\)).)*?)\breturn;\s*\}/s or exit 1;
       my $nb = $1;
       $nb =~ /try \{ sweepAutoJoined\(false\); \}\s*catch \(Throwable \w+\) \{[^}]*\}\s*finally \{ workerDone\(\); \}/ or exit 1;
       my $snap = index($c, "StoreInstaller.snapshotAppSeen(");

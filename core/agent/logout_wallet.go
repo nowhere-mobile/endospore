@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"sync"
 )
 
 // NWP-20261017-02: A SIGN-OUT THAT LANDED TAKES THE WALLET OUT OF THE STATE TMPFS.
@@ -24,7 +25,8 @@ import (
 //
 // A generation with no restore proof KEEPS the file (errWalletNotRestored): the sign-out already went ahead without a
 // wallet publish (logoffWalletRetry, whose notice is decided and unchanged), and the file is the only copy of what
-// the session held. Every failure keeps it too.
+// the session held. Every failure keeps it too. So does a generation whose stored wallet handleLogout could not read
+// before its switch (NWP-20261201-22): nothing is published over a copy that could not be read.
 
 // logoutWalletStep is what handleLogout runs once its seal has landed. A seam for the tests.
 var logoutWalletStep = sealLogoutWalletAndDrop
@@ -34,6 +36,35 @@ var logoutWalletCaptured func()
 
 // logoutWalletPublished, when set (tests only), runs after the publish and before the drop.
 var logoutWalletPublished func()
+
+// errLogoutWalletUnreadable refuses the publish of a generation whose stored wallet handleLogout could not read
+// before its switch (NWP-20261201-22).
+var errLogoutWalletUnreadable = errors.New("the stored wallet could not be read before the switch")
+
+// logoutWalletUnreadableGens holds the generations whose stored wallet could not be read before the switch. Per
+// generation, because the publish runs on a goroutine of its own and can outlast the next session's sign-out.
+var (
+	logoutWalletUnreadableMu   sync.Mutex
+	logoutWalletUnreadableGens = map[string]bool{}
+)
+
+// setLogoutWalletUnreadable notes generation gen (v true) or clears its note.
+func setLogoutWalletUnreadable(gen string, v bool) {
+	logoutWalletUnreadableMu.Lock()
+	defer logoutWalletUnreadableMu.Unlock()
+	if v {
+		logoutWalletUnreadableGens[gen] = true
+	} else {
+		delete(logoutWalletUnreadableGens, gen)
+	}
+}
+
+// logoutWalletUnreadable reports whether generation gen carries the note.
+func logoutWalletUnreadable(gen string) bool {
+	logoutWalletUnreadableMu.Lock()
+	defer logoutWalletUnreadableMu.Unlock()
+	return logoutWalletUnreadableGens[gen]
+}
 
 // sealLogoutWalletAndDrop publishes the wallet of the session at dest that has just signed out, by value, and drops
 // wallet.json while it still holds those bytes at gen. gen is the generation handleLogout read BEFORE the session;
@@ -54,6 +85,9 @@ func sealLogoutWalletAndDrop(dest, name, pass string, se []byte, gen, uid string
 			return false, nil
 		}
 		return false, serr
+	}
+	if logoutWalletUnreadable(gen) {
+		return false, errLogoutWalletUnreadable
 	}
 	basis, proven, err := captureLogoutWallet(wp, gen)
 	if err != nil {

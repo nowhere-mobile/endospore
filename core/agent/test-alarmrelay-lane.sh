@@ -41,7 +41,7 @@ PY
   cp "$W/orig.go" "$P/$f"
 }
 mut "G1 laneFor no longer sends alarmrelay to the RO lane" main.go \
-  'case "storagebreakdown", "sealdelta", "uiderrors", "alarmrelay":' 'case "storagebreakdown", "sealdelta", "uiderrors":'
+  'case "storagebreakdown", "sealdelta", "uiderrors", "alarmrelay", "gmsexits":' 'case "storagebreakdown", "sealdelta", "uiderrors", "gmsexits":'
 mut "G2 relayAlarmAtLock sends the pass again" coldlock_evict.go \
   'coldLockWorker\(dest, "alarmrelay", name, "", uid,' 'coldLockWorker(dest, "alarmrelay", name, pass, uid,'
 mut "G3 workerWaitCap has no alarmrelay case" main.go \

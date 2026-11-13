@@ -13,6 +13,7 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -71,8 +72,11 @@ type BlindToken struct {
 // BlindTokens are zero-knowledge credit (P3b); plain Tokens are dev-faucet credit. Both spend at /lease.
 // PlanSpec is one purchase's size and term: what planPurchase prices and the lease declares as buy_gb and periods.
 type PlanSpec struct {
-	GB      int   `json:"gb"`
-	Periods int64 `json:"periods"`
+	// ID is the purchase's random id (h60 #14, Wallet.PlanID): sealed with the wallet, NEVER sent to the gateway and
+	// NEVER logged. It lets a merge tell two phones' purchases apart. A spec written before this build has none.
+	ID      string `json:"id,omitempty"`
+	GB      int    `json:"gb"`
+	Periods int64  `json:"periods"`
 	// Keep is the customer's answer at the upgrade, asked at redemption (NWP-20261031-10): true = keep each plan at
 	// its own size, sent as plan_change "keep"; false = no keep answer. It rides with the purchase it was given for.
 	Keep bool `json:"keep,omitempty"`
@@ -104,6 +108,9 @@ type Wallet struct {
 	PlanGB      int   `json:"plan_gb,omitempty"`      // plan size; DECLARED on /lease as buy_gb at activation
 	PlanKeep    bool  `json:"plan_keep,omitempty"`    // the waiting purchase's plan-change choice; sent as plan_change "keep" on its lease
 	PlanConvert bool  `json:"plan_convert,omitempty"` // the waiting purchase's convert answer (h51 #5); sent as plan_change "convert" on its lease
+	// PlanID is the random id of the purchase in PlanGB/PlanPeriods (h60 #14): sealed with the wallet, NEVER sent to the
+	// gateway and NEVER logged. A plan recorded before this build has none.
+	PlanID string `json:"plan_id,omitempty"`
 	// PlanQueue is the purchases redeemed while an earlier one had not activated, oldest first (NWP-20261031-07,
 	// decided 2026-10-20: "a bigger plan starts at once ..." in docs/product-decisions.md). PlanGB/PlanPeriods stay
 	// the purchase that activates NEXT (or the last one that did); each queued purchase is priced at its OWN size
@@ -168,8 +175,10 @@ type Wallet struct {
 	// once the gateway proves the code empty; walletForPublish and mergeLateRestore carry it, and the seen-set keys it
 	// by its hash (pendingClaimSeenKey), so a code this session cleared is never brought back from a stored copy.
 	//
-	// Nothing writes one yet (slice 2 does). ⚠ A build older than this field decodes the wallet non-strictly and drops
-	// pending_claims on its next write, so the writer must not ship before this reader is in the field.
+	// keepPendingClaim (NWP-20261201-21) is the first writer: an Add-credits drain cut short keeps its code here. Slice 2's
+	// drain caller, which runs drainPendingClaims at a later session, is not built yet. ⚠ A build older than this field
+	// decodes the wallet non-strictly and drops pending_claims on its next write, so a writer must not ship before this
+	// reader is in the field (the reader is in release 0.5.54; h56 #1 in docs/product-decisions.md).
 	PendingClaims []string `json:"pending_claims,omitempty"`
 }
 
@@ -325,7 +334,8 @@ const rebindCooldownEpochs = 7
 var planMovingNow = func() int64 { return time.Now().Unix() }
 
 // planMovingPath is the marker beside the wallet in the state tmpfs: a decimal unix time and nothing else (no
-// key, no ref, no name), removed by a settle and by removeWallet, so it never outlives the session.
+// key, no ref, no name), removed by a settle, by removeWallet and by a landed sign-out's drop
+// (dropWalletIfUnchanged), so it never outlives the session.
 func planMovingPath(walletPath string) string { return walletPath + ".moving" }
 
 // billPrevAtOf is the time stamped on the outstanding !bill-prev record, 0 when there is none or it predates the field.
@@ -1014,6 +1024,21 @@ func (g *gatewayClient) issueBatch(pub *rsa.PublicKey, denom, claim string, n in
 	return toks, res, code, nil
 }
 
+// purchaseIDRand is where newPurchaseID reads its randomness; a var so a test can make the read fail.
+var purchaseIDRand io.Reader = rand.Reader
+
+// newPurchaseID mints the random id of one recorded purchase (h60 #14), or "" when the random source fails. The purchase
+// is then recorded without an id and merges by the older rule. A variable so a test can replace it. io.ReadFull, not
+// rand.Read: since Go 1.24 rand.Read aborts the process on a reader error instead of returning it.
+var newPurchaseID = func() string {
+	b := make([]byte, 16)
+	if _, err := io.ReadFull(purchaseIDRand, b); err != nil {
+		fmt.Fprintln(os.Stderr, "[agent] wallet: the purchase id could not be generated -- the purchase is recorded without one (h60 #14)")
+		return ""
+	}
+	return hex.EncodeToString(b)
+}
+
 // applyPlanMode records in w what the wallet's owner bought; it saves nothing. ~~It never OVERWRITES a longer term
 // with a shorter one~~ -- SUPERSEDED (NWP-20261031-07; decided 2026-10-20, docs/product-decisions.md "a bigger plan
 // starts at once ..."): that max priced a 10 GB top-up redeemed under a live 50 GB plan at 50 GB x periods, which the
@@ -1042,7 +1067,7 @@ func (g *gatewayClient) issueBatch(pub *rsa.PublicKey, denom, claim string, n in
 // the delay is a fixed privacy budget, not a penalty that compounds. A purchase that QUEUES never moves the hold of the
 // purchase it waits behind, even one that has passed; it starts a hold only when none was ever set.
 //
-// ⚠ RESIDUAL: a hold left in the FUTURE by an over-free activation (planPurchase ignores the hold when overFree) still
+// ⚠ RESIDUAL: a hold left in the FUTURE by an over-free activation (planPurchase ignores the hold when overFree and no live term covers the profile) still
 // applies to a purchase redeemed before it ends, which then starts on that hold's batch day.
 //
 // mode is the customer's answer at redemption: "keep", "convert" (h51 #5, NWP-20261125-12) or "" when the question
@@ -1055,7 +1080,7 @@ func applyPlanMode(w *Wallet, periods int64, gb int, mode string) {
 			last = w.PlanQueue[n-1]
 		}
 		if last.GB != gb || last.Periods != periods || last.Keep != keep || last.Convert != convert {
-			w.PlanQueue = append(w.PlanQueue, PlanSpec{GB: gb, Periods: periods, Keep: keep, Convert: convert})
+			w.PlanQueue = append(w.PlanQueue, PlanSpec{ID: newPurchaseID(), GB: gb, Periods: periods, Keep: keep, Convert: convert})
 		}
 		if w.ActivateAfter == 0 {
 			w.ActivateAfter = activationHold()
@@ -1063,6 +1088,7 @@ func applyPlanMode(w *Wallet, periods int64, gb int, mode string) {
 	} else {
 		w.PlanGB, w.PlanPeriods, w.PlanKeep = gb, periods, keep
 		w.PlanConvert = convert
+		w.PlanID = newPurchaseID()
 		if w.ActivateAfter <= nowEpoch() {
 			w.ActivateAfter = activationHold()
 		}
@@ -1097,6 +1123,7 @@ func (w *Wallet) planActivated() {
 	next := w.PlanQueue[0]
 	w.PlanGB, w.PlanPeriods, w.PlanKeep = next.GB, next.Periods, next.Keep
 	w.PlanConvert = next.Convert
+	w.PlanID = next.ID
 	w.PlanQueue = append([]PlanSpec(nil), w.PlanQueue[1:]...)
 	if len(w.PlanQueue) == 0 {
 		w.PlanQueue = nil
@@ -1203,7 +1230,7 @@ func drawJitter(n, onErr int64) int64 {
 // 0-2 epoch jitter a plan starts only on an epoch that is a multiple of this. Epoch numbers are absolute unix-days
 // (nowEpoch), so every phone shares the same days and every purchase in one 3-day span redeems on the same day,
 // which is what stops the gateway's redemption lining up with the storefront's sale by time. Cost: a wait of up to
-// about 4 days instead of 2; the free tier covers the profile meanwhile, an over-free one starts at once
+// about 4 days instead of 2; the free tier covers the profile meanwhile, an over-free one with no live term starts at once
 // (planPurchase), and the screen already says the plan is waiting.
 const planBatchEpochs = 3
 
@@ -1256,7 +1283,7 @@ func (w *Wallet) planPurchase(nowEp int64, overFree bool) (gb int, periods int64
 	// unspent plan means the term has not started yet, whatever PaidThrough says. Self-limiting for the
 	// same reason -- once spent, this is false.
 	//
-	// It also makes an early renewal take effect immediately instead of waiting for the old term to lapse,
+	// It also lets an early renewal start once its activation hold passes instead of waiting for the old term to lapse,
 	// which is the intended behaviour: the gateway stacks from the current expiry, so nothing is lost.
 	funded := gbWant > 0 && perWant > 0 && w.balance() >= gbWant*int(perWant)
 	if w.PaidThrough > nowEp && !funded {
@@ -1273,10 +1300,12 @@ func (w *Wallet) planPurchase(nowEp int64, overFree bool) (gb int, periods int64
 		}
 		gbWant, perWant = w.balance(), 1
 	}
-	// Hold inside the jitter window -- UNLESS data is actually at risk. An uncovered profile that already
-	// exceeds the free allowance is one sweep away from losing bytes, and no privacy gain is worth that.
-	// Under the free tier there is nothing to lose by waiting, which is where the delay is spent.
-	if w.ActivateAfter > nowEp && !overFree {
+	// Hold inside the jitter window -- UNLESS data is actually at risk: a profile over the free allowance AND with no
+	// live bought term (PaidThrough <= now) is one sweep away from losing bytes. A live term covers the data, so an
+	// early renewal or top-up waits out its hold like any other purchase (h60 #13). PaidThrough moves only on a bought
+	// term (recordCoverage behind leaseBoughtCoverage), so a free window never counts.
+	atRisk := overFree && w.PaidThrough <= nowEp
+	if w.ActivateAfter > nowEp && !atRisk {
 		return 0, 0, nil, nil
 	}
 	p, b, ok := w.choosePayment(gbWant * int(perWant))
@@ -1580,7 +1609,7 @@ func claimTokens(g *gatewayClient, walletPath, claim string, count int) (int, er
 //
 // ⚠ applyPlanMode RUNS BEFORE THE APPEND: its planPending() must read the balance before this batch's tokens, so a
 // waiting purchase means an EARLIER one (see applyPlanMode).
-// ⚠ THE CALLER HOLDS THE WALLET LOCK (NWP-20261010-04) -- drainClaimMode, across the mint that produced toks.
+// ⚠ THE CALLER HOLDS THE WALLET LOCK (NWP-20261010-04) -- drainClaimOutcome, across the mint that produced toks.
 func recordClaimBatch(walletPath string, record bool, periods int64, gb int, mode string, toks []BlindToken) error {
 	w, err := loadWallet(walletPath)
 	if err != nil {
@@ -1600,13 +1629,25 @@ func recordClaimBatch(walletPath string, record bool, periods int64, gb int, mod
 // large request signs nothing). Each successful batch is persisted as it lands, so an interrupted drain
 // can simply be re-run on the same code to finish. Returns the tokens added (0 = unknown or fully spent).
 // mode is the customer's answer at redemption ("keep", "convert" or ""), stored with the plan (h51 #5).
+// It discards drainClaimOutcome's partial flag; a caller that must tell a drain cut short from a complete one calls that.
 func drainClaimMode(g *gatewayClient, walletPath, claim, mode string) (int, error) {
+	n, _, err := drainClaimOutcome(g, walletPath, claim, mode)
+	return n, err
+}
+
+// claimBetweenBatches is a test seam, nil in production: called after a batch lands and before the next lock is taken.
+var claimBetweenBatches func()
+
+// drainClaimOutcome is drainClaimMode's body. partial is true when tokens landed (n > 0, err nil) and the drain stopped
+// before the proving 402 -- a busy wallet, a refused batch or an unexpected status -- so the code may still hold more
+// (NWP-20261201-21; decided 2026-11-06, h60 #15 in docs/product-decisions.md). Every other return has partial false.
+func drainClaimOutcome(g *gatewayClient, walletPath, claim, mode string) (n int, partial bool, err error) {
 	if claim == "" {
-		return 0, errors.New("claim: empty claim code")
+		return 0, false, errors.New("claim: empty claim code")
 	}
 	pub, denom, err := g.issuePubKey()
 	if err != nil {
-		return 0, err
+		return 0, false, err
 	}
 	const maxBatch = 256
 	total, batch := 0, 1
@@ -1665,36 +1706,60 @@ func drainClaimMode(g *gatewayClient, walletPath, claim, mode string) (int, erro
 		if busy {
 			fmt.Fprintf(os.Stderr, "[agent] claim: the wallet is busy -- refused before minting; the code keeps the rest (NWP-20261010-04)\n")
 			if total > 0 {
-				return total, nil // what landed is saved; the code keeps the rest, as on any partial drain
+				return total, true, nil // what landed is saved; the code keeps the rest, as on any partial drain
 			}
-			return 0, errWalletBusy
+			return 0, false, errWalletBusy
 		}
 		if perr != nil {
-			return total, perr
+			return total, false, perr
 		}
 		switch {
 		case err != nil:
 			if total > 0 {
-				return total, nil // keep what already landed; report partial success rather than erroring
+				logClaimDrainStop(total, claimDrainErrWhy(code))
+				return total, true, nil // keep what already landed; report partial success rather than erroring
 			}
-			return 0, err
+			return 0, false, err
 		case code == http.StatusOK:
 			total += len(toks)
 			if batch < maxBatch {
 				batch *= 2
 			}
+			if claimBetweenBatches != nil {
+				claimBetweenBatches()
+			}
 		case code == http.StatusPaymentRequired:
 			if batch == 1 {
-				return total, nil // nothing left to claim -> done
+				return total, false, nil // nothing left to claim -> done
 			}
 			batch /= 2 // overshot the remaining balance; back off and drain the tail
 		default:
 			if total > 0 {
-				return total, nil
+				logClaimDrainStop(total, fmt.Sprintf("HTTP %d", code))
+				return total, true, nil
 			}
-			return 0, fmt.Errorf("issue: HTTP %d", code)
+			return 0, false, fmt.Errorf("issue: HTTP %d", code)
 		}
 	}
+}
+
+// claimDrainErrWhy names in a fixed word why issueBatch returned an error: code 0 is a request that got no answer or was
+// never sent, code 200 is signatures that could not be used.
+func claimDrainErrWhy(code int) string {
+	switch code {
+	case 0:
+		return "no answer"
+	case http.StatusOK:
+		return "signatures refused"
+	}
+	return "error"
+}
+
+// logClaimDrainStop writes the one line that tells a drain cut short from a complete one: the caller logs the landed
+// count alone in both cases (NWP-20261129-43). Counts and a fixed reason only: never the code (h53 #6), a token, the
+// error's text or the gateway URL, so it takes none of them.
+func logClaimDrainStop(total int, why string) {
+	fmt.Fprintf(os.Stderr, "[agent] claim: the drain stopped after %d token(s) (%s) -- the code keeps the rest, and redeeming it again finishes the drain (NWP-20261129-43)\n", total, why)
 }
 
 // drainClaim is drainClaimMode for the callers that carry only keep (true) or no answer (false).
@@ -2892,6 +2957,24 @@ func sealWallet(base, name, pass string, dk []byte, walletPath string) (string, 
 	return h, err
 }
 
+// errStoredWalletUnreadable: the stored wallet could not be read, so the #wallet head was not written; the next save
+// that can read it publishes the merge (dn-1031 #1).
+var errStoredWalletUnreadable = errors.New("the stored wallet could not be read, so the #wallet head was not written; the next save that can read it publishes the merge (dn-1031 #1)")
+
+// storedWalletForDurable is the stored copy a durable publisher merges. Not strict: readStoredWallet, which takes every
+// failure for no copy. Strict: storedWalletForPublish's three answers, as the fold takes them -- the stored wallet; nil
+// for a copy that is absent or damaged, so the local set publishes; errStoredWalletUnreadable for any other failure.
+func storedWalletForDurable(strict bool, base, name, pass string, dk []byte) (*Wallet, error) {
+	if !strict {
+		return readStoredWallet(base, name, pass, dk), nil
+	}
+	w, readable := storedWalletForPublish(base, name, pass, dk)
+	if !readable {
+		return nil, errStoredWalletUnreadable
+	}
+	return w, nil
+}
+
 // sealWalletDurable publishes the wallet and does not return until the bytes have actually landed in the
 // store. Use it wherever "saved" is about to be reported to a HUMAN; use sealWallet where the wallet is
 // merely being kept in step with a flush that is already going to happen.
@@ -2910,6 +2993,20 @@ func sealWallet(base, name, pass string, dk []byte, walletPath string) (string, 
 // so this opens its own. capFlush panics via check() on a store error -- deliberate everywhere else, but
 // here the whole point is to report failure rather than die, so it is recovered and turned into an error.
 func sealWalletDurable(base, name, pass string, dk []byte, walletPath string) (h string, err error) {
+	return sealWalletFilePublish(false, base, name, pass, dk, walletPath)
+}
+
+// sealWalletDurableStrict is sealWalletDurable for a publisher that may wait for a readable stored copy (dn-1031 #1,
+// option (b)): while the stored wallet cannot be read it writes no #wallet head and answers errStoredWalletUnreadable.
+// A claim publishes this way, and its tokens stay in the file for the next save that can read. Direct-store mode
+// delegates to sealWallet, as sealWalletDurable does.
+func sealWalletDurableStrict(base, name, pass string, dk []byte, walletPath string) (h string, err error) {
+	return sealWalletFilePublish(true, base, name, pass, dk, walletPath)
+}
+
+// sealWalletFilePublish is the one body of sealWalletDurable and sealWalletDurableStrict; strict is how it reads the
+// stored copy it merges (storedWalletForDurable).
+func sealWalletFilePublish(strict bool, base, name, pass string, dk []byte, walletPath string) (h string, err error) {
 	if !capMode() {
 		return sealWallet(base, name, pass, dk, walletPath) // direct-store mode: already synchronous
 	}
@@ -2967,7 +3064,12 @@ func sealWalletDurable(base, name, pass string, dk []byte, walletPath string) (h
 	// NWP-20261010-04: the local wallet is parsed from `data`, not re-read -- the head must derive from its basis.
 	var local Wallet
 	if json.Unmarshal(data, &local) == nil {
-		if merged := walletForPublish(readStoredWallet(base, name, pass, dk), &local, walletSeen(walletPath, gen)); merged != nil {
+		stored, serr := storedWalletForDurable(strict, base, name, pass, dk)
+		if serr != nil {
+			capFlush(n) // close the bracket we opened; nothing was buffered
+			return "", serr
+		}
+		if merged := walletForPublish(stored, &local, walletSeen(walletPath, gen)); merged != nil {
 			if mj, merr := json.Marshal(merged); merr == nil {
 				data = mj
 				// NWP-20261107-02: the fold merges against this while no fold of the flush has read the stored
@@ -2984,8 +3086,8 @@ func sealWalletDurable(base, name, pass string, dk []byte, walletPath string) (h
 
 // sealWalletValueDurable is sealWalletDurable for a wallet held in MEMORY: it publishes w to (name, pass)'s
 // #wallet head and does not return until it has landed (NWP-20261010-04). payRent publishes what it spent this
-// way, because by the time it publishes the file may be another profile's (THE GENERATION, wallet_lock.go); a
-// successful create publishes its staged claim this way (finishStagedClaim).
+// way, through sealWalletValueDurableStrict, because by the time it publishes the file may be another profile's (THE
+// GENERATION, wallet_lock.go); a successful create publishes its staged claim this way (finishStagedClaim).
 //
 // walletPath is the file w belongs to. basis and gen are the bytes and generation w was saved as at walletPath;
 // basis is nil when it was NOT saved (the wallet
@@ -3001,6 +3103,19 @@ func sealWalletDurable(base, name, pass string, dk []byte, walletPath string) (h
 // compares it with the file (a fix review reproduced it: stored 10 -> 1). gen's proof is asked again where the head
 // is written (putWalletHead; here, direct): removeWallet forfeits a departed generation's proof it could not move on.
 func sealWalletValueDurable(base, name, pass string, dk []byte, walletPath string, w *Wallet, basis []byte, gen string, proven bool) (h string, err error) {
+	return sealWalletValuePublish(false, base, name, pass, dk, walletPath, w, basis, gen, proven)
+}
+
+// sealWalletValueDurableStrict is sealWalletValueDurable for a publisher that may wait for a readable stored copy
+// (dn-1031 #1, option (b)): while the stored wallet cannot be read it writes no #wallet head, in either mode, and
+// answers errStoredWalletUnreadable. payRent publishes its spend this way.
+func sealWalletValueDurableStrict(base, name, pass string, dk []byte, walletPath string, w *Wallet, basis []byte, gen string, proven bool) (h string, err error) {
+	return sealWalletValuePublish(true, base, name, pass, dk, walletPath, w, basis, gen, proven)
+}
+
+// sealWalletValuePublish is the one body of sealWalletValueDurable and sealWalletValueDurableStrict; strict is how it
+// reads the stored copy it merges (storedWalletForDurable).
+func sealWalletValuePublish(strict bool, base, name, pass string, dk []byte, walletPath string, w *Wallet, basis []byte, gen string, proven bool) (h string, err error) {
 	if !proven {
 		fmt.Fprintf(os.Stderr, "[agent] sealWalletValueDurable: refused -- this wallet was taken while its generation had "+
 			"no wallet restore proof, so it could drop the stored tokens (NWP-20261013-20)\n")
@@ -3016,7 +3131,11 @@ func sealWalletValueDurable(base, name, pass string, dk []byte, walletPath strin
 		return "", err
 	}
 	// NWP-20260907-12: the account's monotonic facts merged forward, as every other wallet publisher does.
-	if merged := walletForPublish(readStoredWallet(base, name, pass, dk), w, walletSeen(walletPath, gen)); merged != nil {
+	stored, serr := storedWalletForDurable(strict, base, name, pass, dk)
+	if serr != nil {
+		return "", serr
+	}
+	if merged := walletForPublish(stored, w, walletSeen(walletPath, gen)); merged != nil {
 		if mj, merr := json.Marshal(merged); merr == nil {
 			data = mj
 		}
@@ -3096,20 +3215,27 @@ func sealWalletValueDurable(base, name, pass string, dk []byte, walletPath strin
 // So when this phone has nothing waiting, the stored copy has, stored tokens were carried, and the published balance
 // funds the stored purchase, that purchase's plan fields, answer and queue are published; otherwise the max stands.
 // The carried count is what keeps this phone's own history out: a stored copy whose tokens this session has already
-// held or spent pays for nothing new, even when this phone's own tokens would fund the price. NOT COVERED: both phones
-// holding a DIFFERENT waiting purchase. This phone's is kept and the other's tokens ride without their plan, which is
-// raised to the maintainer. A wallet already stored in the maxed shape is not repaired.
+// held or spent pays for nothing new, even when this phone's own tokens would fund the price. Both phones holding a
+// DIFFERENT waiting purchase is covered by the purchase ids (h60 #14): every waiting purchase of the stored copy that
+// this session never held is queued after this phone's, and it becomes the head when this phone has nothing waiting.
+// The NWP-20261129-10 rule above applies only to a stored purchase with no id, and only when the ids took nothing: a
+// wallet rewritten by an older build drops the ids and falls back to it. A wallet already stored in the maxed shape is
+// not repaired.
 //
 // seen == nil means no union: today's publish of the local set alone. That is what a set that cannot be read, is
 // absent or belongs to another generation gives (walletSeen), and what mergeLateRestore passes because its own union
 // is already right. It errs toward keeping the old behaviour, never toward resurrecting. The same holds for
 // readStoredWallet's fail-soft, with one exception decided 2026-10-21 (dn-1031 #1, NWP-20261107-02): the cap-mode
-// fold (capFlush) writes no #wallet head while the stored copy cannot be read (storedWalletForPublish). payRent, the
-// claim, create and the sign-out publishers still publish the local set unchanged over an unreadable copy (left;
-// what a sign-out does when its last publish still cannot read the stored copy is not decided). In sealWalletDurable's
-// own bracket, whose head is written whatever the read, the fold never unstages that head: a fold that cannot read
-// merges the wallet as it is then (post-spend, on a re-fold) against the last copy a fold of the same flush read or,
-// before one has, the wallet the publisher merged and sealed.
+// fold (capFlush) writes no #wallet head while the stored copy cannot be read (storedWalletForPublish), and neither do
+// payRent's spend (sealWalletValueDurableStrict) and the claim (sealWalletDurableStrict) (NWP-20261129-33). A landed
+// sign-out no longer publishes over a copy it could not read before its switch (NWP-20261201-22); a read that fails
+// after that check is still fail-soft until its publisher (sealLogoutWalletAndDrop) is strict. END-UNSAVED's and
+// RESTART-UNSAVED's publish no longer goes over an unreadable copy: publishWalletBeforeDiscard reads it strictly first
+// and publishes nothing when it cannot (NWP-20261201-27). These still publish the local set unchanged over an
+// unreadable copy: create's finishStagedClaim and sealWallet (left). In sealWalletDurable's own bracket, whose head is
+// written whatever the read, the fold never unstages that head: a fold that cannot read merges the wallet as it is then
+// (post-spend, on a re-fold) against the last copy a fold of the same flush read or, before one has, the wallet the
+// publisher merged and sealed.
 func walletForPublish(stored, local *Wallet, seen map[string]bool) *Wallet {
 	if stored == nil || local == nil {
 		return local
@@ -3117,9 +3243,9 @@ func walletForPublish(stored, local *Wallet, seen map[string]bool) *Wallet {
 	out := *local // copy: the caller's wallet must not be mutated by a publish
 	// ⚠ A WAITING PURCHASE (OR A QUEUE) IS NOT MAXED (NWP-20261031-07): planPurchase prices at PlanGB x PlanPeriods, so
 	// a stored 50 GB raised over this phone's waiting 10 GB top-up would demand 50 x periods signatures and strand the
-	// money. The plan fields and the queue are this phone's, verbatim. With nothing waiting the max stands (a stale
-	// handset must not lower the account's plan), unless the union below carries the stored purchase's funding
-	// (NWP-20261129-10).
+	// money. The plan fields and the queue stay this phone's; the union below only adds the other phone's purchases by id
+	// after them (h60 #14). With nothing waiting the max stands (a stale handset must not lower the account's plan),
+	// unless the union below publishes a stored purchase (h60 #14, or NWP-20261129-10 for one without an id).
 	if !local.planPending() && len(local.PlanQueue) == 0 {
 		if stored.PlanGB > out.PlanGB {
 			out.PlanGB = stored.PlanGB
@@ -3175,13 +3301,57 @@ func walletForPublish(stored, local *Wallet, seen map[string]bool) *Wallet {
 				out.PendingClaims = append(out.PendingClaims, c)
 			}
 		}
-		// The other phone's waiting purchase, whole (NWP-20261129-10, above). Read after the union: out.balance() is the
-		// published balance.
+		// Every waiting purchase of the stored copy that this session never held (h60 #14). have holds this phone's plan
+		// id and queue ids (walletSeenKeys), and seen holds every id this session held, so a purchase that activated here
+		// stays out. taken is appended after this phone's, and the first becomes the head when this phone has none waiting.
+		var storedWaiting []PlanSpec
+		if stored.planPending() {
+			storedWaiting = append(storedWaiting, PlanSpec{ID: stored.PlanID, GB: stored.PlanGB, Periods: stored.PlanPeriods, Keep: stored.PlanKeep, Convert: stored.PlanConvert})
+		}
+		storedWaiting = append(storedWaiting, stored.PlanQueue...)
+		idless := false
+		var taken []PlanSpec
+		for _, s := range storedWaiting {
+			if s.ID == "" {
+				idless = true
+				continue
+			}
+			if k := "p:" + s.ID; !have[k] && !seen[k] {
+				have[k] = true
+				taken = append(taken, s)
+			}
+		}
+		took := len(taken) > 0
+		if took {
+			queue := append([]PlanSpec(nil), local.PlanQueue...)
+			if idle := !local.planPending() && len(local.PlanQueue) == 0; idle {
+				head := taken[0]
+				out.PlanGB, out.PlanPeriods, out.PlanKeep, out.PlanConvert, out.PlanID = head.GB, head.Periods, head.Keep, head.Convert, head.ID
+				taken = taken[1:]
+			}
+			out.PlanQueue = append(queue, taken...)
+			if len(out.PlanQueue) == 0 {
+				out.PlanQueue = nil
+			}
+		}
+		// The other phone's waiting purchase, whole (NWP-20261129-10, above), for a stored purchase with no id. A waiting
+		// head with an id is settled above, even when nothing was taken: its purchase may have activated here. An id in
+		// the queue does not take the rule from a head without one, and the ids this session refused stay out of the
+		// queue. Read after the union: out.balance() is the published balance.
+		olderRule := idless && (!stored.planPending() || stored.PlanID == "")
 		if carried > 0 && !local.planPending() && len(local.PlanQueue) == 0 && (stored.planPending() || len(stored.PlanQueue) > 0) &&
-			stored.PlanGB > 0 && stored.PlanPeriods > 0 && out.balance() >= stored.PlanGB*int(stored.PlanPeriods) {
+			stored.PlanGB > 0 && stored.PlanPeriods > 0 && out.balance() >= stored.PlanGB*int(stored.PlanPeriods) && !took && olderRule {
 			out.PlanGB, out.PlanPeriods = stored.PlanGB, stored.PlanPeriods
 			out.PlanKeep, out.PlanConvert = stored.PlanKeep, stored.PlanConvert
+			out.PlanID = stored.PlanID
 			out.PlanQueue = append([]PlanSpec(nil), stored.PlanQueue...)
+			var kept []PlanSpec
+			for _, q := range out.PlanQueue {
+				if q.ID == "" {
+					kept = append(kept, q)
+				}
+			}
+			out.PlanQueue = kept
 		}
 	}
 	return &out
@@ -3213,8 +3383,8 @@ func readStoredWallet(base, name, pass string, dk []byte) (w *Wallet) {
 }
 
 // freeRenewedThrough throttles free-tier (#54) lease renewal to once per epoch, so a free session renews
-// its 90-day window when it first becomes due each epoch rather than on every keep-alive cycle. A fresh
-// login starts a new process with an empty map, so renewal always runs on access. Reset in tests.
+// its 90-day window when it first becomes due each epoch rather than on every keep-alive cycle. The map is
+// forgotten at every session end (forgetBillingLatches), so the next sign-in renews on access. Reset in tests.
 //
 // ⚠ KEYED PER PROFILE (NWP-20260915-12). It was one process-wide int, and the login daemon is ONE process
 // for the whole boot serving every profile in turn -- so the first profile to renew in an epoch
@@ -3246,7 +3416,8 @@ func latchFreeRenewed(meterKey string, nowEpoch int64) {
 // noWalletRenewed remembers, per profile (keyed like freeRenewedThrough), what a renewal made with NO wallet file
 // would have recorded had there been one (NWP-20261010-04). Such a renewal saves nothing -- a missing file is not
 // an empty wallet -- so without this renewalDue({}) stays true and every payRent call re-leases the whole
-// footprint, holding the wallet lock through each lease. Reset in tests.
+// footprint, holding the wallet lock through each lease. The map is forgotten at every session end
+// (forgetBillingLatches). Reset in tests.
 var (
 	noWalletRenewedMu sync.Mutex
 	noWalletRenewed   = map[string]*Wallet{}
@@ -3312,6 +3483,19 @@ func noWalletSignOutDue(meterKey string, nowEpoch int64) bool {
 		return true
 	}
 	return sim.RenewedEpoch < nowEpoch
+}
+
+// forgetBillingLatches is h60 #18 (NWP-20261201-37, docs/product-decisions.md 2026-11-06): both latches are keyed by
+// a profile's holder key, and the login daemon is one process for the whole boot, so each session end forgets them.
+// The whole maps go, as the KDF cache's does: naming one entry would mean re-deriving the key the cache just dropped.
+// A same-boot re-sign-in, or a session still kept at that moment, renews once more in that epoch (the accepted cost).
+func forgetBillingLatches() {
+	freeRenewedMu.Lock()
+	freeRenewedThrough = map[string]int64{}
+	freeRenewedMu.Unlock()
+	noWalletRenewedMu.Lock()
+	noWalletRenewed = map[string]*Wallet{}
+	noWalletRenewedMu.Unlock()
 }
 
 // renewRule selects payRentGenRule's due test (NWP-20261112-14).
@@ -3639,7 +3823,11 @@ func payRentGenRule(g *gatewayClient, base, name, pass, walletPath string, se []
 	// NWP-20261010-04: BY VALUE, not by reading the file back. The file may already be another profile's (THE
 	// GENERATION), and reading it under this profile's DK is how one profile's tokens would be published at
 	// another's head. On the departed path the spend reaches this profile's head here or nowhere.
-	_, err = sealWalletValueDurable(base, name, pass, dk, walletPath, w, basis, gen, proven)
+	//
+	// NWP-20261129-33 (dn-1031 #1): strict, so an unreadable stored copy keeps another handset's tokens. The saved path's
+	// next save that can read publishes the merge. On the departed path the stored copy keeps the spent tokens, which
+	// the next paid lease's 409 retires.
+	_, err = sealWalletValueDurableStrict(base, name, pass, dk, walletPath, w, basis, gen, proven)
 	if departed && err == nil {
 		fmt.Fprintf(os.Stderr, "[agent] pay-rent %s: the wallet changed hands mid-renewal -- the spend was published "+
 			"to this profile's own head, not saved locally (NWP-20261010-04)\n", payRentWho(rule, name))

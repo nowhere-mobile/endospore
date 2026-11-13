@@ -21,7 +21,7 @@ import java.nio.charset.StandardCharsets;
  * reboot). Then, per the SIM's owner-set visibility dial, we raise a CONTENT-FREE notice at the gate
  * ("New message - <label>") -- never the sender or the body. Private lines show nothing. An unbound SIM is the
  * device owner's line: the daemon seals it to the device-owner inbox (Slice D), read behind the owner passphrase,
- * and the gate still shows only the content-free UNBOUND_LINE notice (see there).
+ * and the gate still shows only the UNBOUND_LINE notice, with the number only by the owner's opt-in (see there).
  *
  * onReceive must return fast (main thread), so the seal round-trip + notice run on a worker thread.
  */
@@ -65,11 +65,13 @@ public final class SmsDeliverReceiver extends BroadcastReceiver {
      *  behaviours. Proven on lynx 2026-07-23 -- a call to the unbound SIM rang the gate and vanished, while the same
      *  test on the bound SIM sealed and surfaced on the resume banner. So raise the SAME content-free gate notice the
      *  bound path uses; the in-gate banner (task_eefa24b6) renders it, since Lock Task disables the shade.
-     *  Content-free is structural: with no profile owner there is no visibility dial, so the number is NEVER passed.
+     *  ~~Content-free is structural: with no profile owner there is no visibility dial, so the number is NEVER passed.~~
+     *  SUPERSEDED by h59 #13 (docs/product-decisions.md 2026-11-05, NWP-20261129-35): the unassigned SIM is the owner's
+     *  line, so the owner's opt-in shows the caller's number here too: settle passes it when the reply says "number".
      *  The NOTICE is decided and stays (product-decisions.md 2026-09-01 (e): it gains a tap route to the owner
      *  verify). SUPERSEDED by Slice D (NWP-20261001-01): the DROP behind it is gone. An unbound SIM is the DEVICE
      *  OWNER's line, and the daemon now SEALS its arrivals to the device-owner inbox (reply OWNER), read behind the
-     *  owner passphrase (ChooserActivity.buildOwnerInboxScreen). This same content-free notice is still what the gate
+     *  owner passphrase (ChooserActivity.buildOwnerInboxScreen). This same notice is still what the gate
      *  shows; only when no owner key exists yet (reply NONE, a device not verified since the key landed) is the
      *  arrival an accepted loss. */
     static final String UNBOUND_LINE = "an unassigned SIM";
@@ -83,7 +85,8 @@ public final class SmsDeliverReceiver extends BroadcastReceiver {
      *  by RejectedCallSealReceiver) seals a call rejected while a STRANGER held the phone, so a labelled notice would
      *  show that stranger the owner's line label -- an amnesia leak; the owner still gets the record at next login.
      *  The unassigned-SIM and loss notices carry no label and are always posted in user 0 (settle), so gateNotice does
-     *  not govern them. Every caller runs in user 0, the only caller SEAL-TEL answers since NWP-20260930-05. */
+     *  not govern whether they are posted; it governs only the unassigned-SIM notice's number. Every caller runs in
+     *  user 0, the only caller SEAL-TEL answers since NWP-20260930-05. */
     static int sealAndNotify(Context ctx, String kind, int subId, String iccid, String from, long when, String body,
                              int callType, int durSec, boolean gateNotice, String aid, long mono) {
         final String req = TelArrival.telRequest(aid, mono, kind, subId, safe(iccid), from, when, body, callType, durSec);
@@ -103,8 +106,11 @@ public final class SmsDeliverReceiver extends BroadcastReceiver {
      *    a total one in text and in timing and shows no one that the line has more than one owner. Like the loss
      *    notice of a failure, it does not depend on gateNotice.
      *  - OWNER (Slice D: the unbound SIM's arrival sealed to the device-owner inbox) or NONE (no owner key yet): the
-     *    content-free unassigned-SIM notice, in user 0 -- the gate shows the same either way and never reveals whether
-     *    the arrival was kept. A call rejected in a stranger's session is sealed by user 0, where the notice is posted.
+     *    unassigned-SIM notice, in user 0 -- the gate shows the same either way and never reveals whether the arrival
+     *    was kept. A call rejected in a stranger's session is sealed by user 0, where the notice is posted. It carries
+     *    the caller's number when the reply says "number" (the owner's opt-in, h59 #13) and gateNotice is true: as a
+     *    bound line shows nothing for a call sealed while a stranger's session held the phone, this notice then shows
+     *    only the line.
      *  - UNRESOLVED (the SIM was not identified, or its link is unknown), FULL (the store is full), ERR, or no answer
      *    by the deadline: the loss notice, unless the line is known to be Private -- docs/product-decisions.md
      *    2026-09-30, answer 2. An ERR or no answer may still have been kept (a request queued at the daemon can land
@@ -119,8 +125,9 @@ public final class SmsDeliverReceiver extends BroadcastReceiver {
         }
         if ("REMOVED".equals(r.kind)) return SEAL_NONE;
         if (!"OK".equals(r.kind)) { // OWNER (sealed to the device-owner inbox, Slice D) or NONE (no owner key yet):
-            // the SAME content-free unassigned-SIM notice in user 0 -- the gate never reveals whether it was kept.
-            postMessageNotice(asGate(ctx), UNBOUND_LINE, kind, callType, null); // #196
+            // the SAME unassigned-SIM notice in user 0 -- the gate never reveals whether it was kept. The number follows
+            // the owner's opt-in (the reply's "number", h59 #13) and, as on a bound line, gateNotice; the notice does not.
+            postMessageNotice(asGate(ctx), UNBOUND_LINE, kind, callType, gateNotice && "number".equals(r.vis) ? from : null); // #196
             return SEAL_NONE; // no bound owner to count, no live session to kick -- the owner reads it in the inbox
         }
         if (r.partial) { // Q029: kept for some owners, not every one -- the loss notice at the deadline, never the line's own

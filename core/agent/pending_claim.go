@@ -8,8 +8,8 @@ import (
 
 // The pending claim codes (Wallet.PendingClaims, NWP-20261125-05; decided 2026-11-02, h53 #6 in
 // docs/product-decisions.md): the claim code of a deferred drain waits in the profile's wallet, sealed with it, and any
-// later session on any phone drains it. This file is the drain-and-clear step; nothing calls it yet (slice 2 wires the
-// create and the randomised moment).
+// later session on any phone drains it. This file is the drain-and-clear step, which nothing calls yet (slice 2 wires the
+// create and the randomised moment), and the keep of a code whose Add-credits drain was cut short (NWP-20261201-21).
 //
 // ⚠ THE CLEAR RULE. drainClaim returns (total, nil) on a PARTIAL drain too -- an error, an unexpected status or a busy
 // wallet after some batches landed: the code keeps the rest -- so tokens landing do NOT prove the code empty, and
@@ -120,4 +120,34 @@ func drainPendingClaims(g *gatewayClient, walletPath string) (drained int, err e
 	fmt.Fprintf(os.Stderr, "[agent] pending claim: %d code(s) cleared, %d kept, %d tokens added (NWP-20261125-05)\n",
 		gone, len(kept), drained)
 	return drained, errors.Join(errs...)
+}
+
+// keepPendingClaim adds code to the wallet at walletPath's PendingClaims (oldest first, deduplicated), so a later drain
+// finishes a code whose Add-credits drain was cut short (NWP-20261201-21; decided 2026-11-06, h60 #15). A code the
+// wallet already holds is not saved again. The clear stays drainPendingClaims's, after its proving call.
+//
+// It saves the whole wallet, so it runs only under the held lock, by drainPendingClaims's rule: a busy lock returns
+// errWalletBusy, an unavailable one errPendingClaimLockUnavailable, and neither saves. The code is a PAID BEARER CODE, so
+// this function logs nothing and its caller logs counts and a fixed outcome only.
+func keepPendingClaim(walletPath, code string) error {
+	unlock, state := lockWalletWithin(walletPath, walletSignInWait)
+	defer unlock()
+	switch state {
+	case walletLockBusy:
+		return errWalletBusy
+	case walletLocked:
+	default:
+		return errPendingClaimLockUnavailable
+	}
+	w, err := loadWallet(walletPath)
+	if err != nil {
+		return err
+	}
+	for _, c := range w.PendingClaims {
+		if c == code {
+			return nil
+		}
+	}
+	w.PendingClaims = append(w.PendingClaims, code)
+	return saveWallet(walletPath, w)
 }

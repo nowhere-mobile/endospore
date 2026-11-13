@@ -19,7 +19,8 @@
 # primary check of the rewritten match.
 #
 # PINNED AS CURRENT BEHAVIOUR, NOT ENDORSED:
-#   - with no nowhere-perms file the function returns early (`-> 0 perms (no file`) and grants no INTERNET default;
+#   - with no nowhere-perms file a sign-in call returns early (`-> 0 perms (no file, user`) and grants no INTERNET
+#     default (a package-filtered call with no file runs the default, NWP-20261201-19);
 #   - an INTERNET line that is the LAST line with no trailing newline is not returned by `read`, so the per-line
 #     loop never grants it, while both the oracle and the match see it and skip the default: the package gets no
 #     INTERNET grant at all. That is the per-line loop, which predates NWP-20260820-19 and is unchanged by it.
@@ -78,11 +79,12 @@ prep_fn() {
   return 0
 }
 
-# oracle <pf> <pkgfilter> <pkg> -> 0/1: the INTERNET default as the pre-#809 `grep -qxF` code decided it.
+# oracle <pf> <pkgfilter> <pkg> -> 0/1: the INTERNET default as the pre-#809 `grep -qxF` code decided it. With no file,
+# since NWP-20261201-19: a package-filtered call runs the default for its package, and a sign-in call runs none.
 oracle() {
   local pf="$1" filt="$2" pkg="$3"
   [ -n "$filt" ] && [ "$pkg" != "$filt" ] && { echo 0; return; }
-  [ -f "$pf" ] || { echo 0; return; }
+  [ -f "$pf" ] || { if [ -n "$filt" ]; then echo 1; else echo 0; fi; return; }
   grep -qxF "$pkg $INET" "$pf" && { echo 0; return; }
   grep -qxF "$pkg deny:$INET" "$pf" && { echo 0; return; }
   echo 1
@@ -113,8 +115,11 @@ fixture() {
     got=$(grep -cxF "grant $pkg $INET" "$d/calls")
     [ "$got" = $((e1 + e2)) ] || why="$why $pkg: $got INTERNET grant(s), want E1 $e1 + E2 $e2;"
   done
-  if [ "$content" = NOFILE ]; then
+  if [ "$content" = NOFILE ] && [ -z "$filt" ]; then
     grep -q -- "-> 0 perms (no file, user $UIDV)" "$d/log" || why="$why log '$(cat "$d/log")' lacks the no-file return;"
+  elif [ "$content" = NOFILE ]; then
+    n=$(sed -n 's/.*-> 0 perms (no file) + \([0-9]*\) INTERNET default(s) (user .*/\1/p' "$d/log")
+    [ "$n" = "$sum" ] || why="$why log says '${n:-<no line>}' INTERNET default(s) on the no-file path, oracle says $sum;"
   else
     n=$(sed -n 's/.*-> [0-9]* perms + \([0-9]*\) INTERNET default(s).*/\1/p' "$d/log")
     [ "$n" = "$sum" ] || why="$why log says '${n:-<no line>}' INTERNET default(s), grep -qxF oracle says $sum;"
@@ -163,6 +168,8 @@ suite() {  # suite <roamd.sh> [quiet] -> 0 all ok, 1 a case failed, 2 the harnes
       NOFILE "" "nogrant" com.foo
     fixture "$fn" "$sh" "F12 an empty nowhere-perms -> default granted" "" \
       "" "" "" com.foo
+    fixture "$fn" "$sh" "F13 no nowhere-perms file, pkgfilter: the default for that package only" "com.foo" \
+      NOFILE "" "" com.foo com.bar
   done
   command rm -f "$fn"
   [ -n "$quiet" ] || printf '  -- %d ok, %d failed\n' "$p" "$x"

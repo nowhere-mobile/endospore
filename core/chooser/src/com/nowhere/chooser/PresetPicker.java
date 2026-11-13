@@ -43,8 +43,6 @@ final class PresetPicker {
 
     /** The Profile home card's title. */
     static final String CARD_TITLE = "Privacy level";
-    /** The count dialog's button that opens the preview. */
-    static final String CONTINUE = "Continue";
     static final String NO_CUSTOM = "No Custom settings are saved yet.";
     static final String NOTHING_CHANGES = "Nothing changes.";
     static final String APPLY_FAILED = "Couldn't apply every setting.";

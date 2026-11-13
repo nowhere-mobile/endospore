@@ -1,6 +1,7 @@
 package main
 
 import (
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -169,6 +170,105 @@ func TestStoreVerdictTestStore(t *testing.T) {
 				t.Error("TEST-STORE replaced the daemon's store client")
 			}
 			checkVerdictRequests(t, v, c.reached)
+		})
+	}
+}
+
+// verdictGateway is a local gateway fake that answers GET /quote with 200 and {} and counts every request.
+type verdictGateway struct {
+	url  string
+	mu   sync.Mutex
+	reqs int
+	odd  []string // every request that is not GET /quote
+}
+
+func (g *verdictGateway) seen() (reqs int, odd []string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.reqs, append([]string(nil), g.odd...)
+}
+
+// startVerdictGateway answers GET /quote. Anything else gets 400 and is recorded as odd.
+func startVerdictGateway(t *testing.T) *verdictGateway {
+	t.Helper()
+	g := &verdictGateway{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ok := r.Method == http.MethodGet && r.URL.Path == "/quote"
+		g.mu.Lock()
+		g.reqs++
+		if !ok {
+			g.odd = append(g.odd, r.Method+" "+r.URL.Path)
+		}
+		g.mu.Unlock()
+		if !ok {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		io.WriteString(w, "{}")
+	}))
+	t.Cleanup(srv.Close)
+	g.url = srv.URL
+	return g
+}
+
+// TestStoreVerdictPingStoreGateway (NWP-20261129-41): PING-STORE takes the managed arm only in cap mode, a gateway and
+// no keys. A self-hosted store with a GATEWAY_URL keeps its S3 probe, so a rejected key reads ERR-AUTH and not
+// "Managed store -- connected". Every case has a working S3 fake: an arm that falls through to it answers OK.
+func TestStoreVerdictPingStoreGateway(t *testing.T) {
+	for _, c := range []struct {
+		name    string
+		status  int    // the S3 fake's answer
+		ak, sk  string // S3_ACCESS_KEY and S3_SECRET_KEY
+		gwDown  bool   // GATEWAY_URL is a closed port
+		want    string
+		reached bool // the S3 fake must get the probe
+		gwAsked int  // requests the gateway fake must get
+	}{
+		{name: "P1 self-hosted with a gateway, keys rejected", status: 403, ak: "nwtest-ak", sk: "nwtest-sk", want: "ERR-AUTH", reached: true},
+		{name: "P2 self-hosted with a gateway", status: 200, ak: "nwtest-ak", sk: "nwtest-sk", want: "OK", reached: true},
+		{name: "P3 managed", status: 200, want: "OK MANAGED", gwAsked: 1},
+		{name: "P4 managed, gateway down", status: 200, gwDown: true, want: "ERR-NET"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			conf := storeVerbFixture(t)
+			asGate(t)
+			fewStoreRetries(t)
+			v := startVerdictStore(t, c.status)
+			g := startVerdictGateway(t)
+			gw := g.url
+			if c.gwDown {
+				gw = closedStoreURL(t)
+			}
+			t.Setenv("GATEWAY_URL", gw)
+			t.Setenv("S3_ENDPOINT", v.url)
+			t.Setenv("S3_REGION", verdictRegion)
+			t.Setenv("S3_BUCKET", verdictBucket)
+			t.Setenv("S3_ACCESS_KEY", c.ak)
+			t.Setenv("S3_SECRET_KEY", c.sk)
+			freshS3Client(t)
+			before, err := os.ReadFile(conf)
+			if err != nil {
+				t.Fatal(err)
+			}
+			envBefore := storeEnvSnapshot()
+			got := driveLogin(t, t.TempDir(), "PING-STORE\n")
+			if got != c.want {
+				t.Errorf("PING-STORE (%s) answered %q, want %q", c.name, got, c.want)
+			}
+			if after, _ := os.ReadFile(conf); string(after) != string(before) {
+				t.Errorf("PING-STORE changed the store conf:\n%s", after)
+			}
+			if got := storeEnvSnapshot(); got != envBefore {
+				t.Errorf("PING-STORE changed the store environment:\nbefore %s\nafter  %s", envBefore, got)
+			}
+			checkVerdictRequests(t, v, c.reached)
+			reqs, odd := g.seen()
+			if reqs != c.gwAsked {
+				t.Errorf("the fake gateway got %d request(s), want %d", reqs, c.gwAsked)
+			}
+			if len(odd) > 0 {
+				t.Errorf("the fake gateway got requests other than GET /quote: %q", odd)
+			}
 		})
 	}
 }

@@ -688,6 +688,9 @@ func runMediad(args []string) {
 		// instance (ctl.stop is a SIGKILL) leaves its lines behind, and a stale mountpoint->hidden pair is
 		// worse than none: the walk would read a dir that is no longer bound.
 		os.Remove(filepath.Join(stateDir, mediaUndersFile))
+		// NWP-20261201-14: a run with no mounts can leave a DAMAGED name for the session. Only a served scope cleared
+		// the file before, so a later sign-in that serves nothing would relay another profile's file name.
+		os.Remove(filepath.Join(stateDir, mediaProgressFile))
 	}
 
 	// NWP-20261006-10: never serve a profile into a session it does not open in (tied to another phone's chip): its
@@ -710,7 +713,15 @@ func runMediad(args []string) {
 	if len(args) >= 7 {
 		allMounts = append(allMounts, serveMediaScope(base, name+"#media", pass, args[5], args[6], stateDir)...)
 	}
-	if len(allMounts) == 0 {
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, syscall.SIGTERM, syscall.SIGINT)
+	defer signal.Stop(ch)
+	// NWP-20261201-14: the #media background restore. It keeps this daemon up with no mount at all (§3).
+	var lander *bgLander
+	if len(args) >= 7 {
+		lander = startBgLander(base, name+"#media", pass, args[5], stateDir, allMounts)
+	}
+	if len(allMounts) == 0 && lander == nil {
 		dlog("mediad: nothing mounted -> exiting")
 		return
 	}
@@ -718,9 +729,13 @@ func runMediad(args []string) {
 
 	// Serve until told to stop; then unmount every overlay + drop its bind, so no stale FUSE mount is left
 	// behind. NEVER blanket-abort /sys/fs/fuse/connections -- that kills Android's own storage FUSE (spike).
-	ch := make(chan os.Signal, 1)
-	signal.Notify(ch, syscall.SIGTERM, syscall.SIGINT)
-	<-ch
+	if !mediadServe(ch, len(allMounts) > 0, lander.doneC()) {
+		dlog("mediad: background restore finished, nothing mounted -> exiting")
+		return
+	}
+	// ⚠ STOP THE LANDER FIRST. A file landed into an overlay's hidden directory after its bind is gone lands in an
+	// orphan directory, its digest reads as landed, and the next seal drops it as a deletion.
+	lander.Stop()
 	if stateDir != "" {
 		os.Remove(filepath.Join(stateDir, mediaUndersFile))   // DIA-20260816-13: the overlay map dies with the mounts
 		os.Remove(filepath.Join(stateDir, mediaProgressFile)) // #90: clear the "Loading…" line so it can't linger
@@ -810,6 +825,9 @@ func serveMediaScope(base, name, pass, userDir, cacheDir, stateDir string) []med
 		// previous instance so a stale "LOADING" can't outlive it. (Shared file across scopes: the CE scope
 		// usually has 0 deferred and returns above, so in practice only the media scope writes it.)
 		srv.progPath = filepath.Join(st, mediaProgressFile)
+		if isSharedMediaScope(name) {
+			mediaScopeServer.Store(srv) // NWP-20261201-14: the lander publishes through this scope's server
+		}
 		os.Remove(srv.progPath)
 		srv.appProgPath = filepath.Join(st, mediaAppProgFile) // #129 P5: per-app Tier-2 progress for the ring
 		os.Remove(srv.appProgPath)

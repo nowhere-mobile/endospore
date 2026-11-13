@@ -110,7 +110,7 @@ func restoreSeedGuarded(src string) error {
 	rest := src[i:]
 	const parse = "check(json.Unmarshal(pt[len(cdcMagic):], &m))"
 	j := strings.Index(rest, parse)
-	k := strings.Index(rest, "skipped = cdcRestore(base, key, mediaRestorePlan(profile, pass, restoredHead, m), dest)")
+	k := strings.Index(rest, "skipped = restoreSkippingParked(base, key, profile, mediaRestorePlan(profile, pass, restoredHead, m), dest)")
 	if j < 0 || k < 0 || j > k {
 		return errSeed("manifest parse / cdcRestore anchors not found in order")
 	}
@@ -149,7 +149,7 @@ func TestClaimsSeed_RestoreSeedsTheBareVaultOnly(t *testing.T) {
 		t.Error("an unguarded call passes the scan")
 	}
 	moved := strings.Replace(src, guard+"\t\t\t\tseedClaimsAtRestore(m.Claims)\n\t\t\t}\n", "", 1)
-	moved = strings.Replace(moved, "skipped = cdcRestore(base, key, mediaRestorePlan(profile, pass, restoredHead, m), dest)\n", "skipped = cdcRestore(base, key, mediaRestorePlan(profile, pass, restoredHead, m), dest)\n"+guard+"\t\t\t\tseedClaimsAtRestore(m.Claims)\n\t\t\t}\n", 1)
+	moved = strings.Replace(moved, "skipped = restoreSkippingParked(base, key, profile, mediaRestorePlan(profile, pass, restoredHead, m), dest)\n", "skipped = restoreSkippingParked(base, key, profile, mediaRestorePlan(profile, pass, restoredHead, m), dest)\n"+guard+"\t\t\t\tseedClaimsAtRestore(m.Claims)\n\t\t\t}\n", 1)
 	if restoreSeedGuarded(moved) == nil {
 		t.Error("a call after cdcRestore passes the scan")
 	}

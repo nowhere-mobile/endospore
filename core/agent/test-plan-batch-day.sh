@@ -45,7 +45,7 @@ mutate "B3 planActivated keeps the raw jitter" '	w.ActivateAfter = activationHol
 
 '
 mutate "B4 the override-0 case is rounded" '			batch = false' '			batch = true'
-mutate "B5 the over-free override bypassed" 'if w.ActivateAfter > nowEp && !overFree {' 'if w.ActivateAfter > nowEp {'
+mutate "B5 the over-free override bypassed" 'atRisk := overFree && w.PaidThrough <= nowEp' 'atRisk := false'
 cp "$W/billing.go.orig" billing.go
 [ "$FAILS" -eq 0 ] || { echo "== $FAILS mutant(s) not convicted"; exit 1; }
 echo "== all mutations convicted"

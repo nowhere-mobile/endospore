@@ -121,6 +121,7 @@ relabel_launcher() { echo "relabel_launcher" >> "\$ROOT/calls"; }
 remap_media_db() { echo "remap_media_db \$1 \${2#\$ROOT/}" >> "\$ROOT/calls"; }
 remap_per_pkg() { echo "remap_per_pkg \${1#\$ROOT/}" >> "\$ROOT/calls"; }
 restorecon() { echo "restorecon" >> "\$ROOT/calls"; }
+od_park_var() { :; }   # NWP-20261130-03
 . "$W/seg-$2.sh"
 tr '\n' '|' < "\$ROOT/calls"
 CASE

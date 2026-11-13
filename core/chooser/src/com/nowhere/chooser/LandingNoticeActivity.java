@@ -32,16 +32,27 @@ import android.widget.TextView;
  * per app with its state, then {@link LandingLine#KEEP} and one filled {@link LandingLine#GOT_IT} button. From
  * {@code ROWS_MAX + 1}: the headline count, a bar, at most {@link LandingLine#ROWS_BIG} rows and "+<n> more", which
  * opens Your apps. Fixed slots, so the card keeps one size and never scrolls. The rules and words are LandingLine's.
+ * A row's name is fixed at its first paint (NWP-20261201-31).
  *
  * sweepAuto records each app outcome and the end in {@link LandingLine.Sweep} (its id rides {@link #EXTRA_SWEEP}),
  * and each dep that lands (NWP-20261130-09), then sends {@link #ACTION_APP} (package-local; the package never goes to
  * the daemon) or {@link UnarchiveService#ACTION_SWEEP_DONE}. The card registers its receiver FIRST and reads the record AFTER, and
  * reads it again on each broadcast, so an outcome or the end sent before the card started, or while it was being
- * recreated, is never missed. Only an ok outcome ticks the app off: a failed app stays "coming back", keeps its row and
- * counts in "+<n> more" (the rows follow {@code landed}, as LandingLine.rows says). The card closes
+ * recreated, is never missed. Only an ok outcome ticks the app off: a failed app stays "coming back". In the from-5
+ * window it leaves the rows and counts in "+<n> more" until the window reaches it near the end (LandingLine.rows). The
+ * card closes
  * {@link LandingLine#CLOSE_AFTER_MS} after its sweep ends: apps a joined rerun pass fetches after it show only in the
- * notification and Your apps. The notification stays the record. Dismissible, not pinned: no lock task, and a tap
- * outside dismisses it too.
+ * notification and Your apps. The notification stays the record. Dismissible, not pinned: no lock task. Got it, Back
+ * and the close {@link LandingLine#CLOSE_AFTER_MS} after the sweep close it; a tap outside does not (NWP-20261201-32).
+ *
+ * NWP-20261201-34 (docs/product-decisions.md, 2026-11-09 "eight answers to harvest 62 ...", #3): each row reads ready,
+ * installing or coming back. sweepAuto and the dep loop record each start in LandingLine.Sweep, then send
+ * {@link #ACTION_STARTED}. From {@code ROWS_MAX + 1} apps the rows are the rolling window of LandingLine.rows: the app
+ * that landed last, the app installing and the next one coming back.
+ *
+ * NWP-20261201-13 (backlog "An Auto sweep cannot be paused or stopped"): one row of two text buttons, Pause and Stop. Each
+ * raises {@link SweepHold} and sweepAuto ends after the app in flight. A paused card stays and its Pause reads Resume; a
+ * stopped one closes as an ended sweep does.
  */
 public class LandingNoticeActivity extends Activity {
     static final String EXTRA_COUNT = "nowhere.landing.count";
@@ -49,6 +60,8 @@ public class LandingNoticeActivity extends Activity {
     static final String EXTRA_PKGS = "nowhere.landing.pkgs";
     /** One app's outcome: {@link #EXTRA_PKG} and {@link #EXTRA_OK}. Package-local. */
     static final String ACTION_APP = "com.nowhere.chooser.action.LANDING_APP";
+    /** An app or a dep started installing: read the record again. Package-local, no extras. */
+    static final String ACTION_STARTED = "com.nowhere.chooser.action.LANDING_STARTED";
     static final String EXTRA_PKG = "nowhere.landing.pkg";
     static final String EXTRA_OK = "nowhere.landing.ok";
     /** long: the card's sweep in {@link LandingLine.Sweep}. */
@@ -61,12 +74,17 @@ public class LandingNoticeActivity extends Activity {
     private long sweep;
     /** The outcome came back ok: the tick, the count and the rows. A copy of LandingLine.Sweep's. */
     private boolean[] landed;
+    /** The installing row and the row that landed last, -1 for none. Copies of LandingLine.Sweep's. */
+    private int installing = -1, lastLanded = -1;
     private boolean big, closing;
     private TextView headline;
     private ProgressBar bar;
     private View[] rowViews;
     private TextView[] rowLabels, rowStates;
     private TextView moreRow;
+    private Button pauseBtn, stopBtn;
+    /** The small card's line under the rows: KEEP, or the paused or stopped line. */
+    private TextView holdLine;
     private BroadcastReceiver receiver;
 
     @Override protected void onCreate(Bundle b) {
@@ -78,6 +96,8 @@ public class LandingNoticeActivity extends Activity {
         }
         if (look == GatePalette.LIGHT) setTheme(android.R.style.Theme_Material_Light_Dialog_NoActionBar);
         super.onCreate(b);
+        // NWP-20261201-32 (row "The landing card drops an app ..."): the dialog theme finishes on any outside touch; only Got it, Back and the close after the sweep close the card.
+        setFinishOnTouchOutside(false);
         pkgs = getIntent() != null ? getIntent().getStringArrayExtra(EXTRA_PKGS) : null;
         if (pkgs == null || pkgs.length == 0) { finish(); return; } // the service never sends it; nothing to say
         int n = pkgs.length;
@@ -111,6 +131,7 @@ public class LandingNoticeActivity extends Activity {
             keep.setTextColor(look.muted);
             keep.setPadding(0, dp(16), 0, 0);
             card.addView(keep);
+            holdLine = keep;
 
             Button gotIt = new Button(this);
             gotIt.setText(LandingLine.GOT_IT);
@@ -125,6 +146,7 @@ public class LandingNoticeActivity extends Activity {
                     LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
             lp.topMargin = dp(20);
             card.addView(gotIt, lp);
+            addHoldRow(card);
         } else {
             headline = new TextView(this);
             headline.setTextSize(17);
@@ -152,6 +174,7 @@ public class LandingNoticeActivity extends Activity {
                 finish();
             });
             card.addView(moreRow);
+            addHoldRow(card);
         }
 
         setContentView(card);
@@ -161,10 +184,11 @@ public class LandingNoticeActivity extends Activity {
         receiver = new BroadcastReceiver() {
             @Override public void onReceive(Context c, Intent in) {
                 String a = in.getAction();
-                if (ACTION_APP.equals(a) || UnarchiveService.ACTION_SWEEP_DONE.equals(a)) sync();
+                if (ACTION_APP.equals(a) || ACTION_STARTED.equals(a) || UnarchiveService.ACTION_SWEEP_DONE.equals(a)) sync();
             }
         };
         IntentFilter f = new IntentFilter(ACTION_APP);
+        f.addAction(ACTION_STARTED);
         f.addAction(UnarchiveService.ACTION_SWEEP_DONE);
         registerReceiver(receiver, f, Context.RECEIVER_NOT_EXPORTED);
         // AFTER the receiver: what the sweep recorded before this point is read here, anything later is broadcast.
@@ -175,11 +199,10 @@ public class LandingNoticeActivity extends Activity {
     private void sync() {
         boolean[] l = LandingLine.Sweep.landed(sweep);
         if (l != null && l.length == landed.length) {
-            for (int i = 0; i < l.length; i++) {
-                if (l[i] != landed[i]) labels[i] = null; // read again: the installed label wins once the app is back
-            }
             landed = l;
         }
+        installing = LandingLine.Sweep.installing(sweep);
+        lastLanded = LandingLine.Sweep.lastLanded(sweep);
         render();
         if (LandingLine.Sweep.done(sweep)) closeSoon();
     }
@@ -198,6 +221,59 @@ public class LandingNoticeActivity extends Activity {
         if (closing) return;
         closing = true;
         handler.postDelayed(this::finish, LandingLine.CLOSE_AFTER_MS);
+    }
+
+    /** NWP-20261201-13: one row of two text buttons, in both layouts. render() paints them. */
+    private void addHoldRow(LinearLayout card) {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setPadding(0, dp(8), 0, 0);
+        pauseBtn = holdButton(row);
+        stopBtn = holdButton(row);
+        pauseBtn.setOnClickListener(v -> {
+            if (LandingLine.Sweep.paused(sweep)) tapResume(); else tapPause();
+        });
+        stopBtn.setOnClickListener(v -> tapStop());
+        card.addView(row);
+    }
+
+    private Button holdButton(LinearLayout row) {
+        Button b = new Button(this, null, android.R.attr.borderlessButtonStyle);
+        b.setAllCaps(false);
+        b.setTextColor(look.accent);
+        row.addView(b, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        return b;
+    }
+
+    private void tapPause() {
+        if (LandingLine.Sweep.done(sweep) || LandingLine.Sweep.paused(sweep)) return;
+        SweepHold.pause(sweep);
+        holdButtonsInert();
+    }
+
+    private void tapStop() {
+        if (LandingLine.Sweep.done(sweep) || LandingLine.Sweep.paused(sweep)) return;
+        SweepHold.stop();
+        holdButtonsInert();
+    }
+
+    private void tapResume() {
+        holdButtonsInert();
+        try {
+            startService(new Intent(this, UnarchiveService.class).putExtra(UnarchiveService.EXTRA_SWEEP, true)
+                    .putExtra(UnarchiveService.EXTRA_RESUME, true));
+        } catch (Throwable t) { android.util.Log.w("NowhereChooser", "landing card: resume the sweep", t); }
+    }
+
+    /** A pressed button stays inert until the next sync. */
+    private void holdButtonsInert() {
+        setHoldButton(pauseBtn, false);
+        setHoldButton(stopBtn, false);
+    }
+
+    private void setHoldButton(Button b, boolean on) {
+        b.setEnabled(on);
+        b.setAlpha(on ? 1f : 0.4f);
     }
 
     /** {@code count} fixed row slots: the app's label, then its state. */
@@ -228,18 +304,27 @@ public class LandingNoticeActivity extends Activity {
         }
     }
 
-    /** Draw the card from landed. A failed app is not landed: it keeps "coming back", its row and its place in the
-     *  "+<n> more" count. */
+    /** Draw the card from landed, installing and lastLanded. A failed app is not landed: it keeps "coming back" and, in
+     *  the from-5 window, its place in the "+<n> more" count. */
     private void render() {
         int got = 0;
         for (boolean l : landed) if (l) got++;
+        boolean paused = LandingLine.Sweep.paused(sweep);
+        boolean ended = LandingLine.Sweep.done(sweep);
+        String line = LandingLine.heldLine(paused, LandingLine.Sweep.stopped(sweep), got, pkgs.length);
+        pauseBtn.setText(paused ? LandingLine.RESUME : LandingLine.PAUSE);
+        stopBtn.setText(LandingLine.STOP);
+        setHoldButton(pauseBtn, !ended);
+        setHoldButton(stopBtn, !ended && !paused);
         if (!big) {
             for (int i = 0; i < pkgs.length; i++) paintRow(i, i);
+            holdLine.setText(line != null ? line : LandingLine.KEEP);
             return;
         }
         headline.setText(LandingLine.headline(got, pkgs.length));
+        if (line != null) headline.setText(line);
         if (bar != null) bar.setProgress(got);
-        int[] show = LandingLine.rows(pkgs, landed);
+        int[] show = LandingLine.rows(pkgs, landed, installing, lastLanded);
         for (int s = 0; s < rowViews.length; s++) {
             if (s < show.length) {
                 paintRow(s, show[s]);
@@ -248,25 +333,21 @@ public class LandingNoticeActivity extends Activity {
                 rowViews[s].setVisibility(View.INVISIBLE); // INVISIBLE, not GONE: the card keeps one size
             }
         }
-        int more = LandingLine.moreCount(pkgs, landed);
+        int more = LandingLine.moreCount(pkgs, landed, installing, lastLanded);
         moreRow.setText(LandingLine.more(more));
         moreRow.setVisibility(more > 0 ? View.VISIBLE : View.INVISIBLE);
     }
 
     private void paintRow(int slot, int i) {
         rowLabels[slot].setText(label(i));
-        if (landed[i]) {
-            rowStates[slot].setText(LandingLine.TICK + " " + LandingLine.READY);
-            rowStates[slot].setTextColor(look.accent);
-        } else {
-            rowStates[slot].setText(LandingLine.CLOCK + " " + LandingLine.COMING);
-            rowStates[slot].setTextColor(look.muted);
-        }
+        rowStates[slot].setText(LandingLine.state(landed[i], i == installing));
+        rowStates[slot].setTextColor(landed[i] ? look.accent : i == installing ? look.ink : look.muted);
     }
 
     /** The app's name as ProfileActivity.keptLabel resolves it: the installed label, else the archived placeholder's
      *  launcher label, else a provider's fixed name (NWP-20261130-09: it has no placeholder to read), else the package
-     *  name. Cached until the app's outcome arrives. */
+     *  name. Read once, at the row's first paint, and kept for the card's sweep, so neither the app landing nor a
+     *  recreated card renames it (NWP-20261201-31). */
     private String label(int i) {
         if (labels[i] != null) return labels[i];
         String pkg = pkgs[i];
@@ -289,7 +370,7 @@ public class LandingNoticeActivity extends Activity {
             } catch (Throwable ignore) {}
         }
         if (got == null) got = LandingLine.depLabel(pkg);
-        labels[i] = got != null ? got : pkg;
+        labels[i] = LandingLine.Sweep.keepLabel(sweep, i, got != null ? got : pkg);
         return labels[i];
     }
 

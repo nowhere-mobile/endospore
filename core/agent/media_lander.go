@@ -7,7 +7,8 @@ package main
 // items 2 and its fail-direction table (the landed roster), §6's retry rule and §10 O4's order. The split it works
 // from is bgSplit (S1); the seal reads what it records through loadLandedRoster (S3).
 //
-// ⚠ NOTHING CALLS landBackground YET. S4b starts it in mediad, and it stays behind NOWHERE_MEDIA_AFTER_GATE.
+// mediad starts landBackground (S4b, media_lander_run.go), behind NOWHERE_MEDIA_AFTER_GATE. ⚠ S5 must land before any
+// daemon exports that flag: S5 hands the landed paths to the media scan.
 //
 // ⚠ NEVER THROUGH AN OVERLAY. A folder mediad overlays lands in that overlay's hidden real directory. That directory
 // sits under mediad's cache dir (`<cacheDir>/.under/<leaf>`, mediafs.go), outside the media root, so its write is
@@ -33,10 +34,13 @@ import (
 )
 
 const (
-	landerBatch   = 32               // landed-roster digests held back before a write
+	landerBatch   = 32               // media-bg.list paths held back before a write (bgLander.onWritten)
 	landerWaitMin = 30 * time.Second // §6: the first wait, and the wait after a pass that landed anything
 	landerWaitMax = 10 * time.Minute // §6: the cap
 )
+
+// errLanderStopped is a commit seam's refusal: the lander was stopped, so nothing was written and the rel stays pending.
+var errLanderStopped = errors.New("media lander stopped")
 
 // renameat2 is a seam: a test returns EINVAL through it to force renameNoReplace's fallback.
 var renameat2 = unix.Renameat2
@@ -129,6 +133,10 @@ type landerInput struct {
 	sleep     func(time.Duration) bool                                                    // false: stop
 	fetch     func(base string, key []byte, m chunkManifest, r essRegion) ([]byte, error) // default fetchEssSpan
 	onDamaged func(rel string)                                                            // once per corrupt rel
+	onStart   func(pending []string)                                                      // once, before any fetch, also with an empty set
+	onSettled func(rel string, landedHere bool)                                           // once per rel landed (true), present-skipped or copy-dropped (false)
+	onWritten func(rel string)                                                            // inside commit, after a write that landed rel
+	commit    func(write func() error) error                                              // wraps each write; errLanderStopped ends the run as a stop does
 }
 
 // landerCounts is one run's result. skipped holds both a rel found present and a copy dropped because a file appeared
@@ -151,12 +159,18 @@ type landerCounts struct {
 //     the digest is recorded.
 //   - A corrupt span leaves the set for this run: onDamaged once, never retried this session. The rel stays in the head
 //     and is carried. Any other error leaves the rel pending (§6).
+//   - A rel the corrupt roster holds is never fetched (NWP-20261130-17): a restart of mediad inside the session reports
+//     it again through onDamaged and fetches nothing. Its digest is written before that first onDamaged, so a death
+//     between the two costs no fetch.
 //   - Passes repeat over the pending rels. After a pass that landed anything the wait is 30 s; otherwise it doubles, to
 //     a 10 min cap. A skip is not a landing.
 //
-// Digests are recorded after each rename, in batches: every landerBatch rels, at each pass's end and before a stop is
-// honoured. A kill inside a batch is the present-skip above. It logs one line of counts only: a rel names a user's file,
-// and a fetch or write error can name a path, so no error is logged here.
+// A rel's digest is recorded after its rename (or its skip) and before the next fetch (NWP-20261130-17): a kill between
+// the rename and the digest is the present-skip above, and a landing the user deletes during a later fetch stays
+// deleted after a kill. Batching the digests lost that deletion: the restart found neither file nor digest.
+//
+// It logs one line of counts only: a rel names a user's file, and a fetch or write error can name a path, so no error is
+// logged here.
 func landBackground(in landerInput, m chunkManifest) landerCounts {
 	if in.fetch == nil {
 		in.fetch = fetchEssSpan
@@ -170,7 +184,20 @@ func landBackground(in landerInput, m chunkManifest) landerCounts {
 	if in.onDamaged == nil {
 		in.onDamaged = func(string) {}
 	}
+	if in.onStart == nil {
+		in.onStart = func([]string) {}
+	}
+	if in.onSettled == nil {
+		in.onSettled = func(string, bool) {}
+	}
+	if in.onWritten == nil {
+		in.onWritten = func(string) {}
+	}
+	if in.commit == nil {
+		in.commit = func(write func() error) error { return write() }
+	}
 	held := loadLandedRoster(in.ref, in.dk)
+	wasCorrupt := loadCorruptRoster(in.ref, in.dk)
 	bg, _ := bgSplit(m)
 	var pending []string
 	for _, rel := range landerOrder(m, bg) {
@@ -178,18 +205,15 @@ func landBackground(in landerInput, m chunkManifest) landerCounts {
 			pending = append(pending, rel)
 		}
 	}
+	in.onStart(pending)
 
 	var c landerCounts
-	var batch []string
-	record := func(rel string) {
-		batch = append(batch, rel)
-		if len(batch) >= landerBatch {
-			recordLandedRoster(in.ref, in.dk, batch)
-			batch = nil
-		}
-	}
+	record := func(rel string) { appendLandedRoster(in.ref, in.dk, rel) }
 	damaged := func(rel string) {
 		c.damaged++
+		if !wasCorrupt(rel) {
+			recordCorruptRoster(in.ref, in.dk, []string{rel})
+		}
 		in.onDamaged(rel)
 	}
 	wait := landerWaitMin
@@ -203,7 +227,7 @@ func landBackground(in landerInput, m chunkManifest) landerCounts {
 				stopped = true
 				break
 			}
-			if !landerRelOK(rel) {
+			if !landerRelOK(rel) || wasCorrupt(rel) {
 				damaged(rel)
 				continue
 			}
@@ -215,6 +239,7 @@ func landBackground(in landerInput, m chunkManifest) landerCounts {
 			if _, err := os.Lstat(target); err == nil {
 				c.skipped++
 				record(rel)
+				in.onSettled(rel, false)
 				continue
 			}
 			frag, err := in.fetch(in.base, in.key, m, m.Ess[rel])
@@ -231,10 +256,22 @@ func landBackground(in landerInput, m chunkManifest) landerCounts {
 				damaged(rel)
 				continue
 			}
-			err = writeMaterializedVia(target, root, hdr, data, renameNoReplace)
+			err = in.commit(func() error {
+				err := writeMaterializedVia(target, root, hdr, data, renameNoReplace)
+				if err == nil {
+					in.onWritten(rel)
+				}
+				return err
+			})
+			if errors.Is(err, errLanderStopped) {
+				next = append(next, pending[i:]...)
+				stopped = true
+				break
+			}
 			if errors.Is(err, os.ErrExist) {
 				c.skipped++
 				record(rel)
+				in.onSettled(rel, false)
 				continue
 			}
 			if err != nil {
@@ -244,9 +281,8 @@ func landBackground(in landerInput, m chunkManifest) landerCounts {
 			c.landed++
 			c.bytes += int64(len(data))
 			record(rel)
+			in.onSettled(rel, true)
 		}
-		recordLandedRoster(in.ref, in.dk, batch)
-		batch = nil
 		pending = next
 		if stopped || len(pending) == 0 {
 			break

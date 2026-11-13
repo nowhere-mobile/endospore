@@ -22,9 +22,10 @@ package main
 //
 // SCOPE AND LIFETIME. Markers are keyed by the same per-scope ref the receipt gate uses (profileRefV2 of
 // the scope-qualified name), so clearing app data does not open a hole in the media seal. They live in the
-// RAM state tmpfs alongside restore receipts, which gives the right lifetime for free: a marker cannot
-// outlive the session that set it, and an amnesiac boot starts with none. Off-device (NOWHERE_STATE unset,
-// i.e. host CLI and unit tests) the whole mechanism is inert.
+// RAM state tmpfs alongside restore receipts. That tmpfs lives for the BOOT and a marker's name is the same in
+// every session of its profile, so the tmpfs alone does not bound a marker to its session: a new sign-in forgets
+// every marker (forgetShrinkIntents, NWP-20261129-07), a reboot empties the tmpfs, and a resume keeps its
+// session's. Off-device (NOWHERE_STATE unset, i.e. host CLI and unit tests) the whole mechanism is inert.
 //
 // The marker is cleared when a seal of that scope COMMITS, not when the guard reads it. Consuming it at the
 // guard would lose the intent if the push then failed, and the retry -- the same deliberate deletion --
@@ -377,6 +378,58 @@ func recoverShrinkMarkers(dest string) int {
 	}
 	defer unlock()
 	return recoverShrinkDir(dir)
+}
+
+// forgetShrinkIntents ends the authority of every marker an earlier session left in the intent directory, called once a
+// new sign-in has recorded its session (NWP-20261129-07). Only a seal that USED a marker retires it, so a walk-explained
+// or unshrunk scope leaves it armed, and in the next session of that profile on this boot it would allow a drastic
+// shrink outright. A marker ends absent or as the consumed tombstone (neutralizeShrinkMarker); one that can be neither
+// keeps its record and the flag, so a marker that was pending stays pending. The lock file stays: a process waiting on
+// it and one that created a new file would both hold "the" lock. Returns how many markers it neutralised, and logs
+// counts only.
+func forgetShrinkIntents(dest string) int {
+	dir := filepath.Join(dest, "shrink-intent")
+	if _, err := os.Stat(dir); os.IsNotExist(err) {
+		return 0
+	}
+	unlock, err := lockShrinkDir(dir, false)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[logind] shrink-intent: an earlier session's markers were NOT forgotten (%s) (NWP-20261129-07)\n", shrinkLockWhy(err))
+		return 0
+	}
+	defer unlock()
+	ents, err := shrinkReadDir(dir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[logind] shrink-intent: an earlier session's markers were NOT forgotten (%s) (NWP-20261129-07)\n", shrinkLockWhy(err))
+		return 0
+	}
+	n, stuck := 0, 0
+	for _, e := range ents {
+		if strings.Contains(e.Name(), ".") {
+			continue // a marker's name is a hex ref; everything else in the directory has a dot
+		}
+		f := filepath.Join(dir, e.Name())
+		if !neutralizeShrinkMarker(f) {
+			stuck++
+			continue
+		}
+		dropShrinkRecords(f)
+		n++
+	}
+	for _, e := range ents {
+		if strings.HasSuffix(e.Name(), ".new") {
+			os.Remove(filepath.Join(dir, e.Name()))
+		}
+	}
+	if stuck == 0 {
+		shrinkDrop(filepath.Join(dir, shrinkTxnName))
+	} else {
+		fmt.Fprintf(os.Stderr, "[logind] shrink-intent: %d marker(s) an earlier session left could NOT be neutralised (NWP-20261129-07)\n", stuck)
+	}
+	if n > 0 {
+		fmt.Fprintf(os.Stderr, "[logind] shrink-intent: a new sign-in forgot %d marker(s) an earlier session left (NWP-20261129-07)\n", n)
+	}
+	return n
 }
 
 // commitShrinkMarkers writes every target or none, and never truncates or rewrites a marker in place.

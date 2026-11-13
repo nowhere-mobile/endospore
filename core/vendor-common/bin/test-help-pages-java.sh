@@ -6,21 +6,24 @@
 # the gate's "?" reads GateHelpPages (signing in, Gate settings, Owner settings, a locked phone) and Profile › Help
 # reads HelpPages (the six session topics). Both classes hold only words (pure, java.lang only) and are compiled here
 # with their cases; they pin both page lists exactly and apart, 3 to 6 steps and at most 650 characters a page, and no
-# B4 word in a body, for both sets. A source check (comment lines stripped) pins the two doors: showGateHelp builds
-# its list from GateHelpPages.TITLES and shows GateHelpPages.body and moreLine with no other words than "Back" and
-# "Got it", and reads no HelpPages; both Profile home arrays end with a "Help" row that runs showHelp; showHelp lists
+# B4 word in a body, for both sets. A source check (comment lines stripped) pins the two doors: showGateHelp opens the
+# combo screen (NWP-20261130-11; test-gate-help-combo-java.sh runs that screen's own cases), its page dialog
+# (showGateHelpPage) shows moreLine with no words of its own, and these methods read no HelpPages. "Got it" left the page
+# dialog with that slice: on top of the combo screen it did the same as Back. Both Profile home arrays end with a
+# "Help" row that runs showHelp; showHelp lists
 # HelpPages.TITLES and opens a topic in place through showHelpPage, which builds its step cards from HelpPages.steps
 # through HelpCards.cards, shows moreLine and runs close on Back from the first card (NWP-20261122-08,
 # NWP-20261126-08); no Help method, the card screen's helpers (HELP_PAGE_HELPERS below) included, reads a profile name or a daemon reply.
 # HelpCards is not compiled here: test-help-cards-java.sh runs its cases. The cases also pin Gate settings' sun/moon
 # step byte for byte (NWP-20261124-15): "The sun or moon left of ? switches between light and dark, unless the owner
-# has kept the look to Owner settings.", since the owner can hide the sun/moon (GateLookGlyph.OWNER_ONLY_KEY). That
+# has locked the look in Owner settings." (NWP-20261130-13: Owner settings no longer holds a Light mode switch), since the owner can hide the sun/moon (GateLookGlyph.OWNER_ONLY_KEY). That
 # step made Gate settings 645 characters, so the page limit is 650 (it was 600 before NWP-20261124-15).
 # NWP-20261126-03 (decision 2026-11-03): Store settings moved from Gate settings to Owner settings. The cases pin that
 # Gate settings does not name it and that Owner settings' Lock screen clock step does, byte for byte (page 2 keeps 6
-# steps). Gate settings is now 596 characters.
+# steps). Gate settings is now 598 characters (596, plus 2 for NWP-20261130-13's "locked the look in").
 # NWP-20261130-14 (decision 2026-11-06): Backup moved from Gate settings to Owner settings. The cases pin that Gate
 # settings does not name it and that the same Owner settings step does, byte for byte. Owner settings is now 648.
+# NWP-20261130-11 adds the log-off step to the gate's page 3, which keeps within the limit (5 steps).
 #
 # ⚠ IT FAILS WHEN THERE IS NO JAVAC, IT NEVER SKIPS. javac comes from PATH, else from the build host's JDK below;
 # the version is printed first so the log proves which compiler ran.
@@ -88,12 +91,18 @@ HELP_PAGE_HELPERS='helpCardPicture helpCardDrop helpCardFling helpCardChips help
 # source_check <ChooserActivity.java> <ProfileActivity.java> <HelpPages.java> <GateHelpPages.java> -> 0 when the
 # wiring holds, 1 otherwise.
 source_check() {
-  local chooser="$1" profile="$2" pages="$3" gatepages="$4" gate home help page cardsrc h body k n lits rest arrays f bad=0
+  local chooser="$1" profile="$2" pages="$3" gatepages="$4" gate gatenav gatepage home help page cardsrc h body k n lits rest arrays f bad=0
   gate=$(method "$chooser" 'private void showGateHelp\\(\\)')
+  gatenav=$(method "$chooser" 'private GateHelpScreen\\.Nav gateHelpNav\\(\\)')
+  gatepage=$(method "$chooser" 'private void showGateHelpPage\\(')
   home=$(method "$profile" 'private void showConfirm\\(\\)')
   help=$(method "$profile" 'private void showHelp\\(\\)')
   page=$(method "$profile" 'private void showHelpPage\\(')
   [ -n "$gate" ] || { echo "  FAIL  showGateHelp not found in $chooser" >&2; return 1; }
+  [ -n "$gatenav" ] || { echo "  FAIL  gateHelpNav not found in $chooser" >&2; bad=1; }
+  [ -n "$gatepage" ] || { echo "  FAIL  showGateHelpPage not found in $chooser" >&2; bad=1; }
+  # The gate's three Help methods, read together by S1 and S4.
+  gate=$(printf '%s\n%s\n%s\n' "$gate" "$gatenav" "$gatepage")
   [ -n "$home" ] || { echo "  FAIL  showConfirm not found in $profile" >&2; return 1; }
   [ -n "$help" ] || { echo "  FAIL  showHelp not found in $profile" >&2; bad=1; }
   [ -n "$page" ] || { echo "  FAIL  showHelpPage not found in $profile" >&2; bad=1; }
@@ -105,19 +114,18 @@ source_check() {
     cardsrc=$(printf '%s\n%s\n' "$cardsrc" "$body")
   done
 
-  # S1 the gate's "?": the Help list from GateHelpPages, a page from GateHelpPages, never a HelpPages (Profile's set),
-  # and no words of its own but Back / Got it.
-  for k in '.setTitle(GateHelpPages.indexTitle())' '.setItems(GateHelpPages.TITLES,' '.setTitle(GateHelpPages.TITLES[' \
-           'GateHelpPages.body(' 'GateHelpPages.moreLine()' '"Back"' '"Got it"'; do
+  # S1 the gate's "?": the combo screen, then a page dialog that shows GateHelpPages' last line; never a HelpPages
+  # (Profile's set), and no words of its own: every word is GateHelpHome's or GateHelpPages'.
+  for k in 'GateHelpScreen.home(' '.setTitle(' '.setMessage(' 'GateHelpPages.moreLine()'; do
     n=$(printf '%s\n' "$gate" | grep -cF "$k")
-    [ "$n" -ge 1 ] || { echo "  FAIL  showGateHelp has no <$k>" >&2; bad=1; }
+    [ "$n" -ge 1 ] || { echo "  FAIL  showGateHelp and its methods have no <$k>" >&2; bad=1; }
   done
   n=$(printf '%s\n' "$gate" | grep -cE '(^|[^A-Za-z])HelpPages\.')
   [ "$n" -eq 0 ] || { echo "  FAIL  showGateHelp reads HelpPages (Profile › Help's set), not only GateHelpPages" >&2; bad=1; }
-  lits=$(printf '%s\n' "$gate" | grep -o '"[^"]*"' | sort -u | grep -vxF -e '"Back"' -e '"Got it"' -e '"\n\n"')
+  lits=$(printf '%s\n' "$gate" | grep -o '"[^"]*"' | sort -u | grep -vxF -e '"\n\n"')
   [ -z "$lits" ] || { echo "  FAIL  showGateHelp shows its own words: $(printf '%s' "$lits" | tr '\n' ' ')" >&2; bad=1; }
-  n=$(printf '%s\n' "$gate" | grep -cE 'startActivity|Intent|setView\(|WebView|Uri\.')
-  [ "$n" -eq 0 ] || { echo "  FAIL  showGateHelp leaves the dialogs (an activity, a view, a link)" >&2; bad=1; }
+  n=$(printf '%s\n' "$gate" | grep -cE 'startActivity|Intent|WebView|Uri\.')
+  [ "$n" -eq 0 ] || { echo "  FAIL  showGateHelp leaves the gate (an activity, a link)" >&2; bad=1; }
 
   # S2 both home arrays: "Help" last, and the runnable at the same index is showHelp.
   arrays=$(printf '%s\n' "$home" | perl -0ne '
@@ -159,12 +167,12 @@ source_check() {
   n=$(printf '%s\n%s\n%s\n' "$gate" "$help" "$cardsrc" \
         | grep -cE 'profileName|\bname\b|sendDaemon|daemonCmd|daemonLenReply|DaemonSocket|\breply\b|sessionType|getUserName')
   [ "$n" -eq 0 ] || { echo "  FAIL  a Help method reads a profile name or a daemon reply" >&2; bad=1; }
-  rest=$(printf '%s\n' "$gate" | sed 's/GateHelpPages\.body(i) + "\\n\\n" + GateHelpPages\.moreLine()//')
+  rest=$(printf '%s\n' "$gate" | sed 's/body + "\\n\\n" + GateHelpPages\.moreLine()//')
   n=$(printf '%s\n%s\n%s\n' "$rest" "$help" "$cardsrc" | grep -cE '[^+]\+[^+=]')
   [ "$n" -eq 0 ] || { echo "  FAIL  a Help method joins something into a Help string" >&2; bad=1; }
 
-  # S5 HelpPages and GateHelpPages are pure: java.* only.
-  for f in "$pages" "$gatepages"; do
+  # S5 HelpPages, GateHelpPages and GateHelpHome are pure: java.* only.
+  for f in "$pages" "$gatepages" "$SRC/GateHelpHome.java"; do
     [ -f "$f" ] || { echo "  FAIL  $f does not exist" >&2; bad=1; continue; }
     rest=$(sed -e '/^[[:space:]]*\(\*\|\/\*\)/d' -e 's#//.*$##' "$f" | grep -E '^import ' | grep -v '^import java\.')
     n=$(sed -e '/^[[:space:]]*\(\*\|\/\*\)/d' -e 's#//.*$##' "$f" | grep -c 'android\.')
@@ -252,8 +260,8 @@ mut "M8 \"Your apps\" added to the gate set" gate \
   's/^(\s+)"Signing in and creating a profile",$/$1"Signing in and creating a profile",\n$1"Your apps",/m or die "M8: title";
    s/^(\s+)\{ \/\/ page 1: Gate settings$/$1\{ \/\/ page 0b: Your apps\n$1    "Tap Your apps.",\n$1    "Tap an app.",\n$1    "Tap Back.",\n$1\},\n$1\{ \/\/ page 1: Gate settings/m or die "M8: page"' \
   || fails=$((fails+1))
-mut "M9 showGateHelp pointed back at HelpPages" chooser \
-  's/(    private void showGateHelp\(\) \{\n.*?\n    \}\n)/$1 =~ s#GateHelpPages\.#HelpPages.#gr/se or die "M9: showGateHelp not found"' \
+mut "M9 showGateHelpPage pointed back at HelpPages" chooser \
+  's/(    private void showGateHelpPage\(.*?\n    \}\n)/$1 =~ s#GateHelpPages\.#HelpPages.#gr/se or die "M9: showGateHelpPage not found"' \
   || fails=$((fails+1))
 mut "M10 a Gate settings step given the word secure" gate 's/join a network/join a secure network/ or die "M10"' \
   || fails=$((fails+1))
@@ -265,7 +273,7 @@ mut "M12 a seventh step on a gate page" gate \
   's/^(\s+)("Lock screen clock: [^\n]*"\n\s+\+ "[^\n]*",)$/$1$2\n$1"Tap Back.",/m or die "M12"' \
   || fails=$((fails+1))
 mut "M13 (G6) the sun/moon step reverted to its text before NWP-20261124-15" gate \
-  's/"The sun or moon left of \? switches between light and dark, unless the owner has kept the look to Owner "\n\s+\+ "settings\.",/"The sun or moon left of ? switches between light and dark.",/ or die "M13"' \
+  's/"The sun or moon left of \? switches between light and dark, unless the owner has locked the look in Owner "\n\s+\+ "settings\.",/"The sun or moon left of ? switches between light and dark.",/ or die "M13"' \
   || fails=$((fails+1))
 mut "M14 Store settings named on Gate settings again" gate \
   's/"The gear at the top right opens Settings\. Wi-Fi: join a network\.",/"The gear at the top right opens Settings. Wi-Fi: join a network. Store settings: choose where profiles are saved.",/ or die "M14"' \

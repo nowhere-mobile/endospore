@@ -70,6 +70,8 @@ if [ "$MUTATE" = yes ] && [ "$rc" = 0 ]; then
   mutate "untilAnswered returns on ERR" 's/if (!"ERR".equals(last.kind)) return last;/return last;/'
   mutate "J1 parse never sets partial" 's/if ("PARTIAL".equals(f\[i\])) r.partial = true;//'
   mutate "J2 parse sets partial from STRIPPED" 's/"PARTIAL".equals(f\[i\])/"STRIPPED".equals(f[i])/'
+  mutate "W2 parse drops OWNER's vis" 's/if (f.length > 1) r.vis = f\[1\];/if (f.length > 1 \&\& !"OWNER".equals(f[0])) r.vis = f[1];/'
+  mutate "W3 parse drops NONE's vis" 's/if (f.length > 1) r.vis = f\[1\];/if (f.length > 1 \&\& !"NONE".equals(f[0])) r.vis = f[1];/'
 fi
 
 echo

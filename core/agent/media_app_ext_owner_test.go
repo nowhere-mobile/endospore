@@ -177,7 +177,9 @@ func TestMaterialize_BothCallersOwnAppExtFilesAndWaitForAbsentApps(t *testing.T)
 		run  func(base string, key []byte, m chunkManifest, rels []string, dest string) ([]string, int64)
 		body string
 	}{
-		{"essential", essentialMediaEnv, materializeCarried, "small app state"},
+		{"essential", essentialMediaEnv, func(base string, key []byte, m chunkManifest, rels []string, dest string) ([]string, int64) {
+			return materializeCarried(base, key, m, rels, dest, 1<<30)
+		}, "small app state"},
 		{"deferred", func(t *testing.T) {
 			deferredMediaEnv(t)
 			t.Setenv("NOWHERE_MEDIA_MIN", "64") // the app-private floor, so files/ defers too

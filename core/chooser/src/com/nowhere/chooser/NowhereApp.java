@@ -84,10 +84,17 @@ public class NowhereApp extends Application {
         } catch (Throwable t) {
             android.util.Log.w("NowhereChooser", "NowhereApp: install receiver register", t);
         }
+        // NWP-20261130-12: a package can land while the session's process is dead; a tile that waited for it comes back
+        // here. A no-op in user 0.
+        new Thread(() -> SettingsRoamLive.reconcile(this), "nowhere-settings-roam").start();
         // ...and because a runtime receiver dies with its process (android:persistent covers ONLY user 0, so a
         // roamed session's chooser can be killed), reconcile on every process birth. Off the main thread: it
         // walks the installed-package list and touches the keep-set file.
         new Thread(() -> AppInstallReceiver.applyDefaultsToUndecided(this), "nowhere-appdefaults").start();
+        // NWP-20261130-03: and the launch barrier: an app installed while this process was dead and not relayed is held here.
+        new Thread(() -> OdDataBarrierHost.reconcile(this), "nowhere-od-barrier-reconcile").start();
+        // NWP-20261130-03 (RF-013): the same event must reach a session whose chooser process is dead. User-0 guard inside.
+        OdDataInstallWatch.register(this);
         // NWP-20261002-03: the user-0 gate is the only remover of a profile's own Doze choices, and it removes them
         // when that profile's USER is removed (ACTION_USER_REMOVED), never at logoff. Registered at process birth so
         // it is live before the boot-wipe removes a leftover session (BootReceiver). User-0 guard inside.

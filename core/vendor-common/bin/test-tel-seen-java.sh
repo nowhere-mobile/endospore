@@ -3,8 +3,8 @@
 # session's reader, each SMS and MMS it inserted, and login.log carries the counts, so an issue report tells a hidden
 # row from a delivered one. Evidence only: nothing TelIngest inserts, acknowledges, re-stages or notifies changes.
 # Compiles the chooser's pure TelSeen (java.lang and java.util only) with the cases ALONE and EXECUTES them (C1-C5), then
-# checks the REAL TelIngest methods, found by brace count, with comments dropped so a comment can neither satisfy nor
-# trip a check (W1-W4):
+# checks the REAL TelIngest methods, found by brace count. W1-W4 run on the source with comments dropped, so a comment
+# can neither satisfy nor trip them; W6 runs on the raw file, because a comment is what it checks:
 #   C1  a row inserted twice counts once, per kind, in arrival order.
 #   C2  readBack: TRUE counts nothing, FALSE counts hidden in its own kind, null counts unknown only.
 #   C3  addr/part: false counts, true does not; a false alone makes any() true.
@@ -18,6 +18,7 @@
 #   W4  one TELINGEST-SEEN send, behind TelSeen.sends(live, ...), on the line before ACK-TELINGEST.
 #   (W5, the control that v.put("sub_id", -1) and pdu.put("sub_id", -1) were unchanged, was retired by NWP-20261130-01,
 #   which files each SMS and MMS under its SIM's subscription; test-telingest-sub-java.sh pins that.)
+#   W6  the // comment lines directly above the read-back's if (!live) cite the decision: 2026-11-06, harvest 60, #4.
 #
 # It needs a JDK and perl, and it FAILS when there is none: a Java suite that skips without one would read green on a
 # runner that never ran it. javac/java come from PATH, then the build VM's prebuilt JDK 21.
@@ -58,7 +59,8 @@ cases() {
   "$JAVA" -Djava.io.tmpdir="$W" -cp "$d" com.nowhere.chooser.TelSeenCases
 }
 
-# wiring <root>: W1-W4 over <root>'s TelIngest.java. Prints one ok or FAIL line per check; 1 when any failed.
+# wiring <root>: W1-W4 over <root>'s TelIngest.java with comments dropped, W6 over the raw file. Prints one ok or FAIL
+# line per check; 1 when any failed.
 wiring() {
   perl -e '
     use strict; use warnings;
@@ -167,6 +169,29 @@ wiring() {
     index($raw, "        $send\n        $ackt\n") >= 0 or push @e, "in the file itself, the send line is not the line before ACK-TELINGEST";
     verdict("W4", "one TELINGEST-SEEN send behind TelSeen.sends(live, ...), the line before ACK-TELINGEST", @e);
 
+    # From $raw, because the comment is the thing checked: the // lines directly above the if (!live) { whose block,
+    # closed at the indent of that if line, holds the sms read-back. Joined, so a citation may wrap across lines.
+    @e = ();
+    my @lines = split /\n/, $raw;
+    my @found;
+    for my $i (0 .. $#lines) {
+      next unless $lines[$i] =~ /^([ \t]*)if \(!live\) \{[ \t]*$/;
+      my $ind = $1;
+      my ($j, $holds) = ($i + 1, 0);
+      while ($j <= $#lines && $lines[$j] !~ /^\Q$ind\E\}/) { $holds = 1 if index($lines[$j], "seen.readBack(\"sms\"") >= 0; $j++ }
+      next unless $holds;
+      my @note;
+      for (my $k = $i - 1; $k >= 0 && $lines[$k] =~ m{^[ \t]*//[ \t]?(.*)$}; $k--) { unshift @note, $1 }
+      push @found, join(" ", @note);
+    }
+    if (@found != 1) { push @e, "the if (!live) block holding the sms read-back was found " . scalar(@found) . " time(s), want 1" }
+    else {
+      for my $want (qr/2026-11-06/, qr/harvest 60\b/, qr/#4\b/) {
+        $found[0] =~ $want or push @e, "the comment above the read-back does not match $want";
+      }
+    }
+    verdict("W6", "the comment above the read-back cites docs/product-decisions.md 2026-11-06 harvest 60 #4", @e);
+
     exit $bad;' "$1/$CH/TelIngest.java"
 }
 
@@ -210,4 +235,5 @@ mut "M5 insertMmsPart true on a null part Uri" "$TI" 's/inserted = partUri != nu
 mut "M6 the read-back without canReadMessages" "$TI" 's/final boolean canRead = canReadMessages\(ctx\);\n(\s*for \(long w : seen\.sms\))/final boolean canRead = true;\n$1/' W3 || fails=$((fails+1))
 mut "M7 line() unclamped" "$TS" 's/return v < 0 \? 0 : v > 99999 \? 99999 : v;/return v;/' C4 || fails=$((fails+1))
 mut "M8 deliver records an SMS whose insert returned null" "$TI" 's/if \(ins != null && !isCall\) seen\.inserted/if (!isCall) seen.inserted/' W1 || fails=$((fails+1))
+mut "M9 the read-back comment no longer cites h60 #4" "$TI" 's/harvest 60" #4/harvest 60"/' W6 || fails=$((fails+1))
 [ "$fails" -eq 0 ] && echo "== all mutations convicted" || { echo "== $fails mutation(s) not convicted"; exit 1; }

@@ -75,6 +75,24 @@ func TestGatePollVerbsAnswerWhileSessionMuIsHeld(t *testing.T) {
 		{"metered on, no session", "GET-PREFETCH-METERED\n", "0", func(t *testing.T, dest string) {
 			gatePollPlant(t, dest, prefetchMeteredOut, "12 1\n")
 		}},
+		{"save mode wifi for the session", "GET-SAVE-MODE\n", "wifi", func(t *testing.T, dest string) {
+			gatePollMark(t, dest)
+			gatePollPlant(t, dest, saveModeOut, "12 wifi\n")
+		}},
+		{"save mode off for the session", "GET-SAVE-MODE\n", "off", func(t *testing.T, dest string) {
+			gatePollMark(t, dest)
+			gatePollPlant(t, dest, saveModeOut, "12 off\n")
+		}},
+		{"save mode off for another uid", "GET-SAVE-MODE\n", "always", func(t *testing.T, dest string) {
+			gatePollMark(t, dest)
+			gatePollPlant(t, dest, saveModeOut, "13 off\n")
+		}},
+		{"save mode off, no session", "GET-SAVE-MODE\n", "always", func(t *testing.T, dest string) {
+			gatePollPlant(t, dest, saveModeOut, "12 off\n")
+		}},
+		{"save mode, no file", "GET-SAVE-MODE\n", "always", func(t *testing.T, dest string) {
+			gatePollMark(t, dest)
+		}},
 	}
 	for _, c := range cases {
 		dest := t.TempDir()
@@ -169,6 +187,7 @@ func TestGatePollersNeverWaitOnTheSession(t *testing.T) {
 		t.Fatal(err)
 	}
 	toks := lexJava(string(src))
+	arms := parseLoginArms(t)
 	// Writes sent once per state change. They stay serialized (not NWP-20261117-23's call) and still land once the
 	// lock frees.
 	pinned := map[string]bool{"PREFETCH-ARM": false, "PREFETCH-DISARM": false, "REKEY-DISARM": false}
@@ -217,7 +236,7 @@ func TestGatePollersNeverWaitOnTheSession(t *testing.T) {
 					pinned[v] = true
 					continue
 				}
-				if !concurrentSafeCmd(v) {
+				if gatePollWaits(concurrentSafeCmd(v), arms.has(v), chooserVerbsAwaitingArm[v]) {
 					t.Errorf("%s:%d (%s): the gate polls %s, which waits on sessionMu: behind a materialise its 5 s read times out empty", file, toks[i].line, method, v)
 				}
 			}
@@ -236,6 +255,12 @@ func TestGatePollersNeverWaitOnTheSession(t *testing.T) {
 	if !pinnedArgSeen {
 		t.Error(`stale pin: the pollers no longer send rekeyWant + "\n"; drop the pinned argument`)
 	}
+}
+
+// gatePollWaits is the fence's verdict on one polled verb. A verb outside concurrentSafeCmd waits on sessionMu, unless
+// it awaits its arm and handleLogin does not serve it yet: no handler exists to judge. The arm ends that exemption.
+func gatePollWaits(safe, armed, awaitingArm bool) bool {
+	return !safe && (armed || !awaitingArm)
 }
 
 func gatePollSameToks(a, b []jtok) bool {

@@ -59,7 +59,7 @@ import (
 //
 // What it does NOT do: stop spending or leasing. The session's wallet file is used as before; only its PUBLISH is
 // held back. Credit claimed in such a session is therefore NOT durable until a retried read lands
-// (retryWalletRestore, run by "Add credits", by the periodic seal, by a sign-out -- LOGOUT and ROAM-OUT -- and by
+// (retryWalletRestore, run by "Add credits", by the periodic seal, by a sign-out (LOGOUT) and by
 // END-UNSAVED / RESTART-UNSAVED); a session that ends without one loses it, and says so (docs/product-decisions.md,
 // 2026-10-15) -- on the gate, on its own ending screen, or, for a parked session a sign-in supersedes, in the log
 // only. Every retry is handed the generation its caller captured BEFORE it read the session or the store, and
@@ -640,19 +640,30 @@ func mergeLateRestore(stored, local *Wallet) *Wallet {
 	// session's. Decided BEFORE the tokens are unioned, because planPending reads each wallet's own balance. The first
 	// is the plan that activates next; walletForPublish below keeps the plan fields verbatim while any wait.
 	var waiting []PlanSpec
+	haveID := map[string]bool{} // a purchase both copies hold is one purchase (h60 #14)
+	add := func(s PlanSpec) {
+		if s.ID != "" && haveID[s.ID] {
+			return
+		}
+		haveID[s.ID] = true
+		waiting = append(waiting, s)
+	}
 	for _, w := range []*Wallet{stored, local} {
 		if w == nil {
 			continue
 		}
 		if w.planPending() {
-			waiting = append(waiting, PlanSpec{GB: w.PlanGB, Periods: w.PlanPeriods, Keep: w.PlanKeep, Convert: w.PlanConvert})
+			add(PlanSpec{ID: w.PlanID, GB: w.PlanGB, Periods: w.PlanPeriods, Keep: w.PlanKeep, Convert: w.PlanConvert})
 		}
-		waiting = append(waiting, w.PlanQueue...)
+		for _, s := range w.PlanQueue {
+			add(s)
+		}
 	}
 	out.PlanQueue = nil
 	if len(waiting) > 0 {
 		out.PlanGB, out.PlanPeriods, out.PlanKeep = waiting[0].GB, waiting[0].Periods, waiting[0].Keep
 		out.PlanConvert = waiting[0].Convert
+		out.PlanID = waiting[0].ID
 		if len(waiting) > 1 {
 			out.PlanQueue = waiting[1:]
 		}
@@ -789,7 +800,7 @@ func retrySessionWallet(dest, name, pass string, se []byte, gen string, wait tim
 	return retryWalletRestoreWithin("s3", name, pass, resolveDK("s3", name, pass, se), wp, gen, wait)
 }
 
-// logoffWalletRetry is a sign-out's wallet step (decided 2026-10-15, "Retry, then warn"; LOGOUT and ROAM-OUT): nothing
+// logoffWalletRetry is a sign-out's wallet step (decided 2026-10-15, "Retry, then warn"; LOGOUT): nothing
 // when generation gen -- captured by the sign-out before it read the session -- has its restore proof; otherwise one
 // locked retry of the read (walletLogoffRetryWait). It reports whether the gate must be told that credit claimed this
 // session was lost: the retry did not land and the file holds credit. The sign-out goes ahead either way; with no
@@ -1001,13 +1012,12 @@ func walletHoldsCredit(wp string) bool {
 
 // ---- the gate's "credit could not be saved" notice (NWP-20261013-20, decided 2026-10-15; NWP-20261016-47) ----
 //
-// A session that ends without its wallet published -- a sign-out (LOGOUT, ROAM-OUT) whose retried read failed,
+// A session that ends without its wallet published -- a sign-out (LOGOUT) whose retried read failed,
 // END-UNSAVED over a session that never read its stored wallet, or the gate's wipe of a cold-locked one -- loses the
 // credit claimed during it. The reply that could say so is read by the session's own screen, and the reap switches to
 // the gate within a fraction of a second, so the daemon RECORDS the notice instead and the GATE (user 0's chooser)
 // shows it once and clears it. Content-free: the file holds the time it was recorded and nothing else -- no profile
-// name, no amount -- and it lives in the state tmpfs, gone at power-off (so ROAM-OUT's own reboot clears the one it
-// records: there the log line is what remains, and no chooser sends ROAM-OUT). Named wallet.json.* so
+// name, no amount -- and it lives in the state tmpfs, gone at power-off. Named wallet.json.* so
 // wipeSessionState leaves it for the gate. Only a user-0 caller may read or clear it (creditLostCallerOK).
 //
 // Decided 2026-10-16, "warn and tell" (docs/product-decisions.md), for the two endings that recorded none:

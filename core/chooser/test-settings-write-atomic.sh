@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# test-settings-write-atomic.sh [<ProfileActivity.java>] [--mutate] -- the seven per-profile settings writers
+# test-settings-write-atomic.sh [<ProfileActivity.java>] [--mutate] -- the eight per-profile settings writers
 # publish their roamed file by StoreInstaller.writeAtomic (temp + rename), never through a truncating FileWriter.
 #
 # WHY THIS IS COMMITTED. cfgPut (nowhere-config, its body in cfgPutStatic since NWP-20261124-09), setTierOverride (nowhere-media-tiers), writePrefetchMetered
 # (nowhere-prefetch-metered), setPinned (nowhere-pins), writeBudgetBytes (nowhere-media-budget), setReclaimIdleMs
-# (nowhere-reclaim) and writeSealHold (nowhere-seal-hold) each rewrite a whole file in the roamed chooser's files
+# (nowhere-reclaim), writeSealHold (nowhere-seal-hold) and writeSaveMode (nowhere-save-mode) each rewrite a whole file in the roamed chooser's files
 # dir. A FileWriter truncates at open and writes at close, so a write that fails at its close (ENOSPC at the flush)
 # leaves the file empty or cut, the next seal carries it, and every later sign-in reads the damage: an empty
 # nowhere-reclaim reads as the 3-day default (a profile set to "Never" has its on-demand apps re-archived), an
@@ -13,14 +13,14 @@
 #
 # WHAT IS PINNED, on each method's body found by its exact signature (EXTRACTION FAILED, exit 2, when one moved):
 #   * exactly one `StoreInstaller.writeAtomic(` (comments stripped), and the method's own file still named in it
-#     (its literal, or CFG_FILE / SealHold.FILE);
+#     (its literal, or CFG_FILE / SealHold.FILE / SaveMode.FILE);
 #   * no `FileWriter(` (comments stripped and string literals blanked).
 # Controls: setPref (the model caller) passes the same checks, and a fabricated FileWriter body is flagged.
 # The behaviour -- a failed open, write, close or rename leaves the target byte for byte -- is executed by
-# test-write-atomic-java.sh; this suite pins that the seven callers use it.
+# test-write-atomic-java.sh; this suite pins that the eight callers use it.
 #
 #   bash test-settings-write-atomic.sh            # the pins
-#   bash test-settings-write-atomic.sh --mutate   # ... plus five FileWriter bodies put back, each CONVICTED
+#   bash test-settings-write-atomic.sh --mutate   # ... plus six FileWriter bodies put back, each CONVICTED
 #
 # Exit: 0 all pass, 1 a check failed, 2 the suite itself could not run.
 set -uo pipefail
@@ -91,9 +91,10 @@ setPinned|private boolean setPinned\(String app, boolean on\) \{|lit|nowhere-pin
 writeBudgetBytes|private boolean writeBudgetBytes\(long bytes\) \{|lit|nowhere-media-budget
 setReclaimIdleMs|private boolean setReclaimIdleMs\(long ms\) \{|lit|nowhere-reclaim
 writeSealHold|private boolean writeSealHold\(String v\) \{|const|SealHold.FILE
+writeSaveMode|private boolean writeSaveMode\(String v\) \{|const|SaveMode.FILE
 setPref|private boolean setPref\(String key, String value\) \{|const|PREFS_FILE'
 
-echo "== the seven settings writers publish by temp + rename =="
+echo "== the eight settings writers publish by temp + rename =="
 while IFS='|' read -r name sig kind file; do
   lit=$(method "$SUT" 1 "$sig"); r1=$?
   code=$(method "$SUT" 0 "$sig"); r2=$?
@@ -171,6 +172,11 @@ probe "writeSealHold back on a FileWriter" '
 r("""        try {
             StoreInstaller.writeAtomic(new java.io.File(getFilesDir(), SealHold.FILE), val);""",
   """        try (java.io.FileWriter w = new java.io.FileWriter(new java.io.File(getFilesDir(), SealHold.FILE))) {
+            w.write(val);""")'
+probe "writeSaveMode back on a FileWriter" '
+r("""        try {
+            StoreInstaller.writeAtomic(new java.io.File(getFilesDir(), SaveMode.FILE), val);""",
+  """        try (java.io.FileWriter w = new java.io.FileWriter(new java.io.File(getFilesDir(), SaveMode.FILE))) {
             w.write(val);""")'
 probe "setPinned writing piecemeal through a FileWriter again" '
 q = chr(39)

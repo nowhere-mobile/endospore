@@ -29,9 +29,9 @@ public final class HelpPagesCases {
     };
 
     /** NWP-20261124-15: Gate settings' sun/moon step. The owner can hide the sun/moon (GateLookGlyph.OWNER_ONLY_KEY),
-     *  so the step says the owner can keep the look to Owner settings. */
+     *  so the step says the owner can lock the look in Owner settings (NWP-20261130-13). */
     static final String WANT_GATE_LOOK =
-            "The sun or moon left of ? switches between light and dark, unless the owner has kept the look to Owner "
+            "The sun or moon left of ? switches between light and dark, unless the owner has locked the look in Owner "
                     + "settings.";
 
     /** NWP-20261126-03 (decision 2026-11-03): Store settings moved from Gate settings to Owner settings, so its

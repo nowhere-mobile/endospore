@@ -2581,24 +2581,17 @@ public class ProfileActivity extends Activity {
         }
     }
 
-    /** The card's dropdown, a single-choice list: the five presets with their lines, then Custom when one is saved, the
-     *  shown one checked. A tap goes to pickPreset. */
+    /** The card's dropdown, a sheet of cards (NWP-20261201-28): the five presets with their lines and chips, then Custom
+     *  when one is saved, the shown one marked. A tap goes to pickPreset; Back or outside writes nothing. */
     private void showPresetPicker() {
-        boolean saved = presetSavedCustom() != null;
+        java.util.Map<String, String> savedValues = presetSavedCustom();
+        boolean saved = savedValues != null;
         final java.util.List<String> names = PresetPicker.dropdownNames(saved);
-        java.util.List<String> rows = PresetPicker.dropdownRows(saved);
-        new android.app.AlertDialog.Builder(this)
-                .setTitle(PresetPicker.CARD_TITLE)
-                .setSingleChoiceItems(rows.toArray(new String[0]), names.indexOf(presetShown()), (d, which) -> {
-                    d.dismiss();
-                    pickPreset(names.get(which));
-                })
-                .setNegativeButton("Cancel", null)
-                .show();
+        SheetDialog.picker(this, PresetSheet.picker(saved, presetShown(), savedValues), i -> pickPreset(names.get(i)));
     }
 
-    /** Custom with none saved says so and writes nothing; anything else says how many settings will change, and
-     *  Continue opens the preview. */
+    /** Custom with none saved says so and writes nothing; anything else says how many settings will change on a sheet,
+     *  and its green button opens the preview. */
     private void pickPreset(final String picked) {
         final java.util.Map<String, String> cur = presetCurrent();
         final ProfilePresets.Choice c = ProfilePresets.choose(PresetPicker.shown(cur, presetLast()), picked, cur,
@@ -2607,50 +2600,30 @@ public class ProfileActivity extends Activity {
             android.widget.Toast.makeText(this, PresetPicker.NO_CUSTOM, android.widget.Toast.LENGTH_LONG).show();
             return;
         }
-        new android.app.AlertDialog.Builder(this)
-                .setTitle(picked)
-                .setMessage(PresetPicker.countLine(PresetPicker.changeCount(cur, c.valuesToApply)))
-                .setPositiveButton(PresetPicker.CONTINUE, (d, w) -> showPresetPreview(picked, cur, c))
-                .setNegativeButton(PresetPicker.CANCEL, null)
-                .show();
+        SheetDialog.confirm(this, PresetSheet.count(picked, PresetPicker.changeCount(cur, c.valuesToApply)),
+                new Runnable[] { () -> showPresetPreview(picked, cur, c), null }, null);
     }
 
-    /** The preview: one line per change (or "Nothing changes."), then the preset's two consent links. A link is
-     *  tappable only where its screen is offered -- the tie where showSecurity offers it (!local), Location services
-     *  where Preferences does (locOffered) -- and a tap only opens that screen. Apply / Cancel. */
+    /** The preview, on a sheet: one line per change (or "Nothing changes."), then the preset's two consent links. A link
+     *  is tappable only where its screen is offered -- the tie where showSecurity offers it (!local), Location services
+     *  where Preferences does (locOffered) -- and a tap only opens that screen. The green button applies. */
     private void showPresetPreview(final String picked, final java.util.Map<String, String> cur,
             final ProfilePresets.Choice c) {
-        LinearLayout body = new LinearLayout(this);
-        body.setOrientation(LinearLayout.VERTICAL);
-        body.setPadding(dp(20), dp(8), dp(20), dp(4));
         java.util.List<String> lines = ProfilePresets.previewLines(cur, c.valuesToApply);
-        if (lines.isEmpty()) lines = java.util.Collections.singletonList(PresetPicker.NOTHING_CHANGES);
-        for (String l : lines) body.addView(presetLine(l, INK));
-        final android.app.AlertDialog[] dlg = new android.app.AlertDialog[1];
         java.util.List<String> links = PresetPicker.links(picked);
+        boolean[] linkOffered = new boolean[links.size()];
         for (int i = 0; i < links.size(); i++) {
             final boolean tie = i == 0;
             boolean offered = tie ? !"LOCAL".equals(sessionType)
                     : locOffered(sessionType, offlineSession, locServicesAvailable());
-            TextView t = presetLine(links.get(i), offered ? ACCENT : MUTED);
-            if (offered) {
-                t.setPaintFlags(t.getPaintFlags() | android.graphics.Paint.UNDERLINE_TEXT_FLAG);
-                t.setOnClickListener(v -> {
-                    if (dlg[0] != null) dlg[0].dismiss();
-                    if (tie) showPhoneTie();
+            linkOffered[i] = offered;
+        }
+        SheetDialog.confirm(this, PresetSheet.preview(picked, lines, links, linkOffered),
+                new Runnable[] { () -> applyPreset(picked, cur, c), null },
+                key -> {
+                    if (PresetSheet.LINK_TIE.equals(key)) showPhoneTie();
                     else showLocationServices();
                 });
-            }
-            body.addView(t);
-        }
-        android.widget.ScrollView sc = new android.widget.ScrollView(this);
-        sc.addView(body);
-        dlg[0] = new android.app.AlertDialog.Builder(this)
-                .setTitle(picked)
-                .setView(sc)
-                .setPositiveButton("Apply", (d, w) -> applyPreset(picked, cur, c))
-                .setNegativeButton("Cancel", null)
-                .show();
     }
 
     private TextView presetLine(String text, int color) {
@@ -4128,7 +4101,8 @@ public class ProfileActivity extends Activity {
         new Thread(() -> {
             final DaemonReply br = sendDaemonReply("BACKUP\n");
             final String r = br.failed() ? "" : br.text.trim();
-            if (r.startsWith("OK")) {
+            final boolean joined = BackupNowReply.joins(r); // NWP-20261201-09: a save is running; follow it, no retry text
+            if (r.startsWith("OK") || joined) {
                 // NWP-20260901-28: the poll's exits are now HONEST. The old loop treated null (a failed status
                 // read) identically to DONE and then unconditionally painted "Backed up just now." -- a false
                 // save claim on the one screen whose job is to answer "is it saved?" (design "what it must NOT
@@ -4176,6 +4150,13 @@ public class ProfileActivity extends Activity {
                     try { Thread.sleep(400); } catch (InterruptedException ie) { break; }
                 }
                 dataBarHide(); // #88
+                // A joined reply reads no verdict: SEAL-STATUS's DONE/FAILED comes only from manual and sign-out seals, so
+                // after a periodic seal it is stale and a failed save could print "Backed up just now". The headline tells the truth.
+                if (joined) {
+                    runOnUiThread(() -> st.setText(""));
+                    loadSealDelta();
+                    return;
+                }
                 final String verdict = done;
                 // NWP-20261113-11 (case 2): a manual seal never sets sealFail, so a refused data scope reads DONE
                 // PARTIAL, and the claim that the data areas were saved was false for it. Which scope and which guard
@@ -5595,7 +5576,8 @@ public class ProfileActivity extends Activity {
                                     // -- per-app state that a brand-new user starts without -- and no-ops on
                                     // Diaspore, where GosPackageState does not exist. Receipt-gated: it will
                                     // NOT touch the sealed file unless this session proved it can write.
-            captureNextAlarm(); // #151: relay this session's next alarm TIME to the gate so it can still wake the user
+            long nextAlarm = captureNextAlarm(); // #151: relay this session's next alarm TIME to the gate so it can still wake the user
+            AlarmCarry.record(getFilesDir(), nextAlarm); // NWP-20261129-39: and seal it with the CE, for the next sign-in's line in login.log
             if (!forInstall) {
                 // NWP-20261017-17: BEFORE LOGOUT, never after -- the daemon ignores a bare "0" while a sign-out is in
                 // flight. A request recorded by a Profile screen that died before its sign-out would otherwise start
@@ -5991,8 +5973,9 @@ public class ProfileActivity extends Activity {
      *  silently never ring once the phone is logged off / cold-locked. We send the trigger TIME ONLY (no label,
      *  no tone -- amnesia-safe; the time itself is just a clock reading); the daemon stashes it in the RAM tmpfs
      *  and the gate schedules a user-0 alarm that rings generically. 0 = no alarm -> the gate clears any pending
-     *  one. Runs AS the roamed user, so getNextAlarmClock() returns this session's own next alarm directly. */
-    private void captureNextAlarm() {
+     *  one. Runs AS the roamed user, so getNextAlarmClock() returns this session's own next alarm directly.
+     *  Returns the time it read, 0 for no alarm or a failed read (NWP-20261129-39: doLogoffImpl records it). */
+    private long captureNextAlarm() {
         long when = 0L;
         String pkg = null;
         try {
@@ -6020,6 +6003,7 @@ public class ProfileActivity extends Activity {
                     "Your next alarm couldn't be handed to the locked phone, so it may not ring.",
                     android.widget.Toast.LENGTH_LONG).show());
         }
+        return when;
     }
 
     /** #4 (DIA-20260626-04): promote the throwaway into a real, roaming profile. The daemon creates its store
@@ -6931,6 +6915,15 @@ public class ProfileActivity extends Activity {
                  + "Storage screen before trying it again.";
         }
         return "Couldn't redeem that code — check your connection and try again.";
+    }
+
+    /** h60 #15 (NWP-20261201-26): the Add-credits line for a CLAIM reply of PARTIAL n[ UNSAVED], or null for every other
+     *  reply. It says only what is certain. No count: round 8 retired the metered unit from user-facing copy. Not "nothing
+     *  was lost": under UNSAVED the redeemed part exists only on this phone. Not that the phone finishes the code by
+     *  itself: nothing calls drainPendingClaims yet. No button label: the button's words differ with thenSave. */
+    static String claimPartialMessage(String r) {
+        if (r == null || !r.startsWith("PARTIAL ")) return null;
+        return "Only part of this code was redeemed. The rest is still on the code — redeem it again to add it.";
     }
 
     /** What the user is told when the restart did not happen. True by construction: the daemon gave the session
@@ -8839,6 +8832,18 @@ public class ProfileActivity extends Activity {
             new Thread(() -> {
                 final String r = sendDaemon(claimReq); // may take a few seconds
                 runOnUiThread(() -> {
+                    // h60 #15 (NWP-20261201-26): part of the code was redeemed, so this is not a failure and not yet
+                    // done. The code stays in the field for the redeem that finishes it. That later OK runs the save
+                    // of a thenSave screen. No backup here: the daemon sealed the wallet before it answered.
+                    if (r.startsWith("PARTIAL ")) {
+                        add.setEnabled(true);
+                        codeF.setEnabled(true);
+                        convertRb.setEnabled(true);
+                        keepRb.setEnabled(true);
+                        msg.setTextColor(ACCENT);
+                        msg.setText(claimPartialMessage(r));
+                        return;
+                    }
                     if (!r.startsWith("OK")) {
                         add.setEnabled(true);
                         codeF.setEnabled(true);
@@ -11475,7 +11480,9 @@ public class ProfileActivity extends Activity {
      *  GET_RUNTIME_PERMISSIONS (AndroidManifest.xml).
      *  NWP-20261112-07 (Q061): runs from any Context. The sign-out passes midSession=false and the keep-set read
      *  after captureAppCode (behaviour unchanged); PermsCaptureReceiver passes true in the live session. Mid-session,
-     *  an on-demand or auto app whose restore has not landed keeps its carried lines verbatim (PermsCaptureRule). */
+     *  an on-demand or auto app whose restore has not landed keeps its carried lines verbatim (PermsCaptureRule).
+     *  NWP-20261201-20: mid-session, so does any package whose install-heal is still running in this process: its
+     *  not-yet-granted INTERNET must not be saved as a Network-off. The sign-out capture still reads live state. */
     // #204: "special app access" permissions whose grant state lives in AppOps (not the pm runtime grant), so they
     // never rode nowhere-perms and re-prompted on every roam (a file editor lost All-files access each login). Curated,
     // user-facing allowlist ONLY. Captured as `pkg appop:<opstr>`; restored by grant_perms_for with `appops set`
@@ -11555,7 +11562,9 @@ public class ProfileActivity extends Activity {
                 for (String pkg : pkgs) {
                     // NWP-20261112-07: mid-session, a deferred app whose restore has not landed keeps its carried
                     // lines -- odrestore's grant_perms_for reads them from this file (PermsCaptureRule).
-                    if (PermsCaptureRule.keepCarried(midSession, keptModes.get(pkg), UnarchiveService.odRestored(ctx, pkg))) {
+                    // NWP-20261201-20: so does any package whose install-heal is still running: a `deny:` line written
+                    // now would make the heal's grant_perms_for revoke the INTERNET it is about to grant.
+                    if (PermsCaptureRule.keepCarried(midSession, keptModes.get(pkg), UnarchiveService.odRestored(ctx, pkg), PermsCaptureRule.healPending(pkg))) {
                         held.add(pkg);
                         continue;
                     }
@@ -11686,6 +11695,14 @@ public class ProfileActivity extends Activity {
                         }
                         sb.append(ln).append('\n');
                     }
+                }
+                // NWP-20261201-20: a package held for its running install-heal can be outside the keep-set, so the loop
+                // above never met it. Its old lines go back verbatim. A brand-new package has none and gets no line, so
+                // roamd's INTERNET default applies.
+                for (String pkg : held) {
+                    if (keptModes.containsKey(pkg)) continue;
+                    java.util.ArrayList<String> old = oldByPkg.get(pkg);
+                    if (old != null) for (String ln : old) sb.append(ln).append('\n');
                 }
                 // temp + rename: on a failed write the file stays exactly as the login restored it, so this session's
                 // permission changes are not carried but nothing is lost -- an emptied file would re-grant INTERNET
@@ -12407,7 +12424,7 @@ public class ProfileActivity extends Activity {
         LinearLayout col = new LinearLayout(this);
         col.setOrientation(LinearLayout.VERTICAL);
         TextView lab = new TextView(this);
-        lab.setText("Install pending apps now");
+        lab.setText(SweepHold.state() == SweepHold.State.PAUSED ? LandingLine.RESUME_ROW : "Install pending apps now"); // NWP-20261201-13
         lab.setTextColor(INK);
         lab.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
         col.addView(lab);
@@ -12587,6 +12604,76 @@ public class ProfileActivity extends Activity {
                     sub.setText(SealHold.tradeoff(cur[0]));
                 })
                 .setNegativeButton("Cancel", null)
+                .show();
+    }
+
+    /** NWP-20261201-05: this profile's "Save automatically" choice (SaveMode), from getFilesDir()/nowhere-save-mode.
+     *  Absent or unknown is Always. */
+    private String readSaveMode() {
+        try (java.io.BufferedReader r = new java.io.BufferedReader(new java.io.FileReader(new java.io.File(getFilesDir(), SaveMode.FILE)))) {
+            return SaveMode.normalize(r.readLine());
+        } catch (Throwable ignore) {}
+        return SaveMode.DEFAULT;
+    }
+
+    /** NWP-20261201-05: one thread for every SET-SAVE-MODE, so two quick choices reach the daemon in the order they
+     *  were made (each waits for its reply before the next is sent). */
+    private static final java.util.concurrent.ExecutorService SAVE_MODE_IO =
+            java.util.concurrent.Executors.newSingleThreadExecutor();
+
+    /** Save the choice (the copy that ROAMS) and report whether it was saved. Then tell the daemon, so it applies to
+     *  this session's next periodic save, and say what happened in words that are true whatever the outcome
+     *  (SaveMode.afterSave). The saved copy stays on any reply, and a refusal is never an error dialog. */
+    private boolean writeSaveMode(String v) {
+        final String val = SaveMode.normalize(v);
+        try {
+            StoreInstaller.writeAtomic(new java.io.File(getFilesDir(), SaveMode.FILE), val);
+        } catch (Throwable t) {
+            Log.w("NowhereChooser", "writeSaveMode", t);
+            android.widget.Toast.makeText(this, SaveMode.afterSave(false, null), android.widget.Toast.LENGTH_LONG).show();
+            return false;
+        }
+        SAVE_MODE_IO.execute(() -> {
+            String reply = "";
+            // The user this chooser runs as: the daemon applies the choice only to that user's session, so a send
+            // that lands after this session ended cannot set the next profile's.
+            try { reply = sendDaemon("SET-SAVE-MODE\n" + val + "\n" + android.os.UserHandle.myUserId() + "\n"); }
+            catch (Throwable ignore) {}
+            final String msg = SaveMode.afterSave(true, reply);
+            if (msg != null) runOnUiThread(() -> android.widget.Toast.makeText(this, msg,
+                    android.widget.Toast.LENGTH_LONG).show());
+        });
+        return true;
+    }
+
+    private void paintSaveModeChip(TextView chip, String v) {
+        chip.setText(SaveMode.label(v));
+        chip.setTextColor(ACCENT);
+        android.graphics.drawable.GradientDrawable g = new android.graphics.drawable.GradientDrawable();
+        g.setCornerRadius(dp(18));
+        g.setColor(android.graphics.Color.TRANSPARENT);
+        g.setStroke(dp(1), ACCENT);
+        chip.setBackground(g);
+    }
+
+    /** The picker: each choice with its trade-off in one line under it. */
+    private void showSaveModeDialog(final TextView chip, final TextView sub, final String[] cur) {
+        final CharSequence[] items = new CharSequence[SaveMode.VALUES.length];
+        int checked = 0;
+        for (int i = 0; i < SaveMode.VALUES.length; i++) {
+            items[i] = SaveMode.item(SaveMode.VALUES[i]);
+            if (SaveMode.VALUES[i].equals(cur[0])) checked = i;
+        }
+        new android.app.AlertDialog.Builder(this)
+                .setTitle("Save automatically")
+                .setSingleChoiceItems(items, checked, (dlg, which) -> {
+                    dlg.dismiss();
+                    if (!writeSaveMode(SaveMode.VALUES[which])) return; // not saved: the row keeps the old choice
+                    cur[0] = SaveMode.VALUES[which];
+                    paintSaveModeChip(chip, cur[0]);
+                    sub.setText(SaveMode.tradeoff(cur[0]));
+                })
+                .setNegativeButton("Not now", null)
                 .show();
     }
 
@@ -12823,10 +12910,12 @@ public class ProfileActivity extends Activity {
     /** Reconcile the whole sandboxed-Play STACK (Play Store `vending` + Play Services `gms` + `gsf`) in a keep-set map
      *  to match demand. A Play-Services CLIENT (YouTube, a game, ...) depends on the WHOLE stack -- Google apps check
      *  for the Play Store APP itself, not just Services (proven: YouTube "device not compatible" when vending was
-     *  absent). Demand = the strongest mode across kept Play-Services clients, ARCHIVE-SAFE: an on-demand client from
-     *  the recorded nowhere-playdeps set (its manifest is unreadable once archived), an installed client from a live
-     *  read (installed => not archived). Play Store (vending) counts as demand ONLY when the USER kept it (in
-     *  playdeps), never when auto-pulled -> no self-perpetuation. INSTALLED DOMINATES on-demand.
+     *  absent). Demand = the strongest mode across kept Play-Services clients (AppDeps.stackNeed), ARCHIVE-SAFE: a
+     *  client demands from its recorded deps (appDeps over nowhere-playdeps and a recorded nowhere-playseen yes, plus
+     *  the keep-set's group tokens; a manifest is unreadable once archived), and an installed or auto client also from
+     *  a live read (installed => not archived). Play Store (vending) counts as demand ONLY when the USER kept it (in
+     *  playdeps), never from nowhere-playseen and never when auto-pulled -> no self-perpetuation. INSTALLED DOMINATES
+     *  on-demand.
      *
      *  Two ROLES, deliberately different, to avoid the vending duality traps an earlier cut fell into:
      *   - gms / gsf (launcher-less, hidden, never user-toggled): reconcile OWNS their mode -- write it at `need`, drop
@@ -12852,22 +12941,7 @@ public class ProfileActivity extends Activity {
         // by either re-add below. Absent and on leave this method as it was; gms/gsf are unchanged. playState() reads a
         // roamed flag as absent where the GrapheneOS App Store is not installed (Diaspore), so it changes nothing there.
         final boolean playOff = PlayChoice.blocksVendingReadd(playState());
-        String need = null;
-        for (java.util.Map.Entry<String,String> e : m.entrySet()) {
-            String p = e.getKey();
-            if (GMS_PKG.equals(p) || GSF_PKG.equals(p)) continue; // providers are never demand sources
-            String cmode = e.getValue();
-            boolean present = MODE_INSTALLED.equals(cmode) || MODE_AUTO.equals(cmode); // #130: an auto client is
-            // installed for most of the session (the sweep materialises it), so its manifest is live-readable
-            // exactly like an installed one -- both count for the usesPlayServices probe.
-            // A client if it's in playdeps (archive-safe) or present+usesPlayServices (live read). Play Store
-            // demands only when USER-kept (in playdeps), never when auto-pulled.
-            boolean demands = VENDING_PKG.equals(p)
-                    ? playClients.contains(p)
-                    : playClients.contains(p) || (present && usesPlayServices(p));
-            if (!demands) continue;
-            need = stronger(need, cmode);
-        }
+        String need = playStackNeed(this, m, playClients);
         // gms/gsf: reconcile OWNS the mode.
         applyStackMember(m, GMS_PKG, need, preKept);
         applyStackMember(m, GSF_PKG, need, preKept);
@@ -12935,18 +13009,66 @@ public class ProfileActivity extends Activity {
         }
     }
 
+    /** The mode reconcilePlayStack holds the stack at: reads the recorded Play answers and group tokens, and
+     *  AppDeps.stackNeed decides. Only a recorded nowhere-playseen "y" counts; an unreadable file reads empty, which
+     *  loses that term and never removes a stack by itself. */
+    static String playStackNeed(android.content.Context ctx, java.util.Map<String,String> m,
+            java.util.Set<String> playClients) {
+        java.util.Set<String> seenYes = new java.util.HashSet<>();
+        for (java.util.Map.Entry<String,String[]> e : readPlaySeen(ctx).entrySet()) {
+            if ("y".equals(e.getValue()[1])) seenYes.add(e.getKey());
+        }
+        return AppDeps.stackNeed(m, readAppGroups(ctx), DEFAULT_GROUPS, playClients, seenYes,
+                p -> usesPlayServices(ctx, p), GMS_PKG, GSF_PKG, VENDING_PKG, MODE_INSTALLED, MODE_AUTO, MODE_ONDEMAND);
+    }
+
+    /** NWP-20261201-06: run the Play-stack reconcile once at every sign-in, because a stack mode computed while a client
+     *  was archived otherwise stays wrong until the user edits an unrelated app. It only RAISES a kept member whose mode
+     *  reconcile owns: gms, gsf, and Play Store when it is auto-pulled and Google Play is not turned Off. It never adds,
+     *  lowers or drops one (PlayStackSignIn; docs/product-decisions.md, 2026-11-09, "eight answers to harvest 62 ...",
+     *  #2 (2)). Unknown changes nothing: an unreadable keep-set or nowhere-playdeps, or any failure, leaves the file as
+     *  it is. Every PackageManager read is off the lock. The keep-set is re-read under the lock, so an edit that landed
+     *  since the read above is kept. Its logs carry a count only: no package or profile name. */
+    static void reconcilePlayStackAtSignIn(android.content.Context ctx) {
+        try {
+            java.util.Map<String,String> m = readAppModesStrictIn(ctx.getFilesDir());
+            java.util.Set<String> playDeps = readPlayDepsStrict(ctx);
+            if (m == null || playDeps == null) {
+                android.util.Log.w("NowhereChooser", "play stack sign-in: keep-set or playdeps unreadable -- nothing changed");
+                return;
+            }
+            String need = playStackNeed(ctx, m, playDeps);
+            boolean vendingHeld = playDeps.contains(VENDING_PKG) || PlayChoice.blocksVendingReadd(PlayChoice.effective(
+                    PlayChoice.parse(cfgStatic(ctx, PlayChoice.CFG_KEY)), gosStorePresent(ctx)));
+            int raised;
+            synchronized (StoreInstaller.APPKEEP_LOCK) {
+                java.util.Map<String,String> now = readAppModesStrictIn(ctx.getFilesDir());
+                if (now == null) return;
+                java.util.Map<String,String> raises =
+                        PlayStackSignIn.raises(now, need, vendingHeld, GMS_PKG, GSF_PKG, VENDING_PKG);
+                if (raises.isEmpty()) return;
+                java.io.File f = new java.io.File(ctx.getFilesDir(), "nowhere-appkeep");
+                StoreInstaller.writeAtomic(f, PlayStackSignIn.rewrite(KeepOrder.readText(f), raises));
+                raised = raises.size();
+            }
+            android.util.Log.i("NowhereChooser", "play stack sign-in: raised " + raised + " member(s)");
+        } catch (Throwable t) {
+            android.util.Log.w("NowhereChooser", "play stack sign-in failed -- nothing changed", t);
+        }
+    }
+
     /** Fold one dependent's mode into a running provider need. #130 three-level strength: INSTALLED (restored
      *  in-login) > AUTO (background-materialised right after) > ON-DEMAND (tap) -- a provider must be at least
      *  as eager as its most eager client, or the client comes up before its stack does. */
-    private String stronger(String cur, String depMode) {
+    private static String stronger(String cur, String depMode) {
         return modeRank(depMode) > modeRank(cur) ? normalMode(depMode) : cur;
     }
 
-    private int modeRank(String m) {
+    private static int modeRank(String m) {
         return MODE_INSTALLED.equals(m) ? 3 : MODE_AUTO.equals(m) ? 2 : m != null ? 1 : 0;
     }
 
-    private String normalMode(String m) {
+    private static String normalMode(String m) {
         return MODE_INSTALLED.equals(m) ? MODE_INSTALLED : MODE_AUTO.equals(m) ? MODE_AUTO : MODE_ONDEMAND;
     }
 
@@ -13060,10 +13182,6 @@ public class ProfileActivity extends Activity {
     private boolean isInstalledPkg(String pkg) {
         try { getPackageManager().getApplicationInfo(pkg, 0); return true; } catch (Throwable notInstalled) { return false; }
     }
-
-    /** True if pkg declares the com.google.android.gms.version manifest meta-data -- the standard marker every app
-     *  that uses Google Play Services carries. Live PackageManager read (the app is installed when it's toggled). */
-    private boolean usesPlayServices(String pkg) { return usesPlayServices(this, pkg); }
 
     /** Does pkg's manifest declare a Play-Services dependency? Reads com.google.android.gms.version, the
      *  metadata the Play SDK bakes into every client's manifest.
@@ -13413,6 +13531,38 @@ public class ProfileActivity extends Activity {
         rcvlp.leftMargin = dp(8);
         rcRow.addView(rcVal, rcvlp);
         ll.addView(rcRow, new LinearLayout.LayoutParams(MATCH, WRAP));
+
+        // NWP-20261201-05: when this profile's periodic saves run (SaveMode). Roams in nowhere-save-mode; the daemon
+        // gets a change at once from SET-SAVE-MODE.
+        final String[] saveMode = { readSaveMode() };
+        LinearLayout svRow = new LinearLayout(this);
+        svRow.setOrientation(LinearLayout.HORIZONTAL);
+        svRow.setGravity(Gravity.CENTER_VERTICAL);
+        svRow.setPadding(dp(4), dp(8), dp(4), dp(8));
+        LinearLayout svCol = new LinearLayout(this);
+        svCol.setOrientation(LinearLayout.VERTICAL);
+        TextView svLab = new TextView(this);
+        svLab.setText("Save automatically");
+        svLab.setTextColor(INK);
+        svLab.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
+        svCol.addView(svLab);
+        final TextView svSub = new TextView(this);
+        svSub.setText(SaveMode.tradeoff(saveMode[0]));
+        svSub.setTextColor(MUTED);
+        svSub.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        svCol.addView(svSub);
+        svRow.addView(svCol, new LinearLayout.LayoutParams(0, WRAP, 1f));
+        final TextView svVal = new TextView(this);
+        svVal.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        svVal.setPadding(dp(14), dp(7), dp(14), dp(7));
+        svVal.setMinWidth(dp(96));
+        svVal.setGravity(Gravity.CENTER);
+        paintSaveModeChip(svVal, saveMode[0]);
+        svVal.setOnClickListener(v -> showSaveModeDialog(svVal, svSub, saveMode));
+        LinearLayout.LayoutParams svvlp = new LinearLayout.LayoutParams(WRAP, WRAP);
+        svvlp.leftMargin = dp(8);
+        svRow.addView(svVal, svvlp);
+        ll.addView(svRow, new LinearLayout.LayoutParams(MATCH, WRAP));
 
         // NWP-20261011-01: how long backups may wait while an app downloads and installs (SealHold). Roams in
         // nowhere-seal-hold; the daemon gets it at sign-in from roamd and at once from SET-SEAL-HOLD.
@@ -13919,6 +14069,35 @@ public class ProfileActivity extends Activity {
         }
     }
 
+    /** NWP-20261130-07 (h50 #3): the app's Play page. Play Store kept On-demand is archived, and a market:// intent cannot
+     *  reach it, so it comes back first, as a tap on its icon does, and UnarchiveService.launchApp then opens the page (an
+     *  inference, not stated by Chester). If Android refuses that background start, Play Store is installed and a second
+     *  tap opens the page. */
+    private void openPlayPage(String pkg) {
+        try {
+            if (isInstalledPkg(OlderCopy.PLAY)) {
+                startActivity(UnarchiveService.playPageIntent(pkg));
+            } else {
+                UnarchiveService.PLAY_PAGE_AFTER.set(pkg);
+                startForegroundService(new android.content.Intent(this, UnarchiveService.class)
+                        .putExtra(UnarchiveService.EXTRA_PKG, OlderCopy.PLAY));
+            }
+        } catch (Throwable t) {
+            UnarchiveService.PLAY_PAGE_AFTER.set(null);
+            android.widget.Toast.makeText(this, "Couldn't open Play Store.", android.widget.Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    /** NWP-20261130-07: pkg's meta as the sign-out wrote it (captureArchivedMeta), null when there is none to read. */
+    private String readAppMeta(String pkg) {
+        try {
+            java.io.File f = new java.io.File(new java.io.File(new java.io.File(getFilesDir(), "nowhere-appmeta"), pkg), "meta");
+            return new String(java.nio.file.Files.readAllBytes(f.toPath()), java.nio.charset.StandardCharsets.UTF_8);
+        } catch (Throwable noMeta) {
+            return null;
+        }
+    }
+
     /** On -> off asks first: Off removes Play Store and signs the Google account out. */
     private void confirmPlayOff() {
         new android.app.AlertDialog.Builder(this)
@@ -14222,6 +14401,45 @@ public class ProfileActivity extends Activity {
         col.addView(acctNote, kswp);   // #756: shown in the switch's place for account-backed apps
         col.addView(heldNote, kswp);   // NWP-20260826-15: why Play Store cannot be turned off
 
+        // NWP-20261130-07 (h50 #3, slice 3): an app whose stored copy was older than its placeholder this session says
+        // so, and offers Play Store under both of h50 #3's conditions. paintOlder reads a file and asks PackageManager
+        // only for a refused row, so every other row pays one set lookup. h47 #2's Retry is not built, and h50 #3 does
+        // not retry this refusal: a retry fetches the same old copy.
+        final TextView olderLine = new TextView(this);
+        olderLine.setTextColor(MUTED);
+        olderLine.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        olderLine.setVisibility(View.GONE);
+        final TextView olderPlay = new TextView(this);
+        olderPlay.setText(OlderCopy.BUTTON);
+        olderPlay.setContentDescription("Open " + rowLabel + " in Play Store");
+        olderPlay.setTextColor(ACCENT);
+        olderPlay.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        olderPlay.setPadding(0, dp(8), dp(12), dp(8));
+        olderPlay.setVisibility(View.GONE);
+        col.addView(olderLine, kswp);
+        col.addView(olderPlay, kswp);
+        final Runnable paintOlder = () -> {
+            OlderCopy.RowState s = OlderCopy.RowState.NORMAL;
+            if (UnarchiveService.OLDER_COPY.contains(pkg))
+                s = OlderCopy.rowState(true, appMode(pkg) != null, isInstalledPkg(pkg),
+                        readAppMeta(pkg), isOnDevicePkg(OlderCopy.PLAY));
+            String line = OlderCopy.rowLine(s);
+            olderLine.setText(line);
+            olderLine.setVisibility(line != null ? View.VISIBLE : View.GONE);
+            olderPlay.setVisibility(OlderCopy.rowButton(s) ? View.VISIBLE : View.GONE);
+        };
+        olderPlay.setOnClickListener(v -> {
+            openPlayPage(pkg);
+            paintOlder.run();
+        });
+        keepRowSizePaints.add(sizes -> { if (olderLine.isAttachedToWindow()) paintOlder.run(); });
+        // Back or Recents from Play Store gives this window the focus again, as playRow's listener: the app may be back.
+        final android.view.ViewTreeObserver.OnWindowFocusChangeListener olderFocus = has -> { if (has) paintOlder.run(); };
+        row.addOnAttachStateChangeListener(new View.OnAttachStateChangeListener() {
+            @Override public void onViewAttachedToWindow(View v) { v.getViewTreeObserver().addOnWindowFocusChangeListener(olderFocus); }
+            @Override public void onViewDetachedFromWindow(View v) { v.getViewTreeObserver().removeOnWindowFocusChangeListener(olderFocus); }
+        });
+
         // NWP-20261012-06: "Wake for notifications" (DECIDED 2026-10-12). Auto and Keep-installed rows only -- the
         // two modes that restore an app without a tap, so the two that leave it in Android's stopped state, where no
         // push reaches it. Checked = after a confirmed restore the app is taken out of the stopped state
@@ -14338,6 +14556,7 @@ public class ProfileActivity extends Activity {
             } else {                                      // re-sync from the file with the listener detached (no write-back)
                 acctNote.setVisibility(acctBacked ? android.view.View.VISIBLE : android.view.View.GONE);
             }
+            paintOlder.run(); // a mode change: an Off row says nothing (NWP-20261130-07)
         };
         // ⚠ NWP-20260827-08: THE HOLDERS ARE RECOMPUTED HERE, NOT AT ROW-BUILD TIME. The first cut of -15
         // resolved them once while building the row, which is wrong for the case the feature exists for:

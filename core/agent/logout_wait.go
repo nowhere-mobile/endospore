@@ -31,6 +31,15 @@ var loginConnDeadline = 60 * time.Second
 var logoutWaitFirst = 20 * time.Second
 var logoutWaitEvery = 20 * time.Second
 
+// logoutWaitTicker and logoutWaitNow are lockSessionForLogout's tick source and the clock behind its `waited`, hoisted
+// (as logoffStallTicker, NWP-20261110-08) so a test can step both by hand instead of racing real time on a loaded
+// runner. Production never assigns them. conn.SetDeadline stays on time.Now(): a deadline is real time.
+var logoutWaitTicker = func(d time.Duration) (<-chan time.Time, func()) {
+	t := time.NewTicker(d)
+	return t.C, t.Stop
+}
+var logoutWaitNow = time.Now
+
 // odCancelFile is the sign-out marker under dest, the dir roamd calls $STATE.
 const odCancelFile = "od-cancel"
 
@@ -88,21 +97,21 @@ func lockSessionForLogout(conn net.Conn, dest string) {
 		sessionMu.Lock()
 		close(got)
 	})
-	start := time.Now()
-	tk := time.NewTicker(logoutWaitEvery)
-	defer tk.Stop()
+	start := logoutWaitNow()
+	tc, stop := logoutWaitTicker(logoutWaitEvery)
+	defer stop()
 	for {
 		select {
-		case <-tk.C:
+		case <-tc:
 			conn.SetDeadline(time.Now().Add(loginConnDeadline))
-			if waited := time.Since(start); waited >= logoutWaitFirst {
+			if waited := logoutWaitNow().Sub(start); waited >= logoutWaitFirst {
 				// A failed write is ignored and the wait goes on: returning without the lock would leave the
 				// goroutine above holding sessionMu for ever.
 				fmt.Fprintf(conn, "WAIT %d\n", int(waited/time.Second))
 			}
 		case <-got:
 			conn.SetDeadline(time.Now().Add(loginConnDeadline))
-			if waited := time.Since(start); waited >= logoutWaitFirst {
+			if waited := logoutWaitNow().Sub(start); waited >= logoutWaitFirst {
 				fmt.Fprintf(os.Stderr, "[logind] LOGOUT waited %ds for the session lock\n", int(waited/time.Second))
 			}
 			return

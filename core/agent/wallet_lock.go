@@ -306,6 +306,7 @@ func removeWallet(walletPath string) {
 	os.Remove(walletPath + ".tmp")
 	os.Remove(walletPrevPath(walletPath))
 	os.Remove(walletPath + ".seen")
+	os.Remove(walletPath + ".seen.tmp")
 	os.Remove(seenBadPath(walletPath))
 	os.Remove(planMovingPath(walletPath)) // NWP-20261103-05: the plan-moving notice never outlives the session
 }
@@ -341,7 +342,11 @@ func dropWalletIfUnchanged(walletPath, gen string, basis []byte) (bool, string) 
 	}
 	// A removal that fails (anything but already-gone) leaves bearer tokens in the tmpfs: say so, never "dropped".
 	var left []string
-	for _, p := range []string{walletPath, walletPath + ".tmp", walletPrevPath(walletPath), walletPath + ".seen", seenBadPath(walletPath)} {
+	for _, p := range []string{
+		walletPath, walletPath + ".tmp", walletPrevPath(walletPath),
+		walletPath + ".seen", walletPath + ".seen.tmp", seenBadPath(walletPath),
+		planMovingPath(walletPath),
+	} {
 		if err := walletRemoveFile(p); err != nil && !errors.Is(err, fs.ErrNotExist) {
 			left = append(left, filepath.Base(p))
 		}

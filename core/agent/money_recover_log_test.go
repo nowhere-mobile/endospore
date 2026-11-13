@@ -4,18 +4,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/minio/minio-go/v7"
-	"github.com/minio/minio-go/v7/pkg/credentials"
 )
 
-// The two best-effort money paths no longer end in a recover that prints nothing (NWP-20261027-16).
+// The best-effort rent payment no longer ends in a recover that prints nothing (NWP-20261027-16).
 
 // mrlLine returns the one stderr line that holds want, or fails.
 func mrlLine(t *testing.T, stderr, want string) string {
@@ -55,35 +51,6 @@ func TestMaybePayRentLogsAFailedStoreRead(t *testing.T) {
 	}
 }
 
-func TestSealWalletBestEffortLogsAFailedSeal(t *testing.T) {
-	const name = "mrl-wallet-fail"
-	oldBase := s3RetryBase
-	s3RetryBase = time.Millisecond
-	t.Cleanup(func() { s3RetryBase = oldBase })
-	t.Setenv("GATEWAY_URL", "")
-	t.Setenv("S3_ACCESS_KEY", "x")
-	// Own-store mode: the S3 client itself points at a port nothing listens on (cap mode would return at once).
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	addr := ln.Addr().String()
-	ln.Close()
-	c, err := minio.New(addr, &minio.Options{Creds: credentials.NewStaticV4("x", "y", ""), MaxRetries: 1})
-	if err != nil {
-		t.Fatal(err)
-	}
-	oldClient, oldBucket := s3client, s3bucket
-	s3client, s3bucket = c, "nowhere-test"
-	t.Cleanup(func() { s3client, s3bucket = oldClient, oldBucket })
-	dest := rgSession(t, name)
-	got := rgStderr(t, func() { sealWalletBestEffort(dest, name, "pw") })
-	l := mrlLine(t, got, `[logind] roam-out wallet seal "`+name+`" -> skipped: store read FAILED after retries (`)
-	if strings.Contains(l, "?") || strings.Contains(l, "location=") {
-		t.Errorf("the FAILED line carries a URL query: %s", l)
-	}
-}
-
 func TestBestEffortPanic_StoreFailureIsLoggedScrubbed(t *testing.T) {
 	const name = "mrl-scrub-name"
 	hexRef := strings.Repeat("ab12", 16)
@@ -107,8 +74,8 @@ func TestBestEffortPanic_OtherValuesAreWithheld(t *testing.T) {
 	const name = "mrl-withheld-name"
 	hexKey := strings.Repeat("cd34", 16)
 	for _, r := range []any{"corrupt head blob blob/" + hexKey, errors.New("plain failure blob/" + hexKey)} {
-		got := rgStderr(t, func() { bestEffortPanic("roam-out wallet seal", name, r) })
-		want := `[logind] roam-out wallet seal "` + name + `" -> skipped: unexpected failure (details withheld)`
+		got := rgStderr(t, func() { bestEffortPanic("pay-rent", name, r) })
+		want := `[logind] pay-rent "` + name + `" -> skipped: unexpected failure (details withheld)`
 		if !strings.Contains(got, want) {
 			t.Errorf("missing %q in:\n%s", want, got)
 		}

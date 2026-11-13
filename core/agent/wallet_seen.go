@@ -21,6 +21,7 @@ import (
 // per line: "t:"+nonce for a plain token, "b:"+hex(sha256(msg)) for a blind one. NEVER the signature, and a blind
 // token's message is hashed, so the file holds no spendable token. A pending claim code (Wallet.PendingClaims,
 // NWP-20261125-05) is one more key, "c:"+hex(sha256(code)), never the code itself, so the file holds nothing spendable.
+// A recorded purchase's random id (Wallet.PlanID, PlanSpec.ID, h60 #14) is one more key, "p:"+id; the id spends nothing.
 // It lives beside the wallet in the session's tmpfs and nowhere else: it is not sealed, never roams, and goes with the
 // wallet (removeWallet, dropWalletIfUnchanged) and with the power-off wipe, so a new session starts with none and
 // publishes by the unread-set rule.
@@ -87,8 +88,9 @@ func walletTokenKeys(w *Wallet) []string {
 	return keys
 }
 
-// walletSeenKeys lists every seen-set key of w: its tokens' (walletTokenKeys) and one per pending claim code. A separate
-// helper so walletTokenKeys stays tokens only.
+// walletSeenKeys lists every seen-set key of w: its tokens' (walletTokenKeys), one per pending claim code and one per
+// purchase id (the plan's and the queue's), so a purchase this session held is never resurrected. A separate helper so
+// walletTokenKeys stays tokens only.
 func walletSeenKeys(w *Wallet) []string {
 	keys := walletTokenKeys(w)
 	if w == nil {
@@ -96,6 +98,14 @@ func walletSeenKeys(w *Wallet) []string {
 	}
 	for _, c := range w.PendingClaims {
 		keys = append(keys, pendingClaimSeenKey(c))
+	}
+	if w.PlanID != "" {
+		keys = append(keys, "p:"+w.PlanID)
+	}
+	for _, q := range w.PlanQueue {
+		if q.ID != "" {
+			keys = append(keys, "p:"+q.ID)
+		}
 	}
 	return keys
 }
