@@ -1925,6 +1925,19 @@ remap_media_db() {
   return 0
 }
 
+# rescan_media UID (NWP-20261113-45): since NWP-20261202-02 MediaProvider's index is not roamed, and the provider
+# scans the new user's volume at user start, BEFORE the #media restore, so nothing indexes the restored files and the
+# Gallery shows none of them. Ask the session's chooser to call the provider's own volume scan: the call takes the
+# user from the CALLER's uid, so it must come from inside the session (from here, a root process in user 0, it answers
+# "Couldn't find volume"). Fire and forget: the chooser logs the scan's duration to logcat; a failed start leaves
+# the index as it was. stdio to /dev/null: a su:s0 init script cannot capture am output (DIA-56).
+rescan_media() {
+  am startservice --user "$1" -n com.nowhere.chooser/.CredentialService --ez rescanmedia true </dev/null >/dev/null 2>&1
+  _rsrc=$?
+  echo "[roamd] media rescan requested from the session chooser (user $1, rc=$_rsrc) (NWP-20261113-45) $(date)" >> "$LOG"
+  unset _rsrc
+}
+
 # insert_deferred_media UID USERDIR DEDIR (NWP-20261130-02; docs/product-decisions.md, 2026-11-06): on the default tier
 # MediaStore never learns that a file not yet downloaded exists, so the Gallery is empty. The #media restore leaves
 # $STATE/media.rows (core/agent/media_rows.go), and nowhere_db_fix media-insert writes one row per file straight into
@@ -10794,6 +10807,7 @@ case "$op" in
           _sumt=$(_ms)
           restore_media_tail "$MEDIADIR"
           _ssum reown "$_sumt"
+          rescan_media "$uid"   # NWP-20261113-45: the provider scanned before this restore; ask it to index what landed
         fi
         rm -f "$STATE/media.rows" 2>> "$LOG"   # NWP-20261130-02: the session's file names, gone on every path
         if [ "$_mdrc" = 5 ]; then _innet=media; fi

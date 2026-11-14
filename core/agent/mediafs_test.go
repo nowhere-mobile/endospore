@@ -140,3 +140,19 @@ func TestSetFileAttrMTimeIsSeconds(t *testing.T) {
 		t.Fatalf("Nlink=%d; st_nlink 0 reads as deleted to some scanners", a.Nlink)
 	}
 }
+
+// NWP-20261113-44: mediad's overlay must never negotiate FUSE passthrough. On a kernel that grants it (frankel,
+// 6.18) the grant raises our superblock's stack depth, and MediaProvider's own passthrough open of a file in an
+// overlaid dir then fails with ELOOP, which its FuseDaemon reports to the app as EFAULT: every new file in that
+// folder failed and was left empty. go-fuse requests CAP_PASSTHROUGH unless the capability is disabled.
+func TestMediaMountOptionsDisablePassthrough(t *testing.T) {
+	opts := mediaMountOptions()
+	if opts.MountOptions.DisabledCapabilities&fuse.CAP_PASSTHROUGH == 0 {
+		t.Fatalf("mediaMountOptions does not disable CAP_PASSTHROUGH (DisabledCapabilities=%#x)", opts.MountOptions.DisabledCapabilities)
+	}
+	// The kill-switch path sets mount options too; it must not drop the capability mask.
+	t.Setenv("NOWHERE_MEDIA_MOUNT_CONTEXT", "u:object_r:nowhere_media_file:s0")
+	if mediaMountOptions().MountOptions.DisabledCapabilities&fuse.CAP_PASSTHROUGH == 0 {
+		t.Fatal("with NOWHERE_MEDIA_MOUNT_CONTEXT set, CAP_PASSTHROUGH is no longer disabled")
+	}
+}

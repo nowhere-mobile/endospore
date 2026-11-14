@@ -1,0 +1,4 @@
+version 0.5.57
+previous 0.5.56
+- Smaller photos and videos show up in Gallery and photo pickers again after sign-in; large ones still downloading do not appear there yet.
+- Pixel 10: new photos, screenshots and app downloads save again in folders that still have media waiting to download, instead of failing or saving empty.

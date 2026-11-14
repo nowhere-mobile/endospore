@@ -156,6 +156,30 @@ public class CredentialService extends Service {
         // user, which is the side whose receipt records what we hold.
         // NWP-20261029-11: a "claimsLogin" start applies the claim map the sign-in seeded, once, right after
         // provisionRoamedApps. Only the apply: the held-list refresh and the alarm relay are seal-cycle work.
+        // NWP-20261113-45: a "rescanmedia" start is roamd, right after the sign-in's #media restore, asking this
+        // session's MediaProvider to index what the restore wrote. Since NWP-20261202-02 the index is no longer
+        // roamed, and the provider's own scan at user start ran BEFORE the restore, so nothing indexed the restored
+        // files: the Gallery and every photo picker showed none of them (0.5.56). The scan call works out WHICH
+        // user's volume to scan from the caller's uid, so it has to come from inside the session -- roamd, a root
+        // process in user 0, gets "Couldn't find volume" -- and it is the provider's own interface, never a write
+        // to its database. It is synchronous inside MediaProvider and can take a while on a large volume, so it
+        // runs on its own thread; a timeout or an exception leaves the index as it was, which is today's state.
+        // Same B4 reason as every branch here for riding THIS service rather than a new one.
+        if (intent != null && intent.getBooleanExtra("rescanmedia", false)) {
+            new Thread(() -> {
+                long t0 = android.os.SystemClock.elapsedRealtime();
+                try {
+                    getContentResolver().call(android.provider.MediaStore.AUTHORITY_URI, "scan_volume",
+                            android.provider.MediaStore.VOLUME_EXTERNAL_PRIMARY, null);
+                    android.util.Log.i("NowhereChooser", "media rescan: " + android.provider.MediaStore.VOLUME_EXTERNAL_PRIMARY
+                            + " scanned in " + (android.os.SystemClock.elapsedRealtime() - t0) + " ms (NWP-20261113-45)");
+                } catch (Throwable t) {
+                    android.util.Log.w("NowhereChooser", "media rescan failed after "
+                            + (android.os.SystemClock.elapsedRealtime() - t0) + " ms (NWP-20261113-45)", t);
+                } finally { finishUnit(); }
+            }, "nowhere-media-rescan").start();
+            return START_NOT_STICKY;
+        }
         if (intent != null && intent.getBooleanExtra("claimsLogin", false)) {
             new Thread(() -> {
                 try {

@@ -629,6 +629,15 @@ func mediaMountOptions() *fs.Options {
 	opts.MountOptions.AllowOther = true
 	opts.MountOptions.DirectMount = true
 	opts.MountOptions.Debug = os.Getenv("NOWHERE_MEDIAD_DEBUG") == "1"
+	// NWP-20261113-44: NEVER negotiate FUSE passthrough. go-fuse asks for CAP_PASSTHROUGH by default, and a kernel
+	// with upstream passthrough (6.9+; frankel runs 6.18, every other fleet device 6.1, which lacks it) grants it and
+	// sets this mount's s_stack_depth to MaxStackDepth (1). MediaProvider's FUSE stacks on top of ours, and its own
+	// passthrough open of a file in an overlaid dir then fails the kernel's stacking check (backing s_stack_depth >=
+	// its max_stack_depth), which its FuseDaemon turns into EFAULT: on frankel, 0.5.56, every new photo, screenshot
+	// and download in a folder with deferred media failed and left an empty file behind (beta tickets
+	// NW-a2f8bee5b817, NW-01ac9f2e0b0a). Our handles are loopback fds served by mediad either way; passthrough only
+	// skipped mediad on reads and writes, which a deferred overlay does not need.
+	opts.MountOptions.DisabledCapabilities |= fuse.CAP_PASSTHROUGH
 	return opts
 }
 

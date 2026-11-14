@@ -145,7 +145,7 @@ _ms() { echo 0; }
 od_fetch_data() { return 0; }; od_listed() { return 1; }; od_block_app() { return 0; }; od_unblock_app() { :; }; od_pending_clear() { :; }; od_block_installed() { :; }; od_shipped_prep() { return 0; }; od_park_var() { :; }; od_unf_path() { echo "$STATE/odfetch.$1/unfetched.$2"; }   # NWP-20261130-03
 _sum0=0; _sumt=0   # set above the `in` arm in the script (NWP-20261130-08); this harness runs the arm alone under set -u
 sleep() { return 0; }
-for t in usb_host remap_media_db insert_deferred_media remap_per_pkg _tlog _ssum remap_tree reown_ext_appdata keystore_push restorecon uiderrors_floor_take; do
+for t in usb_host remap_media_db insert_deferred_media rescan_media remap_per_pkg _tlog _ssum remap_tree reown_ext_appdata keystore_push restorecon uiderrors_floor_take; do
   eval "$t() { :; }"
 done
 for t in relabel_launcher restore_media_tail ks_signin_reset keystore_restore tz_surface sroam_surface hold_ondemand \

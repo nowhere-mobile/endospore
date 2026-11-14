@@ -81,6 +81,7 @@ _ssum() { :; }
 remap_per_pkg() { echo tail >> "\$ROOT/calls"; }
 remap_media_db() { :; }   # NWP-20261124-01: the #de tail calls it before remap_per_pkg
 insert_deferred_media() { :; }   # NWP-20261130-02: the #media tail calls it after restore_media_tail
+rescan_media() { :; }   # NWP-20261113-45: the #media tail calls it after the reown
 restorecon() { :; }
 restore_media_tail() { echo tail >> "\$ROOT/calls"; }
 od_park_var() { :; }   # NWP-20261130-03
