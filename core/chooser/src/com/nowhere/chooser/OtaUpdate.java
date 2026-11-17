@@ -1,6 +1,8 @@
 package com.nowhere.chooser;
 
 import java.text.SimpleDateFormat;
+import java.util.Arrays;
+import java.util.Collections;
 import java.util.Date;
 import java.util.List;
 import java.util.Locale;
@@ -245,13 +247,23 @@ final class OtaUpdate {
                 + "\n\nIf it isn't installed: " + s.consequence;
     }
 
-    /** The confirmation before "Sign out &amp; install". {@code local} = a session that is not saved to the store (a
-     *  throwaway, or one signed in offline), which a sign-out erases. */
-    static String installConfirm(boolean local) {
-        String first = local
+    /** The confirmation's context sentence before "Sign out and install". {@code local} = a session that is not saved
+     *  to the store (a throwaway, or one signed in offline), which a sign-out erases. */
+    static String installContext(boolean local) {
+        return local
                 ? "You'll be signed out first. This session isn't saved to your store, so it's erased when you sign out."
                 : "You'll be signed out first, and this session is saved as usual.";
-        return first + " Then the update downloads and installs." + SLOW;
+    }
+
+    /** The confirmation's "what happens" lines, after the context (SignOutSheets.install draws them). */
+    static List<String> installLines() {
+        return Collections.unmodifiableList(Arrays.asList("Then the update downloads and installs.", SLOW.trim()));
+    }
+
+    /** The whole confirmation as one text: the context, then each line after one space. */
+    static String installConfirm(boolean local) {
+        List<String> lines = installLines();
+        return installContext(local) + " " + lines.get(0) + " " + lines.get(1);
     }
 
     // --- "Sign out & install" on the gate, after the reap ---

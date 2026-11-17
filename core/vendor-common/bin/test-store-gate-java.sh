@@ -32,7 +32,7 @@
 # Backup entry and no shortcut (s15). Owner settings has one Backup row, and it is the one way to buildOwnerBackupScreen
 # (s16). That menu opens only through DEST_MENU's verify, so neither the row nor the screen asks again (s6, s17), and
 # Back returns to Owner settings (s18). DEST_DEVICE now guards automatic install and install time only, and its line
-# says so (s19). An AlertDialog outlives the screen under it, so the picker is one at a time and onPause closes it: a
+# says so (s19). A picker dialog outlives the screen under it, so the picker is one at a time and onPause closes it: a
 # wake shows the gate with no picker over it (s20). The B mutants each name the check that must convict them.
 #
 # ⚠ IT FAILS WHEN THERE IS NO JAVAC, IT NEVER SKIPS. javac comes from PATH, else from the build host's JDK below.
@@ -237,7 +237,7 @@ source_checks() {
     || { echo "  FAIL  s19: the DEST_DEVICE verify line does not name update settings only" >&2; bad=1; }
   [ "$(count "$picker" '^        if \(syncPicker != null && syncPicker\.isShowing\(\)\) return;')" -eq 1 ] \
     || { echo "  FAIL  s20: showSyncIntervalPicker can open a second picker over the one syncPicker holds" >&2; bad=1; }
-  [ "$(count "$picker" 'syncPicker = new android\.app\.AlertDialog\.Builder\(this\)')" -eq 1 ] \
+  [ "$(count "$picker" 'syncPicker = SheetDialog\.picker\(this, GateSheets\.sync\(labels\),')" -eq 1 ] \
     || { echo "  FAIL  s20: showSyncIntervalPicker does not store its dialog in syncPicker" >&2; bad=1; }
   [ "$(count "$pause" '^        if \(syncPicker != null\) \{ syncPicker\.dismiss\(\); syncPicker = null; \}')" -eq 1 ] \
     || { echo "  FAIL  s20: onPause does not close the picker" >&2; bad=1; }
@@ -336,7 +336,7 @@ mutb s18 "B7 Back goes to Gate settings" 's/(LinearLayout ll = ownerColumn\("Bac
 mutb s18 "B8 Back goes to the gate" 's/(LinearLayout ll = ownerColumn\("Backup"\);.*?ownerBack\("Back", v -> setContentView\()buildOwnerMenu\(\)/$1gateView/s' || fails=$((fails+1))
 mutb s19 "B9 the DEST_DEVICE line names backup again" 's/to change update settings\./to change backup and update settings./' || fails=$((fails+1))
 mutb s20 "B10 onPause does not close the picker" 's/\n *if \(syncPicker != null\) \{ syncPicker\.dismiss\(\); syncPicker = null; \}//' || fails=$((fails+1))
-mutb s20 "B11 the picker is not stored" 's/syncPicker = new android\.app\.AlertDialog\.Builder\(this\)/new android.app.AlertDialog.Builder(this)/' || fails=$((fails+1))
+mutb s20 "B11 the picker is not stored" 's/syncPicker = SheetDialog\.picker\(this, GateSheets\.sync\(labels\),/SheetDialog.picker(this, GateSheets.sync(labels),/' || fails=$((fails+1))
 mutb s20 "B12 a second picker can open over the one syncPicker holds" 's/\n *if \(syncPicker != null && syncPicker\.isShowing\(\)\) return;[^\n]*//' || fails=$((fails+1))
 mutb s16 "B13 SET-SYNC-INTERVAL is sent from the Backup screen too" 's/(private View buildOwnerBackupScreen\(\) \{\n)/$1        daemonCmd("SET-SYNC-INTERVAL\\n60");\n/' || fails=$((fails+1))
 [ "$fails" -eq 0 ] && echo "== all mutations convicted" || { echo "== $fails mutation(s) not convicted"; exit 1; }

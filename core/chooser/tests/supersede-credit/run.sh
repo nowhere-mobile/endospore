@@ -14,7 +14,7 @@ JAVAC="${JAVAC:-javac}"; JAVA="${JAVA:-java}"
 here=$(cd "$(dirname "$0")" && pwd)
 D=$(mktemp -d -p "${SC_TMP:-${TMPDIR:-/tmp}}")
 trap 'rm -rf "$D"' EXIT
-methods="parkedCreditProbeDue parkedCreditLost supersedeLossTitle supersedeLossText supersedeWarnExpired parseColdLock parkedSessionStill"
+methods="parkedCreditProbeDue parkedCreditLost supersedeLossTitle supersedeLossContext supersedeLossLines supersedeWarnExpired parseColdLock parkedSessionStill"
 {
   echo "final class Lifted {"
   for m in $methods; do

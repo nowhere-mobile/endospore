@@ -8,7 +8,9 @@
 # gone or partial: the next odrestore found no full hold and never reowned it, so the app could not read its own
 # data this session. The arm also wrote no progress, so the daemon's 150 s stall clock counted all four volumes as
 # one silence. This suite EXECUTES the real extracted arm under every shell found (the device's is mksh), records
-# the order of cp / reown_restored / od_relabel / rm through stubs, and runs the REAL cutoff_prog:
+# the order of cp / reown_restored / od_relabel / rm through stubs, and runs the REAL cutoff_prog. Since
+# NWP-20261202-32 the arm runs reown_restored and od_relabel through one od_label_watched call; the stub here runs
+# them in that order in the foreground, so the trace still names each:
 #   O1 a clean copy: the order is cp, reown, relabel, rm; the hold is gone; the reply is OK <pkg>
 #   O2 a failed copy: cp, reown, relabel, no rm; the hold is kept; the reply is ERR-NOTREADY
 #   P1 NOWHERE_PROGRESS set, holds on CE and DE: a NEW progress line before each copy, no package name, no .tmp left
@@ -131,6 +133,7 @@ reown_restored() {
   [ ! -f "$ROOT/sim/stop-at-reown" ] || exit 9
 }
 od_relabel() { echo "relabel $2" >> "$T"; }
+od_label_watched() { reown_restored "$2"; od_relabel "$1" "$2"; }
 od_watched() { shift; "$@" 2>&1; }
 rm() {
   case "$1" in -rf) echo rm >> "$T" ;; esac
@@ -219,14 +222,14 @@ echo "== mutations (each MUST be convicted under EACH shell's own line) =="
 L_CP='        if [ "$_odsc" = 0 ]; then'
 L_RM='          rm -rf "$src" 2>/dev/null'
 L_WARN='          [ -e "$src" ] && echo "[roamd] WARN odrestore $pkg ($vol) could not remove all of the hold'
-L_REOWN='          reown_restored "$dst"'
-L_RELAB='          od_relabel "$vol" "$dst"'
+L_LABEL='          od_label_watched "$vol" "$dst"'
 L_PROG='      cutoff_prog od '
 L_LOOP='    odn=0; odsrc=0; odkept=0'
-# xform <order> <prog>: the arm with its success branch's reown (R), relabel (L), rm (D) and WARN (N) lines put back in
-# <order> after the branch's comment lines; prog=keep|drop|hoist moves the cutoff_prog line. Outside the arm, nothing.
+# xform <order> <prog>: the arm with its success branch's label step (R: od_label_watched, reown then relabel), rm (D)
+# and WARN (N) lines put back in <order> after the branch's comment lines; prog=keep|drop|hoist moves the cutoff_prog
+# line. Outside the arm, nothing.
 xform() {
-  awk -v ORD="$1" -v PM="$2" -v CP="$L_CP" -v RM="$L_RM" -v WN="$L_WARN" -v RO="$L_REOWN" -v RL="$L_RELAB" \
+  awk -v ORD="$1" -v PM="$2" -v CP="$L_CP" -v RM="$L_RM" -v WN="$L_WARN" -v RO="$L_LABEL" \
       -v PG="$L_PROG" -v LP="$L_LOOP" '
     $0 == "  odrestore)" { arm = 1 }
     arm && /^    ;;$/ { arm = 0 }
@@ -240,7 +243,6 @@ xform() {
     arm && blk {
       if ($0 ~ /^ *#/ && nt == 0 && !(("R") in ln)) { com[++nc] = $0; next }
       if ($0 == RO) { ln["R"] = $0; next }
-      if ($0 == RL) { ln["L"] = $0; next }
       if ($0 == RM) { ln["D"] = $0; next }
       if (index($0, WN) == 1) { ln["N"] = $0; next }
       tl[++nt] = $0; next
@@ -266,12 +268,12 @@ mutate() {  # mutate <id> <label> <order> <prog>
 }
 # The control: the transform with today's order and the progress line kept must reproduce roamd byte for byte.
 c=$(mktemp -p "$W") || exit 2
-xform RLDN keep > "$c"
+xform RDN keep > "$c"
 cmp -s "$SUT" "$c" || { echo "  FAIL  the transform does not reproduce $SUT with today's order (the anchors moved)"; MF=$((MF+1)); }
-mutate m1 "the hold is dropped before the reown again" DNRL keep
-mutate m2 "the relabel runs after the hold is dropped" RDNL keep
-mutate m3 "the progress call is removed" RLDN drop
-mutate m4 "the progress call is moved out of the loop, above it" RLDN hoist
+mutate m1 "the hold is dropped before the label step again" DNR keep
+mutate m2 "the label step runs after the hold is dropped" DRN keep
+mutate m3 "the progress call is removed" RDN drop
+mutate m4 "the progress call is moved out of the loop, above it" RDN hoist
 
 echo
 echo "mutants failed: $MF"

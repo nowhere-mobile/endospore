@@ -27,6 +27,12 @@ const reapLedgerTailBytes = 256 << 10
 //	                    retried=<n>", every class always present
 //	reap_ledger_userdir "blind=<n> timeout=<n>": rows whose userdir field is anchor:blind / anchor:timeout (Q037's
 //	                    size of the stuck-reap residual)
+//	reap_ledger_fw      "restart=<n> unknown=<n> pmleft=<n>" (NWP-20261203-01): rows whose fw= is restart / unknown
+//	                    (system_server restarted under the reap / its start count could not be read), and rows whose
+//	                    pm:ownerless=<n> is above 0 (the reap left a package installed for no user); always three
+//	                    numbers, and a row without the field counts as none
+//	reap_ledger_keys    "notsealed=<n> norcpt=<n>": rows with keys=notsealed; of those, rows with kwhy=no-receipt
+//	                    (NWP-20261203-22: a #keys seal refused for want of a restore-completion receipt)
 //
 // A class=<c> field with c in clean/gaveup/husk/recheck/residue/retried counts as c (gaveup and retried since
 // NWP-20261114-25, #67), a `userdir ctx=boot` row as boot, anything else (or a malformed row) as other. Only the last
@@ -46,6 +52,8 @@ func reapLedgerCounts(path string) map[string]string {
 	}
 	n := map[string]int{}
 	rows, blind, timeout := 0, 0, 0
+	fwRestart, fwUnknown, pmLeft := 0, 0, 0
+	ksNotsealed, ksNorcpt := 0, 0
 	for _, ln := range strings.Split(string(b), "\n") {
 		fields := strings.Fields(ln)
 		if len(fields) == 0 {
@@ -53,12 +61,32 @@ func reapLedgerCounts(path string) map[string]string {
 		}
 		rows++
 		n[reapLedgerClass(fields)]++
+		notsealed, kwhy := false, ""
 		for _, fl := range fields {
 			switch {
 			case strings.HasPrefix(fl, "userdir=anchor:blind"):
 				blind++
 			case strings.HasPrefix(fl, "userdir=anchor:timeout"):
 				timeout++
+			case fl == "fw=restart":
+				fwRestart++
+			case fl == "fw=unknown":
+				fwUnknown++
+			case strings.HasPrefix(fl, "pm:ownerless="):
+				v, _, _ := strings.Cut(strings.TrimPrefix(fl, "pm:ownerless="), ",")
+				if k, err := strconv.Atoi(v); err == nil && k > 0 {
+					pmLeft++
+				}
+			case fl == "keys=notsealed":
+				notsealed = true
+			case strings.HasPrefix(fl, "kwhy="):
+				kwhy = strings.TrimPrefix(fl, "kwhy=")
+			}
+		}
+		if notsealed {
+			ksNotsealed++
+			if kwhy == "no-receipt" {
+				ksNorcpt++
 			}
 		}
 	}
@@ -67,6 +95,8 @@ func reapLedgerCounts(path string) map[string]string {
 		"reap_ledger_classes": fmt.Sprintf("boot=%d clean=%d gaveup=%d husk=%d other=%d recheck=%d residue=%d retried=%d",
 			n["boot"], n["clean"], n["gaveup"], n["husk"], n["other"], n["recheck"], n["residue"], n["retried"]),
 		"reap_ledger_userdir": fmt.Sprintf("blind=%d timeout=%d", blind, timeout),
+		"reap_ledger_fw":      fmt.Sprintf("restart=%d unknown=%d pmleft=%d", fwRestart, fwUnknown, pmLeft),
+		"reap_ledger_keys":    fmt.Sprintf("notsealed=%d norcpt=%d", ksNotsealed, ksNorcpt),
 	}
 }
 

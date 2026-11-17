@@ -45,6 +45,14 @@ public class GateAlarmVerbsCases {
         eq("arm(false,true)", "armed-inexact", GateAlarmVerbs.arm(false, true));
         eq("arm(false,false)", "armed-err", GateAlarmVerbs.arm(false, false));
 
+        // NWP-20261204-07: roamed(secondary, running, err) -- err wins, then a running user, then a stopped one.
+        eq("R1 roamed(2,1,err)", "fired-roamed-err", GateAlarmVerbs.roamed(2, 1, true));
+        eq("R1 roamed(0,0,err)", "fired-roamed-err", GateAlarmVerbs.roamed(0, 0, true));
+        eq("R2 roamed(1,1)", "fired-roamed-running", GateAlarmVerbs.roamed(1, 1, false));
+        eq("R3 roamed(2,0)", "fired-roamed-stopped", GateAlarmVerbs.roamed(2, 0, false));
+        eq("R4 roamed(0,0)", "fired-roamed-none", GateAlarmVerbs.roamed(0, 0, false));
+        eq("R5 roamed(0,1)", "fired-roamed-running", GateAlarmVerbs.roamed(0, 1, false));
+
         for (String s : seen) {
             boolean in = false;
             for (String v : GateAlarmVerbs.VERBS) in |= v.equals(s);

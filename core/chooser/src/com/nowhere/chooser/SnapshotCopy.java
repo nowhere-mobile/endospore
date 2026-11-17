@@ -1,5 +1,9 @@
 package com.nowhere.chooser;
 
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.List;
+
 /**
  * The words the chooser puts on screen when the user deletes or restores a retained version in "Restore a snapshot"
  * (NWP-20261027-07, docs/product-decisions.md 2026-10-19; Restore since NWP-20261116-22). Decided here so the
@@ -15,6 +19,9 @@ package com.nowhere.chooser;
  * says the change may or may not have happened, never that the connection failed. BUSY names no save: the daemon also
  * answers BUSY while a teardown is queued (endUnsavedBlocked), so its text says only that nothing changed.
  *
+ * The delete ask is a sheet since NWP-20261205-14 (HistorySheets.delete): a context sentence and two lines. Joined by
+ * spaces, they are the earlier one-paragraph message byte for byte.
+ *
  * Pure Java, no android.* import: core/chooser/test-snapshot-copy-java.sh compiles this file directly.
  */
 final class SnapshotCopy {
@@ -24,9 +31,14 @@ final class SnapshotCopy {
         return "Delete this version?";
     }
 
-    static String confirmMessage(String label) {
-        return "The version saved " + label + " will be deleted from your store. This can't be undone, and you won't "
-                + "be able to restore it. Your current data and your other saved versions are not affected.";
+    static String confirmContext(String label) {
+        return "The version saved " + label + " will be deleted from your store.";
+    }
+
+    static List<String> confirmLines() {
+        return Collections.unmodifiableList(Arrays.asList(
+                "This can't be undone, and you won't be able to restore it.",
+                "Your current data and your other saved versions are not affected."));
     }
 
     /** The toast for a DELETE-SNAPSHOT reply. */

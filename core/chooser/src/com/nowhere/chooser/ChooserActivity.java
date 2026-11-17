@@ -114,7 +114,7 @@ public class ChooserActivity extends Activity {
     };
     private Button unlockBtn;
     private View gateView;   // the main gate layout, kept so the recover/recovery-code screens can swap back
-    private android.app.AlertDialog snapshotOffer; // NWP-20261118-07: the open "Couldn't load your data" offer; UI thread
+    private android.app.Dialog snapshotOffer; // NWP-20261118-07: the open "Couldn't load your data" offer; UI thread
     private View gateSubScreen;   // NWP-20261118-07: Reset passphrase / Add this phone while it is the content view
     private int gateSubScreenGen; // NWP-20261118-07: moved only when a screen-off closes gateSubScreen
     private boolean coverShown = false; // #134 v2: the opaque switch/cold-lock cover (showSwitchCover) is up in
@@ -170,7 +170,7 @@ public class ChooserActivity extends Activity {
     // free -- line label only) and clears when the owner logs in (cancelTelNotices, task_c65700f5).
     private TextView noticeBanner;
     private android.app.AlertDialog noticePopup; // NWP-20261105-06: the one per-notice popup (showNoticePopup); refreshNoticeBanner and onDestroy close it
-    private android.app.AlertDialog syncPicker; // NWP-20261130-14: the one Backup cadence picker (showSyncIntervalPicker); onPause closes it. UI thread only.
+    private android.app.Dialog syncPicker; // NWP-20261130-14: the one Backup cadence picker (showSyncIntervalPicker); onPause closes it. UI thread only.
     private TextView otaBanner; // #194: in-gate "software update available" banner (kiosk shade is disabled, so the gate draws its own)
     private OtaUpdate.Status otaStatus = OtaUpdate.NONE; // NWP-20261011-05: the last OTA-STATUS checkForOta read (UI thread)
     private boolean otaAuto; // NWP-20261011-05: the install-while-charging setting, read with otaStatus (UI thread)
@@ -231,6 +231,43 @@ public class ChooserActivity extends Activity {
         new Thread(() -> {
             try { DaemonSocket.roundTrip("IDLE-TRACE\n" + ev + "\n", 3000); } catch (Throwable ignore) {}
         }, "nowhere-idle-trace").start();
+    }
+
+    /** NWP-20261203-04: one `smsprobe` line into login.log -- the session user's SMS-role holder class and the chooser's
+     *  six SMS-role grants there as bits (SignInTrace), on the uptime clock the session's `credsvc` and `exitinfo` lines
+     *  use. roamLogin calls it before the cede (step 0) and after the component disables (step 1); step 1 also starts
+     *  ONE thread for steps 2 and 3 at +1 s and +5 s. A change already at step 1 points at the disables; one first seen
+     *  at step 2 or 3 points at the session's smsrole apply. Each read failing gives -1. Never throws, never sleeps on
+     *  the calling thread. Integers only. */
+    private static void smsProbe(final android.content.Context ctx, final int uid, final int step) {
+        try {
+            java.util.List<String> holders = null;
+            try {
+                holders = ctx.getSystemService(android.app.role.RoleManager.class)
+                        .getRoleHoldersAsUser(android.app.role.RoleManager.ROLE_SMS, android.os.UserHandle.of(uid));
+            } catch (Throwable ignore) {}
+            boolean[] granted = new boolean[PermDeclines.SMS_ROLE_PERMS.length];
+            try {
+                android.content.pm.PackageManager pm =
+                        ctx.createContextAsUser(android.os.UserHandle.of(uid), 0).getPackageManager();
+                for (int i = 0; i < granted.length; i++)
+                    granted[i] = pm.checkPermission(PermDeclines.SMS_ROLE_PERMS[i], ctx.getPackageName())
+                            == android.content.pm.PackageManager.PERMISSION_GRANTED;
+            } catch (Throwable ignore) { granted = null; }
+            idleTrace("smsprobe step=" + step + " u=" + uid
+                    + " holder=" + SignInTrace.holderClass(holders, ctx.getPackageName(), SmsRoleRoam.MESSAGING)
+                    + " perms=" + SignInTrace.permBits(granted) + " up=" + android.os.SystemClock.uptimeMillis());
+            if (step == 1) {
+                new Thread(() -> {
+                    try {
+                        Thread.sleep(1000);
+                        smsProbe(ctx, uid, 2);
+                        Thread.sleep(4000);
+                        smsProbe(ctx, uid, 3);
+                    } catch (Throwable ignore) {}
+                }, "nowhere-smsprobe").start();
+            }
+        } catch (Throwable ignore) {}
     }
     static final long IDLE_LOGOFF_MS = 15 * 60 * 1000L; // default 15 min cold-lock, no `idle=` pref (DIA-20260626-03; was 1 h)
     // DIA-20260709: floor for the setMaxTimeToLock (screen-STAYS-ON) backstop. "Idle" is time since the last
@@ -1229,7 +1266,7 @@ public class ChooserActivity extends Activity {
         } catch (Throwable ignore) {}
         armGateNfc(); // #81 item 5: keep NFC reader mode armed while the gate is up (auto-detect a key-tap login)
         refreshSimLockState(); // #162: show/hide the "SIM locked — enter PIN" link for a PIN/PUK-locked SIM
-        scheduleGateAlarmFromDaemon(); // #151: ring a logged-off session's next alarm at the gate
+        scheduleGateAlarmFromDaemon(getApplicationContext()); // #151: ring a logged-off session's next alarm at the gate
         refreshCreditLostNotice(); // NWP-20261013-20: a session that just ended may have lost the credit it claimed
         refreshBuildWarningNotice(); // NWP-20261120-03: a signed warning may name this build (Q098)
         refreshNoticeBanner(); // task_eefa24b6: a telephony notice may have arrived while we were away -> show the banner
@@ -1732,23 +1769,21 @@ public class ChooserActivity extends Activity {
         return new android.view.ContextThemeWrapper(this, tv.resourceId);
     }
 
-    /** Dialog to pick the preferred install time; the neutral "Any time" button clears it (back to the
-     *  default next-screen-off-while-charging behaviour). */
+    /** The preferred install time on the bottom sheet (NWP-20261206-05): today's TimePicker in SheetDialog's slot, a
+     *  green Set, an outlined Any time (clears it: back to the default next-screen-off-while-charging behaviour) and
+     *  Not now. Back or a tap outside equals Not now. */
     private void showOtaTimePicker(Runnable onChanged) {
         new Thread(() -> {
             final String cur = daemonCmd("GET-OTA-TIME");
-            final int ch = cur.length() == 5 ? Integer.parseInt(cur.substring(0, 2)) : 3;
-            final int cm = cur.length() == 5 ? Integer.parseInt(cur.substring(3, 5)) : 0;
+            final int[] hm = OtaTimeSheet.current(cur);
             runOnUiThread(() -> {
                 final android.widget.TimePicker tp = new android.widget.TimePicker(dialogContext());
                 tp.setIs24HourView(false);
-                tp.setHour(ch);
-                tp.setMinute(cm);
-                new android.app.AlertDialog.Builder(this)
-                        .setTitle("Install time (while charging)")
-                        .setView(tp)
-                        .setPositiveButton("Set", (d, w) -> {
-                            final String hhmm = String.format(java.util.Locale.US, "%02d:%02d", tp.getHour(), tp.getMinute());
+                tp.setHour(hm[0]);
+                tp.setMinute(hm[1]);
+                SheetDialog.slot(this, OtaTimeSheet.model(), tp, new Runnable[] {
+                        () -> {
+                            final String hhmm = OtaTimeSheet.hhmm(tp.getHour(), tp.getMinute());
                             new Thread(() -> {
                                 final boolean saved = ReplyCopy.settingSaved(daemonCmd("SET-OTA-TIME\n" + hhmm));
                                 if (saved) OtaTimeReceiver.arm(getApplicationContext(), hhmm);
@@ -1758,19 +1793,17 @@ public class ChooserActivity extends Activity {
                                     onChanged.run();
                                 });
                             }).start();
-                        })
-                        .setNeutralButton("Any time", (d, w) ->
-                                new Thread(() -> {
-                                    final boolean saved = ReplyCopy.settingSaved(daemonCmd("SET-OTA-TIME\n"));
-                                    if (saved) OtaTimeReceiver.cancel(getApplicationContext());
-                                    runOnUiThread(() -> {
-                                        if (!saved) android.widget.Toast.makeText(this,
-                                                "Couldn't save that change — try again.", android.widget.Toast.LENGTH_LONG).show();
-                                        onChanged.run();
-                                    });
-                                }).start())
-                        .setNegativeButton("Cancel", null)
-                        .show();
+                        },
+                        () -> new Thread(() -> {
+                            final boolean saved = ReplyCopy.settingSaved(daemonCmd("SET-OTA-TIME\n"));
+                            if (saved) OtaTimeReceiver.cancel(getApplicationContext());
+                            runOnUiThread(() -> {
+                                if (!saved) android.widget.Toast.makeText(this,
+                                        "Couldn't save that change — try again.", android.widget.Toast.LENGTH_LONG).show();
+                                onChanged.run();
+                            });
+                        }).start(),
+                        null });
             });
         }).start();
     }
@@ -1783,19 +1816,15 @@ public class ChooserActivity extends Activity {
         if (syncPicker != null && syncPicker.isShowing()) return;
         final int[] secs = SyncChoices.SECS;
         final String[] labels = SyncChoices.LABELS;
-        syncPicker = new android.app.AlertDialog.Builder(this)
-                .setTitle("Back up my data")
-                .setItems(labels, (d, w) ->
-                        new Thread(() -> {
-                            final boolean saved = ReplyCopy.cadenceSaved(daemonCmd("SET-SYNC-INTERVAL\n" + secs[w]));
-                            runOnUiThread(() -> {
-                                if (!saved) android.widget.Toast.makeText(this,
-                                        "Not changed — the phone didn't save it", android.widget.Toast.LENGTH_LONG).show();
-                                onChanged.run();
-                            });
-                        }).start())
-                .setNegativeButton("Cancel", null)
-                .show();
+        syncPicker = SheetDialog.picker(this, GateSheets.sync(labels), w ->
+                new Thread(() -> {
+                    final boolean saved = ReplyCopy.cadenceSaved(daemonCmd("SET-SYNC-INTERVAL\n" + secs[w]));
+                    runOnUiThread(() -> {
+                        if (!saved) android.widget.Toast.makeText(this,
+                                "Not changed — the phone didn't save it", android.widget.Toast.LENGTH_LONG).show();
+                        onChanged.run();
+                    });
+                }).start());
     }
 
     // NWP-20261128-35: GateBarsTrace ran in this activity instance (once per gate start).
@@ -3752,25 +3781,40 @@ public class ChooserActivity extends Activity {
             StatusLine.busy(swMsg, "Starting update…");
             otaBar.setVisibility(View.VISIBLE);
             new Thread(() -> {
-                daemonCmd("OTA-APPLY"); // seeds STAGING (or BUSY if already running) -> the poll picks up the real phase
+                final String ar = daemonCmd("OTA-APPLY"); // seeds STAGING (or BUSY if already running) -> the poll picks up the real phase
+                // NWP-20261206-19: until otad writes its first phase, OTA-STATUS can still read AVAIL, empty or FAILED ERR-STALE;
+                // rendering that re-offered Install update mid-apply. Keep "Starting update…" over those (OtaCard.holdStarting).
+                final long t0 = android.os.SystemClock.uptimeMillis();
+                for (;;) {
+                    String[] rp = otaStatusAndProg();
+                    if (!OtaCard.holdStarting(ar, rp[0], android.os.SystemClock.uptimeMillis() - t0)) break;
+                    try { Thread.sleep(3000); } catch (InterruptedException ie) { break; }
+                }
                 doCheck.run();
             }).start();
         };
-        install.setOnClickListener(v -> new Thread(() -> {
-            String cl = "";
-            try { cl = sendDaemon("GET-COLDLOCK\n").trim(); } catch (Throwable ignore) {}
-            if (!installAsksFirst(cl)) {
-                runOnUiThread(startInstall);
-                return;
-            }
-            String pc = "";
-            if (parseColdLock(cl) != null) {
-                try { pc = sendDaemon("GET-PARKED-CREDIT\n"); } catch (Throwable ignore) {}
-            }
-            final String[] parsed = parseColdLock(cl);
-            final boolean lost = parkedCreditLost(pc);
-            runOnUiThread(() -> confirmInstallOverParked(parsed, lost, startInstall));
-        }).start());
+        // NWP-20261206-19: the tap disables Install first, so a second tap during the reads below starts nothing.
+        install.setOnClickListener(v -> {
+            install.setEnabled(false);
+            new Thread(() -> {
+                String cl = "";
+                try { cl = sendDaemon("GET-COLDLOCK\n").trim(); } catch (Throwable ignore) {}
+                if (!installAsksFirst(cl)) {
+                    runOnUiThread(startInstall);
+                    return;
+                }
+                String pc = "";
+                if (parseColdLock(cl) != null) {
+                    try { pc = sendDaemon("GET-PARKED-CREDIT\n"); } catch (Throwable ignore) {}
+                }
+                final String[] parsed = parseColdLock(cl);
+                final boolean lost = parkedCreditLost(pc);
+                runOnUiThread(() -> {
+                    install.setEnabled(true); // the dialog is modal: Cancel leaves Install usable
+                    confirmInstallOverParked(parsed, lost, startInstall);
+                });
+            }).start();
+        });
 
         // About is the last item on the screen, above Back (NWP-20261108-19).
         LinearLayout.LayoutParams alp = new LinearLayout.LayoutParams(MATCH, WRAP);
@@ -3859,8 +3903,7 @@ public class ChooserActivity extends Activity {
             final OtaNotes.View view = OtaNotes.render(DaemonSocket.roundTripLines("OTA-NOTES\n", 5000), mode);
             runOnUiThread(() -> {
                 try {
-                    new android.app.AlertDialog.Builder(this).setTitle(view.title).setMessage(view.body)
-                            .setPositiveButton("OK", null).show();
+                    SheetDialog.confirm(this, GateNoticeSheets.otaNotes(view.title, view.body), null, null);
                 } catch (Throwable t) { android.util.Log.w("NowhereChooser", "OTA notes dialog", t); }
             });
         }, "nowhere-ota-notes").start();
@@ -3945,7 +3988,8 @@ public class ChooserActivity extends Activity {
         }
         // Install offered only when there's something installable (AVAIL) or to retry a FAILED one; hidden while
         // an install is in flight. Check hidden while in flight too (a re-check would fight the running apply).
-        install.setVisibility("AVAIL".equals(head) || "FAILED".equals(head) ? View.VISIBLE : View.GONE);
+        install.setVisibility(OtaCard.installShown(head) ? View.VISIBLE : View.GONE);
+        if (OtaCard.installShown(head)) install.setEnabled(true); // NWP-20261206-19: a tap disabled it
         check.setVisibility(inFlight ? View.GONE : View.VISIBLE);
         bar.setVisibility(inFlight ? View.VISIBLE : View.GONE);
         // NWP-20260901-23: the restart notice tracks the APPLY only -- a download can still be interrupted
@@ -4190,38 +4234,30 @@ public class ChooserActivity extends Activity {
                 + "way, anything it hasn't saved is lost.";
     }
 
-    /** Explain the refusal and offer the way forward. "Resume it" opens the "Welcome back" prompt for the parked
-     *  session (only when GET-COLDLOCK named it); there is no gate control that signs a parked session out, so the
-     *  text says how: resume it, then sign out. Off the UI thread is fine: it posts. */
+    /** Explain the refusal and offer the way forward, on the routine sheet (GateParkedSheets.coldLock). "Resume it"
+     *  opens the "Welcome back" prompt for the parked session (only when GET-COLDLOCK named it, else the sheet has one
+     *  "Got it"); Not now, Back or a touch outside changes nothing. There is no gate control that signs a parked
+     *  session out, so the text says how: resume it, then sign out. Off the UI thread is fine: it posts. */
     private void showCreateOverColdLock(String coldLockReply) {
         final String[] p = parseColdLock(coldLockReply);
         runOnUiThread(() -> {
             if (isFinishing() || resumeMode) return;
-            android.app.AlertDialog.Builder b = new android.app.AlertDialog.Builder(this)
-                    .setTitle(createOverColdLockTitle())
-                    .setMessage(createOverColdLockText(p));
-            if (p != null) {
-                b.setPositiveButton("Resume it", (d, w) -> {
-                    if (!resumeMode) enterResumeMode(p[3], p[0], "fido2".equals(p[1]), "pin".equals(p[2]));
-                });
-                b.setNegativeButton("Cancel", null);
-            } else {
-                b.setPositiveButton("OK", null);
-            }
-            b.show();
+            SheetDialog.confirm(this,
+                    GateParkedSheets.coldLock(createOverColdLockTitle(), createOverColdLockText(p), p != null),
+                    new Runnable[] { () -> {
+                        if (p != null && !resumeMode) enterResumeMode(p[3], p[0], "fido2".equals(p[1]), "pin".equals(p[2]));
+                    } }, null);
         });
     }
 
-    /** Explain the ERR-LIVE refusal (h46 #5) and offer the restart that ends the open session. It posts, so any
-     *  thread may call it. */
+    /** Explain the ERR-LIVE refusal (h46 #5) on the warning sheet (GateParkedSheets.createLive) and offer the restart
+     *  that ends the open session: only Restart, the red-outlined button, reboots; Not now, Back or a touch outside
+     *  changes nothing. It posts, so any thread may call it. */
     private void showCreateOverLiveSession() {
         runOnUiThread(() -> {
             if (isFinishing()) return;
-            new android.app.AlertDialog.Builder(this)
-                    .setMessage(createLiveText())
-                    .setPositiveButton("Restart", (d, w) -> rebootForCreateOverLive())
-                    .setNegativeButton("Cancel", null)
-                    .show();
+            SheetDialog.confirm(this, GateParkedSheets.createLive(createLiveText()),
+                    new Runnable[] { null, () -> rebootForCreateOverLive() }, null);
         });
     }
 
@@ -4334,41 +4370,55 @@ public class ChooserActivity extends Activity {
         return "Install and restart?";
     }
 
-    /** The warning. The name is the one the "Welcome back" screen already shows anyone holding the phone (parsed may be
-     *  null: the daemon did not say). The credit clause is added only when GET-PARKED-CREDIT said LOST. */
-    private static String installOverParkedText(String[] parsed, boolean creditLost) {
+    /** The warning's context: who is parked. The name is the one the "Welcome back" screen already shows anyone holding
+     *  the phone (parsed may be null: the daemon did not say). */
+    private static String installOverParkedContext(String[] parsed) {
         String who = parsed == null ? "A session is" : parsed[3] + "'s session is";
-        return who + " locked on this phone. Installing restarts the phone, which ends that session: anything it "
-                + "hasn't saved is lost." + (creditLost ? " That includes storage credit it hasn't saved." : "");
+        return who + " locked on this phone.";
     }
 
-    /** Ask before an Install that restarts the phone over a parked session. Install runs go; Cancel, the default, does
-     *  nothing. Call on the UI thread. */
+    /** The warning's lines: what Install does. The credit line is added only when GET-PARKED-CREDIT said LOST. */
+    private static String[] installOverParkedLines(boolean creditLost) {
+        java.util.List<String> lines = new java.util.ArrayList<>();
+        lines.add("Installing restarts the phone, which ends that session: anything it hasn't saved is lost.");
+        if (creditLost) lines.add("That includes storage credit it hasn't saved.");
+        return lines.toArray(new String[0]);
+    }
+
+    /** The warning as one text: the context and the lines, joined. Built from its parts, never parsed, so a name that
+     *  holds ". " cannot move a sentence. */
+    private static String installOverParkedText(String[] parsed, boolean creditLost) {
+        return installOverParkedContext(parsed) + " " + String.join(" ", installOverParkedLines(creditLost));
+    }
+
+    /** Ask before an Install that restarts the phone over a parked session, on the warning sheet
+     *  (GateParkedSheets.installOverParked). Only Install, the red-outlined button, runs go; Not now, Back or a touch
+     *  outside does nothing. Call on the UI thread. */
     private void confirmInstallOverParked(String[] parsed, boolean creditLost, Runnable go) {
         if (isFinishing() || isDestroyed()) return;
-        new android.app.AlertDialog.Builder(this)
-                .setTitle(installOverParkedTitle())
-                .setMessage(installOverParkedText(parsed, creditLost))
-                .setCancelable(true)
-                .setPositiveButton("Install", (d, w) -> go.run())
-                .setNegativeButton("Cancel", null)
-                .show();
+        SheetDialog.confirm(this, GateParkedSheets.installOverParked(installOverParkedTitle(),
+                installOverParkedContext(parsed), installOverParkedLines(creditLost)), new Runnable[] { null, go }, null);
     }
 
     private static String supersedeLossTitle() {
         return "End the locked session?";
     }
 
-    /** The warning. Names no profile and no amount: whoever is at the gate reads it, and the gate already shows that a
-     *  session is parked. Every sentence is true of a stored parked session and of a throwaway alike: what Cancel keeps
-     *  is said, not what that session's owner can do next (a stored session's sign-out retries its wallet read, a
-     *  throwaway's credit rides "Save to your store"), because saying which would tell which kind is parked. It makes
-     *  no claim about whether anything is unsaved: the gate cannot know (NWP-20261124-08). The credit sentence is added
-     *  only when GET-PARKED-CREDIT said LOST. */
-    private static String supersedeLossText(boolean creditLost) {
-        return "Signing in now ends a locked session on this phone. Anything that session hasn't saved is lost."
-                + (creditLost ? " That includes storage credit it hasn't saved. Credit saved before that session is safe." : "")
-                + "\n\nCancel keeps that session.";
+    /** The warning's context sentence and its lines. Names no profile and no amount: whoever is at the gate reads it,
+     *  and the gate already shows that a session is parked. Every sentence is true of a stored parked session and of a
+     *  throwaway alike: what the green button keeps is said, not what that session's owner can do next (a stored
+     *  session's sign-out retries its wallet read, a throwaway's credit rides "Save to your store"), because saying
+     *  which would tell which kind is parked. It makes no claim about whether anything is unsaved: the gate cannot
+     *  know (NWP-20261124-08). */
+    private static String supersedeLossContext() {
+        return "Signing in now ends a locked session on this phone.";
+    }
+
+    /** The credit line is added only when GET-PARKED-CREDIT said LOST. */
+    private static String[] supersedeLossLines(boolean creditLost) {
+        final String lost = "Anything that session hasn't saved is lost.";
+        if (!creditLost) return new String[] { lost };
+        return new String[] { lost, "That includes storage credit it hasn't saved. Credit saved before that session is safe." };
     }
 
     /** Whether the warning has waited long enough to count as Cancel: two minutes. The login thread holds
@@ -4379,22 +4429,20 @@ public class ChooserActivity extends Activity {
         return waitedMs >= 120_000L;
     }
 
-    /** Show the warning and wait for the answer, on the login thread: true for Continue. Cancel, a gate that goes away
-     *  before anyone answers, and no answer within supersedeWarnExpired's limit are false. */
+    /** Show the warning and wait for the answer, on the login thread: true for Continue. Keep that session, a gate
+     *  that goes away before anyone answers, and no answer within supersedeWarnExpired's limit are false. The sheet is
+     *  not cancelable, so Back and a touch outside it do nothing. */
     private boolean confirmSupersedeLoss(final boolean creditLost) {
         final java.util.concurrent.CountDownLatch answered = new java.util.concurrent.CountDownLatch(1);
         final boolean[] go = {false};
-        final android.app.AlertDialog[] shown = {null};
+        final android.app.Dialog[] shown = {null};
         final long since = android.os.SystemClock.elapsedRealtime();
         runOnUiThread(() -> {
             if (isFinishing() || isDestroyed()) { answered.countDown(); return; }
-            shown[0] = new android.app.AlertDialog.Builder(this)
-                    .setTitle(supersedeLossTitle())
-                    .setMessage(supersedeLossText(creditLost))
-                    .setCancelable(false)
-                    .setPositiveButton("Continue", (d, w) -> { go[0] = true; answered.countDown(); })
-                    .setNegativeButton("Cancel", (d, w) -> answered.countDown())
-                    .show();
+            shown[0] = SheetDialog.confirm(this,
+                    SigninLossSheets.supersede(supersedeLossTitle(), supersedeLossContext(), supersedeLossLines(creditLost)),
+                    new Runnable[] { () -> answered.countDown(), () -> { go[0] = true; answered.countDown(); } }, null);
+            if (shown[0] != null) shown[0].setCancelable(false);
         });
         try {
             while (!answered.await(500, java.util.concurrent.TimeUnit.MILLISECONDS)) {
@@ -4880,6 +4928,7 @@ public class ChooserActivity extends Activity {
                 try {
                     if (appCtx.startServiceAsUser(new android.content.Intent(appCtx, CredentialService.class)
                             .putExtra("gosstate", true), android.os.UserHandle.of(uid)) != null) {
+                        CredSvcWatch.record(appCtx, uid, CredSvcWatch.GOSSTATE); // NWP-20261203-05: re-sent if the service is stuck
                         android.util.Log.i("NowhereChooser",
                                 "gos apply kicked -> user " + uid + " (try " + (try_ + 1) + ")");
                         return;
@@ -5171,14 +5220,10 @@ public class ChooserActivity extends Activity {
                     if (label.isEmpty()) label = units.get(i)[1]; // fall back to the edition
                     labels[i] = label;
                 }
-                new android.app.AlertDialog.Builder(this)
-                        .setTitle("Restore data from…")
-                        .setItems(labels, (d, which) -> {
-                            restoreSrcUnit = units.get(which)[0];   // consumed once by roamInStreaming
-                            roamLogin(name, pw, false);             // a normal login carrying the source unit
-                        })
-                        .setNegativeButton("Cancel", null)
-                        .show();
+                SheetDialog.picker(this, GateSheets.restore(labels), which -> {
+                    restoreSrcUnit = units.get(which)[0];   // consumed once by roamInStreaming
+                    roamLogin(name, pw, false);             // a normal login carrying the source unit
+                });
             });
         }, "nowhere-list-units").start();
     }
@@ -5599,9 +5644,11 @@ public class ChooserActivity extends Activity {
                 // native delivery.~~ (Superseded by the 2026-11-06 decision: GrapheneOS 2026110200 shows a sub_id=-1 row
                 // only to user 0. A row under a real subscription showing in Messaging waits for the lynx check.) cede
                 // still runs so Messaging is the roamed user's SMS default (it must own+read the provider to show our rows).
+                smsProbe(appCtx, fuid, 0); // NWP-20261203-04: the session's SMS-role holder and the chooser's role grants, before the cede
                 android.util.Log.i("NowhereChooser", "#149 live-intercept-mode: SIM stays on gate, no associate");
                 cedeSmsToMessagingInRoamedUser(fuid);
                 disableRoamedDialerComponents(fuid); // NWP-20261012-07: the missed-call receiver works only in user 0
+                smsProbe(appCtx, fuid, 1); // NWP-20261203-04: the same after the component disables; also starts the +1 s / +5 s reads
                 // #135 delivery v2: kick the roamed user's OWN chooser to pull + insert its decrypted
                 // telephony inbox (TelIngest settles, verifies, retries -- the su:s0 worker never could).
                 // No pw extra -> CredentialService's telingest branch; fire-and-forget, session-scoped.
@@ -5609,6 +5656,7 @@ public class ChooserActivity extends Activity {
                     appCtx.startServiceAsUser(new android.content.Intent(appCtx, CredentialService.class)
                             .putExtra("telingest", true), android.os.UserHandle.of(fuid));
                 } catch (Throwable t) { android.util.Log.w("NowhereChooser", "telingest kick", t); }
+                CredSvcWatch.record(appCtx, fuid, CredSvcWatch.TELINGEST); // NWP-20261203-05: re-sent if the service is stuck
                 // NWP-20260827-18: kick the web-import ingestion the same way -- the roamed user's own
                 // chooser pulls its staged Documents/Imported/*.vcf|*.ics from the daemon (GET-INGEST) and
                 // inserts them into its OWN contacts/calendar providers with verify-back. Cheap no-op on
@@ -5617,6 +5665,7 @@ public class ChooserActivity extends Activity {
                     appCtx.startServiceAsUser(new android.content.Intent(appCtx, CredentialService.class)
                             .putExtra("ingest", true), android.os.UserHandle.of(fuid));
                 } catch (Throwable t) { android.util.Log.w("NowhereChooser", "ingest kick", t); }
+                CredSvcWatch.record(appCtx, fuid, CredSvcWatch.INGEST); // NWP-20261203-05: re-sent if the service is stuck
                 // NWP-20261029-11: apply the claim map the sign-in seeded (NWP-20261029-06) HERE, after
                 // provisionRoamedApps, because a suspend of a package not yet installed for the user is refused
                 // silently. Sign-in only: a resume keeps its holds.
@@ -5624,6 +5673,10 @@ public class ChooserActivity extends Activity {
                     appCtx.startServiceAsUser(new android.content.Intent(appCtx, CredentialService.class)
                             .putExtra("claimsLogin", true), android.os.UserHandle.of(fuid));
                 } catch (Throwable t) { android.util.Log.w("NowhereChooser", "claims-login kick", t); }
+                CredSvcWatch.record(appCtx, fuid, CredSvcWatch.CLAIMS_LOGIN); // NWP-20261203-05: re-sent if the service is stuck
+                // NWP-20261203-05: the sign-in's chooser kill can leave this user's CredentialService restarting with
+                // the starts above pending; the watch confirms that state twice and then stops it and re-sends them.
+                CredSvcWatch.watch(appCtx, fuid, "signin");
                 // #123: this login committed OVER a parked cold-lock -> the user chose a new session instead of
                 // "Welcome back", so reap that superseded user DIRECTLY (device-owner removeUser) rather than
                 // leaving it for the async orphan-sweep. Runs AFTER the switch is posted so it never delays the
@@ -5716,18 +5769,14 @@ public class ChooserActivity extends Activity {
     }
 
     /** #58 P4: after a login restore failed post-progress, not in transport (that is BLANK NET), offer a
-     *  retry OR a rollback to the last good snapshot. */
+     *  retry OR a rollback to the last good snapshot. Not now hands the form back; a screen-off closes it the same way. */
     private void offerSnapshotRecovery(final String name, final String pw) {
         runOnUiThread(() -> {
             // NWP-20261118-07: kept so a screen-off closes it (closeScreenOffSurfaces)
-            snapshotOffer = new android.app.AlertDialog.Builder(this)
-                    .setTitle("Couldn't load your data")
-                    .setMessage("Your latest data didn't load. Try again first. If it fails again, your most recent "
-                            + "save may be damaged, and you can restore your last good version instead.")
-                    .setPositiveButton("Try again", (d, w) -> roamLogin(name, pw, false))
-                    .setNeutralButton("Restore last good version", (d, w) -> doGateRollback(name, pw))
-                    .setNegativeButton("Cancel", (d, w) -> { hideRestore(); if (result != null) result.setText(""); })
-                    .show();
+            snapshotOffer = SheetDialog.confirm(this, SigninLossSheets.snapshotOffer(), new Runnable[] {
+                    () -> roamLogin(name, pw, false),
+                    () -> doGateRollback(name, pw),
+                    () -> { hideRestore(); if (result != null) result.setText(""); } }, null);
         });
     }
 
@@ -6917,6 +6966,7 @@ public class ChooserActivity extends Activity {
             st.put("os_build", android.os.Build.FINGERPRINT);
             st.put("android_sdk", String.valueOf(android.os.Build.VERSION.SDK_INT)); // string: the daemon decodes Status as map[string]string, and a JSON number poisons the (deliberately swallowed) unmarshal
             st.put("context", "gate");
+            GateNoticeEvidence.put(this, st); // NWP-20261204-12, row "After a sign-out the gate can show a missed call from inside the session, and a location icon": the gate's own notices, the missed-call delegation and the location grant, counts and fixed classes only
             try { st.put("chooser_version", getPackageManager().getPackageInfo(getPackageName(), 0).versionName); } catch (Exception ignore) {}
             o.put("status", st);
             return o.toString();
@@ -8138,10 +8188,10 @@ public class ChooserActivity extends Activity {
     // A session that never read its stored wallet publishes none, so credit claimed during it is lost when it ends --
     // a normal sign-out whose retried read failed, or "End session without saving". The session's own screen cannot
     // say so: the reap switches here within a moment. So the daemon records the notice (wallet.json.creditlost: a
-    // time and nothing else -- no name, no amount) and the gate shows it here, once, until the user taps OK, which
+    // time and nothing else -- no name, no amount) and the gate shows it here, once, until the user taps Got it, which
     // clears exactly that notice (a newer one recorded meanwhile stays, to be shown).
 
-    private android.app.AlertDialog creditLostDialog;
+    private android.app.Dialog creditLostDialog;
 
     /** Ask the daemon for a recorded lost-credit notice and show it. Off-thread (a daemon round trip); from onResume. */
     private void refreshCreditLostNotice() {
@@ -8152,14 +8202,10 @@ public class ChooserActivity extends Activity {
             runOnUiThread(() -> {
                 boolean showing = creditLostDialog != null && creditLostDialog.isShowing();
                 if (!creditLostNoticeDue(stamp, showing, isFinishing() || isDestroyed())) return;
-                creditLostDialog = new android.app.AlertDialog.Builder(this)
-                        .setTitle(CREDIT_LOST_TITLE)
-                        .setMessage(creditLostNoticeText())
-                        .setCancelable(false)
-                        .setPositiveButton("OK", (d, w) -> new Thread(() -> {
+                creditLostDialog = SheetDialog.confirmHeld(this, GateNoticeSheets.creditLost(CREDIT_LOST_TITLE,
+                        creditLostNoticeText()), new Runnable[] { () -> new Thread(() -> {
                             try { sendDaemon(creditLostClearCommand(stamp)); } catch (Throwable ignore) {}
-                        }, "nowhere-credit-lost").start())
-                        .show();
+                        }, "nowhere-credit-lost").start() });
             });
         }, "nowhere-credit-lost").start();
     }
@@ -8234,11 +8280,11 @@ public class ChooserActivity extends Activity {
     // and (deliberately) NOT re-registered on boot -- a power-off wipes the session AND its gate alarm.
 
     /** Read the relayed next-alarm time (one-shot: GET clears the stash) and schedule a user-0 gate alarm.
-     *  Off-thread (a daemon round-trip); called from onResume. */
-    private void scheduleGateAlarmFromDaemon() {
-        final android.content.Context appCtx = getApplicationContext();
+     *  Off-thread (a daemon round-trip); called from onResume and from ensureReapWatcher's LOCK arm
+     *  (NWP-20261207-10). Static, so the watcher can call it; the 90 s bound is sendDaemon's. */
+    static void scheduleGateAlarmFromDaemon(final android.content.Context appCtx) {
         new Thread(() -> {
-            String reply = sendDaemon("GET-GATE-ALARM\n");
+            String reply = DaemonSocket.roundTrip("GET-GATE-ALARM\n", 90000);
             long now = System.currentTimeMillis();
             // NWP-20261028-13: say what the consume found (nothing for "0"). The trace goes AFTER the arm -- it
             // starts a thread, and nothing may sit in front of AlarmManager once the daemon's stash is consumed.
@@ -8507,10 +8553,7 @@ public class ChooserActivity extends Activity {
      *  and ERR io points at a reset. */
     private void confirmRepairBindings(TextView status) {
         final boolean owned = ownerSessionPass != null;
-        new android.app.AlertDialog.Builder(this)
-                .setTitle(BindingsRepair.TITLE)
-                .setMessage(BindingsRepair.CONFIRM)
-                .setPositiveButton("Repair", (d, w) -> {
+        SheetDialog.confirm(this, GateNoticeSheets.repairBindings(), new Runnable[] { () -> {
                     if (!OwnerLanding.lands(owned, ownerSessionPass != null)) return; // NWP-20261129-12: owner mode ended while the dialog was open: do nothing
                     StatusLine.busy(status, "Repairing…");
                     new Thread(() -> {
@@ -8527,9 +8570,7 @@ public class ChooserActivity extends Activity {
                             StatusLine.error(status, line);
                         });
                     }, "nowhere-bindings-repair").start();
-                })
-                .setNegativeButton("Cancel", null)
-                .show();
+                }, null }, null);
     }
 
     // Bind form for one SIM. sim0 == null (or an empty ICCID) => manual entry with an editable ICCID field.
@@ -10659,6 +10700,7 @@ public class ChooserActivity extends Activity {
                 app.startServiceAsUser(new android.content.Intent(app, CredentialService.class).putExtra("smsrole", true),
                         android.os.UserHandle.of(uid));
             } catch (Throwable t) { android.util.Log.w("NowhereChooser", "#148 sms role kick", t); }
+            CredSvcWatch.record(getApplicationContext(), uid, CredSvcWatch.SMSROLE); // NWP-20261203-05: re-sent if the service is stuck
             repairSmsRoleLater(uid, "cede");
             grantMessagingRestrictedRead(uc); // #150: also grant now for the common case where the role is already held (idempotent)
         } catch (Throwable t) { android.util.Log.w("NowhereChooser", "#148 cedeSmsToMessagingInRoamedUser", t); }
@@ -11425,6 +11467,8 @@ public class ChooserActivity extends Activity {
             int shownForUid = -1;       // backup notice: the user we last posted to (-1 = nothing shown)
             int storShownForUid = -1;   // storage notice (#82), tracked independently
             int mediaShownForUid = -1;  // media-loading notice (#90), tracked independently
+            int landedUid = -1;          // NWP-20261114-34: the session the landed count below belongs to (-1 = none)
+            String landedSeen = "0";     // NWP-20261114-34: mediad's landed count last seen for that session
             int offlineShownForUid = -1; // offline-session notice (#49), tracked independently
             int dropShownForUid = -1;    // net-drop notice: STORED session that lost the network mid-use
             int offTicks = 0;            // NWP-20260822-24: consecutive stored-and-offline ticks (the debounce)
@@ -11459,9 +11503,10 @@ public class ChooserActivity extends Activity {
                     if (shownForUid >= 0) { cancelBackupNotice(app, shownForUid); shownForUid = -1; }
                     if (storShownForUid >= 0) { cancelStorageNotice(app, storShownForUid); storShownForUid = -1; }
                     if (mediaShownForUid >= 0) { cancelMediaNotice(app, mediaShownForUid); mediaShownForUid = -1; }
+                    landedUid = -1; // NWP-20261114-34: the next session starts again from "0"
                     if (offlineShownForUid >= 0) { cancelOfflineNotice(app, offlineShownForUid); cancelReconnectNotice(app, offlineShownForUid); offlineShownForUid = -1; }
                     if (dropShownForUid >= 0) { cancelDropNotice(app, dropShownForUid); dropShownForUid = -1; }
-                    if (backNowShownForUid >= 0) { cancelBackNowNotice(app, backNowShownForUid); backNowShownForUid = -1; }
+                    if (backNowShownForUid >= 0) { idleTrace("backnow cancel gate user=" + backNowShownForUid); cancelBackNowNotice(app, backNowShownForUid); backNowShownForUid = -1; }
                     if (healthShownForUid >= 0) { cancelHealthNotice(app, healthShownForUid); healthShownForUid = -1; healthShownOffer = HealthNotice.NONE; }
                     // NWP-20260901-06: clear the update notice with the session. It is addressed to a signed-in
                     // owner; leaving it in a torn-down user's shade would also mean the NEXT session's
@@ -11500,7 +11545,8 @@ public class ChooserActivity extends Activity {
                 // "LOADING <done> <total> <nfiles> <name>" while a fetch runs, "DAMAGED <nfiles> <name>" once a chunk
                 // is proven corrupt (#110), "INCOMPLETE <napps> <app>" after a short #media restore, and
                 // "RESTORING <done B> <total B> <files left>" while the after-gate #media restore has files left
-                // (NWP-20261201-14) -- and the daemon relays the file whole, or IDLE. So read every line and let
+                // (NWP-20261201-14), then "RESTORE-WAITING" while that restore is parked on the network
+                // (NWP-20261207-11) -- and the daemon relays the file whole, or IDLE. So read every line and let
                 // MediaStatus.route give each kind its own line: postMediaNotice and postDamagedNotice take the name
                 // as the tail field.
                 java.util.List<String> msl = DaemonSocket.roundTripLines("GET-MEDIA-STATUS\n", 5000);
@@ -11539,7 +11585,7 @@ public class ChooserActivity extends Activity {
                     postMediaNotice(app, uid, loadLine);
                     mediaShownForUid = uid;
                 } else if (MediaStatus.restoring(restLine) != null) { // after-gate #media restore -> byte bar
-                    postMediaNotice(app, uid, restLine);
+                    postMediaNotice(app, uid, restLine, MediaStatus.restoreWaiting(mr)); // NWP-20261207-11: parked
                     mediaShownForUid = uid;
                 } else if (prefetchActive) {          // background (T2) prefetch -> generic indeterminate notice
                     postMediaNotice(app, uid, "PREFETCH");
@@ -11548,6 +11594,16 @@ public class ChooserActivity extends Activity {
                     cancelMediaNotice(app, mediaShownForUid);
                     mediaShownForUid = -1;
                 }
+                // NWP-20261114-34: files a background run made local after the sign-in (a prefetch or pin materialize,
+                // or the after-gate #media restore) reach the Gallery only through another MediaProvider scan: the
+                // provider scanned at user start and once more right after the sign-in restore (NWP-20261113-45).
+                // mediad counts those runs in media.landed; a changed, non-zero count starts the session's rescan,
+                // which must run inside the session (scan_volume takes the user from the caller's uid).
+                if (uid != landedUid) { landedUid = uid; landedSeen = "0"; }
+                String landedReply = pollDaemon("GET-MEDIA-LANDED\n");
+                if (MediaStatus.rescanAfterLanding(landedSeen, landedReply)) requestMediaRescan(app, uid, MediaStatus.landed(landedReply));
+                String landedNow = MediaStatus.landed(landedReply);
+                if (landedNow != null) landedSeen = landedNow;
                 // #110: a damaged verdict is sticky for the session -- post the alert ONCE (re-posting every
                 // 5s would re-buzz a heads-up), pointing at the snapshot-restore remedy (#58). Dismissible;
                 // no cancel path (the damage doesn't heal mid-session).
@@ -11607,7 +11663,8 @@ public class ChooserActivity extends Activity {
                         // announcement either.
                         offTicks++;
                         if (offTicks >= 3) {
-                            if (backNowShownForUid >= 0) { cancelBackNowNotice(app, backNowShownForUid); backNowShownForUid = -1; }
+                            if (offTicks == 3) idleTrace("backnow drop user=" + uid); // NWP-20261204-03: once per drop
+                            if (backNowShownForUid >= 0) { idleTrace("backnow cancel drop user=" + backNowShownForUid); cancelBackNowNotice(app, backNowShownForUid); backNowShownForUid = -1; }
                             postDropNotice(app, uid);
                             dropShownForUid = uid; backNow.onDrop();
                         }
@@ -11640,6 +11697,7 @@ public class ChooserActivity extends Activity {
                         if (backNow.onOnline(System.currentTimeMillis() / 1000L) == BackNowCycle.POST) {
                             postBackNowNotice(app, uid, backNow.reconnectAt(), SaveMode.backNowBody(pollDaemon("GET-SAVE-MODE\n"), unmeteredCtx(app)));
                             backNowShownForUid = uid; // cleared once a seal from after the reconnect lands (below)
+                            idleTrace("backnow post user=" + uid + " at=" + backNow.reconnectAt());
                         }
                     }
                 }
@@ -11686,10 +11744,17 @@ public class ChooserActivity extends Activity {
                 // Residuals: the cycle lives in this thread's memory, so a chooser restart mid-cycle leaves the
                 // notice until the next drop's cycle clears it or the session ends; a tap whose seal and every
                 // later seal fail keeps "Backing up" beside "Not backed up".
-                if (backNow.awaitingLanded()
-                        && backNow.onReply(pollDaemon("GET-SEAL-LANDED\n").trim()) == BackNowCycle.CANCEL) {
-                    cancelBackNowNotice(app, uid);
-                    backNowShownForUid = -1;
+                // NWP-20261204-03: one read per tick; each new stamp it shows and the cancel go to login.log
+                // (IDLE-TRACE `backnow landed s= at=`, `backnow cancel s=`), read before onReply resets reconnectAt.
+                if (backNow.awaitingLanded()) {
+                    String reply = pollDaemon("GET-SEAL-LANDED\n").trim();
+                    long st = BackNowCycle.landedStamp(reply);
+                    if (backNow.landedChanged(st)) idleTrace("backnow landed user=" + uid + " s=" + st + " at=" + backNow.reconnectAt());
+                    if (backNow.onReply(reply) == BackNowCycle.CANCEL) {
+                        cancelBackNowNotice(app, uid);
+                        idleTrace("backnow cancel user=" + uid + " s=" + st);
+                        backNowShownForUid = -1;
+                    }
                 }
                 // Device-storage warning (#82): local statfs of /data (no daemon, no network). Warn at >=80%
                 // full, clear below 77% (hysteresis). This is DEVICE storage, distinct from the store quota.
@@ -12301,6 +12366,19 @@ public class ChooserActivity extends Activity {
         }
     }
 
+    /** The "Back up now" action's PendingIntent, created from the USER-0 context <app>: getBroadcast delivers to its
+     *  creator's user, so the tap reaches the user-0 chooser's BackupNowReceiver, which posts every NOTIF_BACKNOW_ID state
+     *  into roamed user <uid> as the watcher's own app uid (NWP-20261204-02). Request code = <uid>, so two sessions'
+     *  intents stay distinct. */
+    private static android.app.PendingIntent backNowTapIntent(Context app, int uid, long reconnectAt) {
+        Intent tap = new Intent(app, BackupNowReceiver.class);
+        tap.putExtra(BackupNowReceiver.EXTRA_BACKNOW_UID, uid);
+        if (reconnectAt > 0) tap.putExtra(BackupNowReceiver.EXTRA_RECONNECT_AT, reconnectAt);
+        return android.app.PendingIntent.getBroadcast(app, uid,
+                tap,
+                android.app.PendingIntent.FLAG_UPDATE_CURRENT | android.app.PendingIntent.FLAG_IMMUTABLE);
+    }
+
     /** Post the "back online — Back up now" prompt (ALERTING once) after a mid-session drop, in roamed user
      *  <uid>'s shade. The action seals the LIVE session IN PLACE (BACKUP) -- it does NOT discard it like the
      *  #49 "Load my saved data" (RELOGIN) path, so the unsynced changes are preserved. Auto-clears when the
@@ -12311,11 +12389,7 @@ public class ChooserActivity extends Activity {
             android.app.NotificationManager nm = uc.getSystemService(android.app.NotificationManager.class);
             if (nm == null) return;
             createBackNowChannel(nm);
-            Intent tap = new Intent(uc, BackupNowReceiver.class);
-            if (reconnectAt > 0) tap.putExtra(BackupNowReceiver.EXTRA_RECONNECT_AT, reconnectAt);
-            android.app.PendingIntent pi = android.app.PendingIntent.getBroadcast(uc, 0,
-                    tap,
-                    android.app.PendingIntent.FLAG_UPDATE_CURRENT | android.app.PendingIntent.FLAG_IMMUTABLE);
+            android.app.PendingIntent pi = backNowTapIntent(app, uid, reconnectAt);
             android.app.Notification n = new android.app.Notification.Builder(uc, NOTIF_BACKNOW_CHANNEL)
                     .setSmallIcon(R.drawable.ic_backup_warn)
                     .setContentTitle("Back online")
@@ -12333,8 +12407,8 @@ public class ChooserActivity extends Activity {
         }
     }
 
-    /** Create the "Back online" channel in the user <nm> belongs to; idempotent. A notification posted from a roamed
-     *  user's own process (BackupNowReceiver) needs it there: the channel was only ever created from user 0. */
+    /** Create the "Back online" channel in the user <nm> belongs to; idempotent. Every NOTIF_BACKNOW_ID poster calls it
+     *  before notify, so the channel exists in that roamed user whichever state is posted first. */
     private static void createBackNowChannel(android.app.NotificationManager nm) {
         android.app.NotificationChannel ch = new android.app.NotificationChannel(
                 NOTIF_BACKNOW_CHANNEL, "Back online", android.app.NotificationManager.IMPORTANCE_DEFAULT);
@@ -12342,10 +12416,12 @@ public class ChooserActivity extends Activity {
         nm.createNotificationChannel(ch);
     }
 
-    /** Replace the "Back up now" prompt with a transient "Saving…" state (no action) so the tap gives
-     *  feedback; the watcher clears it once the seal reports OK. Called by BackupNowReceiver. */
-    static void postSavingNotice(Context uc, int uid) {
+    /** Replace the "Back up now" prompt with a transient "Saving…" state (no action) so the tap gives feedback; the
+     *  watcher clears it once the save lands. Posts into roamed user <uid> from the user-0 process, as the watcher's uid,
+     *  so it replaces the prompt (NWP-20261204-02). Called by BackupNowReceiver. */
+    static void postSavingNotice(Context app, int uid) {
         try {
+            Context uc = app.createContextAsUser(android.os.UserHandle.of(uid), 0);
             android.app.NotificationManager nm = uc.getSystemService(android.app.NotificationManager.class);
             if (nm == null) return;
             createBackNowChannel(nm);
@@ -12363,17 +12439,15 @@ public class ChooserActivity extends Activity {
     }
 
     /** Put the "Back up now" prompt back after a tap that neither started nor joined a save: the same notification, action
-     *  included so a second tap is possible, with <body> saying what refused it. Called by BackupNowReceiver. */
-    static void postBackNowRefused(Context uc, String body, long reconnectAt) {
+     *  included so a second tap is possible, with <body> saying what refused it. Posts into roamed user <uid> from the
+     *  user-0 process, as the watcher's uid (NWP-20261204-02). Called by BackupNowReceiver. */
+    static void postBackNowRefused(Context app, int uid, String body, long reconnectAt) {
         try {
+            Context uc = app.createContextAsUser(android.os.UserHandle.of(uid), 0);
             android.app.NotificationManager nm = uc.getSystemService(android.app.NotificationManager.class);
             if (nm == null) return;
             createBackNowChannel(nm);
-            Intent tap = new Intent(uc, BackupNowReceiver.class);
-            if (reconnectAt > 0) tap.putExtra(BackupNowReceiver.EXTRA_RECONNECT_AT, reconnectAt);
-            android.app.PendingIntent pi = android.app.PendingIntent.getBroadcast(uc, 0,
-                    tap,
-                    android.app.PendingIntent.FLAG_UPDATE_CURRENT | android.app.PendingIntent.FLAG_IMMUTABLE);
+            android.app.PendingIntent pi = backNowTapIntent(app, uid, reconnectAt);
             android.app.Notification n = new android.app.Notification.Builder(uc, NOTIF_BACKNOW_CHANNEL)
                     .setSmallIcon(R.drawable.ic_backup_warn)
                     .setContentTitle("Back online")
@@ -12391,10 +12465,12 @@ public class ChooserActivity extends Activity {
         }
     }
 
-    /** Clear the "Backing up" state when the tap found nothing to save (NONE / LOCAL). Called by BackupNowReceiver,
-     *  which cannot reach NOTIF_BACKNOW_ID. */
-    static void clearBackNowNotice(Context uc) {
+    /** Clear the "Backing up" state from roamed user <uid>'s shade when the tap found nothing to save (NONE / LOCAL).
+     *  Cancels from the user-0 process, so it removes the watcher's own record (NWP-20261204-02). Called by
+     *  BackupNowReceiver. */
+    static void clearBackNowNotice(Context app, int uid) {
         try {
+            Context uc = app.createContextAsUser(android.os.UserHandle.of(uid), 0);
             android.app.NotificationManager nm = uc.getSystemService(android.app.NotificationManager.class);
             if (nm != null) nm.cancel(NOTIF_BACKNOW_ID);
         } catch (Throwable t) {
@@ -12506,7 +12582,11 @@ public class ChooserActivity extends Activity {
      *  spaces). Determinate bar when the total is known; indeterminate otherwise. NWP-20261202-28: or mediad's
      *  "RESTORING <done B> <total B> <files left>" line -> MediaStatus.RESTORING_TITLE with a byte bar, no advisory
      *  and no file name; a RESTORING line MediaStatus.restoring refuses posts nothing. */
-    private static void postMediaNotice(Context app, int uid, String status) {
+    private static void postMediaNotice(Context app, int uid, String status) { postMediaNotice(app, uid, status, false); }
+
+    /** postMediaNotice with the parked state (NWP-20261207-11): when waiting, the RESTORING form's body reads
+     *  MediaStatus.WAITING_BODY in place of the byte count; the title and the bar stay. */
+    private static void postMediaNotice(Context app, int uid, String status, boolean waiting) {
         try {
             long[] rest = null;
             if (status.startsWith("RESTORING")) {
@@ -12538,7 +12618,7 @@ public class ChooserActivity extends Activity {
             String title = rest != null ? MediaStatus.RESTORING_TITLE
                     : prefetch ? "Downloading offline media"
                     : (fname.isEmpty() ? "Loading your media" : "Loading " + prettyMediaName(fname));
-            String body = rest != null ? humanBytes(done) + " / " + humanBytes(total)
+            String body = rest != null ? (waiting ? MediaStatus.WAITING_BODY : humanBytes(done) + " / " + humanBytes(total))
                     : prefetch ? "Getting your maps & files ready to use offline"
                     : ((total > 0 ? humanBytes(done) + " / " + humanBytes(total) : humanBytes(done))
                        + (nfiles > 1 ? "  (+" + (nfiles - 1) + " more)" : ""));
@@ -12837,6 +12917,13 @@ public class ChooserActivity extends Activity {
                         // Released after the ACK -- once the work this lock exists for is actually done.
                         // COLD_WAKE_MS is the backstop for every path that never reaches that ack.
                         coldWakeAcquire(app);
+                        // NWP-20261207-10: read the gate alarm stash again. The daemon publishes LOCK only after
+                        // the at-lock relay ended (endAtLockRelay), so this read sees it, also when the gate read
+                        // the stash before the lock began (a hand-switch or a Q087 re-park: no onResume follows
+                        // that SWITCH). The read is one-shot: after a normal lock whose onResume read consumed it,
+                        // this one answers 0 and does nothing. Once per LOCK, a redelivered LOCK included (0).
+                        // Its own thread, so the poll cadence is unchanged.
+                        scheduleGateAlarmFromDaemon(app);
                         main.post(() -> {
                             try { doColdLock(app, uid); ackReap("LOCK", uid); }
                             finally { coldWakeRelease(); }
@@ -13044,6 +13131,22 @@ public class ChooserActivity extends Activity {
     /** One short request/reply to the daemon (used by the reap watcher's poll + coldWipe's re-check). #77:
      *  bounded connect via DaemonSocket -- a wedged daemon here would otherwise stall the reap poll forever (a
      *  queued logoff never reaps) or block the 12h hard-wipe; now it just returns "" and the caller retries. */
+    /** NWP-20261114-34: start the session's media rescan (CredentialService rescanmedia, which calls MediaProvider's
+     *  scan_volume as the session's user) after mediad reported newly landed files. startServiceAsUser, the proven
+     *  cross-user start; it returns null when the user is not up, which is logged and left to the next landing or
+     *  sign-in. */
+    private static void requestMediaRescan(Context app, int uid, String count) {
+        try {
+            android.content.ComponentName cn = app.startServiceAsUser(
+                    new android.content.Intent(app, CredentialService.class).putExtra("rescanmedia", true),
+                    android.os.UserHandle.of(uid));
+            android.util.Log.i("NowhereChooser", "media rescan requested after background landing " + count
+                    + " (user " + uid + ", " + (cn != null ? "started" : "not started") + ") (NWP-20261114-34)");
+        } catch (Throwable t) {
+            android.util.Log.w("NowhereChooser", "media rescan request failed (user " + uid + ") (NWP-20261114-34)", t);
+        }
+    }
+
     private static String pollDaemon(String msg) {
         return DaemonSocket.roundTrip(msg, 5000);
     }
@@ -14300,11 +14403,14 @@ public class ChooserActivity extends Activity {
                 pathBefore = createContextAsUser(android.os.UserHandle.of(uid), 0)
                         .getPackageManager().getApplicationInfo(pkg, 0).sourceDir;
             } catch (Throwable notInstalled) { }
+            // NWP-20261207-09: the receiver outlives a gate recreate(); an Activity's receivers are dropped when it is
+            // destroyed, and the login worker is still waiting on this one.
+            final android.content.Context rxCtx = getApplicationContext();
             android.content.IntentFilter fl = new android.content.IntentFilter(action);
             if (android.os.Build.VERSION.SDK_INT >= 33)
-                registerReceiver(rcv, fl, android.content.Context.RECEIVER_NOT_EXPORTED);
+                rxCtx.registerReceiver(rcv, fl, android.content.Context.RECEIVER_NOT_EXPORTED);
             else
-                registerReceiver(rcv, fl);
+                rxCtx.registerReceiver(rcv, fl);
             try {
                 android.app.PendingIntent pend = android.app.PendingIntent.getBroadcast(this, sid,
                         new android.content.Intent(action).setPackage(getPackageName()),
@@ -14324,7 +14430,7 @@ public class ChooserActivity extends Activity {
                 if (outcome == InstallWait.Outcome.LANDED) st[0] = android.content.pm.PackageInstaller.STATUS_SUCCESS;
                 if (outcome != InstallWait.Outcome.BROADCAST) stMsg[0] = InstallWait.message(outcome);
             } finally {
-                try { unregisterReceiver(rcv); } catch (Throwable ignore) {}
+                try { rxCtx.unregisterReceiver(rcv); } catch (Throwable ignore) {}
             }
             if (st[0] != android.content.pm.PackageInstaller.STATUS_SUCCESS)
                 android.util.Log.w("NowhereChooser", "installApkSet " + pkg + " failed status=" + st[0]
@@ -14439,9 +14545,12 @@ public class ChooserActivity extends Activity {
                 latch.countDown();
             }
         };
+        // NWP-20261207-09: the receiver outlives a gate recreate(); an Activity's receivers are dropped when it is
+        // destroyed, and the login worker is still waiting on this one.
+        final android.content.Context rxCtx = getApplicationContext();
         android.content.IntentFilter fl = new android.content.IntentFilter(action);
-        if (android.os.Build.VERSION.SDK_INT >= 33) registerReceiver(rcv, fl, android.content.Context.RECEIVER_NOT_EXPORTED);
-        else registerReceiver(rcv, fl);
+        if (android.os.Build.VERSION.SDK_INT >= 33) rxCtx.registerReceiver(rcv, fl, android.content.Context.RECEIVER_NOT_EXPORTED);
+        else rxCtx.registerReceiver(rcv, fl);
         try {
             android.app.PendingIntent pend = android.app.PendingIntent.getBroadcast(this, Math.abs(pkg.hashCode()),
                     new android.content.Intent(action).setPackage(getPackageName()),
@@ -14449,7 +14558,7 @@ public class ChooserActivity extends Activity {
             pi.installPackageArchived(api, p, pend.getIntentSender());
             latch.await(120, java.util.concurrent.TimeUnit.SECONDS);
         } finally {
-            try { unregisterReceiver(rcv); } catch (Throwable ignore) {}
+            try { rxCtx.unregisterReceiver(rcv); } catch (Throwable ignore) {}
         }
         // Installed archived DIRECTLY for the roamed user -- no installExistingPackageAsUser needed (that would
         // re-add it as a normal, APK-less package and break the archived-tap flow).

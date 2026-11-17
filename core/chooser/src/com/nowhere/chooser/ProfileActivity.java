@@ -126,12 +126,21 @@ public class ProfileActivity extends Activity {
     // when that screen has no Back link), so pendingBack is null between UI tasks. All UI-thread only, like shownView.
     private Runnable backTarget;
     private Runnable pendingBack;
+    // NWP-20261203-20: showRecovery sets this while it builds the recovery-code screen; setContentView moves it into
+    // FLAG_SECURE (on for that screen, cleared for every next one), so it is false between UI tasks. UI-thread only.
+    private boolean pendingSecure;
     private Object backCallback; // android.window.OnBackInvokedCallback on API 33+, made lazily
     private boolean backRegistered;
 
     @Override
     public void setContentView(android.view.View view) {
         if (getWindow() != null) PassReveal.maskAll(getWindow().getDecorView());
+        boolean secure = pendingSecure;
+        pendingSecure = false;
+        if (getWindow() != null) {
+            if (secure) getWindow().addFlags(android.view.WindowManager.LayoutParams.FLAG_SECURE);
+            else getWindow().clearFlags(android.view.WindowManager.LayoutParams.FLAG_SECURE);
+        }
         shownView = view;
         backTarget = pendingBack;
         pendingBack = null;
@@ -605,16 +614,12 @@ public class ProfileActivity extends Activity {
         card.addView(accentButton("Sign out & install", () -> confirmSignOutAndInstall(local)), btnLp(dp(12)));
     }
 
-    /** NWP-20261011-05: "Sign out &amp; install" -- confirm, record the request with the daemon, then the ordinary
-     *  sign-out. The gate starts the install once the sign-out has saved and removed this session
-     *  (ChooserActivity.maybeInstallAfterLogoff), and a refused sign-out withdraws the request (doLogoffImpl). It is the ONLY caller of
+    /** NWP-20261011-05: the card's "Sign out &amp; install" -- confirm on the routine sheet (SignOutSheets.install,
+     *  NWP-20261206-10), record the request with the daemon, then the ordinary sign-out. The gate starts the install
+     *  once the sign-out has saved and removed this session (ChooserActivity.maybeInstallAfterLogoff), and a refused sign-out withdraws the request (doLogoffImpl). It is the ONLY caller of
      *  doLogoffForInstall: every other sign-out goes through doLogoff(), which withdraws the request first. */
     private void confirmSignOutAndInstall(final boolean local) {
-        new android.app.AlertDialog.Builder(this)
-                .setTitle("Sign out and install?")
-                .setMessage(OtaUpdate.installConfirm(local))
-                .setNegativeButton("Not now", null)
-                .setPositiveButton("Sign out & install", (d, w) -> new Thread(() -> {
+        SheetDialog.confirm(this, SignOutSheets.install(local), new Runnable[] { () -> new Thread(() -> {
                     // Off the UI thread (sendDaemon blocks). If the daemon does not take the request, do NOT sign out:
                     // the user asked for an install, and a bare sign-out would silently be something else.
                     final boolean ok = sendDaemon("OTA-AFTER-LOGOFF\n1 " + android.os.UserHandle.myUserId() + " "
@@ -627,8 +632,7 @@ public class ProfileActivity extends Activity {
                                     android.widget.Toast.LENGTH_LONG).show();
                         }
                     });
-                }, "nowhere-signout-install").start())
-                .show();
+                }, "nowhere-signout-install").start(), null }, null);
     }
 
     /** A titled card of tappable rows (label left, chevron right) with hairline dividers. danger -> red, no chevron. */
@@ -963,12 +967,8 @@ public class ProfileActivity extends Activity {
             }).start();
         }), btnLp(dp(6)));
 
-        ll.addView(accentButton("Send report", () -> new android.app.AlertDialog.Builder(this)
-                .setTitle("Send report?")
-                .setMessage("Your device info and scrubbed diagnostics will be sent to support. This can't be traced "
-                        + "back to you. Continue?")
-                .setNegativeButton("Cancel", (d, w) -> {})
-                .setPositiveButton("Send", (d, w) -> {
+        ll.addView(accentButton("Send report", () -> SheetDialog.confirm(this, ReportRepairSheets.sendReport(),
+                new Runnable[] { () -> {
                     statusTv.setTextColor(MUTED);
                     StatusLine.busy(statusTv, "Sending…");
                     final String noteText = note.getText().toString();
@@ -976,7 +976,7 @@ public class ProfileActivity extends Activity {
                         final String reply = sendDaemon("REPORT-ISSUE\n" + reportRequestJson(noteText, false) + "\n").trim();
                         runOnUiThread(() -> renderReportResult(reply, statusTv, noteText));
                     }).start();
-                }).show()), btnLp(dp(10)));
+                }, null }, null)), btnLp(dp(10)));
 
         ll.addView(statusTv, sglp);
         ticketTable(ll); // past reports (persisted locally, rides the profile seal)
@@ -1375,6 +1375,23 @@ public class ProfileActivity extends Activity {
         } catch (Exception ignore) {}
         // NWP-20261202-29: who holds each default-app role in this user, as a class word, never a package name.
         st.put("default_roles", readDefaultRoles(ctx));
+        // NWP-20261203-07 (backlog: "P1: An Auto sweep stalls after its first fetch ..."): the sweep's state, the frames
+        // of the sweep thread and of a tap holding the materialise lane, and the chooser process's age, so a stalled
+        // sweep's report names the frame it is blocked in and shows a chooser restarted mid-session. Counts, states and
+        // frames only. Every call that can throw runs before the first put, so a throw adds no key.
+        try {
+            SweepSnapshot.Input in = UnarchiveService.snapshot();
+            long now = android.os.SystemClock.elapsedRealtime();
+            String state = SweepSnapshot.state(in, now);
+            String sweepStack = in.sweep == null ? null : SweepSnapshot.frames(in.sweep.getStackTrace());
+            Thread tap = SweepSnapshot.tapHolder(in);
+            String laneStack = tap == null ? null : SweepSnapshot.frames(tap.getStackTrace());
+            String up = String.valueOf((now - android.os.Process.getStartElapsedRealtime()) / 1000);
+            st.put("sweep_state", state);
+            if (sweepStack != null) st.put("sweep_stack", sweepStack);
+            if (laneStack != null) st.put("lane_stack", laneStack);
+            st.put("chooser_up_s", up);
+        } catch (Throwable ignore) {}
         return st;
     }
 
@@ -1659,12 +1676,8 @@ public class ProfileActivity extends Activity {
             appendTicket(ticket, noteText); // persist so the user can track it later
             statusTv.setTextColor(ACCENT);
             statusTv.setText("Sent · " + ticket);
-            new android.app.AlertDialog.Builder(this)
-                    .setTitle("Report sent")
-                    .setMessage("Thanks. Your reference is:\n\n" + ticket + "\n\nQuote it if you follow up with support. "
-                            + "The report is anonymous.")
-                    .setPositiveButton("Done", (d, w) -> showReportIssue()) // re-render so the new row shows in the table
-                    .show();
+            // Got it re-renders so the new row shows in the table; Back or a tap outside only closes, as before.
+            SheetDialog.confirm(this, ReportRepairSheets.reportSent(ticket), new Runnable[] { () -> showReportIssue() }, null);
             return;
         }
         String msg;
@@ -2056,41 +2069,25 @@ public class ProfileActivity extends Activity {
      *  NFC cannot confirm a removal yet, and the daemon's ERR-NOKEY reads "Plug in one of your keys to remove a key." */
     private void confirmRemoveKey(final String credID, String label, boolean last,
                                   final LinearLayout keyList, final Button enroll) {
-        String msg = last
-                ? "This is your only security key. Removing it means signing in needs just your passphrase "
-                  + "again — no key. You can add one back any time. Your recovery code is unchanged."
-                : "Sign-in will still need one of your other keys. Your recovery code is unchanged.";
-        final String tapMsg = last
-                ? "Touch this key to confirm."
-                : "Touch one of your other keys to confirm. The key you're removing doesn't count.";
-        new android.app.AlertDialog.Builder(this)
-                .setTitle("Remove " + label + "?")
-                .setNegativeButton("Keep it", (d, w) -> {})
-                .setPositiveButton("Remove", (d, w) -> new android.app.AlertDialog.Builder(this)
-                        .setTitle("Confirm with a key")
-                        .setMessage(tapMsg)
-                        .setNegativeButton("Cancel", (d2, w2) -> {})
-                        .setPositiveButton("USB-C key", (d2, w2) -> {
-                            final android.app.AlertDialog working =
-                                    showWorking("Plug in your security key and touch it when it blinks.");
-                            // The daemon's REMOVE-FIDO2-KEY deadline is 220 s from when it has READ the request (the
-                            // tap, then the paid vault write): read past it, as ADOPT-FIDO2's caller does.
-                            new Thread(() -> {
-                                final String r = DaemonSocket.roundTrip("REMOVE-FIDO2-KEY\n" + credID + "\n", 230000);
-                                runOnUiThread(() -> {
-                                    // NWP-20261116-29: the text for every reply comes from Fido2KeyList.removeText, and
-                                    // the list is reloaded on EVERY reply. A lost reply ("") can follow a vault write
-                                    // that committed, so the screen shows the daemon's list, never the old one on a guess.
-                                    working.dismiss();
-                                    android.widget.Toast.makeText(this, Fido2KeyList.removeText(r),
-                                            android.widget.Toast.LENGTH_LONG).show();
-                                    loadEnrolledKeys(keyList, enroll);
-                                });
-                            }, "nowhere-fido2-remove").start();
-                        })
-                        .show())
-                .setMessage(msg)
-                .show();
+        SheetDialog.confirm(this, KeyPinSheets.removeKey(label, last), new Runnable[] { null,
+                () -> SheetDialog.confirm(this, KeyPinSheets.confirmWithKey(last), new Runnable[] { () -> {
+                    final android.app.AlertDialog working =
+                            showWorking("Plug in your security key and touch it when it blinks.");
+                    // The daemon's REMOVE-FIDO2-KEY deadline is 220 s from when it has READ the request (the
+                    // tap, then the paid vault write): read past it, as ADOPT-FIDO2's caller does.
+                    new Thread(() -> {
+                        final String r = DaemonSocket.roundTrip("REMOVE-FIDO2-KEY\n" + credID + "\n", 230000);
+                        runOnUiThread(() -> {
+                            // NWP-20261116-29: the text for every reply comes from Fido2KeyList.removeText, and
+                            // the list is reloaded on EVERY reply. A lost reply ("") can follow a vault write
+                            // that committed, so the screen shows the daemon's list, never the old one on a guess.
+                            working.dismiss();
+                            android.widget.Toast.makeText(this, Fido2KeyList.removeText(r),
+                                    android.widget.Toast.LENGTH_LONG).show();
+                            loadEnrolledKeys(keyList, enroll);
+                        });
+                    }, "nowhere-fido2-remove").start();
+                }, null }, null) }, null);
     }
 
     /** #81 item 3 (DIA-20260704-40): the remembered session PIN. A 4-16 digit LOCAL convenience credential --
@@ -2432,14 +2429,8 @@ public class ProfileActivity extends Activity {
         // but until now nothing told the user that clearing the PIN is what disarmed it. Measured cost, from
         // frankel: a PIN cleared on 2026-09-07 for one test left every abort attempt for three days logging
         // "abort skip secure=0", and two cold locks landed in the user’s hand while it did.
-        remove.setOnClickListener(v -> new android.app.AlertDialog.Builder(this)
-                .setTitle("Remove PIN?")
-                .setMessage("Sign-in will have no device credential. That also switches off the safeguard "
-                        + "that cancels a pending cold lock when you pick the phone up — with no credential, "
-                        + "unlocking is only a swipe, so it cannot count as proof it’s you. Expect the phone "
-                        + "to cold-lock in your hand sometimes. You can set a PIN again any time.")
-                .setNegativeButton("Keep it", (d, w) -> {})
-                .setPositiveButton("Remove", (d, w) -> new Thread(() -> {
+        remove.setOnClickListener(v -> SheetDialog.confirm(this, KeyPinSheets.removePin(),
+                new Runnable[] { null, () -> new Thread(() -> {
             final String r = sendDaemon("SET-PIN\n\n").trim(); // empty PIN = clear
             runOnUiThread(() -> {
                 final String err = PinCopy.clearText(r); // NWP-20261124-10: the whole reply, BUSY and no answer included
@@ -2450,8 +2441,7 @@ public class ProfileActivity extends Activity {
                     StatusLine.error(msg, err);
                 }
             });
-        }, "nowhere-clear-pin").start())
-                .show());
+        }, "nowhere-clear-pin").start() }, null));
         new Thread(() -> {
             final String ps = sendDaemon("PIN-STATUS\n").trim();
             final boolean has = "SET".equals(ps);
@@ -2904,18 +2894,13 @@ public class ProfileActivity extends Activity {
     }
 
     private void confirmGoogleSignOut(final android.accounts.Account acct) {
-        new android.app.AlertDialog.Builder(this)
-                .setTitle(GoogleSignOut.ROW_LABEL)
-                .setMessage(GoogleSignOut.CONFIRM)
-                .setNegativeButton("Cancel", null)
-                .setPositiveButton("Sign out", (d, w) -> {
-                    final String hash = GoogleSignOut.markHash(acct.name);
-                    // one sign-out per account at a time, through its removal callback
-                    if (GoogleSignOut.claim(hash)) {
-                        new Thread(() -> signOutGoogle(acct, hash), "nowhere-google-signout").start();
-                    }
-                })
-                .show();
+        SheetDialog.confirm(this, GoogleSheets.signOut(), new Runnable[] { () -> {
+            final String hash = GoogleSignOut.markHash(acct.name);
+            // one sign-out per account at a time, through its removal callback
+            if (GoogleSignOut.claim(hash)) {
+                new Thread(() -> signOutGoogle(acct, hash), "nowhere-google-signout").start();
+            }
+        }, null }, null);
     }
 
     /** Off the UI thread. Mark first; remove the account only if the mark was written. The claim on hash ends in
@@ -4217,10 +4202,15 @@ public class ProfileActivity extends Activity {
         st.setText("Backing up…");
         dataBarIndeterminate(); // #88: show activity immediately; flips to determinate once the seal reports a %
         new Thread(() -> {
-            final DaemonReply br = sendDaemonReply("BACKUP\n");
+            final String[] wait = new String[1];
+            final DaemonReply br = sendDaemonReply("BACKUP\n", wait);
             final String r = br.failed() ? "" : br.text.trim();
             final boolean joined = BackupNowReply.joins(r); // NWP-20261201-09: a save is running; follow it, no retry text
             if (r.startsWith("OK") || joined) {
+                // NWP-20261206-20: during a re-key batch the OK carries "WAIT rekey-batch"; say why the save waits
+                // (DRAFT words in BackupWait). The first SEALING frame with a total below replaces them.
+                final String waitText = joined ? null : BackupWait.text(wait[0]);
+                if (waitText != null) runOnUiThread(() -> st.setText(waitText));
                 // NWP-20260901-28: the poll's exits are now HONEST. The old loop treated null (a failed status
                 // read) identically to DONE and then unconditionally painted "Backed up just now." -- a false
                 // save claim on the one screen whose job is to answer "is it saved?" (design "what it must NOT
@@ -4866,15 +4856,11 @@ public class ProfileActivity extends Activity {
                 .format(new java.util.Date(unixSecs * 1000L));
     }
 
+    /** Ask before rolling back to a retained version, on a warning sheet whose green button keeps the current data
+     *  (NWP-20261205-14). */
     private void confirmRollback(final long version, final String label) {
-        new android.app.AlertDialog.Builder(this)
-                .setTitle("Restore this version?")
-                .setMessage("This rolls your data back to the version saved " + label + ". Your current data on "
-                        + "this device will be discarded and you'll be signed out — sign in again to load the "
-                        + "earlier version.")
-                .setPositiveButton("Restore", (d, w) -> doRollback(version))
-                .setNegativeButton("Cancel", null)
-                .show();
+        SheetDialog.confirm(this, HistorySheets.rollback(label),
+                new Runnable[] { null, () -> doRollback(version) }, null);
     }
 
     /** Send ROLLBACK; on OK the daemon rolls the store head + queues the switch+reap, so the user-0 watcher
@@ -4913,14 +4899,10 @@ public class ProfileActivity extends Activity {
     }
 
     /** Ask before deleting ONE retained version (docs/product-decisions.md 2026-10-19): never the current state, and
-     *  the message promises no size. */
+     *  the sheet promises no size. */
     private void confirmDeleteSnapshot(final long version, final String label) {
-        new android.app.AlertDialog.Builder(this)
-                .setTitle(SnapshotCopy.confirmTitle())
-                .setMessage(SnapshotCopy.confirmMessage(label))
-                .setPositiveButton("Delete", (d, w) -> doDeleteSnapshot(version))
-                .setNegativeButton("Cancel", null)
-                .show();
+        SheetDialog.confirm(this, HistorySheets.delete(label), new Runnable[] { () -> doDeleteSnapshot(version), null },
+                null);
     }
 
     /** Send DELETE-SNAPSHOT. The session carries on (no sign-out), and showSnapshots() runs on EVERY reply so the
@@ -5006,23 +4988,17 @@ public class ProfileActivity extends Activity {
      *  sessions will not carry it either. That is stated here, because "its data from this session" alone
      *  would understate what the user is agreeing to. */
     private void confirmDropAndSignOut(String[] pkgs, String who, String one, boolean restSaved) {
-        new android.app.AlertDialog.Builder(this)
-                .setTitle("Sign out without " + one + "?")
-                .setMessage(who + "'s data from this session will NOT be saved, and cannot be recovered.\n\n"
-                        + one + " stays switched off for this profile until you turn it back on in Your apps, "
-                        + "so later sessions will not carry it either."
-                        // NWP-20261010-10: claimed only when the refusal named nothing but unreadable apps.
-                        + (restSaved ? "\n\nEverything else in this session is saved either way." : ""))
+        // NWP-20261010-10: claimed only when the refusal named nothing but unreadable apps.
+        SheetDialog.confirm(this, SealRefusedSheets.drop(who, one, pkgs.length > 1, restSaved), new Runnable[] {
                 // NWP-20261029-19 (row "Three UI-thread paths still wait on `APPKEEP_LOCK`"): recordTurnedOff takes
                 // StoreInstaller.APPKEEP_LOCK, a leaf held for milliseconds -- but this path must not wait on it
                 // from the main thread, so the records run on a worker and the logoff (it builds views) follows
                 // the LAST record back on the UI thread.
-                .setPositiveButton("Drop " + one + " and sign out", (d2, w2) -> new Thread(() -> {
+                () -> new Thread(() -> {
                     for (String pkg : pkgs) recordTurnedOff(pkg);
                     runOnUiThread(this::doLogoff); // the next seal excludes them via the drop list -- no override, a real re-seal
-                }, "nowhere-dropsignout").start())
-                .setNegativeButton("Back", (d2, w2) -> showSealRefusedDialog(pkgs, restSaved))
-                .show();
+                }, "nowhere-dropsignout").start(),
+                () -> showSealRefusedDialog(pkgs, restSaved) }, null);
     }
 
     /**
@@ -5180,24 +5156,14 @@ public class ProfileActivity extends Activity {
      * very action being confirmed.
      */
     private void confirmRelease(final String pkg, String what, boolean all) {
-        final String it = all ? "them" : "it";
-        new android.app.AlertDialog.Builder(this)
-                .setTitle(all ? "Release " + what + "?" : "Release " + what + "?")
-                .setMessage("Your other device will be able to open " + it + ". Nothing is deleted and "
-                        + what + " keeps working here." + "\n\n"
-                        + "If your other device then opens " + it + ", " + it + " becomes held THERE — and "
-                        + "you won't be able to open " + it + " here until that device lets go." + "\n\n"
-                        + "Either way it takes a few minutes to reach your other device.")
-                .setPositiveButton("Release", (d, w) -> {
-                    new Thread(() -> {
-                        AppHeld.release(this, pkg);
-                        runOnUiThread(this::showHeldApps);
-                    }, "nowhere-heldrelease").start();
-                    android.widget.Toast.makeText(this, "Released. It takes a few minutes to reach your "
-                            + "other device.", android.widget.Toast.LENGTH_LONG).show();
-                })
-                .setNegativeButton("Keep holding", null)
-                .show();
+        SheetDialog.confirm(this, SignOutSheets.release(what, all), new Runnable[] { () -> {
+            new Thread(() -> {
+                AppHeld.release(this, pkg);
+                runOnUiThread(this::showHeldApps);
+            }, "nowhere-heldrelease").start();
+            android.widget.Toast.makeText(this, "Released. It takes a few minutes to reach your "
+                    + "other device.", android.widget.Toast.LENGTH_LONG).show();
+        }, null }, null);
     }
 
     private void showSealRefusedDialog(String[] pkgs, boolean restSaved) {
@@ -5208,21 +5174,11 @@ public class ProfileActivity extends Activity {
         }
         final String who = names.toString();
         final String one = pkgs.length == 1 ? who : "these apps";
-        new android.app.AlertDialog.Builder(this)
-                .setTitle(who + (pkgs.length == 1 ? " is blocking sign-out" : " are blocking sign-out"))
-                .setMessage("Nowhere couldn't read some of " + who + "'s files, so it can't save this session "
-                        + "safely and has not signed you out.\n\n"
-                        // NWP-20261010-10: "IS saved" only when the refusal named nothing else (blindRestSaved), and
-                        // "intact" rather than "unchanged": the scopes that sealed in this attempt changed it.
-                        + (restSaved ? "Everything else in your session IS saved, and your stored copy is intact.\n\n"
-                                     : "Not everything else in your session could be saved either, but your stored "
-                                       + "copy is intact.\n\n")
-                        + "You can sign out without " + one + ". If you do, " + one + " is switched off for this "
-                        + "profile and its data from this session is NOT kept.")
-                .setPositiveButton("Sign out without " + one, (d, w) -> confirmDropAndSignOut(pkgs, who, one, restSaved))
-                .setNeutralButton("Report this", (d, w) -> showReportIssue())
-                .setNegativeButton("Stay signed in", null)
-                .show();
+        // NWP-20261010-10: "IS saved" only when the refusal named nothing else (blindRestSaved), and
+        // "intact" rather than "unchanged": the scopes that sealed in this attempt changed it.
+        SheetDialog.confirm(this, SealRefusedSheets.refused(who, one, pkgs.length > 1, restSaved),
+                new Runnable[] { null, () -> confirmDropAndSignOut(pkgs, who, one, restSaved), () -> showReportIssue() },
+                null);
     }
 
     /** NWP-20261010-10: the daemon's account of the session's last refused sign-out and its run of failed media
@@ -5302,7 +5258,8 @@ public class ProfileActivity extends Activity {
 
     /** A plain message dialog that stays until it is answered. */
     private void showNotice(String msg) {
-        new android.app.AlertDialog.Builder(this).setMessage(msg).setCancelable(false).setPositiveButton("OK", null).show();
+        android.app.Dialog d = SheetDialog.confirm(this, NoticeSheets.notDone(msg), null, null);
+        if (d != null) d.setCancelable(false);
     }
 
     /** NWP-20261010-10: the busy state while a sign-out exit runs. Without it the screen showed nothing for up to the
@@ -5663,6 +5620,13 @@ public class ProfileActivity extends Activity {
             AppHeld.releaseForSignOut(this);
             captureAppList(); // snapshot the user's apps so they roam + reprovision on the next login
             captureAppCode(); // #199: snapshot the CODE (APK paths) of opted-in user-installed apps so they roam too
+            // NWP-20261203-24: "2026-09-26 — DECIDED: an app switched Off leaves the store at the next roam, exactly
+            // like an app that was never kept". An app this sign-in restored installed with no keep line now is
+            // recorded Off, so a head that already carries an unkept app drops its code at THIS sign-out:
+            // captureAppDrops and roamd's appoff INTERSECT appdrop run after it. A missing restored list heals
+            // nothing (the safe direction). Residual: a package another handset kept but this handset's roamed
+            // keep-set lacks is recorded Off here only if this sign-in restored it while that keep-set did not keep it.
+            recordUnkeptRestoredOff();
             captureAppDrops(); // DIA-20260804-04: name the switched-OFF apps so the seal stops carrying their data
             if (clearedStorageThisSession) {
                 // DIA-20260804-05: re-declare the shrink intent right before the seal that can act on it. A
@@ -6136,8 +6100,10 @@ public class ProfileActivity extends Activity {
     }
 
     private String pendingSavePass; // #101: the ceremony's typed pass -- survives the Add-credits detour
+    private volatile String saveAckReply; // NWP-20261204-09: null = not read yet
 
     private void showSaveCeremony() {
+        saveAckReply = null; // NWP-20261204-09: not read yet -- every entry re-reads the gate
         LinearLayout ll = menuScreen("Save to your store",
                 "choose the passphrase this profile opens with — you'll type it at every sign-in");
 
@@ -6210,6 +6176,20 @@ public class ProfileActivity extends Activity {
             });
         }).start());
 
+        // NWP-20261204-09 (docs/product-decisions.md, 2026-11-10, "three answers to harvest 63", answer 2): the save asks
+        // for the first-boot screen's lost-passphrase acknowledgement, behind the same one gate (OsAgreement.saveStep).
+        // Unticked and hidden here; readSaveAckGate shows it through OsAgreement.saveAckShown. Nothing records the tick.
+        final android.widget.CheckBox ack = new android.widget.CheckBox(this);
+        ack.setText(OsAgreement.createAckText());
+        ack.setTextColor(MUTED);
+        ack.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        ack.setChecked(false);
+        ack.setVisibility(View.GONE);
+        LinearLayout.LayoutParams aklp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        aklp.topMargin = dp(14);
+        ll.addView(ack, aklp);
+        readSaveAckGate(ack);
+
         final Button save = accentBtn("Save");
         LinearLayout.LayoutParams alp = new LinearLayout.LayoutParams(MATCH, WRAP);
         alp.topMargin = dp(18);
@@ -6224,6 +6204,22 @@ public class ProfileActivity extends Activity {
             }
             if (pw.isEmpty()) {
                 hint.setText("• type a passphrase (or generate one)");
+                hint.setTextColor(MUTED);
+                hint.setVisibility(android.view.View.VISIBLE);
+                return;
+            }
+            // NWP-20261204-09: the lost-passphrase acknowledgement, behind the OS agreement gate (OsAgreement.saveStep)
+            final int ackStep = OsAgreement.saveStep(saveAckReply, ack.isChecked());
+            if (ackStep == OsAgreement.CREATE_WAIT) {
+                hint.setText(OsAgreement.SAVE_WAIT_TEXT);
+                hint.setTextColor(MUTED);
+                hint.setVisibility(android.view.View.VISIBLE);
+                readSaveAckGate(ack);
+                return;
+            }
+            if (ackStep == OsAgreement.CREATE_ASK) {
+                ack.setVisibility(View.VISIBLE);
+                hint.setText(OsAgreement.SAVE_ACK_NEED);
                 hint.setTextColor(MUTED);
                 hint.setVisibility(android.view.View.VISIBLE);
                 return;
@@ -6246,6 +6242,17 @@ public class ProfileActivity extends Activity {
         sc.setBackgroundColor(BG);
         sc.addView(ll);
         setContentView(sc);
+    }
+
+    /** NWP-20261204-09: read the OS agreement gate for the save ceremony off the UI thread, then show or hide its box.
+     *  Any failure stores "" (hides the box, as on the first-boot screen); the reply is never stored as null here. */
+    private void readSaveAckGate(final android.widget.CheckBox box) {
+        new Thread(() -> {
+            String r;
+            try { r = DaemonSocket.roundTrip("GET-OS-AGREEMENT\n", 5000); } catch (Throwable t) { r = ""; }
+            saveAckReply = r == null ? "" : r;
+            runOnUiThread(() -> box.setVisibility(OsAgreement.saveAckShown(saveAckReply) ? View.VISIBLE : View.GONE));
+        }, "nowhere-saveack").start();
     }
 
     /** A masked passphrase field styled like the other Profile inputs. */
@@ -6299,17 +6306,18 @@ public class ProfileActivity extends Activity {
                 android.widget.Toast.makeText(this, PromoteCopy.text(r), android.widget.Toast.LENGTH_LONG).show();
                 showConfirm();
                 break;
-            case EXISTS:
+            case EXISTS: {
                 // NWP-20261003-02: the same next step as the gate's EXISTS message (ChooserActivity), same vocabulary
                 // as the storefront's restore page. A DIALOG, not a Toast: Android 12+ cuts a text toast to two lines,
                 // which drops exactly the next step this message exists to give. The ceremony reopens when it is
-                // dismissed (OK or back), so a different passphrase still saves and the two never stack.
-                new android.app.AlertDialog.Builder(this)
-                        .setMessage(PromoteCopy.text(r))
-                        .setPositiveButton("OK", null)
-                        .setOnDismissListener(d -> showSaveCeremony())
-                        .show();
+                // dismissed (Got it or back), so a different passphrase still saves and the two never stack.
+                // NWP-20261206-08: a routine sheet with one Got it (NoticeSheets); SheetDialog sets no dismiss
+                // listener of its own, so Got it, back and a touch outside each reopen the ceremony once.
+                android.app.Dialog d =
+                        SheetDialog.confirm(this, NoticeSheets.saveExists(PromoteCopy.text(r)), null, null);
+                if (d != null) d.setOnDismissListener(x -> showSaveCeremony());
                 break;
+            }
             case ALREADY:
                 sessionType = "STORED"; showConfirm(); // already saved -> just refresh
                 break;
@@ -6319,17 +6327,16 @@ public class ProfileActivity extends Activity {
                 // pass rides pendingSavePass through the detour). (DIA-20260629-06)
                 showAddCreditsForSave();
                 break;
-            case SPLIT:
+            case SPLIT: {
                 // ERR-SESSION: the screen lock took the NEW passphrase and the session marker did not; nothing was
                 // saved. A retry would re-key from the old passphrase and fail for ever, so say what happened (a
-                // dialog, for the same two-line reason as EXISTS) and return to the Profile hub.
+                // sheet, for the same two-line reason as EXISTS) and return to the Profile hub.
                 pendingSavePass = null;
-                new android.app.AlertDialog.Builder(this)
-                        .setMessage(PromoteCopy.text(r))
-                        .setPositiveButton("OK", null)
-                        .setOnDismissListener(d -> showConfirm())
-                        .show();
+                android.app.Dialog d =
+                        SheetDialog.confirm(this, NoticeSheets.saveSplit(PromoteCopy.text(r)), null, null);
+                if (d != null) d.setOnDismissListener(x -> showConfirm());
                 break;
+            }
         }
     }
 
@@ -6395,6 +6402,7 @@ public class ProfileActivity extends Activity {
         android.widget.ScrollView sc = new android.widget.ScrollView(this);
         sc.setBackgroundColor(BG);
         sc.addView(ll);
+        pendingSecure = true; // NWP-20261203-20: the recovery code stays out of the Recents thumbnail and screenshots
         setContentView(sc);
     }
 
@@ -7863,45 +7871,38 @@ public class ProfileActivity extends Activity {
             if (WalletRepairCopy.offerRepair(repairCheck)) runOnUiThread(() -> {
                 if (isFinishing() || isDestroyed() || repair[0] != null) return;
                 repair[0] = secondaryButton(WalletRepairCopy.BUTTON_LABEL, () -> {
-                    android.app.AlertDialog dlg = new android.app.AlertDialog.Builder(this)
-                            .setTitle(WalletRepairCopy.TITLE)
-                            .setMessage(WalletRepairCopy.MESSAGE)
-                            .setNegativeButton(WalletRepairCopy.NEGATIVE, (d, w) -> {})
-                            // Disabled here, on the UI thread, BEFORE CONFIRM is sent: a second dialog (a double
-                            // tap) sends nothing while a CONFIRM is in flight, nor after a repair removed the button.
-                            .setPositiveButton(WalletRepairCopy.POSITIVE, (d, w) -> {
-                                if (repair[0] == null || !repair[0].isEnabled()) return;
-                                repair[0].setEnabled(false);
-                                new Thread(() -> {
-                                    final String r = sendDaemon(WalletRepairCopy.CONFIRM_REQUEST);
-                                    runOnUiThread(() -> {
-                                        if (isFinishing() || isDestroyed() || repair[0] == null) return;
-                                        final boolean keep = WalletRepairCopy.keepButton(r);
-                                        if (repairNote[0] != null) { ll.removeView(repairNote[0]); repairNote[0] = null; }
-                                        if (WalletRepairCopy.repaired(r)) {
-                                            // CONFIRM writes only the proof and the seen-set, never the wallet,
-                                            // so the summary repaints from its last reply. A second GET-BILLING
-                                            // that failed ("") would paint a live plan as the free tier, and
-                                            // every GET-USAGE repaint after it would repeat that.
-                                            if (lastBill[0] != null) body.setText(formatBilling(lastBill[0], lastEnt[0]));
-                                        } else {
-                                            repairNote[0] = new TextView(this);
-                                            repairNote[0].setTextColor(MUTED);
-                                            repairNote[0].setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
-                                            repairNote[0].setGravity(Gravity.CENTER);
-                                            StatusLine.error(repairNote[0], WalletRepairCopy.reasonLine(r));
-                                            final int at = keep ? ll.indexOfChild(repair[0]) : ll.indexOfChild(body);
-                                            ll.addView(repairNote[0], at + 1, btnLp(dp(8)));
-                                        }
-                                        if (keep) { repair[0].setEnabled(true); return; }
-                                        ll.removeView(repair[0]);
-                                        repair[0] = null;
-                                    });
-                                }, "nowhere-wallet-repair").start();
-                            })
-                            .show();
-                    android.widget.Button neg = dlg.getButton(android.content.DialogInterface.BUTTON_NEGATIVE);
-                    if (neg != null) neg.requestFocus(); // Cancel is the default
+                    // Disabled here, on the UI thread, BEFORE CONFIRM is sent: a second sheet (a double
+                    // tap) sends nothing while a CONFIRM is in flight, nor after a repair removed the button.
+                    SheetDialog.confirm(this, ReportRepairSheets.repairCredit(), new Runnable[] { null, () -> {
+                        if (repair[0] == null || !repair[0].isEnabled()) return;
+                        repair[0].setEnabled(false);
+                        new Thread(() -> {
+                            final String r = sendDaemon(WalletRepairCopy.CONFIRM_REQUEST);
+                            runOnUiThread(() -> {
+                                if (isFinishing() || isDestroyed() || repair[0] == null) return;
+                                final boolean keep = WalletRepairCopy.keepButton(r);
+                                if (repairNote[0] != null) { ll.removeView(repairNote[0]); repairNote[0] = null; }
+                                if (WalletRepairCopy.repaired(r)) {
+                                    // CONFIRM writes only the proof and the seen-set, never the wallet,
+                                    // so the summary repaints from its last reply. A second GET-BILLING
+                                    // that failed ("") would paint a live plan as the free tier, and
+                                    // every GET-USAGE repaint after it would repeat that.
+                                    if (lastBill[0] != null) body.setText(formatBilling(lastBill[0], lastEnt[0]));
+                                } else {
+                                    repairNote[0] = new TextView(this);
+                                    repairNote[0].setTextColor(MUTED);
+                                    repairNote[0].setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+                                    repairNote[0].setGravity(Gravity.CENTER);
+                                    StatusLine.error(repairNote[0], WalletRepairCopy.reasonLine(r));
+                                    final int at = keep ? ll.indexOfChild(repair[0]) : ll.indexOfChild(body);
+                                    ll.addView(repairNote[0], at + 1, btnLp(dp(8)));
+                                }
+                                if (keep) { repair[0].setEnabled(true); return; }
+                                ll.removeView(repair[0]);
+                                repair[0] = null;
+                            });
+                        }, "nowhere-wallet-repair").start();
+                    } }, null);
                 });
                 ll.addView(repair[0], ll.indexOfChild(body) + 1, btnLp(dp(8)));
             });
@@ -8455,18 +8456,11 @@ public class ProfileActivity extends Activity {
     /** The stop-keeping confirm. Its whole job is to be accurate about a change that LOOKS destructive and is
      *  not: nothing is deleted, the app keeps working, and the effect lands at logoff. */
     private void confirmStopKeeping(final String pkg, final Runnable repaint) {
-        new android.app.AlertDialog.Builder(this)
-                .setTitle("Stop keeping " + keptLabel(pkg) + "?")
-                // "stops counting" would be false even when everything works: the vault keeps recent
-                // snapshots (#58 rollback) and those still lease the dropped chunks, so what the plan counts
-                // falls gradually as they age out -- not at the next logoff.
-                .setMessage("It stays on this phone and keeps working until you log off. It just won't come "
-                        + "back on your next phone. Its data stops being carried when you log off — what "
-                        + "your plan counts then takes a few days to drop, because recent backups are kept "
-                        + "for a while.")
-                .setPositiveButton("Stop keeping it", (d, w) -> applyStorageDrop(pkg, repaint))
-                .setNegativeButton("Cancel", null)
-                .show();
+        // "stops counting" would be false even when everything works: the vault keeps recent
+        // snapshots (#58 rollback) and those still lease the dropped chunks, so what the plan counts
+        // falls gradually as they age out -- not at the next logoff.
+        SheetDialog.confirm(this, StorageDropSheets.stopKeeping(String.valueOf(keptLabel(pkg))),
+                new Runnable[] { null, () -> applyStorageDrop(pkg, repaint) }, null);
     }
 
     /** The ORPHAN variant of the stop-keeping confirm (NWP-20260825-22). Different words for a genuinely
@@ -8480,15 +8474,8 @@ public class ProfileActivity extends Activity {
      *  amnesiac device the tap records INTENT, and the release happens in the logoff seal by the new manifest
      *  not referencing those chunks. */
     private void confirmStopCarrying(final String pkg, final Runnable repaint) {
-        new android.app.AlertDialog.Builder(this)
-                .setTitle("Stop carrying " + keptLabel(pkg) + "?")
-                .setMessage("This app is not on your phone any more, but your profile is still carrying its "
-                        + "data — and still counting it against your plan. Stopping means the data is not "
-                        + "kept when you log off. What your plan counts takes a few days to drop, because "
-                        + "recent backups are kept for a while.")
-                .setPositiveButton("Stop carrying it", (d, w) -> applyStorageDrop(pkg, repaint))
-                .setNegativeButton("Cancel", null)
-                .show();
+        SheetDialog.confirm(this, StorageDropSheets.stopCarrying(String.valueOf(keptLabel(pkg))),
+                new Runnable[] { null, () -> applyStorageDrop(pkg, repaint) }, null);
     }
 
     /** Off-thread: declare the shrink intent FIRST, and only change the keep-set if the daemon accepted it.
@@ -9705,23 +9692,17 @@ public class ProfileActivity extends Activity {
             showSecurity(); return;
         }
         final String[] current = vpnCurrent();
-        int sel = Math.max(0, pkgs.indexOf(current[0]));
-        new android.app.AlertDialog.Builder(this)
-                .setTitle("Always-on VPN")
-                .setSingleChoiceItems(labels.toArray(new String[0]), sel, null)
-                .setPositiveButton("Save", (d, w) -> {
-                    int idx = ((android.app.AlertDialog) d).getListView().getCheckedItemPosition();
-                    if (idx < 0) idx = 0;
-                    String pkg = pkgs.get(idx);
-                    String lock = vpnPickLockdown(current, pkg);
-                    android.widget.Toast.makeText(this, writeVpnPick(pkg, lock)
-                            ? vpnPickToast(labels.get(idx), pkg, lock)
-                            : "Couldn't save the VPN choice — try again",
-                            android.widget.Toast.LENGTH_LONG).show();
-                    showSecurity();
-                })
-                .setNegativeButton("Cancel", (d, w) -> showSecurity())
-                .show();
+        // NWP-20261204-15: a sheet of cards (SecuritySheets.vpn); a tap applies, Back or outside writes nothing. The
+        // current card is the app in effect; one that is no longer installed marks no card.
+        SheetDialog.picker(this, SecuritySheets.vpn(labels, pkgs.indexOf(current[0])), idx -> {
+            String pkg = pkgs.get(idx);
+            String lock = vpnPickLockdown(current, pkg);
+            android.widget.Toast.makeText(this, writeVpnPick(pkg, lock)
+                    ? vpnPickToast(labels.get(idx), pkg, lock)
+                    : "Couldn't save the VPN choice — try again",
+                    android.widget.Toast.LENGTH_LONG).show();
+            showSecurity();
+        });
     }
 
     /** The always-on VPN choice in effect for this profile: {app ("" = none), block "0"/"1"}. See vpnCurrentFrom. */
@@ -9961,89 +9942,36 @@ public class ProfileActivity extends Activity {
     // ---- L5 (DIA-20260623-26): per-profile idle auto-logoff timeout. Roams in nowhere-prefs (idle=<min>,
     // 0 = Never) like tz/locale; the user-0 gate reads it at each sign-in and arms the idle watcher with
     // it (the at-rest backstop from lock-model.md L3/L4). A high-security profile can pick a short timeout.
-    // NWP-20261119-21: a Save also sends it to the gate (sendLivePrefs), which applies it to this session at once.
+    // NWP-20261119-21: each card tap and each box toggle also sends it to the gate (sendLivePrefs), which applies it to
+    // this session at once. NWP-20261206-04: a sheet of cards with the two "Before standby, wait for" boxes
+    // (StandbySheets); a card tap applies the timeout, a box saves on its toggle, each through saveStandby.
     private void showIdlePicker() {
-        // NWP-20260913-17: the shortest option is 5 MINUTES, not 2. At idle=2 the phone STOPPED SEALING.
-        // Measured on frankel 2026-09-13 in one log, either side of the change: 10 `periodic seal -> OK`
-        // in the idle=60 hour, and in the idle=2 hour ONE (itself PARTIAL) plus three `deferred: login`.
-        // The cause is arithmetic on shipped constants, not a model: a resume arms a seal-suppression
-        // window of loginWindowCap=180s (main.go:9765, armed at main.go:10451) and ONLY a login can close
-        // it early -- the sole GRANT-PERMS sender is provisionRoamedApps, inside roamLogin
-        // (ChooserActivity.java:8912, called from :3794). The cold lock fires at 120s and removes
-        // .roamsession, which stops the sync (main.go:10267). With syncIntervalDefault=120 (main.go:8231;
-        // syncIntervalDefault was 120 then; 900 since NWP-20261202-25's release), 180 > 120 means no
-        // instant exists at which a periodic seal is both permitted AND has a live session to seal. On a phone
-        // that wipes at power-off, that is lost work, so the option was not honest to offer.
-        //
-        // ⚠ 3 MINUTES WOULD BE THE WORST CHOICE AVAILABLE: 180s IS loginWindowCap exactly, so a 3-minute
-        // idle leaves a ZERO-second seal-eligible window -- the same starvation, made intermittent. 5 min
-        // leaves 120s, one whole sync tick, which is the smallest value that is not zero.
-        //
-        // ⚠ NO MIGRATION, BY DECISION (Chester, 2026-09-13). A profile whose roamed prefs already say
-        // `idle=2` KEEPS arming 120000ms -- ChooserActivity.java:9271 parses the pref raw with no clamp --
-        // while the dialog below highlights "After 15 minutes", because the loop sets sel only on an exact
-        // match. So for those profiles this screen shows something other than what the phone does until
-        // the user picks a value again. Recorded here rather than hidden: it is the known cost of the
-        // decision, not an oversight.
-        final int[] mins = { 5, 15, 30, 60, 0 };
-        final String[] labels = { "After 5 minutes", "After 15 minutes", "After 30 minutes", "After 1 hour", "Never" };
-        int cur = 15; // matches IDLE_LOGOFF_MS: the default when no idle= pref is set (DIA-20260626-03)
-        try { String v = readPrefValue("idle"); if (!v.isEmpty()) cur = Integer.parseInt(v); } catch (Throwable ignore) {}
-        int sel = 1; // default highlight = 15 minutes
-        for (int i = 0; i < mins.length; i++) if (mins[i] == cur) sel = i;
-        // NWP-20261005-02 (Chester, 2026-10-05): "Wait for app installs" qualifies THIS setting, so it lives in this
-        // picker -- he moved it here from a separate switch under the Security card ("looks off outside"). Saved with
-        // the timeout. On by default: only holdlock=0 turns it off (setPref).
-        // NWP-20261124-17 (decision 2026-11-01, "before the idle cold lock, a session can wait for app installs and for
-        // audio playing ..."): one heading over two boxes, "app installs" (holdlock=) and "audio playing" (holdaudio=).
-        // Each is on unless its key is "0". A throwaway never sees either: showSecurity does not add this row there.
-        final TextView waitHead = new TextView(this);
-        waitHead.setText("Before standby, wait for:");
-        waitHead.setTextColor(MUTED);
-        waitHead.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
-        final android.widget.CheckBox holdBox = new android.widget.CheckBox(this);
-        holdBox.setText("app installs");
-        holdBox.setTextColor(INK);
-        holdBox.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
-        holdBox.setChecked(!"0".equals(readPrefValue("holdlock")));
-        final android.widget.CheckBox audioBox = new android.widget.CheckBox(this);
-        audioBox.setText("audio playing");
-        audioBox.setTextColor(INK);
-        audioBox.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
-        audioBox.setChecked(!"0".equals(readPrefValue("holdaudio")));
-        LinearLayout holdWrap = new LinearLayout(this);
-        holdWrap.setOrientation(LinearLayout.VERTICAL);
-        holdWrap.setPadding(dp(20), dp(8), dp(20), dp(4));
-        holdWrap.addView(waitHead, new LinearLayout.LayoutParams(MATCH, WRAP));
-        holdWrap.addView(holdBox, new LinearLayout.LayoutParams(MATCH, WRAP));
-        holdWrap.addView(audioBox, new LinearLayout.LayoutParams(MATCH, WRAP));
-        new android.app.AlertDialog.Builder(this)
-                .setTitle("Auto standby when idle")
-                .setSingleChoiceItems(labels, sel, null)
-                .setView(holdWrap)
-                .setPositiveButton("Save", (d, w) -> {
-                    int pick = ((android.app.AlertDialog) d).getListView().getCheckedItemPosition();
-                    if (pick < 0) pick = 0;
-                    final int idx = pick;
-                    // NWP-20261122-02: through the preset guard, which may ask before it replaces a saved Custom.
-                    presetGuard(PresetPicker.change("idle", String.valueOf(mins[idx]),
-                            "holdlock", holdBox.isChecked() ? "" : "0",
-                            "holdaudio", audioBox.isChecked() ? "" : "0"), () -> {
-                        // All three writes always run; the gate is told only when all three landed.
-                        final boolean idleOk = writeIdlePref(mins[idx]);
-                        final boolean holdOk = setPref("holdlock", holdBox.isChecked() ? "" : "0");
-                        final boolean audioOk = setPref("holdaudio", audioBox.isChecked() ? "" : "0");
-                        boolean live = false;
-                        if (idleOk && holdOk && audioOk) live = sendLivePrefs();
-                        if (!(idleOk && holdOk && audioOk)) android.widget.Toast.makeText(this, SettingLanded.NOT_SAVED,
-                                android.widget.Toast.LENGTH_LONG).show();
-                        else android.widget.Toast.makeText(this, "Auto standby when idle: " + labels[idx].toLowerCase()
-                                + (live ? "" : " — applies next sign-in"), android.widget.Toast.LENGTH_LONG).show();
-                        showSecurity();
-                    }, () -> showSecurity());
-                })
-                .setNegativeButton("Cancel", (d, w) -> showSecurity())
-                .show();
+        final int cur = StandbySheets.current(readPrefValue("idle"));
+        SheetDialog.pickerWithBoxes(this, StandbySheets.picker(cur),
+                StandbySheets.boxes(readPrefValue("holdlock"), readPrefValue("holdaudio")),
+                idx -> saveStandby("idle", String.valueOf(StandbySheets.MINS[idx]), idx, () -> showSecurity(),
+                        () -> showSecurity()),
+                (i, on, settle) -> saveStandby(StandbySheets.BOX_KEYS[i], StandbySheets.boxValue(on), cur,
+                        () -> settle.accept(on),
+                        () -> settle.accept(!"0".equals(readPrefValue(StandbySheets.BOX_KEYS[i])))));
+    }
+
+    /** NWP-20261206-04: write one Auto standby key (idle=, holdlock= or holdaudio=) through the preset guard
+     *  (NWP-20261122-02), which may ask before it replaces a saved Custom. The gate is told only when the write landed.
+     *  landed runs after a write that landed; undo runs after Cancel or Back on the guard's ask, or a failed write. */
+    private void saveStandby(String key, String value, int toastIdx, Runnable landed, Runnable undo) {
+        presetGuard(PresetPicker.change(key, value), () -> {
+            final boolean ok = "idle".equals(key) ? writeIdlePref(Integer.parseInt(value)) : setPref(key, value);
+            boolean live = false;
+            if (ok) live = sendLivePrefs();
+            if (!ok) {
+                android.widget.Toast.makeText(this, SettingLanded.NOT_SAVED, android.widget.Toast.LENGTH_LONG).show();
+                undo.run();
+            } else {
+                android.widget.Toast.makeText(this, StandbySheets.toast(toastIdx, live), android.widget.Toast.LENGTH_LONG).show();
+                landed.run();
+            }
+        }, undo);
     }
 
     /** Write idle=<min> into nowhere-prefs, preserving the other prefs, and report whether the write landed. */
@@ -10075,31 +10003,23 @@ public class ProfileActivity extends Activity {
     // NWP-20261119-21: a Save also sends it to the gate (sendLivePrefs); the gate uses it at this session's next cold lock.
     // NWP-20261106-15: Q138 "Right away, once saved" writes wipe=1 + wipesaved=1; the gate asks EVICT-RECHECK-SAVED at the
     // cold lock (WipeOnSave).
+    // NWP-20261204-15: a sheet of cards (SecuritySheets.wipe); a tap applies, Back or outside writes nothing.
     private void showWipePicker() {
         final int sel = WipeChoice.selected(readPrefValue("wipe"), readPrefValue(WipeOnSave.PREF));
-        new android.app.AlertDialog.Builder(this)
-                .setTitle("Erase a locked session after")
-                .setSingleChoiceItems(WipeChoice.LABELS, sel, null)
-                .setPositiveButton("Save", (d, w) -> {
-                    int pick = ((android.app.AlertDialog) d).getListView().getCheckedItemPosition();
-                    if (pick < 0) pick = sel; // nothing checked: keep the current choice, never the strongest by accident
-                    final int idx = pick;
-                    // NWP-20261122-02: through the preset guard, which may ask before it replaces a saved Custom.
-                    presetGuard(PresetPicker.change("wipe", String.valueOf(idx)), () -> {
-                        boolean live = false;
-                        if (writeWipePref(idx)) live = sendLivePrefs();
-                        // NWP-20261125-22: the toast follows the file read back, not the write's own answer.
-                        final boolean saved = SettingLanded.landed(PresetPicker.change("wipe", String.valueOf(idx)),
-                                presetCurrent());
-                        if (!saved) android.widget.Toast.makeText(this, SettingLanded.NOT_SAVED,
-                                android.widget.Toast.LENGTH_LONG).show();
-                        else android.widget.Toast.makeText(this, "Auto-wipe " + WipeChoice.LABELS[idx].toLowerCase()
-                                + (live ? "" : " — applies next sign-in"), android.widget.Toast.LENGTH_LONG).show();
-                        showSecurity();
-                    }, () -> showSecurity());
-                })
-                .setNegativeButton("Cancel", (d, w) -> showSecurity())
-                .show();
+        // NWP-20261122-02: through the preset guard, which may ask before it replaces a saved Custom.
+        SheetDialog.picker(this, SecuritySheets.wipe(sel), idx ->
+                presetGuard(PresetPicker.change("wipe", String.valueOf(idx)), () -> {
+                    boolean live = false;
+                    if (writeWipePref(idx)) live = sendLivePrefs();
+                    // NWP-20261125-22: the toast follows the file read back, not the write's own answer.
+                    final boolean saved = SettingLanded.landed(PresetPicker.change("wipe", String.valueOf(idx)),
+                            presetCurrent());
+                    if (!saved) android.widget.Toast.makeText(this, SettingLanded.NOT_SAVED,
+                            android.widget.Toast.LENGTH_LONG).show();
+                    else android.widget.Toast.makeText(this, "Auto-wipe " + WipeChoice.LABELS[idx].toLowerCase()
+                            + (live ? "" : " — applies next sign-in"), android.widget.Toast.LENGTH_LONG).show();
+                    showSecurity();
+                }, () -> showSecurity()));
     }
 
     /** Write choice i of WipeChoice into nowhere-prefs, preserving the other prefs: wipe= and wipesaved= are composed
@@ -10839,6 +10759,14 @@ public class ProfileActivity extends Activity {
     /** sendDaemon, but the caller can tell a timeout from an answer. Same socket, same 90s cap; only the
      *  failure reporting differs, so it is safe to adopt one call site at a time. */
     private DaemonReply sendDaemonReply(String msg) {
+        return sendDaemonReply(msg, null);
+    }
+
+    /** sendDaemonReply, plus an optional second line in {@code second[0]} (NWP-20261206-20; the sealStatus(String[])
+     *  precedent). It is read only when the caller asks and line 1 is exactly "OK", inside its own catch: a slow or
+     *  failed second read never turns an answered OK into timedOut/unreachable. A daemon that sends one line closes
+     *  the socket, so the read returns null at once. */
+    private DaemonReply sendDaemonReply(String msg, String[] second) {
         try {
             LocalSocket s = DaemonSocket.connect(); // NWP-20261005-19: bounded connect
             if (s == null) throw new java.io.IOException("daemon connect timed out");
@@ -10848,6 +10776,9 @@ public class ProfileActivity extends Activity {
             os.flush();
             BufferedReader br = new BufferedReader(new InputStreamReader(s.getInputStream(), "UTF-8"));
             String line = br.readLine();
+            if (second != null && line != null && line.trim().equals("OK")) {
+                try { second[0] = br.readLine(); } catch (java.io.IOException ignore) {}
+            }
             s.close();
             return new DaemonReply(line, false, false);
         } catch (java.io.InterruptedIOException te) {
@@ -11114,6 +11045,46 @@ public class ProfileActivity extends Activity {
             StoreInstaller.writeAtomic(new java.io.File(getFilesDir(), "nowhere-apporphan.list"), sb.toString());
         } catch (Throwable t) {
             android.util.Log.w("NowhereChooser", "recordInferredOrphan", t);
+        }
+    }
+
+    /** NWP-20261203-24: record Off every app this sign-in restored installed from #apps (nowhere-installed-restored)
+     *  that has no keep line now, so captureAppDrops' explicitOff union and roamd's appoff INTERSECT appdrop name it
+     *  and its code leaves #apps at this sign-out. Before this, nothing put such an app in nowhere-appoff.list, and
+     *  the agent's carry re-emitted its code from the head at every sign-out. "2026-09-26 — DECIDED: an app switched
+     *  Off leaves the store at the next roam, exactly like an app that was never kept". An Off is never an
+     *  uninstall: this calls recordTurnedOff only and never mints the tombstone. Every unknown heals nothing: an
+     *  absent restored list selects nothing, and an unreadable restored list, keep-set or orphan record writes
+     *  nothing. Never throws; no log line names a package. */
+    private void recordUnkeptRestoredOff() {
+        try {
+            String text = SettingsText.read(new java.io.File(getFilesDir(), UnarchiveService.INSTALLED_RESTORED));
+            if (text == null) {
+                android.util.Log.w("NowhereChooser", "sign-out: " + UnarchiveService.INSTALLED_RESTORED
+                        + " unreadable -- no restored app recorded Off (NWP-20261203-24)");
+                return;
+            }
+            if (text.isEmpty()) return;
+            final java.util.LinkedHashMap<String,String> keptModes = readAppModesStrictIn(getFilesDir());
+            final java.util.LinkedHashSet<String> orphans = inferredOrphansStrict();
+            if (keptModes == null || orphans == null) {
+                android.util.Log.w("NowhereChooser", "sign-out: "
+                        + (keptModes == null ? (orphans == null ? "nowhere-appkeep and nowhere-apporphan.list"
+                                                                : "nowhere-appkeep")
+                                             : "nowhere-apporphan.list")
+                        + " unreadable -- no restored app recorded Off (NWP-20261203-24)");
+                return;
+            }
+            final android.content.pm.PackageManager pm = getPackageManager();
+            java.util.LinkedHashSet<String> sel = UnkeptRestored.select(java.util.Arrays.asList(text.split("\n")),
+                    keptModes.keySet(), orphans, getPackageName(),
+                    p -> isBundledSystem(pm, p), p -> UnarchiveService.hasInstalledCode(this, p));
+            for (String p : sel) StoreInstaller.recordTurnedOff(this, p);
+            if (!sel.isEmpty()) android.util.Log.i("NowhereChooser", "sign-out: " + sel.size()
+                    + " restored app(s) with no keep line recorded Off -- their code leaves #apps (NWP-20261203-24)");
+        } catch (Throwable t) {
+            android.util.Log.w("NowhereChooser", "recordUnkeptRestoredOff: " + t.getClass().getSimpleName()
+                    + " -- nothing more recorded Off (NWP-20261203-24)");
         }
     }
 
@@ -12573,8 +12544,10 @@ public class ProfileActivity extends Activity {
      *  A second tap while one runs is harmless (the shared queue de-duplicates), but the chip goes inert anyway so the
      *  screen does not invite it.
      *  NWP-20261119-14 (Q042, h49 #1): with the "Download over mobile data" switch off and no Wi-Fi the grey line says
-     *  the apps wait for Wi-Fi (AutoPendingCopy), and a link under it opens Offline media, which holds the switch. */
-    private LinearLayout installPendingRow(int n, boolean allowMetered, boolean onWifi) {
+     *  the apps wait for Wi-Fi (AutoPendingCopy), and a link under it opens Offline media, which holds the switch.
+     *  NWP-20261203-23: mode is HoldRow's. While a sweep runs (RUNNING) the row offers Pause and Stop in place of
+     *  Install, so the sweep can be held with its landing card closed; a pause resumes from this row's Install. */
+    private LinearLayout installPendingRow(int n, boolean allowMetered, boolean onWifi, int mode) {
         LinearLayout row = new LinearLayout(this);
         row.setOrientation(LinearLayout.HORIZONTAL);
         row.setGravity(Gravity.CENTER_VERTICAL);
@@ -12583,7 +12556,7 @@ public class ProfileActivity extends Activity {
         LinearLayout col = new LinearLayout(this);
         col.setOrientation(LinearLayout.VERTICAL);
         TextView lab = new TextView(this);
-        lab.setText(SweepHold.state() == SweepHold.State.PAUSED ? LandingLine.RESUME_ROW : "Install pending apps now"); // NWP-20261201-13
+        lab.setText(HoldRow.label(mode)); // NWP-20261201-13, NWP-20261203-23
         lab.setTextColor(INK);
         lab.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
         col.addView(lab);
@@ -12603,6 +12576,31 @@ public class ProfileActivity extends Activity {
             col.addView(to);
         }
         row.addView(col, new LinearLayout.LayoutParams(0, WRAP, 1f));
+        if (mode == HoldRow.RUNNING) { // NWP-20261203-23: the card's Pause and Stop, with the card closed
+            final TextView pause = holdChip(LandingLine.PAUSE);
+            final TextView stop = holdChip(LandingLine.STOP);
+            final Runnable inert = () -> {
+                for (TextView t : new TextView[] {pause, stop}) {
+                    t.setEnabled(false);
+                    t.setAlpha(0.4f);
+                    t.setOnClickListener(null);
+                }
+            };
+            pause.setOnClickListener(v -> {
+                if (HoldRow.mode(SweepJoin.running(), SweepHold.state()) == HoldRow.RUNNING) SweepHold.pause(UnarchiveService.passCard());
+                inert.run();
+            });
+            stop.setOnClickListener(v -> {
+                if (HoldRow.mode(SweepJoin.running(), SweepHold.state()) == HoldRow.RUNNING) SweepHold.stop();
+                inert.run();
+            });
+            for (TextView t : new TextView[] {pause, stop}) {
+                LinearLayout.LayoutParams hlp = new LinearLayout.LayoutParams(WRAP, WRAP);
+                hlp.leftMargin = dp(8);
+                row.addView(t, hlp);
+            }
+            return row;
+        }
         final TextView chip = new TextView(this);
         chip.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
         chip.setPadding(dp(14), dp(7), dp(14), dp(7));
@@ -12636,6 +12634,23 @@ public class ProfileActivity extends Activity {
         return row;
     }
 
+    /** NWP-20261203-23: a chip in the Install chip's look, for the row's Pause and Stop. */
+    private TextView holdChip(String word) {
+        TextView chip = new TextView(this);
+        chip.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        chip.setPadding(dp(14), dp(7), dp(14), dp(7));
+        chip.setMinWidth(dp(96));
+        chip.setGravity(Gravity.CENTER);
+        chip.setText(word);
+        chip.setTextColor(ACCENT);
+        android.graphics.drawable.GradientDrawable g = new android.graphics.drawable.GradientDrawable();
+        g.setCornerRadius(dp(18));
+        g.setColor(android.graphics.Color.TRANSPARENT);
+        g.setStroke(dp(1), ACCENT);
+        chip.setBackground(g);
+        return chip;
+    }
+
     /** NWP-20261119-30: applyPendingRow for a count that does not come from a sweep's end. */
     private void applyPendingRow(LinearLayout ll, View summary, View[] rowRef, int[] shown, int n) {
         applyPendingRow(ll, summary, rowRef, shown, n, false);
@@ -12651,6 +12666,9 @@ public class ProfileActivity extends Activity {
         boolean onWifi = ChooserActivity.onWifiCtx(this); // the sweep's own Wi-Fi test (AutoSweepNet.mayFetch)
         // the same count can still need new words: Wi-Fi came or went since the row was drawn
         act = AutoPendingCopy.rowAction(act, rowRef[0] == null ? null : rowRef[0].getTag(), allowMetered, onWifi);
+        // NWP-20261203-23: and when a sweep started or ended, or was paused or stopped (shown[1], the mode drawn)
+        int mode = HoldRow.mode(SweepJoin.running(), SweepHold.state());
+        if (act == PendingRow.NONE && rowRef[0] != null && shown[1] != mode) act = PendingRow.REPLACE;
         if (act == PendingRow.NONE) return;
         if (act != PendingRow.ADD && rowRef[0] != null) ll.removeView(rowRef[0]);
         if (act == PendingRow.REMOVE) {
@@ -12658,10 +12676,11 @@ public class ProfileActivity extends Activity {
             shown[0] = 0;
             return;
         }
-        View v = installPendingRow(n, allowMetered, onWifi);
+        View v = installPendingRow(n, allowMetered, onWifi, mode);
         ll.addView(v, ll.indexOfChild(summary) + 1);
         rowRef[0] = v;
         shown[0] = n;
+        shown[1] = mode;
     }
 
     /** NWP-20261119-30: refreshPendingRow for a recount that does not come from a sweep's end. */
@@ -12745,25 +12764,15 @@ public class ProfileActivity extends Activity {
         chip.setBackground(g);
     }
 
-    /** The picker: each choice with its trade-off in one line under it. */
+    /** The picker, a sheet of cards (NWP-20261204-17): each choice with its trade-off under it, the saved one current.
+     *  A tap saves it; Back or a touch outside writes nothing. */
     private void showSealHoldDialog(final TextView chip, final TextView sub, final String[] cur) {
-        final CharSequence[] items = new CharSequence[SealHold.VALUES.length];
-        int checked = 0;
-        for (int i = 0; i < SealHold.VALUES.length; i++) {
-            items[i] = SealHold.item(SealHold.VALUES[i]);
-            if (SealHold.VALUES[i].equals(cur[0])) checked = i;
-        }
-        new android.app.AlertDialog.Builder(this)
-                .setTitle("Backups while apps set up")
-                .setSingleChoiceItems(items, checked, (dlg, which) -> {
-                    dlg.dismiss();
-                    if (!writeSealHold(SealHold.VALUES[which])) return; // not saved: the row keeps the old choice
-                    cur[0] = SealHold.VALUES[which];
-                    paintSealHoldChip(chip, cur[0]);
-                    sub.setText(SealHold.tradeoff(cur[0]));
-                })
-                .setNegativeButton("Cancel", null)
-                .show();
+        SheetDialog.picker(this, StorageSheets.sealHold(cur[0]), which -> {
+            if (!writeSealHold(SealHold.VALUES[which])) return; // not saved: the row keeps the old choice
+            cur[0] = SealHold.VALUES[which];
+            paintSealHoldChip(chip, cur[0]);
+            sub.setText(SealHold.tradeoff(cur[0]));
+        });
     }
 
     /** NWP-20261201-05: this profile's "Save automatically" choice (SaveMode), from getFilesDir()/nowhere-save-mode.
@@ -12815,51 +12824,37 @@ public class ProfileActivity extends Activity {
         chip.setBackground(g);
     }
 
-    /** The picker: each choice with its trade-off in one line under it. */
+    /** The picker, a sheet of cards (NWP-20261204-17): each choice with its trade-off under it, the saved one current.
+     *  A tap saves it; Back or a touch outside writes nothing. */
     private void showSaveModeDialog(final TextView chip, final TextView sub, final String[] cur) {
-        final CharSequence[] items = new CharSequence[SaveMode.VALUES.length];
-        int checked = 0;
-        for (int i = 0; i < SaveMode.VALUES.length; i++) {
-            items[i] = SaveMode.item(SaveMode.VALUES[i]);
-            if (SaveMode.VALUES[i].equals(cur[0])) checked = i;
-        }
-        new android.app.AlertDialog.Builder(this)
-                .setTitle("Save automatically")
-                .setSingleChoiceItems(items, checked, (dlg, which) -> {
-                    dlg.dismiss();
-                    if (!writeSaveMode(SaveMode.VALUES[which])) return; // not saved: the row keeps the old choice
-                    cur[0] = SaveMode.VALUES[which];
-                    paintSaveModeChip(chip, cur[0]);
-                    sub.setText(SaveMode.tradeoff(cur[0]));
-                })
-                .setNegativeButton("Not now", null)
-                .show();
+        SheetDialog.picker(this, StorageSheets.saveMode(cur[0]), which -> {
+            if (!writeSaveMode(SaveMode.VALUES[which])) return; // not saved: the row keeps the old choice
+            cur[0] = SaveMode.VALUES[which];
+            paintSaveModeChip(chip, cur[0]);
+            sub.setText(SaveMode.tradeoff(cur[0]));
+        });
     }
 
-    /** The reclaim picker: Never / 1 day / 3 days / 1 week. Writes the per-profile setting + repaints the chip. */
+    /** The reclaim picker, a sheet of cards (NWP-20261204-17): Never / 1 day / 3 days / 1 week, the saved one current.
+     *  Writes the per-profile setting + repaints the chip; Back or a touch outside writes nothing. */
     private void showReclaimDialog(final TextView chip, final long[] cur) {
         final long[] opts = { RECLAIM_NEVER, RECLAIM_1D, RECLAIM_3D, RECLAIM_1W };
         final CharSequence[] items = { "Never", "1 day", "3 days", "1 week" };
-        int checked = 0;
+        int checked = -1;
         for (int i = 0; i < opts.length; i++) if (opts[i] == cur[0]) { checked = i; break; }
-        new android.app.AlertDialog.Builder(this)
-                .setTitle("Re-archive idle apps")
-                .setSingleChoiceItems(items, checked, (d, which) -> {
-                    d.dismiss();
-                    // NWP-20261122-02: through the preset guard; its Cancel leaves the chip as it was.
-                    presetGuard(PresetPicker.change("reclaim", Long.toString(opts[which])), () -> {
-                        // NWP-20261124-23: not saved -- the chip keeps the choice the file still holds
-                        if (!setReclaimIdleMs(opts[which])) {
-                            android.widget.Toast.makeText(this, SettingsSaveCopy.NOT_SAVED,
-                                    android.widget.Toast.LENGTH_LONG).show();
-                            return;
-                        }
-                        cur[0] = opts[which];
-                        paintReclaimChip(chip, cur[0]);
-                    }, null);
-                })
-                .setNegativeButton("Cancel", null)
-                .show();
+        SheetDialog.picker(this, StorageSheets.reclaim(items, checked), which -> {
+            // NWP-20261122-02: through the preset guard; its Cancel leaves the chip as it was.
+            presetGuard(PresetPicker.change("reclaim", Long.toString(opts[which])), () -> {
+                // NWP-20261124-23: not saved -- the chip keeps the choice the file still holds
+                if (!setReclaimIdleMs(opts[which])) {
+                    android.widget.Toast.makeText(this, SettingsSaveCopy.NOT_SAVED,
+                            android.widget.Toast.LENGTH_LONG).show();
+                    return;
+                }
+                cur[0] = opts[which];
+                paintReclaimChip(chip, cur[0]);
+            }, null);
+        });
     }
 
     /** Set pkg's keep mode. mode = null / "" / "off" drops it from the keep-set; otherwise installed / ondemand.
@@ -13999,6 +13994,13 @@ public class ProfileActivity extends Activity {
                 // thread -- the messaging rule is PackageManager work. A row kept later this visit asks on its own.
                 keepRowWake.clear(); // the map outlives the visit: a stale entry would paint an old default
                 for (String p : pkgs) if (keptNow.contains(p)) keepRowWake.put(p, UnarchiveService.wakeOnRestore(this, p));
+                // NWP-20261205-12: which rows' icons fetch on a tap, here and not per row on the UI thread -- the code
+                // and archive reads are PackageManager work, as keepRowWake's. The rule is nApps' Download rule.
+                keepRowFetch.clear(); // the set outlives the visit, as keepRowWake does
+                final java.util.Set<String> kept = deferredKeepSet(this); // read ONCE
+                for (String p : pkgs)
+                    if (StoreService.mayMaterializeOwn(UnarchiveService.hasInstalledCode(this, p), archivedHere(this, p), kept.contains(p)))
+                        keepRowFetch.add(p);
             } catch (Throwable ignore) {}
             // NWP-20260826-11: resolve the Keystore census HERE, on the background thread and once for the
             // whole screen. It is a socket round-trip to the daemon plus a worker hop, so doing it per row --
@@ -14059,9 +14061,30 @@ public class ProfileActivity extends Activity {
                 // NWP-20261027-12: the visible row and its count, local to this build; the first row and every refresh
                 // go through applyPendingRow.
                 final View[] pendingRowView = {null};
-                final int[] pendingShown = {0};
+                final int[] pendingShown = {0, -1}; // [0] the count on screen, [1] the HoldRow mode drawn (-1: none)
                 final java.util.concurrent.atomic.AtomicInteger pendingTicket = new java.util.concurrent.atomic.AtomicInteger();
                 applyPendingRow(ll, summary, pendingRowView, pendingShown, pendingAuto.size());
+                // NWP-20261203-23: a sweep that starts or ends redraws the install row, so it offers Pause and Stop only
+                // while one runs. No recount: the count on screen goes back in, so only a new mode redraws the row.
+                if (ll.isAttachedToWindow()) {
+                    final android.content.BroadcastReceiver sweepState = new android.content.BroadcastReceiver() {
+                        @Override public void onReceive(android.content.Context c, Intent i) {
+                            runOnUiThread(() -> {
+                                if (!ll.isAttachedToWindow()) return;
+                                if (MODE_PENDING.get() == 0 && pendingShown[0] > 0)
+                                    applyPendingRow(ll, summary, pendingRowView, pendingShown, pendingShown[0]);
+                            });
+                        }
+                    };
+                    registerReceiver(sweepState, new android.content.IntentFilter(UnarchiveService.ACTION_SWEEP_STATE),
+                            android.content.Context.RECEIVER_NOT_EXPORTED);
+                    ll.addOnAttachStateChangeListener(new View.OnAttachStateChangeListener() {
+                        @Override public void onViewAttachedToWindow(View v) {}
+                        @Override public void onViewDetachedFromWindow(View v) {
+                            try { unregisterReceiver(sweepState); } catch (Throwable ignore) {}
+                        }
+                    });
+                }
                 // NWP-20261016-48: a mode change refreshes the summary and re-applies the search, so the count line and
                 // the reorder pause follow a row switched On or Off under a search. NWP-20261027-12: and, once the
                 // batch has drained, re-counts the pending Auto apps and redraws the install row.
@@ -14282,12 +14305,7 @@ public class ProfileActivity extends Activity {
 
     /** On -> off asks first: Off removes Play Store and signs the Google account out. */
     private void confirmPlayOff() {
-        new android.app.AlertDialog.Builder(this)
-                .setTitle(PlayChoice.OFF_TITLE)
-                .setMessage(PlayChoice.OFF_MESSAGE)
-                .setNegativeButton(PlayChoice.OFF_CANCEL, null)
-                .setPositiveButton(PlayChoice.OFF_CONFIRM, (d, w) -> turnPlayOff())
-                .show();
+        SheetDialog.confirm(this, GoogleSheets.playOff(), new Runnable[] { null, () -> turnPlayOff() }, null);
     }
 
     /** Write "0" first, so the reconcile the drop runs already sees Off and does not put Play Store back. Then drop
@@ -14501,6 +14519,12 @@ public class ProfileActivity extends Activity {
         LinearLayout.LayoutParams ilp = new LinearLayout.LayoutParams(dp(38), dp(38));
         ilp.rightMargin = dp(12);
         row.addView(icon, ilp);
+        // NWP-20261205-12: a kept app with no code fetches on a tap of its icon, after the Play setup's question.
+        // keepRowFetch was filled on the list thread; other rows get no listener.
+        if (keepRowFetch.contains(pkg)) {
+            icon.setContentDescription(YourAppsFetch.ICON_DESC + rowLabel);
+            icon.setOnClickListener(v -> yourAppsTap(pkg));
+        }
 
         LinearLayout col = new LinearLayout(this);
         col.setOrientation(LinearLayout.VERTICAL);
@@ -14928,6 +14952,64 @@ public class ProfileActivity extends Activity {
 
     /** NWP-20261012-06: each kept row's "Wake for notifications" state, read once per visit off the UI thread. */
     private final java.util.Map<String, Boolean> keepRowWake = new java.util.concurrent.ConcurrentHashMap<>();
+    /** NWP-20261205-12: the Your apps rows whose icon fetches on a tap (StoreService.mayMaterializeOwn), read once per
+     *  visit off the UI thread. */
+    private final java.util.Set<String> keepRowFetch = java.util.concurrent.ConcurrentHashMap.newKeySet();
+    /** NWP-20261205-12: one Your apps tap at a time; a tap while its ask is open does nothing. */
+    private static final java.util.concurrent.atomic.AtomicBoolean YOUR_APPS_TAP =
+            new java.util.concurrent.atomic.AtomicBoolean();
+
+    /** NWP-20261205-12: a copy of StoreService.archivedHere, callable with any Context. The package is an archived
+     *  placeholder in this user; any failure is false, so no fetch starts. */
+    private static boolean archivedHere(android.content.Context ctx, String pkg) {
+        try {
+            return ctx.getPackageManager().getPackageInfo(pkg, android.content.pm.PackageManager.PackageInfoFlags.of(
+                    android.content.pm.PackageManager.MATCH_ARCHIVED_PACKAGES)) != null;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /** NWP-20261205-12 (DECIDED UNBUILT 2026-11-06, the backlog row is the record): a tap on the icon of a kept app
+     *  with no code sizes it, asks in the Play setup's question, and on Download starts UnarchiveService exactly as
+     *  StoreService.materializeOwn does, so the app installs as a drawer tap installs it. Its own daemon thread, never
+     *  KEEP_ROW_WRITES: the ask waits up to PlayFetchAsk.WAIT_MS. NO and TIMEOUT start nothing. The Download marks
+     *  PlayFetchAsk.CONFIRMED, so materializeLocked does not ask the Play-stack question a second time. */
+    private void yourAppsTap(final String pkg) {
+        if (PlayFetchAskActivity.showing() || !YOUR_APPS_TAP.compareAndSet(false, true)) return;
+        final android.content.Context app = getApplicationContext();
+        Thread th = new Thread(() -> {
+            try {
+                if (!StoreService.mayMaterializeOwn(UnarchiveService.hasInstalledCode(app, pkg), archivedHere(app, pkg),
+                        deferredKeepSet(app).contains(pkg))) return;
+                java.util.List<String> set = YourAppsFetch.sizeSet(pkg, appDeps(app, pkg),
+                        d -> UnarchiveService.hasInstalledCode(app, d));
+                boolean play = PlayFetchAsk.needsAsk(false, set.subList(0, set.size() - 1),
+                        d -> isStackMember(app, d) || GMS_PKG.equals(d));
+                long bytes = PlayFetchAsk.parseSize(DaemonSocket.roundTrip(
+                        "APP-FETCH-SIZE\n" + String.join(" ", set) + "\n", PlayFetchAsk.SIZE_READ_MS));
+                PlayFetchAsk.Reply reply = PlayFetchAskActivity.ask(app, pkg, bytes, play, PlayFetchAsk.WAIT_MS);
+                if (reply == PlayFetchAsk.Reply.YES) {
+                    if (!StoreService.mayMaterializeOwn(UnarchiveService.hasInstalledCode(app, pkg),
+                            archivedHere(app, pkg), deferredKeepSet(app).contains(pkg))) return;
+                    PlayFetchAsk.CONFIRMED.mark(pkg, System.currentTimeMillis());
+                    try {
+                        app.startForegroundService(new Intent(app, UnarchiveService.class)
+                                .putExtra(UnarchiveService.EXTRA_PKG, pkg));
+                    } catch (Throwable t) {
+                        PlayFetchAsk.CONFIRMED.clear(pkg);
+                        Log.w("NowhereChooser", "Your apps tap: UnarchiveService did not start: " + t);
+                        new android.os.Handler(android.os.Looper.getMainLooper()).post(() -> android.widget.Toast
+                                .makeText(app, "Couldn't start the download.", android.widget.Toast.LENGTH_SHORT).show());
+                    }
+                }
+            } finally {
+                YOUR_APPS_TAP.set(false);
+            }
+        }, "yourapps-fetch");
+        th.setDaemon(true);
+        th.start();
+    }
     /** NWP-20261111-13: the Your apps rows with no launcher icon, from the last list build. UI thread only: assigned in
      *  the build's runOnUiThread block before any row is painted, read by showKeepModeDialog. */
     private java.util.Set<String> yourAppsNoIcon = java.util.Collections.emptySet();
@@ -15035,18 +15117,13 @@ public class ProfileActivity extends Activity {
             if (java.util.Objects.equals(modes.get(i)[1], cur)) checked = i;
         }
         if (checked < 0 && hasIcon) checked = 0; // as before: a mode word it does not know reads as Off
+        // DIA-20260727-01: keptLabel (archived-aware) not appLabel (getApplicationInfo flags=0, which throws
+        // for an APK-less archived on-demand placeholder and falls back to the bare pkg name) -- else the row
+        // says "Calculator" while its own mode dialog is titled "com.example.calculator". Matches the row label.
+        // NWP-20261205-10: a sheet of cards; Back or a tap outside applies nothing, as Cancel did.
         // NWP-20261012-06: no "Download first" button -- the install order is the order of the rows, dragged.
-        new android.app.AlertDialog.Builder(this)
-                // DIA-20260727-01: keptLabel (archived-aware) not appLabel (getApplicationInfo flags=0, which throws
-                // for an APK-less archived on-demand placeholder and falls back to the bare pkg name) -- else the row
-                // says "Calculator" while its own mode dialog is titled "com.example.calculator". Matches the row label.
-                .setTitle(keptLabel(pkg))
-                .setSingleChoiceItems(items, checked, (d, which) -> {
-                    d.dismiss();
-                    applyKeepMode(pkg, modes.get(which)[1], sideloaded, paint, preview, onChange);
-                })
-                .setNegativeButton("Cancel", null)
-                .show();
+        SheetDialog.picker(this, KeepModeSheets.picker(String.valueOf(keptLabel(pkg)), items, checked),
+                which -> applyKeepMode(pkg, modes.get(which)[1], sideloaded, paint, preview, onChange));
     }
 
     /** Apply a chosen keep mode. A keep mode (not Off) on a SIDELOADED app is gated behind the one-time sideload
@@ -15169,14 +15246,9 @@ public class ProfileActivity extends Activity {
     /** One-time warning before keeping a SIDELOADED app (the T4 security sign-off): unvetted code that will
      *  auto-install on every device the profile touches. onConfirm runs only on "Keep it". */
     private void showSideloadWarning(final Runnable onConfirm) {
-        new android.app.AlertDialog.Builder(this)
-                .setTitle("Keep a sideloaded app?")
-                .setMessage("This app didn't come from an app store, so no one has vetted it. Keeping it saves its "
-                        + "code to your account and reinstalls it automatically on every nowhere phone you sign in "
-                        + "on. Only keep apps you trust.")
-                .setPositiveButton("Keep it", (d, w) -> { if (onConfirm != null) onConfirm.run(); })
-                .setNegativeButton("Cancel", null)
-                .show();
+        // NWP-20261205-10: an amber confirmation. Not now (slot 0), Back and a tap outside apply nothing.
+        SheetDialog.confirm(this, KeepModeSheets.sideload(),
+                new Runnable[] { null, () -> { if (onConfirm != null) onConfirm.run(); } }, null);
     }
 
     // ===== Daemon length-prefixed replies (the storefront itself is com.nowhere.napps) =====
@@ -15491,13 +15563,8 @@ public class ProfileActivity extends Activity {
         // elsewhere in this file.
         if (isFinishing() || isDestroyed()) return;
         try {
-            new android.app.AlertDialog.Builder(this)
-                    .setTitle("Not enough storage for " + dispName(pkg, label))
-                    .setMessage("Keeping " + dispName(pkg, label) + " would put your account over the storage your plan "
-                            + "covers. Free up space or add storage, then try again.")
-                    .setPositiveButton("See what's using space", (d, w) -> showStorageBreakdown())
-                    .setNegativeButton("Not now", null)
-                    .show();
+            SheetDialog.confirm(this, StorageDropSheets.overPlan(dispName(pkg, label)),
+                    new Runnable[] { () -> showStorageBreakdown(), null }, null);
         } catch (Throwable ignore) {}
     }
 

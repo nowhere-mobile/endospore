@@ -54,6 +54,9 @@ public class PushService extends Service {
     private static final int NOTIF_ID = 1;
     private static final String FILE = "registrations.json";
     private static final String DEFAULT_GATEWAY = "https://api.nowhere.mobile";
+    // The gateway nowhere_login.sh publishes at boot from the merged conf (GATEWAY_URL, else NOWHERE_GATEWAY_DEFAULT, as
+    // the agent's issueGatewayURL). Not persist.: it is re-derived every boot. Labelled nowhere_gateway_prop (sepolicy).
+    static final String GATEWAY_PROP = "nowhere.gateway_url";
     // The SSE read timeout: three of the gateway's 25 s keep-alive pings (nowhere-cloud internal/gateway/push.go
     // pushKeepAlive), so two lost pings are tolerated. The two must move together. Silence this long means the path died
     // without a FIN/RST, and the SocketTimeoutException drops into the backoff and reconnect.
@@ -90,18 +93,37 @@ public class PushService extends Service {
 
     // ---- entry points from the receiver ----
     static void enqueueRegister(Context ctx, String appPackage, String appToken) {
-        startFg(ctx, new Intent(ctx, PushService.class)
-                .putExtra(EXTRA_OP, OP_REGISTER).putExtra(X_APP, appPackage).putExtra(X_APPTOKEN, appToken));
+        Intent i = new Intent(ctx, PushService.class)
+                .putExtra(EXTRA_OP, OP_REGISTER).putExtra(X_APP, appPackage).putExtra(X_APPTOKEN, appToken);
+        // Refused (NWP-20261203-25): answer the app with the "error" handleRegister's catch sends, so its connector
+        // knows the registration failed and may retry, instead of waiting for an answer that never comes.
+        if (!startFg(ctx, i, OP_REGISTER)) ctx.sendBroadcast(registrationFailedIntent(appPackage, appToken, "error"));
     }
 
     static void enqueueUnregister(Context ctx, String appToken) {
-        startFg(ctx, new Intent(ctx, PushService.class)
-                .putExtra(EXTRA_OP, OP_UNREGISTER).putExtra(X_APPTOKEN, appToken));
+        Intent i = new Intent(ctx, PushService.class)
+                .putExtra(EXTRA_OP, OP_UNREGISTER).putExtra(X_APPTOKEN, appToken);
+        // Refused (NWP-20261203-25): send the app nothing. The endpoint was not dropped, so UNREGISTERED would be
+        // false, and registrations.json stays as it is. The app's next UNREGISTER, once a start succeeds, drops the
+        // registration at the gateway.
+        startFg(ctx, i, OP_UNREGISTER);
     }
 
-    private static void startFg(Context ctx, Intent i) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) ctx.startForegroundService(i);
-        else ctx.startService(i);
+    /**
+     * Starts this service for one op. False when the platform refuses the start (NWP-20261203-25): a background
+     * start throws ForegroundServiceStartNotAllowedException on API 31+ and IllegalStateException before it, and
+     * both are an IllegalStateException. Any other failure still propagates. The log line names the op only, never
+     * the app, its token or the exception message.
+     */
+    private static boolean startFg(Context ctx, Intent i, String op) {
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) ctx.startForegroundService(i);
+            else ctx.startService(i);
+            return true;
+        } catch (IllegalStateException e) {
+            Log.w(TAG, "foreground start refused: " + op);
+            return false;
+        }
     }
 
     @Override
@@ -410,10 +432,15 @@ public class PushService extends Service {
     private String gatewayBase() {
         String p = "";
         try {
-            p = android.os.SystemProperties.get("persist.nowhere.gateway_url", "");
+            p = android.os.SystemProperties.get(GATEWAY_PROP, "");
         } catch (Throwable ignore) {
         }
-        String base = (p != null && !p.isEmpty()) ? p : DEFAULT_GATEWAY;
+        return gatewayFrom(p);
+    }
+
+    /** The gateway base from the property value: the value without one trailing "/", or DEFAULT_GATEWAY when unset. */
+    static String gatewayFrom(String prop) {
+        String base = (prop != null && !prop.isEmpty()) ? prop : DEFAULT_GATEWAY;
         return base.endsWith("/") ? base.substring(0, base.length() - 1) : base;
     }
 
@@ -492,12 +519,17 @@ public class PushService extends Service {
         sendBroadcast(i);
     }
 
-    private void broadcastRegistrationFailed(String appPackage, String appToken, String reason) {
+    /** The REGISTRATION_FAILED answer to one app: the service's catch and a refused start (NWP-20261203-25) send it. */
+    static Intent registrationFailedIntent(String appPackage, String appToken, String reason) {
         Intent i = new Intent(DistributorReceiver.ACTION_REGISTRATION_FAILED).setPackage(appPackage)
                 .addFlags(Intent.FLAG_INCLUDE_STOPPED_PACKAGES);
         i.putExtra(DistributorReceiver.EXTRA_TOKEN, appToken);
         i.putExtra(DistributorReceiver.EXTRA_REASON, reason);
-        sendBroadcast(i);
+        return i;
+    }
+
+    private void broadcastRegistrationFailed(String appPackage, String appToken, String reason) {
+        sendBroadcast(registrationFailedIntent(appPackage, appToken, reason));
     }
 
     private void broadcastUnregistered(Reg r) {

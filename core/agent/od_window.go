@@ -21,7 +21,8 @@ import (
 //
 //  1. FETCH. MATERIALIZE-APP opens the package's lease for odFetchLease and, while its worker op is in flight
 //     (waiting for the slot or running), renews it every odRenewEvery. The renewal goroutine has exited before
-//     the lease is settled, so a late renewal can never re-open a lease that has just been ended.
+//     the lease is settled, so a late renewal can never re-open a lease that has just been ended. Each renewal
+//     also renews a live Auto sweep's lease (renewOdWhileSweep, NWP-20261204-05).
 //  2. INSTALL. A fetch that succeeded AND whose reply reached the chooser extends the lease to odInstallLease,
 //     the chooser's own hard bound on waiting for a PackageInstaller commit (UnarchiveService.installApks,
 //     10 minutes). That package's RESTORE-ODDATA then ends it.
@@ -277,6 +278,44 @@ func renewOdWhile(pkg string, epoch uint64, stop <-chan struct{}) {
 			extendOdLease(pkg, epoch, now, odFetchLease)
 		}
 	}
+}
+
+// renewOdWhileSweep is renewOdWhile for a step of an Auto sweep: a materialise's fetch and a RESTORE-ODDATA's
+// odrestore. Each tick that still renews pkg's lease also renews a LIVE sweep's lease (NWP-20261204-05, the backlog
+// row '"Backups while apps set up: until setup finishes" lets a periodic save start in the middle of an Auto
+// sweep'). Before it the sweep lease was renewed only at a MATERIALIZE-APP's start, so one step longer than
+// autoSweepLease let it lapse, and a lapsed lease is never revived: the field case was a 28-minute odrestore with a
+// periodic seal in the middle of its sweep. A FETCH-APP's store Get keeps renewOdWhile: it is not a sweep app.
+//
+// THE BOUND. The sweep lease is renewed only while one of those worker ops is in flight; between steps it lapses
+// autoSweepLease after the last renewal. So a dead chooser releases seals within autoSweepLease plus the end of the
+// op in flight, which the worker's stall watchdog and hard cap bound. renewAutoSweep never STARTS a sweep: a lapsed
+// lease stays lapsed. A renewal moves a lease's end, never sealsHeldSince, so a capped choice still lets one seal
+// through at its maximum; only "as long as materialisation runs" now holds through a long step.
+//
+// The sweep is renewed only when the package's lease was (the epoch is current): after resetOdWindow a late tick of
+// the old session's op must not extend the NEXT session's sweep.
+func renewOdWhileSweep(pkg string, epoch uint64, stop <-chan struct{}) {
+	t := time.NewTicker(odRenewEvery)
+	defer t.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case now := <-t.C:
+			odRenewHook()
+			if extendOdLease(pkg, epoch, now, odFetchLease) {
+				renewAutoSweep(now)
+			}
+		}
+	}
+}
+
+// odWindowEpochNow is odWindowEpoch under pendingReapMu: the epoch a RESTORE-ODDATA's renewals carry.
+func odWindowEpochNow() uint64 {
+	pendingReapMu.Lock()
+	defer pendingReapMu.Unlock()
+	return odWindowEpoch
 }
 
 // How a MATERIALIZE-APP ended, for settleOdMaterialise.

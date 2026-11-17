@@ -64,8 +64,7 @@ IFS= read -r -d '' P_DIALOG <<'EOF'
             final OtaNotes.View view = OtaNotes.render(DaemonSocket.roundTripLines("OTA-NOTES\n", 5000), mode);
             runOnUiThread(() -> {
                 try {
-                    new android.app.AlertDialog.Builder(this).setTitle(view.title).setMessage(view.body)
-                            .setPositiveButton("OK", null).show();
+                    SheetDialog.confirm(this, GateNoticeSheets.otaNotes(view.title, view.body), null, null);
                 } catch (Throwable t) { android.util.Log.w("NowhereChooser", "OTA notes dialog", t); }
             });
         }, "nowhere-ota-notes").start();
@@ -174,7 +173,7 @@ mut "N20 not available back to were published"      O 's/"No notes are available
 # call sites -- each must be convicted by a pin
 mut "C1 the version line opens what's new"           C 's/swCurrent\.setOnClickListener\(v -> showOtaNotes\(OtaNotes\.Mode\.IN_IT\)\);/swCurrent.setOnClickListener(v -> showOtaNotes(OtaNotes.Mode.NEW));/' || fails=$((fails+1))
 mut "C2 the update line opens what's in it"          C 's/msg\.setOnClickListener\(v -> showOtaNotes\(OtaNotes\.Mode\.NEW\)\);/msg.setOnClickListener(v -> showOtaNotes(OtaNotes.Mode.IN_IT));/' || fails=$((fails+1))
-mut "C3 the dialog title is fixed"                   C 's/\.setTitle\(view\.title\)\.setMessage\(view\.body\)/.setTitle("What\x27s new").setMessage(view.body)/' || fails=$((fails+1))
+mut "C3 the dialog title is fixed"                   C 's/GateNoticeSheets\.otaNotes\(view\.title, view\.body\)/GateNoticeSheets.otaNotes("What\x27s new", view.body)/' || fails=$((fails+1))
 mut "C4 the mode never reaches render"               C 's/roundTripLines\("OTA-NOTES\x5cn", 5000\), mode\);/roundTripLines("OTA-NOTES\x5cn", 5000), OtaNotes.Mode.NEW);/' || fails=$((fails+1))
 mut "C5 a third line opens the notes"                C 's/(        TextView swHdr = new TextView\(this\);\n)/$1        swHdr.setOnClickListener(v -> showOtaNotes(OtaNotes.Mode.NEW));\n/' || fails=$((fails+1))
 mut "C6 the notes read runs on the UI thread"       C 's/\}, "nowhere-ota-notes"\)\.start\(\);/}, "nowhere-ota-notes").run();/' || fails=$((fails+1))

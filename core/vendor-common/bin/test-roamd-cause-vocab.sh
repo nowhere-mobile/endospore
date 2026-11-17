@@ -191,6 +191,7 @@ seal_run(){
     printf 'agent_stub(){ echo "$*" >> "$T/calls"; return %s; }; AGENT=agent_stub\n' "$2"
     printf 'timeout(){ shift 3; "$@"; }\n'
     printf 'keystore_register_all(){ :; }; appcode_pm_snapshot(){ :; }; _ms(){ echo 0; }; _apps_stage_prog(){ :; }; live_code_dir(){ :; }; stage_live_apks(){ :; }; stage_keep_mtimes(){ :; }\n'
+    printf 'round_record() { :; }\n'   # NWP-20261204-01 (h58 #1): its own suite is core/agent/test-round-record.sh
     printf 'bt_reset(){ return 0; }; rc=%s; nc=0; refused=0; stopped=0; skind=%s; : > "$STATE/.btlogoff"\n' "${5:-0}" "${6:-periodic}"
     printf '%s\n' "$SEALFUNCS"
     case "$3" in

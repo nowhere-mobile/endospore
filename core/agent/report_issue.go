@@ -600,23 +600,196 @@ const bootReasonUnread = "unread"
 // bootReasonHistoryCap bounds boot_reason_history in bytes, after the scrub.
 const bootReasonHistoryCap = 512
 
+// The file sources of the boot reason, and the property areas whose openability boot_reason_read lists. Absolute
+// paths, vars so tests replace them. nowhere.te grants u:r:nowhere:s0 nothing on proc_bootconfig or proc_cmdline (the
+// labels of the two files), so on a shipped image both reads are EXPECTED to answer denied; and on a Pixel (Android
+// 12+ bootconfig) androidboot.* is not on /proc/cmdline at all. The reads stay as a fallback: correct if a policy ever
+// allows one, harmless when denied, and their class (denied, absent, ...) is evidence in boot_reason_read. Only the
+// androidboot.bootreason value is ever kept: /proc/cmdline also carries the serial number (androidboot.serialno), so
+// nothing else from either file is returned, kept or logged.
+var (
+	bootconfigPath = "/proc/bootconfig"
+	cmdlinePath    = "/proc/cmdline"
+	propAreaDir    = "/dev/__properties__"
+)
+
+// bootFileMax bounds one boot file read. /proc files report size 0, so the read is a limited ReadAll, not a stat.
+const bootFileMax = 64 << 10
+
+// readBootFile reads at most bootFileMax bytes of a boot file. A var so tests replace it.
+var readBootFile = func(path string) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	return io.ReadAll(io.LimitReader(f, bootFileMax))
+}
+
+// openPropFile opens one property area and closes it at once, never reading it: the open alone says whether the
+// domain may read that context. A var so tests replace it.
+var openPropFile = func(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	return f.Close()
+}
+
+// reBootReasonValue is the only shape a file's boot reason is taken in: 1-128 bytes of [A-Za-z0-9,_:.-].
+var reBootReasonValue = regexp.MustCompile(`^[A-Za-z0-9,_:.\-]{1,128}$`)
+
+func bootReasonValueOK(v string) bool { return reBootReasonValue.MatchString(v) }
+
+// bootReasonFromBootconfig returns the androidboot.bootreason value of /proc/bootconfig (`key = "value"` lines, one
+// pair of surrounding double quotes stripped). The first line with the key decides; a value the check refuses is not
+// found. Nothing else of raw is returned.
+func bootReasonFromBootconfig(raw string) (string, bool) {
+	for _, line := range strings.Split(raw, "\n") {
+		k, v, ok := strings.Cut(line, "=")
+		if !ok || strings.TrimSpace(k) != "androidboot.bootreason" {
+			continue
+		}
+		v = strings.TrimSpace(v)
+		if len(v) >= 2 && v[0] == '"' && v[len(v)-1] == '"' {
+			v = v[1 : len(v)-1]
+		}
+		if !bootReasonValueOK(v) {
+			return "", false
+		}
+		return v, true
+	}
+	return "", false
+}
+
+// bootReasonFromCmdline returns the androidboot.bootreason value of /proc/cmdline (whitespace-separated tokens). The
+// first token with the key decides; a value the check refuses is not found. Nothing else of raw is returned: the line
+// carries the serial number.
+func bootReasonFromCmdline(raw string) (string, bool) {
+	for _, tok := range strings.Fields(raw) {
+		val, ok := strings.CutPrefix(tok, "androidboot.bootreason=")
+		if !ok {
+			continue
+		}
+		if !bootReasonValueOK(val) {
+			return "", false
+		}
+		return val, true
+	}
+	return "", false
+}
+
+// bootErrClass names an error's class for boot_reason_read: denied, absent or error. Never the error's text.
+func bootErrClass(err error) string {
+	switch {
+	case errors.Is(err, fs.ErrPermission):
+		return "denied"
+	case errors.Is(err, fs.ErrNotExist):
+		return "absent"
+	}
+	return "error"
+}
+
+// bootFileReason reads one boot file and parses its boot reason. state is found, nokey (no key, or a value the check
+// refuses), denied, absent or error.
+func bootFileReason(path string, parse func(string) (string, bool)) (value, state string) {
+	raw, err := readBootFile(path)
+	if err != nil {
+		return "", bootErrClass(err)
+	}
+	if v, ok := parse(string(raw)); ok {
+		return v, "found"
+	}
+	return "", "nokey"
+}
+
+// reBootPropShort is the shape a property area's short name is listed in; another name is written "unnamed", so the
+// "<name>:<state>" tokens stay unambiguous.
+var reBootPropShort = regexp.MustCompile(`^[A-Za-z0-9_.\-]{1,128}$`)
+
+// bootPropFilesState lists each property area under propAreaDir whose name contains boot_reason as
+// "<short name>:<ok|denied|error>", sorted and joined with ","; or denied, absent or error when the dir cannot be
+// listed, and none when it holds no such area. The areas are opened and closed, never read.
+func bootPropFilesState() string {
+	ents, err := os.ReadDir(propAreaDir)
+	if err != nil {
+		return bootErrClass(err)
+	}
+	var toks []string
+	for _, e := range ents {
+		name := e.Name()
+		if !strings.Contains(name, "boot_reason") {
+			continue
+		}
+		state := "ok"
+		if err := openPropFile(filepath.Join(propAreaDir, name)); err != nil {
+			state = "error"
+			if errors.Is(err, fs.ErrPermission) {
+				state = "denied"
+			}
+		}
+		short := strings.TrimSuffix(strings.TrimPrefix(name, "u:object_r:"), ":s0")
+		if !reBootPropShort.MatchString(short) {
+			short = "unnamed"
+		}
+		toks = append(toks, short+":"+state)
+	}
+	if len(toks) == 0 {
+		return "none"
+	}
+	sort.Strings(toks)
+	return strings.Join(toks, ",")
+}
+
 // bootReasonMarker returns Android's own record of why the device booted, raw (the caller scrubs and caps it):
 // boot_reason (ro.boot.bootreason, the bootloader's reason for THIS boot), boot_reason_last (sys.boot.reason.last,
 // bootstat's reason for the last boot) and boot_reason_history (persist.sys.boot.reason.history, one line per boot,
 // joined with "; ").
+//
+// NWP-20261204-13: getprop run in u:r:nowhere:s0 answers EMPTY on user builds (reports NW-132f at the gate and NW-81dd
+// in a session, frankel 2026110301 and husky 2026110601, 2026-11-06), while adb read ro.boot.bootreason on the same
+// handset: the domain has no get_prop grant for the boot-reason contexts, and getprop prints an empty line for a
+// refused read. So boot_reason falls back to androidboot.bootreason from /proc/bootconfig, then /proc/cmdline, and
+// boot_reason_src names the source (getprop, bootconfig, cmdline or none). bootstat's two values have no file source,
+// so boot_reason_last and boot_reason_history stay getprop only. boot_reason_read is always present and says per source
+// why a read did not answer -- getprop=<ok|empty|failed> x3, bootconfig= and cmdline=<found|nokey|denied|absent|error>,
+// propfiles= each boot-reason property area openable or denied -- which is what tells "refused" from "never set". The
+// file reads are expected to be denied too (see bootconfigPath), so nothing here is a fix for the empty getprop.
 func bootReasonMarker() map[string]string {
-	read := func(prop string) string {
+	read := func(prop string) (string, string) {
 		v, err := readBootProp(prop)
 		v = strings.TrimSpace(v)
-		if err != nil || v == "" {
-			return bootReasonUnread
+		if err != nil {
+			return bootReasonUnread, "failed"
 		}
-		return v
+		if v == "" {
+			return bootReasonUnread, "empty"
+		}
+		return v, "ok"
+	}
+	reason, reasonState := read("ro.boot.bootreason")
+	last, lastState := read("sys.boot.reason.last")
+	history, historyState := read("persist.sys.boot.reason.history")
+	bcValue, bcState := bootFileReason(bootconfigPath, bootReasonFromBootconfig)
+	clValue, clState := bootFileReason(cmdlinePath, bootReasonFromCmdline)
+	propfiles := bootPropFilesState()
+
+	src := "none"
+	switch {
+	case reasonState == "ok":
+		src = "getprop"
+	case bcState == "found":
+		reason, src = bcValue, "bootconfig"
+	case clState == "found":
+		reason, src = clValue, "cmdline"
 	}
 	return map[string]string{
-		"boot_reason":         read("ro.boot.bootreason"),
-		"boot_reason_last":    read("sys.boot.reason.last"),
-		"boot_reason_history": joinBootHistory(read("persist.sys.boot.reason.history")),
+		"boot_reason":         reason,
+		"boot_reason_src":     src,
+		"boot_reason_last":    last,
+		"boot_reason_history": joinBootHistory(history),
+		"boot_reason_read": "getprop=" + reasonState + "," + lastState + "," + historyState +
+			"; bootconfig=" + bcState + "; cmdline=" + clState + "; propfiles=" + propfiles,
 	}
 }
 
@@ -1380,6 +1553,13 @@ func buildIssueReportWith(name string, deviceScope bool, note string, extra map[
 		for k, v := range grantTimingStatus(filepath.Join(loginStateDir(), grantTimingFile)) {
 			status[k] = v
 		}
+		// NWP-20261202-34 (h50 #1, docs/product-decisions.md 2026-11-01: the handset measurement of what the size walk
+		// costs): this session's watched odrestore copies -- the copies, their du reads, the reads' summed and worst
+		// time, the largest size in KiB. An app's data size is a profile fact, so session scope only. Digits only
+		// (odGrowTimingStatus copies nothing else), so they skip statusValue.
+		for k, v := range odGrowTimingStatus(filepath.Join(loginStateDir(), odGrowTimingFile)) {
+			status[k] = v
+		}
 	}
 	for k, v := range extra { // caller status; scrub values defensively (never trust free-form in)
 		status[k] = statusValue(v, secrets)
@@ -1610,7 +1790,8 @@ func handleReportIssue(conn net.Conn, dest, reqLine string) {
 	mergeDaySummary(rep.Status, uid, deviceScope)              // NWP-20261124-12: session scope only, this session's uid only
 	// NWP-20261201-02: session scope only; the fetch waits at most gmsExitsWait.
 	mergeGmsExits(rep.Status, func() string { return fetchGmsExits(dest, name, uid) }, dest, deviceScope)
-	mergeHealth(rep.Status, uid, deviceScope) // NWP-20261201-08: session scope only, this session's uid only
+	mergeHealth(rep.Status, uid, deviceScope)        // NWP-20261201-08: session scope only, this session's uid only
+	mergeMediaIO(rep.Status, dest, uid, deviceScope) // NWP-20261205-08: session scope only, this session's uid only
 
 	if req.Preview {
 		// "View what's sent": hand the chooser the EXACT scrubbed bytes to show the user before they consent.

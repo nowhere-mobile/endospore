@@ -187,9 +187,11 @@ func refusalToken(s string) bool {
 // or would drop, a package whose data this session has not fetched; a retry cannot pass while the package stays
 // unfetched, and the class is the fetch slice's to set when the unfetched list has a writer), "aftergate-no-carry"
 // (NWP-20261128-03: the #media restore was split after the gate and the seal's carry did not run; every decline is
-// transient or configuration, and END-UNSAVED must not be offered on a reason that is about keeping files), and
-// anything unknown. Unknown is retry on purpose: offering a control that discards data on a reason this build
-// cannot name would be the wrong way round.
+// transient or configuration, and END-UNSAVED must not be offered on a reason that is about keeping files),
+// "deferred-missing" and "deferred-unchecked" (NWP-20261207-02, h51 #2: the stored head names a deferred piece the
+// store does not hold, or one the check could not answer; re-running the restore page with the full folder fills the
+// gap, so END-UNSAVED is never offered), and anything unknown. Unknown is retry on purpose: offering a control that
+// discards data on a reason this build cannot name would be the wrong way round.
 func refusalReasonFinal(reason string) bool {
 	switch reason {
 	case "shrink", "no-receipt", "stale-base", "blind", "deleted", "apps-vanished",
@@ -1125,7 +1127,7 @@ func handleEndUnsaved(conn net.Conn, dest string) {
 	resetPushStuck() // the committed end: nothing of this session's run outlives it
 	// NWP-20261013-20: the reply is read by the session's own screen, and the reap switches to the gate within a moment,
 	// so the gate shows the lost credit (noteCreditLost) -- recorded here, after every abort above, before the switch.
-	if creditLost && walletHoldsCredit(walletPathFor(dest)) {
+	if creditLost && walletHoldsUnrestoredCredit(walletPathFor(dest)) {
 		noteCreditLost(dest)
 	}
 	handleLogout(reply, dest) // the throwaway branch: clears the markers, queues the switch+reap, replies OK (or OK-CREDIT-LOST)
@@ -1480,7 +1482,7 @@ func handleRestartUnsaved(conn net.Conn, dest string) {
 	// Its reboot clears the state tmpfs where the gate's notice lives, so the notice goes to durable storage, stamped
 	// now and carried in the marker below so a reboot that does not happen takes it back (removeRestartMarker).
 	tell := ""
-	if ok == endUnsavedCreditLost && walletHoldsCredit(walletPathFor(dest)) {
+	if ok == endUnsavedCreditLost && walletHoldsUnrestoredCredit(walletPathFor(dest)) {
 		tell = strconv.FormatInt(time.Now().Unix(), 10)
 	}
 	// The marker FIRST (round 7): a session marked local with no marker is one a daemon restart cannot give back, so

@@ -29,6 +29,16 @@ func TestIdleTraceKeepsTheChooserEvents(t *testing.T) {
 		"pushdoze other appid=10330 ok=1",
 		"smsnotice sum=0 subst=0 pub=1 icon=1",
 		"smsnotice sum=1 subst=-1",
+		"credsvc-watch u=10 found=1 stuck=1 next=-1 resent=6",
+		"credsvc-watch u=10 found=0 stuck=0 next=-1 resent=0 err",
+		"credsvc-watch u=10 found=1 stuck=1 next=4 resent=0 skip",
+		"backnow drop user=14",
+		"backnow post user=14 at=1763000000",
+		"backnow landed user=14 s=1763000400 at=1763000000",
+		"backnow landed user=14 s=-1 at=1763000000",
+		"backnow cancel user=14 s=1763000400",
+		"backnow cancel drop user=14",
+		"backnow cancel gate user=14",
 	} {
 		if got := idleTraceLine(ev + "\n"); got != ev {
 			t.Errorf("idleTraceLine(%q) = %q, want it kept byte for byte", ev, got)
@@ -38,15 +48,19 @@ func TestIdleTraceKeepsTheChooserEvents(t *testing.T) {
 
 func TestIdleTraceDropsFreeText(t *testing.T) {
 	for in, want := range map[string]string{
-		"arm alice":             "arm ?",
-		"screen ms=alice":       "screen ?",
-		"alice on":              "trace-unknown",
-		"arm ms=":               "arm ?",
-		"arm ms=1x":             "arm ?",
-		"arm alice=1":           "arm ?",
-		"smsnotice subst=alice": "smsnotice ?",
-		"":                      "",
-		"OK\n":                  "",
+		"arm alice":               "arm ?",
+		"screen ms=alice":         "screen ?",
+		"alice on":                "trace-unknown",
+		"arm ms=":                 "arm ?",
+		"arm ms=1x":               "arm ?",
+		"arm alice=1":             "arm ?",
+		"smsnotice subst=alice":   "smsnotice ?",
+		"backnow post user=alice": "backnow post ?",
+		"":                        "",
+		"OK\n":                    "",
+		// NWP-20261203-05: a name-like token after credsvc-watch prints `?`.
+		"credsvc-watch alice":               "credsvc-watch ?",
+		"credsvc-watch u=10 resent=3 alice": "credsvc-watch u=10 resent=3 ?",
 	} {
 		if got := idleTraceLine(in); got != want {
 			t.Errorf("idleTraceLine(%q) = %q, want %q", in, got, want)
@@ -252,5 +266,63 @@ func TestIdleTraceVocabularyCoversTheChooser(t *testing.T) {
 				t.Errorf("%s: literal %q: token %q is in neither idleTraceVerbs nor idleTraceWords", l.file, l.text, tok)
 			}
 		}
+	}
+}
+
+// NWP-20261203-04: the sign-in chooser-kill evidence (SignInTrace) survives whole, and a name after its verbs does not.
+func TestIdleTraceKeepsTheSignInEvidence(t *testing.T) {
+	for _, ev := range []string{
+		"smsprobe step=0 u=10 holder=1 perms=63 up=1234567",
+		"smsprobe step=3 u=10 holder=-1 perms=-1 up=99",
+		"credsvc claimslogin u=10 id=3 up=55",
+		"credsvc smsrole u=10 id=2 up=56",
+		"credsvc pw u=10 id=1 up=5",
+		"exitinfo u=10 reason=8 ago=118 up=777",
+	} {
+		if got := idleTraceLine(ev + "\n"); got != ev {
+			t.Errorf("idleTraceLine(%q) = %q, want it kept byte for byte", ev, got)
+		}
+	}
+	for in, want := range map[string]string{
+		"smsprobe alice":               "smsprobe ?",
+		"credsvc alice u=10":           "credsvc ? u=10",
+		"exitinfo alice":               "exitinfo ?",
+		"exitinfo u=10 reason=x ago=5": "exitinfo u=10 ? ago=5",
+		"smsprobe step=0 holder=bob":   "smsprobe step=0 ?",
+	} {
+		if got := idleTraceLine(in); got != want {
+			t.Errorf("idleTraceLine(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// NWP-20261203-04: the credsvc start kinds reach idleTrace through a variable, so the chooser scan above cannot see
+// them. Read every `return "..."` of SignInTrace.startKind and require each in idleTraceWords.
+func TestIdleTraceCoversSignInTraceKinds(t *testing.T) {
+	raw, err := os.ReadFile("../chooser/src/com/nowhere/chooser/SignInTrace.java")
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := string(raw)
+	k := strings.Index(src, "static String startKind(")
+	if k < 0 {
+		t.Fatal("SignInTrace.java has no startKind(")
+	}
+	body := idleTraceBalanced(src, k+strings.Index(src[k:], "{"), '{', '}')
+	n := 0
+	for _, l := range strings.Split(body, "\n") {
+		r := strings.Index(l, "return ")
+		if r < 0 {
+			continue
+		}
+		for _, s := range idleTraceJavaStrings(l[r:]) {
+			n++
+			if !idleTraceWords[s] {
+				t.Errorf("SignInTrace.startKind returns %q, which is not in idleTraceWords", s)
+			}
+		}
+	}
+	if n < 10 {
+		t.Fatalf("SignInTrace.startKind: found %d returned words, want >= 10", n)
 	}
 }

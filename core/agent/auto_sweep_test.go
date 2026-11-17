@@ -511,3 +511,145 @@ func TestAutoSweepAppAnswersWhileSessionMuIsHeld(t *testing.T) {
 		t.Fatal("AUTO-SWEEP-APP waited on the session lock a materialise holds")
 	}
 }
+
+// NWP-20261203-03: AUTO-SWEEP-STEP, a sweep step with no progress, its end, an abandon, a join -- one strictly-typed
+// login.log line, no package.
+
+var sweepStepKinds = []string{"stall", "ended", "abandoned", "joined"}
+
+var sweepStepTokens = []string{"list", "card", "seal-hold", "tap", "restore-only", "lock", "dep-fetch", "dep-install", "dep-restore", "fetch", "version", "install", "restore", "report", "busy-wait"}
+
+// sweepStep sends one AUTO-SWEEP-STEP through the real dispatcher and returns its reply and the stderr it wrote.
+func sweepStep(t *testing.T, d, kind, step, i, n, secs string) (reply, logged string) {
+	t.Helper()
+	logged = captureStderr(t, func() {
+		reply = evictConn(t, d, "AUTO-SWEEP-STEP\n"+kind+"\n"+step+"\n"+i+"\n"+n+"\n"+secs+"\n")
+	})
+	return reply, logged
+}
+
+// sweepStepLines is the "auto sweep step" lines of s.
+func sweepStepLines(s string) []string {
+	var out []string
+	for _, l := range strings.Split(s, "\n") {
+		if strings.Contains(l, "auto sweep step") {
+			out = append(out, l)
+		}
+	}
+	return out
+}
+
+func TestAutoSweepStepLogsEachKind(t *testing.T) {
+	sweepState(t)
+	d := t.TempDir()
+	if len(sweepStepKinds) != len(autoSweepStepKinds) || len(sweepStepTokens) != len(autoSweepStepTokens) {
+		t.Fatalf("the closed sets changed: %d kinds, %d steps", len(autoSweepStepKinds), len(autoSweepStepTokens))
+	}
+	for _, kind := range sweepStepKinds {
+		reply, logged := sweepStep(t, d, kind, "fetch", "3", "7", "42")
+		want := "[logind] auto sweep step " + kind + ": fetch app 3/7 after 42s"
+		if got := sweepStepLines(logged); reply != "OK" || len(got) != 1 || got[0] != want {
+			t.Errorf("%s: reply %q, logged %q, want OK and exactly %q", kind, reply, got, want)
+		}
+	}
+	for _, step := range sweepStepTokens {
+		reply, logged := sweepStep(t, d, "stall", step, "3", "7", "42")
+		want := "[logind] auto sweep step stall: " + step + " app 3/7 after 42s"
+		if got := sweepStepLines(logged); reply != "OK" || len(got) != 1 || got[0] != want {
+			t.Errorf("%s: reply %q, logged %q, want OK and exactly %q", step, reply, got, want)
+		}
+	}
+	for _, c := range [][3]string{{"0", "0", "0"}, {"9999", "9999", "86400"}} {
+		reply, logged := sweepStep(t, d, "abandoned", "restore", c[0], c[1], c[2])
+		want := "[logind] auto sweep step abandoned: restore app " + c[0] + "/" + c[1] + " after " + c[2] + "s"
+		if got := sweepStepLines(logged); reply != "OK" || len(got) != 1 || got[0] != want {
+			t.Errorf("boundary %v: reply %q, logged %q, want OK and %q", c, reply, got, want)
+		}
+	}
+}
+
+func TestAutoSweepStepRefusesABadRequest(t *testing.T) {
+	sweepState(t)
+	d := t.TempDir()
+	cases := []struct{ why, kind, step, i, n, secs string }{
+		{"unknown kind", "hung", "fetch", "1", "4", "5"},
+		{"kind in another case", "Stall", "fetch", "1", "4", "5"},
+		{"empty kind", "", "fetch", "1", "4", "5"},
+		{"unknown step", "stall", "download", "1", "4", "5"},
+		{"step with a trailing space", "stall", "fetch ", "1", "4", "5"},
+		{"step with a leading space", "stall", " fetch", "1", "4", "5"},
+		{"package-shaped step", "stall", "com.example.app", "1", "4", "5"},
+		{"empty step", "stall", "", "1", "4", "5"},
+		{"i>n", "stall", "fetch", "5", "4", "5"},
+		{"n=10000", "stall", "fetch", "1", "10000", "5"},
+		{"secs past a day", "stall", "fetch", "1", "4", "86401"},
+		{"negative i", "stall", "fetch", "-1", "4", "5"},
+		{"negative secs", "stall", "fetch", "1", "4", "-1"},
+		{"signed n", "stall", "fetch", "1", "+4", "5"},
+		{"non-digit secs", "stall", "fetch", "1", "4", "5s"},
+		{"over-long i", "stall", "fetch", "00001", "4", "5"},
+		{"over-long secs", "stall", "fetch", "1", "4", "000005"},
+		{"empty secs", "stall", "fetch", "1", "4", ""},
+	}
+	for _, c := range cases {
+		reply, logged := sweepStep(t, d, c.kind, c.step, c.i, c.n, c.secs)
+		if reply != "ERR-ARG" {
+			t.Errorf("%s: reply %q, want ERR-ARG", c.why, reply)
+		}
+		if strings.Contains(logged, "auto sweep step") {
+			t.Errorf("%s: a refused request logged %q", c.why, logged)
+		}
+	}
+}
+
+// A request cut short answers at once (the reader's EOF), never with a line. Direct call, as for AUTO-SWEEP-APP.
+func TestAutoSweepStepRefusesATruncatedRequest(t *testing.T) {
+	sweepState(t)
+	full := []string{"stall\n", "fetch\n", "1\n", "2\n", "5\n"}
+	for cut := 0; cut < len(full); cut++ {
+		body := strings.Join(full[:cut], "")
+		if cut == len(full)-1 {
+			body += "5" // the last line without its newline
+		}
+		cli, srv := net.Pipe()
+		got := make(chan string, 1)
+		logged := captureStderr(t, func() {
+			go func() { b, _ := io.ReadAll(cli); got <- string(b) }()
+			handleAutoSweepStep(srv, bufio.NewReader(strings.NewReader(body)))
+			srv.Close()
+		})
+		select {
+		case reply := <-got:
+			if strings.TrimRight(reply, "\r\n") != "ERR-ARG" {
+				t.Errorf("%q: reply %q, want ERR-ARG", body, reply)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatalf("%q: no reply within 3s", body)
+		}
+		cli.Close()
+		if strings.Contains(logged, "auto sweep step") {
+			t.Errorf("%q: a truncated request logged %q", body, logged)
+		}
+	}
+}
+
+// A stalled sweep may itself wait on sessionMu; the line that names its step must not queue behind it.
+func TestAutoSweepStepAnswersWhileSessionMuIsHeld(t *testing.T) {
+	sweepState(t)
+	if !concurrentSafeCmd("AUTO-SWEEP-STEP") {
+		t.Fatal("AUTO-SWEEP-STEP is serialised on sessionMu")
+	}
+	d := t.TempDir()
+	sessionMu.Lock() // a materialise in progress
+	defer sessionMu.Unlock()
+	done := make(chan string, 1)
+	go func() { done <- evictConn(t, d, "AUTO-SWEEP-STEP\nstall\nrestore\n1\n2\n300\n") }()
+	select {
+	case got := <-done:
+		if got != "OK" {
+			t.Fatalf("AUTO-SWEEP-STEP replied %q", got)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("AUTO-SWEEP-STEP waited on the session lock a materialise holds")
+	}
+}

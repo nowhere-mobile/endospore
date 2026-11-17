@@ -9,6 +9,9 @@
 # StoreInstaller.installStaged, NWP-20261129-21) call it, map LANDED to success, read the session defensively and
 # (installApkSet) read the codePath as the target user. The store site's pins also forbid its old 180 s latch and
 # isInstalled verdict, and require HARD_BOUND to answer PENDING and pathBefore to be read before the commit.
+# The RXPINS (NWP-20261207-09) check that installApkSet and installArchivedPlaceholder register and unregister their
+# PackageInstaller result receiver on the application context, inside a finally: a gate recreate() destroys the
+# Activity, Android drops an Activity's receivers on destroy, and the login worker is still waiting on the result.
 #
 # ⚠ IT FAILS WHEN THERE IS NO JAVAC, IT NEVER SKIPS. javac comes from PATH, else from the build host's JDK below;
 # the version is printed first so the log proves which compiler ran.
@@ -79,6 +82,34 @@ pins() {
   fi
 }
 
+# rxpins <label> <method text> -> sets bad=1 (caller's local) on a failed pin (NWP-20261207-09). Comments are stripped
+# first, so a call written in a comment neither satisfies nor breaks a pin.
+#   R1 one `<v> = getApplicationContext();`, and through that <v>: two registerReceiver(rcv, fl (one with
+#      RECEIVER_NOT_EXPORTED, one without) and one unregisterReceiver(rcv).
+#   R2 no registerReceiver(rcv / unregisterReceiver(rcv that is not called on a receiver (the Activity's own).
+#   R3 the unregisterReceiver(rcv) sits inside a finally block.
+rxpins() {
+  local label="$1" body="$2" code v n
+  if [ -z "$body" ]; then echo "  PIN   $label: R1 the method was not found" >&2; bad=1; return; fi
+  code=$(printf '%s' "$body" | perl -0pe 's{/\*.*?\*/}{}gs; s{//[^\n]*}{}g')
+  n=$(printf '%s' "$code" | perl -0ne 'my $c = () = /\b\w+\s*=\s*getApplicationContext\(\);/g; print $c')
+  v=$(printf '%s' "$code" | perl -0ne 'print $1 if /\b(\w+)\s*=\s*getApplicationContext\(\);/')
+  if [ "$n" != 1 ] || [ -z "$v" ]; then
+    echo "  PIN   $label: R1 expected exactly one <v> = getApplicationContext(); found ${n:-0}" >&2; bad=1
+  else
+    n=$(printf '%s' "$code" | V="$v" perl -0ne 'my $v = quotemeta $ENV{V}; my $c = () = /(?<![\w.])$v\.registerReceiver\(rcv, fl, android\.content\.Context\.RECEIVER_NOT_EXPORTED\);/g; print $c')
+    [ "$n" = 1 ] || { echo "  PIN   $label: R1 expected one $v.registerReceiver(rcv, fl, ...RECEIVER_NOT_EXPORTED), found ${n:-0}" >&2; bad=1; }
+    n=$(printf '%s' "$code" | V="$v" perl -0ne 'my $v = quotemeta $ENV{V}; my $c = () = /(?<![\w.])$v\.registerReceiver\(rcv, fl\);/g; print $c')
+    [ "$n" = 1 ] || { echo "  PIN   $label: R1 expected one $v.registerReceiver(rcv, fl) for SDK < 33, found ${n:-0}" >&2; bad=1; }
+    n=$(printf '%s' "$code" | V="$v" perl -0ne 'my $v = quotemeta $ENV{V}; my $c = () = /(?<![\w.])$v\.unregisterReceiver\(rcv\)/g; print $c')
+    [ "$n" = 1 ] || { echo "  PIN   $label: R1 expected one $v.unregisterReceiver(rcv), found ${n:-0}" >&2; bad=1; }
+  fi
+  n=$(printf '%s' "$code" | perl -0ne 'my $c = () = /(?<!\.)\b(?:un)?registerReceiver\(rcv/g; print $c')
+  [ "$n" = 0 ] || { echo "  PIN   $label: R2 $n registerReceiver(rcv / unregisterReceiver(rcv call(s) on the Activity itself" >&2; bad=1; }
+  printf '%s' "$code" | perl -0ne 'while (/\bfinally\s*(\{(?:[^{}]++|(?1))*\})/g) { exit 0 if index($1, "unregisterReceiver(rcv)") >= 0 } exit 1' || {
+    echo "  PIN   $label: R3 the unregisterReceiver(rcv) is not inside a finally block" >&2; bad=1; }
+}
+
 # suite <InstallWait.java> <UnarchiveService.java> <ChooserActivity.java> <StoreInstaller.java> -> 0 pass, 1 a case or
 # pin failed (the only code that convicts a mutant), 3 the helper or the cases did not compile.
 suite() {
@@ -87,6 +118,8 @@ suite() {
   pins installApks "$(method "$svc" installApks)" svc
   pins installApkSet "$(method "$act" installApkSet)" act
   pins installStaged "$(method "$store" installStaged)" store
+  rxpins installApkSet "$(method "$act" installApkSet)"
+  rxpins installArchivedPlaceholder "$(method "$act" installArchivedPlaceholder)"
   [ -f "$helper" ] || { echo "  FAIL  InstallWait.java does not exist (the wait-and-decide rule is missing)" >&2; return 1; }
   [ "$bad" -eq 0 ] || return 1
   d=$(mktemp -d -p "$W")
@@ -106,19 +139,21 @@ suite "$HELPER" "$SVC" "$ACT" "$STORE" || { echo "FAILED"; exit 1; }
 [ "$MUTATE" = yes ] || exit 0
 
 echo "== mutations (each must be CONVICTED -- a mutant that does not compile proves nothing)"
-mut() { # mut <label> <helper|svc|act|store> <perl-expr>
-  local d h s a i rc target
+mut() { # mut <label> <helper|svc|act|store> <perl-expr> [<ERE of the PIN line that must convict it>]
+  local d h s a i rc target out
   d=$(mktemp -d -p "$W"); h="$d/InstallWait.java"; s="$d/UnarchiveService.java"; a="$d/ChooserActivity.java"; i="$d/StoreInstaller.java"
   cp "$HELPER" "$h"; cp "$SVC" "$s"; cp "$ACT" "$a"; cp "$STORE" "$i"
   case "$2" in helper) target="$h" ;; svc) target="$s" ;; store) target="$i" ;; *) target="$a" ;; esac
   if ! perl -0pi -e "$3" "$target"; then echo "  ERROR     $1 -- perl failed on the mutation"; rm -rf "$d"; return 1; fi
   if cmp -s "$HELPER" "$h" && cmp -s "$SVC" "$s" && cmp -s "$ACT" "$a" && cmp -s "$STORE" "$i"; then
     echo "  INERT     $1 -- the mutation changed nothing"; rm -rf "$d"; return 1; fi
-  suite "$h" "$s" "$a" "$i" >/dev/null 2>&1; rc=$?
+  out=$(suite "$h" "$s" "$a" "$i" 2>&1); rc=$?
   rm -rf "$d"
   case "$rc" in
     0) echo "  SURVIVED  $1"; return 1 ;;
-    1) echo "  convicted $1"; return 0 ;;
+    1) if [ -n "${4:-}" ] && ! [[ "$out" =~ $4 ]]; then
+         echo "  WRONG     $1 -- failed, but not on the expected pin ($4)"; return 1; fi
+       echo "  convicted $1"; return 0 ;;
     *) echo "  BROKEN    $1 -- the mutant did not compile (rc=$rc)"; return 1 ;;
   esac
 }
@@ -135,4 +170,9 @@ mut "S2 HARD_BOUND returns OK"                          store 's/if \(outcome ==
 mut "S3 LANDED not mapped to STATUS_SUCCESS (installStaged)" store 's/if \(outcome == InstallWait\.Outcome\.LANDED\) st\[0\] = android\.content\.pm\.PackageInstaller\.STATUS_SUCCESS;/\/\/ dropped/' || fails=$((fails+1))
 mut "S4 pathBefore read after the commit"               store 's/\n\s*try \{\n\s*pathBefore = ctx\.getPackageManager\(\)\.getApplicationInfo\(pkg, 0\)\.sourceDir;\n\s*\} catch \(Throwable notInstalled\) \{ \}//; s/(committed = true;[^\n]*\n)/$1                    try { pathBefore = ctx.getPackageManager().getApplicationInfo(pkg, 0).sourceDir; } catch (Throwable notInstalled) { }\n/' || fails=$((fails+1))
 mut "S5 the session adapter answers true on a throw"    store 's/(return pi\.getSessionInfo\(sid\) != null; \} catch \(Throwable \w+\) \{ return) false;/$1 true;/' || fails=$((fails+1))
+mut "M8 installApkSet registers on the Activity (SDK >= 33) -> R1/R2" act 's/rxCtx\.registerReceiver\(rcv, fl, android\.content\.Context\.RECEIVER_NOT_EXPORTED\)/registerReceiver(rcv, fl, android.content.Context.RECEIVER_NOT_EXPORTED)/' 'PIN   installApkSet: R[12] ' || fails=$((fails+1))
+mut "M9 installApkSet unregisters on the Activity -> R1/R2" act 's/(\(NWP-20260831-03\)"\)\);.*?\} finally \{\n\s*try \{ )rxCtx\.(unregisterReceiver\(rcv\);)/$1$2/s' 'PIN   installApkSet: R[12] ' || fails=$((fails+1))
+mut "M10 installArchivedPlaceholder registers on the Activity (SDK < 33) -> R1/R2" act 's/else rxCtx\.registerReceiver\(rcv, fl\);/else registerReceiver(rcv, fl);/' 'PIN   installArchivedPlaceholder: R[12] ' || fails=$((fails+1))
+mut "M11 installArchivedPlaceholder's rxCtx is the Activity -> R1" act 's/(\n {8}final android\.content\.Context rxCtx = )getApplicationContext\(\);/$1this;/' 'PIN   installArchivedPlaceholder: R1 ' || fails=$((fails+1))
+mut "M12 installApkSet unregisters after the try, not in its finally -> R3" act 's/(\(NWP-20260831-03\)"\)\);.*?)\} finally \{\n\s*try \{ rxCtx\.unregisterReceiver\(rcv\); \} catch \(Throwable ignore\) \{\}\n(\s*)\}\n/$1}\n$2try { rxCtx.unregisterReceiver(rcv); } catch (Throwable ignore) {}\n/s' 'PIN   installApkSet: R3 ' || fails=$((fails+1))
 [ "$fails" -eq 0 ] && echo "== all mutations convicted" || { echo "== $fails mutation(s) not convicted"; exit 1; }

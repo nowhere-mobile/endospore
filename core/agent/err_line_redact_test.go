@@ -325,6 +325,7 @@ func TestErrLineSourcePins(t *testing.T) {
 		{"main.go", "rollbackGateReply", `[logind] rollback-gate %q FAILED: `, "logSafeErrText("},
 		{"billing.go", "rebindPlanReporting", `[agent] plan carry: skipped (`, "logSafeErrText("},
 		{"release_gen.go", "relGenAtRestore", `release generation not checked (`, "logSafeErrText("},
+		{"release_gen.go", "relGenAtScopeRestore", `release generation not checked (`, "logSafeErrText("},
 		{"snapshot_delete.go", "handleDeleteSnapshot", `snapshot delete %q user %s FAILED: `, "logSafeErrText("},
 		{"ota_mandatory.go", "refreshOtaMandatory", `[ota] release metadata for %s not used: `, "logSafeErrText("},
 		{"build_warning_fetch.go", "fetchBuildWarning", `[build-warning] not fetched: `, "logSafeErrText("},

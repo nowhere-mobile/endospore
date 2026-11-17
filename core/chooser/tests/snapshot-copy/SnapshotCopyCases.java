@@ -1,4 +1,4 @@
-/** Cases for SnapshotCopy (NWP-20261027-07, NWP-20261116-22). Run by test-snapshot-copy-java.sh. Exits 1 on any
+/** Cases for SnapshotCopy (NWP-20261027-07, NWP-20261116-22, NWP-20261205-14). Run by test-snapshot-copy-java.sh. Exits 1 on any
  *  failure. The expected texts are literals, never read back from SnapshotCopy. */
 public class SnapshotCopyCases {
     static int fails = 0;
@@ -15,6 +15,18 @@ public class SnapshotCopyCases {
     static final String BUSY_RESTORE = "This phone is busy right now — nothing was restored. Try again in a moment.";
     static final String LOST_RESTORE = "The phone didn't answer, so the restore may or may not have happened. If it "
             + "did, this session ends without saving in a moment and the earlier version loads when you sign in again.";
+
+    /** The delete message before NWP-20261205-14, for two labels. */
+    static final String OLD_OCT = "The version saved Oct 3, 4:05 PM will be deleted from your store. This can't be "
+            + "undone, and you won't be able to restore it. Your current data and your other saved versions are not "
+            + "affected.";
+    static final String OLD_EARLIER = "The version saved earlier will be deleted from your store. This can't be "
+            + "undone, and you won't be able to restore it. Your current data and your other saved versions are not "
+            + "affected.";
+
+    static String join(String label) {
+        return SnapshotCopy.confirmContext(label) + " " + String.join(" ", SnapshotCopy.confirmLines());
+    }
 
     static String show(String r) {
         return r == null ? "null" : "'" + r.replace("\n", "\\n") + "'";
@@ -90,10 +102,16 @@ public class SnapshotCopyCases {
         }
 
         check(SnapshotCopy.confirmTitle().equals("Delete this version?"), "title");
-        String m = SnapshotCopy.confirmMessage("Oct 3, 4:05 PM");
+        // NWP-20261205-14: the message is a context sentence and two lines on a sheet; joined, they are the earlier
+        // message byte for byte, and the checks on that message run over the join.
+        check(SnapshotCopy.confirmLines().size() == 2, "two lines");
+        check(SnapshotCopy.confirmContext("Oct 3, 4:05 PM").contains("Oct 3, 4:05 PM"), "context names the version");
+        check(join("Oct 3, 4:05 PM").equals(OLD_OCT), "join is the earlier message: " + join("Oct 3, 4:05 PM"));
+        check(join("earlier").equals(OLD_EARLIER), "join is the earlier message: " + join("earlier"));
+        String m = join("Oct 3, 4:05 PM");
         check(m.contains("Oct 3, 4:05 PM"), "message names the version");
         check(m.contains("can't be undone"), "message says it can't be undone");
-        String n = SnapshotCopy.confirmMessage("earlier");
+        String n = join("earlier");
         check(!n.matches("(?s).*[0-9].*"), "message has no digit (no size): " + n);
         String low = n.toLowerCase();
         for (String bad : new String[] {"gb", "mb", "kb", "free", "bytes"})

@@ -53,6 +53,12 @@ if [ -n "$CONF" ]; then
   # export a baked value is silently ignored and enrolment falls through to defaultGatewayURL = PROD.
   # That is the difference between a beta device enrolling against beta and against production.
   export NOWHERE_GATEWAY_DEFAULT
+  # NWP-20261203-13: publish the gateway NowherePush uses (PushService.gatewayBase reads nowhere.gateway_url), by the
+  # agent's own rule (issueGatewayURL): GATEWAY_URL when enrolled, else the ring's NOWHERE_GATEWAY_DEFAULT. Not a
+  # persist. prop: it is re-derived from the merged conf every boot. Neither set -> no call, and the app keeps prod.
+  _nwgw=${GATEWAY_URL:-$NOWHERE_GATEWAY_DEFAULT}
+  if [ -n "$_nwgw" ]; then setprop nowhere.gateway_url "$_nwgw"; fi
+  unset _nwgw
   # NWP-20261114-13: the beta-setup ring's DRAFT OS-agreement signal; the daemon serves it as GET-OS-AGREEMENT.
   export NOWHERE_OS_AGREEMENT
   echo "[login] store config loaded $(date)" >> "$LOG"

@@ -23,7 +23,7 @@ final class WalletRepairCopy {
       + "Repairing gives that credit up, so credit you buy from now on is saved again. "
       + "Credit this phone holds now is kept.";
     static final String POSITIVE = "Repair";
-    static final String NEGATIVE = "Cancel";
+    static final String NEGATIVE = "Not now";
 
     private static String norm(String r) { return r == null ? "" : r.trim(); }
 

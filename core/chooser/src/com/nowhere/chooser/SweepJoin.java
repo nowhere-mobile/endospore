@@ -60,6 +60,13 @@ final class SweepJoin {
         }
     }
 
+    /** NWP-20261203-18, NWP-20261203-23: true while a sweep owns the walk, from the owner's enter() to the exit() that
+     *  returns -1. A rerun keeps it true. The progress notification and Your apps' install row offer Pause and Stop
+     *  only while it is. */
+    static boolean running() {
+        synchronized (LOCK) { return running; }
+    }
+
     /** For the cases only: back to idle. */
     static void reset() {
         synchronized (LOCK) {

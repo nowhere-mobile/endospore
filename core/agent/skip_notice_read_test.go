@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -16,6 +17,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -144,6 +146,11 @@ func TestSkipNoticeReadAbsentAndForeign(t *testing.T) {
 	}
 }
 
+// skipNoticeDriveBeforeWrite is a test seam (NWP-20261202-30): nil in every caller but one. When it is set,
+// skipNoticeVerbDrive calls it after the Dial and before the write, with the channel the server goroutine closes
+// after it has closed its conn, so a test can order the client's write after the peer's close.
+var skipNoticeDriveBeforeWrite func(served <-chan struct{})
+
 // skipNoticeVerbDrive runs h on a REAL unix socket (net.Pipe cannot half-close): the client writes req, closes its
 // write side so a ReadString past req returns io.EOF, and the trimmed reply comes back. The socket dir is short
 // (a t.TempDir() path can pass the 108-byte sun_path limit). The 20 s is a hang guard, not a timing claim.
@@ -174,6 +181,9 @@ func skipNoticeVerbDrive(t *testing.T, req string, h func(c net.Conn, r *bufio.R
 		t.Fatal(err)
 	}
 	defer cli.Close()
+	if skipNoticeDriveBeforeWrite != nil {
+		skipNoticeDriveBeforeWrite(served)
+	}
 	// An empty request is no write: a handler that reads nothing can answer and close first, and a zero-length write
 	// to a closed peer fails with EPIPE (NWP-20261128-31 and NWP-20261128-33, a CI flake of TestSkipNoticeReadLabelOneLine;
 	// NWP-20261129-07 met it too: a refused GET-SKIP-NOTICE replies and closes without reading, in a farm CI run under load).
@@ -197,6 +207,52 @@ func skipNoticeVerbDrive(t *testing.T, req string, h func(c net.Conn, r *bufio.R
 	case <-time.After(20 * time.Second):
 		t.Fatalf("no reply to %q", req)
 		return ""
+	}
+}
+
+// TestSkipNoticeVerbDriveEmptyRequestAfterThePeerClosed pins the NWP-20261128-31/-33 and NWP-20261129-07 fix
+// (NWP-20261202-30): a handler that answers and closes without reading, as handleGetSkipNotice's refused arm does,
+// must leave an empty request readable. The seam orders the client's write after the server's close, so the EPIPE
+// the farm met only under load happens on every run if the empty-request guard goes. The control proves that a
+// zero-length write to a closed peer is EPIPE on this kernel.
+func TestSkipNoticeVerbDriveEmptyRequestAfterThePeerClosed(t *testing.T) {
+	old := skipNoticeDriveBeforeWrite
+	t.Cleanup(func() { skipNoticeDriveBeforeWrite = old })
+	skipNoticeDriveBeforeWrite = func(s <-chan struct{}) { <-s }
+	got := skipNoticeVerbDrive(t, "", func(c net.Conn, _ *bufio.Reader) { c.Write([]byte("NONE\n")) })
+	if got != "NONE" {
+		t.Fatalf("an empty request after the peer closed: %q, want NONE", got)
+	}
+
+	// CONTROL: the same order on a pair built here; a raw zero-length write must fail with EPIPE.
+	dir, err := os.MkdirTemp("", "sn")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	l, err := net.Listen("unix", filepath.Join(dir, "s"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	served := make(chan struct{})
+	go func() {
+		defer close(served)
+		c, err := l.Accept()
+		if err != nil {
+			return
+		}
+		c.Write([]byte("NONE\n"))
+		c.Close()
+	}()
+	cli, err := net.Dial("unix", filepath.Join(dir, "s"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cli.Close()
+	<-served
+	if _, err := cli.Write([]byte("")); !errors.Is(err, syscall.EPIPE) {
+		t.Fatalf("the control did not reproduce: a zero-length write to a closed unix peer returned %v, want EPIPE", err)
 	}
 }
 

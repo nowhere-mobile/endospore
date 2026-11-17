@@ -10,7 +10,8 @@
 #                 row for row, and the class has no row the doc lacks;
 #   DEFAULTS PIN  Standard equals the code's defaults (IDLE_LOGOFF_MS, WipeChoice DEFAULT, RECLAIM_DEFAULT_MS, the
 #                 cfg/cfgStatic fallbacks, holdlock and holdaudio each on unless "0");
-#   STORAGE PIN   each row's stored values are what the screens write (showIdlePicker's mins, the RECLAIM_* values,
+#   STORAGE PIN   each row's stored values are what the screens write (StandbySheets' MINS, LABELS and boxValue, which
+#                 showIdlePicker's sheet writes through saveStandby (NWP-20261206-04), the RECLAIM_* values,
 #                 WipeChoice.LABELS, appDefaultRow's and showConfiguration's label -> value pairs, the CFG_* keys).
 # Comment lines (//, *, /*) and trailing // comments never count as code.
 #
@@ -34,6 +35,7 @@ SUT="$SRC/ProfilePresets.java"
 CHA="$SRC/ChooserActivity.java"
 PA="$SRC/ProfileActivity.java"
 WC="$SRC/WipeChoice.java"
+SS="$SRC/StandbySheets.java"
 RP="$SRC/RoamedPrefs.java"   # NWP-20261119-21: the gate's lock prefs are parsed here, holdlock and holdaudio included
 DOC="$root/docs/profile-presets.md"
 CASES="$root/core/chooser/tests/profile-presets/ProfilePresetsCases.java"
@@ -49,7 +51,7 @@ else
   exit 2
 fi
 "$JAVAC" -version || { echo "FAIL: $JAVAC does not run" >&2; exit 2; }
-for f in "$CASES" "$CHA" "$PA" "$WC" "$RP" "$DOC"; do [ -f "$f" ] || { echo "FAIL: missing $f" >&2; exit 2; }; done
+for f in "$CASES" "$CHA" "$PA" "$WC" "$SS" "$RP" "$DOC"; do [ -f "$f" ] || { echo "FAIL: missing $f" >&2; exit 2; }; done
 
 # suite <ProfilePresets.java> <doc-dump out> <store-dump out> -> 0 pass, 1 a case failed or the class is missing (the
 # only codes that convict a mutant), 3 the class or the cases did not compile. The two dumps feed the pins.
@@ -138,13 +140,14 @@ reclaim_ms() {
   echo $(( e ))
 }
 
-# codepin <store-dump> <ChooserActivity.java> <ProfileActivity.java> <WipeChoice.java> -> 0 when the DEFAULTS PIN and
-# the STORAGE PIN hold, 1 (with the first reason) when not. An extraction that finds nothing is a FAIL.
+# codepin <store-dump> <ChooserActivity.java> <ProfileActivity.java> <WipeChoice.java> [<StandbySheets.java>] -> 0 when
+# the DEFAULTS PIN and the STORAGE PIN hold, 1 (with the first reason) when not. An extraction that finds nothing is a
+# FAIL.
 codepin() {
-  local st="$1" cha pa wc v want n cfgb cfgsb sip rcd conf adr k name const key
-  cha=$(code "$2"); pa=$(code "$3"); wc=$(code "$4")
-  local paf; paf=$(mktemp -p "$W") || return 1
-  printf '%s\n' "$pa" > "$paf"
+  local st="$1" cha pa wc ss v want n cfgb cfgsb sip rcd conf adr k name const key bxs bxv
+  cha=$(code "$2"); pa=$(code "$3"); wc=$(code "$4"); ss=$(code "${5:-$SS}")
+  local paf ssf; paf=$(mktemp -p "$W") || return 1; ssf=$(mktemp -p "$W") || return 1
+  printf '%s\n' "$pa" > "$paf"; printf '%s\n' "$ss" > "$ssf"
   fail() { echo "  FAIL  $*" >&2; return 1; }
 
   # DEFAULTS.
@@ -176,27 +179,34 @@ codepin() {
   for k in play aurora gos other; do
     v=$(sv "$st" "apps.default.$k" 4); [ "$v" = off ] || { fail "DEFAULTS PIN: Standard apps.default.$k is '$v', the fallback is APPDEF_OFF"; return 1; }
   done
-  has "$pa" 'holdBox.setChecked(!"0".equals(readPrefValue("holdlock")));' || { fail "DEFAULTS PIN: the install wait is not on unless holdlock=0 (ProfileActivity)"; return 1; }
+  bxs=$(meth "$ssf" boxes); bxv=$(meth "$ssf" boxValue)
+  [ -n "$bxs" ] && [ -n "$bxv" ] || { fail "DEFAULTS PIN: boxes( or boxValue( not found in StandbySheets"; return 1; }
+  has "$pa" 'StandbySheets.boxes(readPrefValue("holdlock"), readPrefValue("holdaudio"))' \
+    || { fail "DEFAULTS PIN: showIdlePicker does not read holdlock= and holdaudio= into StandbySheets.boxes (ProfileActivity)"; return 1; }
+  has "$ss" 'static final String[] BOX_KEYS = { "holdlock", "holdaudio" };' || { fail "STORAGE PIN: StandbySheets.BOX_KEYS is not holdlock, holdaudio"; return 1; }
+  has "$pa" 'saveStandby(StandbySheets.BOX_KEYS[i], StandbySheets.boxValue(on), ' || { fail "STORAGE PIN: a box toggle does not write StandbySheets.boxValue to its BOX_KEYS key (ProfileActivity)"; return 1; }
+  has "$bxv" 'return on ? "" : "0";' || { fail "STORAGE PIN: StandbySheets.boxValue does not write \"\" for On and \"0\" for Off"; return 1; }
+  has "$bxs" '!"0".equals(holdlock)' || { fail "DEFAULTS PIN: the install wait is not on unless holdlock=0 (StandbySheets.boxes)"; return 1; }
   has "$(code "$RP")" 'return new Values(idleMs, wipeMs, WipeOnSave.on(wipesaved), !"0".equals(holdlock), !"0".equals(holdaudio));' || { fail "DEFAULTS PIN: the gate does not hold unless holdlock=0 / holdaudio=0 (RoamedPrefs.parse)"; return 1; }
   has "$cha" 'sHoldLockForInstalls = rp.holdLock;' || { fail "DEFAULTS PIN: the gate does not take holdlock from RoamedPrefs.parse (ChooserActivity)"; return 1; }
-  has "$pa" 'setPref("holdlock", holdBox.isChecked() ? "" : "0");' || { fail "STORAGE PIN: the install wait does not write \"\" for On and \"0\" for Off"; return 1; }
   v=$(sv "$st" holdlock 2); [ "$v" = ",0" ] || { fail "STORAGE PIN: holdlock's values are '$v', want ',0' (On, Off)"; return 1; }
   v=$(sv "$st" holdlock 4); [ "$v" = "" ] || { fail "DEFAULTS PIN: Standard holdlock is '$v', the default is On (\"\")"; return 1; }
   # NWP-20261124-17: the audio wait, the same rule.
-  has "$pa" 'audioBox.setChecked(!"0".equals(readPrefValue("holdaudio")));' || { fail "DEFAULTS PIN: the audio wait is not on unless holdaudio=0 (ProfileActivity)"; return 1; }
+  has "$bxs" '!"0".equals(holdaudio)' || { fail "DEFAULTS PIN: the audio wait is not on unless holdaudio=0 (StandbySheets.boxes)"; return 1; }
   has "$cha" 'sHoldLockForAudio = rp.holdAudio;' || { fail "DEFAULTS PIN: the gate does not take holdaudio from RoamedPrefs.parse (ChooserActivity)"; return 1; }
-  has "$pa" 'setPref("holdaudio", audioBox.isChecked() ? "" : "0");' || { fail "STORAGE PIN: the audio wait does not write \"\" for On and \"0\" for Off"; return 1; }
   v=$(sv "$st" holdaudio 2); [ "$v" = ",0" ] || { fail "STORAGE PIN: holdaudio's values are '$v', want ',0' (On, Off)"; return 1; }
   v=$(sv "$st" holdaudio 4); [ "$v" = "" ] || { fail "DEFAULTS PIN: Standard holdaudio is '$v', the default is On (\"\")"; return 1; }
 
   # STORAGE.
-  sip=$(meth "$paf" showIdlePicker)
-  [ -n "$sip" ] || { fail "STORAGE PIN: showIdlePicker( not found"; return 1; }
-  want=$(printf '%s\n' "$sip" | sed -nE 's/^ *final int\[\] mins = \{ *([0-9, ]*) *\};$/\1/p' | tr -d ' ')
-  [ -n "$want" ] || { fail "STORAGE PIN: no mins array in showIdlePicker"; return 1; }
-  v=$(sv "$st" idle 2); [ "$v" = "$want" ] || { fail "STORAGE PIN: idle's values are '$v', showIdlePicker's mins are '$want'"; return 1; }
-  want=$(strarr "$(printf '%s\n' "$sip" | grep -E '^ *final String\[\] labels = \{')")
-  v=$(sv "$st" idle 3); [ -n "$want" ] && [ "$v" = "$want" ] || { fail "STORAGE PIN: idle's labels are '$v', showIdlePicker's are '$want'"; return 1; }
+  sip=$(meth "$paf" saveStandby)
+  [ -n "$sip" ] || { fail "STORAGE PIN: saveStandby( not found"; return 1; }
+  has "$sip" 'writeIdlePref(Integer.parseInt(value))' && has "$pa" 'saveStandby("idle", String.valueOf(StandbySheets.MINS[idx]), idx, ' \
+    || { fail "STORAGE PIN: a card tap does not write StandbySheets.MINS[idx] to idle="; return 1; }
+  want=$(printf '%s\n' "$ss" | sed -nE 's/^ *static final int\[\] MINS = \{ *([0-9, ]*) *\};$/\1/p' | tr -d ' ')
+  [ -n "$want" ] || { fail "STORAGE PIN: no MINS array in StandbySheets"; return 1; }
+  v=$(sv "$st" idle 2); [ "$v" = "$want" ] || { fail "STORAGE PIN: idle's values are '$v', StandbySheets.MINS is '$want'"; return 1; }
+  want=$(strarr "$(printf '%s\n' "$ss" | grep -E '^ *static final String\[\] LABELS = \{')")
+  v=$(sv "$st" idle 3); [ -n "$want" ] && [ "$v" = "$want" ] || { fail "STORAGE PIN: idle's labels are '$v', StandbySheets.LABELS is '$want'"; return 1; }
   want=""
   for n in NEVER 1D 3D 1W; do
     k=$(reclaim_ms "$pa" "$n") || { fail "STORAGE PIN: RECLAIM_$n does not evaluate"; return 1; }
@@ -261,13 +271,14 @@ command -v perl >/dev/null 2>&1 || { echo "FAIL: --mutate needs perl, and there 
 echo "== mutations (each must be CONVICTED -- a mutant that does not compile or does not apply proves nothing)"
 DUMP_DOC=$(mktemp -p "$W") || exit 1; DUMP_STORE=$(mktemp -p "$W") || exit 1
 suite "$SUT" "$DUMP_DOC" "$DUMP_STORE" >/dev/null 2>&1 || { echo "FAIL: the unmutated class did not dump" >&2; exit 1; }
-mut() { # mut <label> <file: class|doc|pa|cha> <perl-expr>
+mut() { # mut <label> <file: class|doc|pa|cha|ss> <perl-expr>
   local d c rc orig out why
   d=$(mktemp -d -p "$W") || return 1
   case "$2" in
     class) orig="$SUT" ;;
     doc) orig="$DOC" ;;
     pa) orig="$PA" ;;
+    ss) orig="$SS" ;;
     *) orig="$CHA" ;;
   esac
   c="$d/$(basename "$orig")"
@@ -278,6 +289,7 @@ mut() { # mut <label> <file: class|doc|pa|cha> <perl-expr>
     class) out=$(check_all "$c" "$DOC" "$CHA" "$PA" "$WC" 2>&1); rc=$? ;;
     doc) out=$(docpin "$c" "$DUMP_DOC" 2>&1); rc=$? ;;
     pa) out=$(codepin "$DUMP_STORE" "$CHA" "$c" "$WC" 2>&1); rc=$? ;;
+    ss) out=$(codepin "$DUMP_STORE" "$CHA" "$PA" "$WC" "$c" 2>&1); rc=$? ;;
     *) out=$(codepin "$DUMP_STORE" "$c" "$PA" "$WC" 2>&1); rc=$? ;;
   esac
   rm -rf "$d"
@@ -297,7 +309,7 @@ mut "M5 match takes a partial match"            class 's/if \(!e\.getValue\(\)\.
 mut "M6 leaving Custom does not save it"        class 's/if \(now != null\) saved = now;//' || fails=$((fails+1))
 mut "M7 handChange never asks"                  class 's/return new HandChange\(true, savedCustom, now\);/return new HandChange(false, now, null);/' || fails=$((fails+1))
 mut "M8 parseCustom returns a partial map"      class 's/return tableValues\(seen\);/return Collections.unmodifiableMap(seen);/' || fails=$((fails+1))
-mut "M9 showIdlePicker's mins drift"            pa    's/final int\[\] mins = \{ 5, 15, 30, 60, 0 \};/final int[] mins = { 5, 10, 30, 60, 0 };/' || fails=$((fails+1))
+mut "M9 StandbySheets' MINS drift"              ss    's/static final int\[\] MINS = \{ 5, 15, 30, 60, 0 \};/static final int[] MINS = { 5, 10, 30, 60, 0 };/' || fails=$((fails+1))
 mut "M10 the gate's idle default moves"         cha   's/IDLE_LOGOFF_MS = 15 \* 60 \* 1000L;/IDLE_LOGOFF_MS = 30 * 60 * 1000L;/' || fails=$((fails+1))
 mut "D1 the doc's Hardened idle is 30 minutes"  doc   's/^(\| Security > Auto standby when idle \|[^\n]*\| Never \| After 15 minutes \| )After 5 minutes/${1}After 30 minutes/m' || fails=$((fails+1))
 mut "H1 the class's Hardened install wait is On"  class 's/(new Row\("holdlock",\n[^\n]*\n[^\n]*\n\s*new String\[\]\{ "", "0" \},\n\s*"", "", )"0"(, "0", "0"\),)/$1""$2/' || fails=$((fails+1))

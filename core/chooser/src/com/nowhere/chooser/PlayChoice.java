@@ -65,10 +65,11 @@ final class PlayChoice {
     /** The decided draft, verbatim (h50 #7, "the addition Chester accepted"). */
     static final String NOT_INSTALLED = "On · not installed yet — tap to install from the GrapheneOS App Store";
     static final String OFF_TITLE = "Turn Google Play off?";
-    static final String OFF_MESSAGE = "Turning Google Play off removes Play Store from this profile at the next save. "
-            + "Your Google account is signed out here, and apps that sign in with it will ask again.";
+    // DRAFT (NWP-20261206-18): mockup for Chester -- the Off dialog's message split into the sheet's context and its
+    // one line (GoogleSheets.playOff); joined by one space they are that message byte for byte
+    static final String OFF_CONTEXT = "Turning Google Play off removes Play Store from this profile at the next save.";
+    static final String OFF_LINE = "Your Google account is signed out here, and apps that sign in with it will ask again.";
     static final String OFF_CONFIRM = "Turn off";
-    static final String OFF_CANCEL = "Cancel";
 
     /** Does the row read On? Absent follows what the profile holds (Play Store kept or installed); only an explicit
      *  choice overrides it. Keep membership counts ONLY here, for the absent state. */

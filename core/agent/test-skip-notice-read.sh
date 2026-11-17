@@ -5,11 +5,13 @@
 # Backlog row "`pushProfile`'s tombstone skips report "Saved" and the next login tells nobody (#119)" (h50 #6).
 # --mutate applies each mutant to a pristine copy of its file (every copy restored on exit) and requires a real
 # `--- FAIL`: a mutant that does not apply, or does not compile, is a failure, never a conviction.
+# NWP-20261202-30: M5 pins skipNoticeVerbDrive's empty-request guard (the EPIPE flake), convicted by
+# TestSkipNoticeVerbDriveEmptyRequestAfterThePeerClosed.
 set -uo pipefail
 cd "$(dirname "$0")" || exit 2
 . ./suite-report.sh
 W=$(mktemp -d) || exit 2
-FILES="skip_notice.go"
+FILES="skip_notice.go skip_notice_read_test.go"
 for f in $FILES; do cp "$f" "$W/$f.orig" || exit 2; done
 trap 'for f in $FILES; do cp "$W/$f.orig" "$f"; done; rm -rf "$W"' EXIT
 export GOTMPDIR="$W" TMPDIR="$W"
@@ -45,4 +47,6 @@ mutate "M3 the sessionCaller check removed" skip_notice.go \
   'if !sessionCaller(conn, uid) {' 'if false && !sessionCaller(conn, uid) {'
 mutate "M4 the lower-time guard removed" skip_notice.go \
   'if have && cur.Time >= t {' 'if false && have && cur.Time >= t {'
+mutate "M5 the empty-request guard removed (TestSkipNoticeVerbDriveEmptyRequestAfterThePeerClosed)" skip_notice_read_test.go \
+  'if req != "" {' 'if true {'
 [ "$FAILS" -eq 0 ] && echo "== all mutations convicted" || { echo "== $FAILS mutation(s) not convicted"; exit 1; }

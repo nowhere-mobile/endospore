@@ -35,11 +35,12 @@ PY
   cp -f "$W/$F.orig" "$F"
 }
 CREATE='refuseCreateOverColdLock(conn, dest) || refuseCreateOverLiveSession(conn, dest) || !createPrecheck'
-CODE='\tif refuseCreateOverLiveSession(conn, dest) { // NWP-20261101-04: likewise, a refused create redeems nothing\n\t\treturn\n\t}\n'
+CODE='\tif refuseCreateOverLiveSession(conn, dest) { // NWP-20261101-04: likewise, a refused create stages nothing\n\t\treturn\n\t}\n'
 mut "L1 the handleCreate call removed" \
   "s.replace('$CREATE', 'refuseCreateOverColdLock(conn, dest) || !createPrecheck', 1) if s.count('$CREATE') == 1 else None"
-mut "L2 the handleCreateCode call moved after the drain" \
-  "s.replace('$CODE', '', 1).replace('\tn, err := drainClaim(newGatewayClient(gw, gwDefault), staged, code, false)', '\tn, err := drainClaim(newGatewayClient(gw, gwDefault), staged, code, false)\n$CODE', 1) if s.count('$CODE') == 1 and s.count('\tn, err := drainClaim(newGatewayClient(gw, gwDefault), staged, code, false)') == 1 else None"
+STAGED='\tcreateAndReply(conn, dest, name, pass)\n}\n\n// handleAddDevice '
+mut "L2 the handleCreateCode call moved after the staging" \
+  "s.replace('$CODE', '', 1).replace('$STAGED', '$CODE$STAGED', 1) if s.count('$CODE') == 1 and s.count('$STAGED') == 1 else None"
 mut "L3 refuseCreateOverLiveSession always false" \
   "s.replace('\tif !roamSessionExists(dest) {\n\t\treturn false\n\t}\n\tfmt.Fprint(os.Stderr, \"[logind] create refused: a roamed', '\treturn false\n\tfmt.Fprint(os.Stderr, \"[logind] create refused: a roamed', 1)"
 [ "$fails" -eq 0 ] && echo "== all mutations convicted" || { echo "== $fails mutation(s) not convicted"; exit 1; }

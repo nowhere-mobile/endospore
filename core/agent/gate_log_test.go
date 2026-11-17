@@ -392,3 +392,29 @@ func TestGateLogBarsLight(t *testing.T) {
 		t.Errorf("line 3 = %q, want the GATE-TRACE line written as \" bars-light fields=0\"", lines[2])
 	}
 }
+
+// TestGateLogRoamedVerbs pins NWP-20261204-07: the four fired-roamed-* verbs the chooser sends at a gate-alarm
+// fire reach gate.log through the GATE-TRACE wire parser as themselves, never as trace-unknown, and every line
+// keeps the closed grammar (a relation; no user id, no count, no time).
+func TestGateLogRoamedVerbs(t *testing.T) {
+	p := gateLogTestFile(t)
+	verbs := []string{"fired-roamed-running", "fired-roamed-stopped", "fired-roamed-none", "fired-roamed-err"}
+	for _, w := range verbs {
+		v, k, n := gateTraceLine(w)
+		gateLog(v, k, n)
+	}
+	lines := gateLogTestLines(t, p)
+	if len(lines) != len(verbs) {
+		t.Fatalf("gate.log has %d lines, want %d:\n%s", len(lines), len(verbs), strings.Join(lines, "\n"))
+	}
+	const gap = `(none|lt10s|lt1m|lt10m|lt1h|ge1h)`
+	grammar := regexp.MustCompile(`^d=` + gap + ` m=` + gap + ` s=` + gap + ` [a-z-]+( (in=(past|under1h|1to12h|over12h)|(ms|fields)=-?\d+))?$`)
+	for i, w := range verbs {
+		if !strings.HasSuffix(lines[i], " "+w) || strings.Contains(lines[i], "trace-unknown") {
+			t.Errorf("line %d = %q, want it to end %q -- %s is not in gateLogVerbs", i+1, lines[i], " "+w, w)
+		}
+		if !grammar.MatchString(lines[i]) {
+			t.Errorf("line %d = %q does not match the closed grammar", i+1, lines[i])
+		}
+	}
+}

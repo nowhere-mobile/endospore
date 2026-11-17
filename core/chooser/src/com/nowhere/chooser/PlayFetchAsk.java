@@ -108,4 +108,29 @@ final class PlayFetchAsk {
             }
         }
     }
+
+    /** How long a Your apps Download stands for the Play-stack question (NWP-20261205-12). */
+    static final long CONFIRM_MS = 600000;
+
+    /** NWP-20261205-12: the Your apps tap marks a package after its Download; materializeLocked takes the mark, so the
+     *  same question is not asked twice. A miss (expired, another package) only asks again: the safe direction. */
+    static final Confirmed CONFIRMED = new Confirmed();
+
+    /** A one-shot mark per package, RAM only. take is true ONCE, and only within CONFIRM_MS of the mark. */
+    static final class Confirmed {
+        private final java.util.HashMap<String, Long> marks = new java.util.HashMap<>();
+
+        synchronized void mark(String pkg, long now) {
+            marks.put(pkg, now);
+        }
+
+        synchronized boolean take(String pkg, long now) {
+            Long t = marks.remove(pkg);
+            return t != null && now >= t && now - t <= CONFIRM_MS;
+        }
+
+        synchronized void clear(String pkg) {
+            marks.remove(pkg);
+        }
+    }
 }

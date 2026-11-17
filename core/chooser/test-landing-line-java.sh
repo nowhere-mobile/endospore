@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # test-landing-line-java.sh [--mutate] -- NWP-20261122-15, NWP-20261126-05, NWP-20261130-09,
-# NWP-20261201-32: the sign-in's Auto sweep shows ONE dismissible checklist card, once per sign-in, when it has apps to fetch, and it lists Play services.
+# NWP-20261201-32, NWP-20261203-28: the sign-in's Auto sweep shows ONE dismissible checklist card, once per sign-in, when it has apps to fetch, and it lists Play services.
 #
 # WHY. The switch-landing sweep materialises quietly, so a sign-in with 40 Auto apps pending landed on an empty-looking
 # home for most of an hour with only a shade notification. DECIDED 2026-11-01 (h50 #5, docs/product-decisions.md
@@ -61,14 +61,18 @@
 # materializeAndInstall; (P18) the dep loop calls cardDepStarted(dep) between qStart(dep) and materializeMember(dep); (P19)
 # both helpers record in LandingLine.Sweep first, then send one package-local ACTION_STARTED with no extras, in a try that
 # logs a fixed line; (P20) the card registers ACTION_STARTED, sync() reads the installing and last-landed rows before it
-# draws, render() gives them to rows and moreCount, and paintRow takes its words from LandingLine.state.
+# draws, render() gives them to rows and moreCount, and paintRow takes its words from LandingLine.state;
+# (P21, NWP-20261203-28, docs/product-decisions.md 2026-11-12 "the Auto sweep's landing card has "Got it" at every size")
+# both card sizes end with one filled Got it from the one helper addGotIt, above Pause/Stop, the from-5 card's after
+# "+<n> more"; its click only finishes the card and names no SweepHold, tap*, broadcast, service or activity start.
 # The merger's full javac / `m NowhereChooser` covers UnarchiveService, LandingNoticeActivity and ProfileActivity.
 #
 # What this does NOT prove: the card on a handset in both looks (sign-ins with 2 and with 12 Auto apps pending: the
 # width, the rows ticking off, the bar, "+<n> more" opening Your apps, the close after the sweep) stays the merger's
 # device follow-up, and so does a sign-in with Google Play On that shows Play services from the first second, and a
 # handset sweep that installs Play Store and shows one name on its row throughout, and a tap
-# outside the card on a handset during a sweep, which must leave the card up.
+# outside the card on a handset during a sweep, which must leave the card up, and a sign-in with 5 or more Auto apps
+# pending where Got it is tapped mid-sweep and the progress notification keeps counting.
 #
 #   bash test-landing-line-java.sh              # the cases and the pins
 #   bash test-landing-line-java.sh --mutate     # ... plus mutants that must each CONVICT the suite
@@ -587,9 +591,60 @@ if os.path.isfile(la_path):
         if t not in pr19:
             bad.append('(P20) paintRow does not hold %s' % t)
 
+# P21 (NWP-20261203-28, docs/product-decisions.md 2026-11-12 "the Auto sweep's landing card has "Got it" at every size"):
+# one helper builds the filled Got it; both arms call it just before addHoldRow, the from-5 arm after "+<n> more"; its
+# click only finishes the card. Never one() here: it exits 2, and a mutant that exits 2 is a failure, not a conviction.
+if os.path.isfile(la_path):
+    la21 = strip(io.open(la_path, encoding='utf-8').read())
+    sig21 = 'private void addGotIt(LinearLayout card) {'
+    call21 = 'addGotIt(card);'
+    if la21.count(sig21) != 1:
+        bad.append('(P21) %s is declared %d times, not once' % (sig21, la21.count(sig21)))
+    else:
+        g0, g1 = block(la21, la21.index(sig21))
+        gb = la21[g0:g1]
+        for t in ('gotIt.setText(LandingLine.GOT_IT);', 'gotIt.setAllCaps(false);', 'gotIt.setTextColor(look.onAccent);',
+                  'fill.setColor(look.accent);', 'fill.setCornerRadius(dp(12));', 'gotIt.setBackground(fill);',
+                  'LinearLayout.LayoutParams.MATCH_PARENT', 'lp.topMargin = dp(20);', 'card.addView(gotIt, lp);'):
+            if t not in gb:
+                bad.append('(P21) addGotIt does not hold %s' % t)
+        if gb.count('gotIt.setOnClickListener(v -> finish());') != 1 or gb.count('setOnClickListener(') != 1:
+            bad.append('(P21) addGotIt does not set one click listener, v -> finish()')
+        for t in ('SweepHold', 'tapPause', 'tapStop', 'tapResume', 'sendBroadcast', 'startService',
+                  'startForegroundService', 'startActivity'):
+            if t in gb:
+                bad.append('(P21) addGotIt names %s: closing the card must not touch the sweep' % t)
+    oc = la21.find('protected void onCreate(Bundle b) {')
+    if oc < 0:
+        bad.append('(P21) LandingNoticeActivity has no onCreate')
+    else:
+        o0, o1 = block(la21, oc)
+        ob = la21[o0:o1]
+        if la21.count(call21) != 2 or ob.count(call21) != 2:
+            bad.append('(P21) %s occurs %d times in the file and %d in onCreate, not 2 and 2'
+                       % (call21, la21.count(call21), ob.count(call21)))
+        bi = ob.find('if (!LandingLine.big(n)) {')
+        if bi < 0:
+            bad.append('(P21) onCreate has no if (!LandingLine.big(n)) {')
+        else:
+            s0, s1 = block(ob, bi)
+            rest = ob[s1:]
+            if not rest.lstrip().startswith('else'):
+                bad.append('(P21) the LandingLine.big if has no else arm')
+            else:
+                e0, e1 = block(ob, s1 + rest.index('else'))
+                sa, ea = ob[s0:s1], ob[e0:e1]
+                if sa.count(call21) != 1 or not (0 <= sa.find('holdLine = keep;') < sa.find(call21)
+                                                 < sa.find('addHoldRow(card);')):
+                    bad.append('(P21) the small arm does not call %s once, after KEEP and before addHoldRow' % call21)
+                if ea.count(call21) != 1 or not (0 <= ea.find('card.addView(moreRow);') < ea.find(call21)
+                                                 < ea.find('addHoldRow(card);')):
+                    bad.append('(P21) the from-5 arm does not call %s once, after "+<n> more" and before addHoldRow'
+                               % call21)
+
 for b in bad: print('PIN FAILED: ' + b)
-if not bad: print('ok P1-P20 the LANDING flag, the sweepAuto block, the stamp, the manifest entry, the per-app broadcast, '
-                  'the card, the Your apps hook, the Play services row, the kept row names, the outside tap and the installing state')
+if not bad: print('ok P1-P21 the LANDING flag, the sweepAuto block, the stamp, the manifest entry, the per-app broadcast, '
+                  'the card, the Your apps hook, the Play services row, the kept row names, the outside tap, the installing state and the Got it at every size')
 sys.exit(1 if bad else 0)
 PY
 }
@@ -732,5 +787,11 @@ mutant "M82 cardDepStarted records nothing (P19)" us 'if \(!LandingLine\.Sweep\.
 mutant "M83 the started broadcast is not package-local (P19)" us '(ACTION_STARTED\))\.setPackage\(getPackageName\(\)\)' '\1'
 mutant "M84 begin keeps the old rows (W6)" ll '\n[^\n]*installing = resume = lastLanded = -1;' ''
 mutant "M85 sync reads the rows after it draws (P20)" la '(\n[^\n]*installing = LandingLine\.Sweep\.installing\(sweep\);\n[^\n]*lastLanded = LandingLine\.Sweep\.lastLanded\(sweep\);)(\n[^\n]*render\(\);)' '\2\1'
+mutant "M86 the from-5 card has no Got it (P21)" la '(card\.addView\(moreRow\);)\n[ \t]*addGotIt\(card\);' '\1'
+mutant "M87 the small card has no Got it (P21)" la '(holdLine = keep;\n)\s*addGotIt\(card\);' '\1'
+mutant "M88 Got it also pauses the sweep (P21)" la '(gotIt\.setOnClickListener\(v -> finish\(\)\);)' '\1\n        gotIt.setOnClickListener(v -> { SweepHold.pause(sweep); finish(); });'
+mutant "M89 Got it stops the sweep instead of closing the card (P21)" la 'gotIt\.setOnClickListener\(v -> finish\(\)\);' 'gotIt.setOnClickListener(v -> tapStop());'
+mutant "M90 the from-5 Got it is below Pause and Stop (P21)" la '(card\.addView\(moreRow\);\n)([ \t]*addGotIt\(card\);\n)([ \t]*addHoldRow\(card\);\n)' '\1\3\2'
+mutant "M91 Got it is not filled with the accent (P21)" la 'fill\.setColor\(look\.accent\);' 'fill.setColor(look.bg);'
 if [ "$fails" -ne 0 ]; then echo "test-landing-line-java: FAIL -- $fails mutant(s) not convicted"; exit 1; fi
 echo "test-landing-line-java: all mutants convicted"

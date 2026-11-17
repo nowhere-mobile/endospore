@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"strings"
 	"testing"
 )
@@ -138,8 +137,8 @@ func checkSlotLabels(t *testing.T, base, name, pass string, hs []handsetLabel) {
 		t.Errorf("the vault has %d se slots, want %d", se, len(hs))
 	}
 	for _, h := range hs {
-		if bytes.Contains(blob, []byte(h.label)) {
-			t.Errorf("the stored head holds %q in the clear", h.label)
+		for _, f := range clearLabelFindings(blob, h.label) {
+			t.Errorf("the stored head holds %q in the clear: %s", h.label, f)
 		}
 	}
 }

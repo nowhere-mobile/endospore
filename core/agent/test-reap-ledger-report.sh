@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # test-reap-ledger-report.sh [--mutate] -- runs reap_ledger_report_test.go (NWP-20261107-14, Q143): an issue report carries
 # the reap ledger's counts per class (reap_ledger_rows / _classes / _userdir) at both scopes and never a uid, a time or
-# a name; the reap retry's gaveup and retried rows count as their own classes (NWP-20261114-25, #67). --mutate re-runs the cases against a COPY of the package with each guard broken in turn. Each mutant must be
+# a name; the reap retry's gaveup and retried rows count as their own classes (NWP-20261114-25, #67); reap_ledger_fw
+# counts the rows whose fw= is restart / unknown and whose pm:ownerless= is above 0 (NWP-20261203-01); reap_ledger_keys
+# counts the keys=notsealed rows and, of those, the kwhy=no-receipt ones (NWP-20261203-22). --mutate re-runs
+# the cases against a COPY of the package with each guard broken in turn. Each mutant must be
 # CONVICTED by a real `--- FAIL`; one that fails to apply or to compile is a failure.
 set -uo pipefail
 cd "$(dirname "$0")"
@@ -45,4 +48,7 @@ mut "N7 gaveup counted as other" reap_ledger_report.go 'case "clean", "gaveup", 
 mut "N8 retried counted as other" reap_ledger_report.go '"residue", "retried":' '"residue":'
 mut "N9 the gaveup and retried counts swapped" reap_ledger_report.go 'n\["gaveup"\](.*)n\["retried"\]' 'n["retried"]\1n["gaveup"]'
 mut "N10 tries= copied into the value" reap_ledger_report.go 'n\["retried"\]\),' 'n["retried"]) + " " + strings.Join(func() (t []string) { for _, fl := range strings.Fields(string(b)) { if strings.HasPrefix(fl, "tries=") { t = append(t, fl) } }; return }(), " "),'
-[ "$fails" -eq 0 ] && echo "== all 10 mutations convicted" || { echo "== $fails mutation(s) not convicted"; exit 1; }
+mut "N11 fw=same counted as restart" reap_ledger_report.go 'case fl == "fw=restart":' 'case fl == "fw=restart", fl == "fw=same":'
+mut "N12 pm:ownerless=0 counted as a package left" reap_ledger_report.go 'err == nil && k > 0 \{' 'err == nil && k >= 0 {'
+mut "N13 norcpt counted without kwhy=no-receipt" reap_ledger_report.go 'if kwhy == "no-receipt" \{' 'if len(kwhy) >= 0 {'
+[ "$fails" -eq 0 ] && echo "== all 13 mutations convicted" || { echo "== $fails mutation(s) not convicted"; exit 1; }

@@ -6,7 +6,8 @@ import java.util.List;
 import java.util.Objects;
 
 /** NWP-20261117-15: the GET-MEDIA-STATUS routing; NWP-20261202-28: the RESTORING slot, its parser, its bar and the
- *  decided title. Exit 0 when every case holds, 1 otherwise. */
+ *  decided title; NWP-20261207-11: the RESTORE-WAITING slot, restoreWaiting() and the decided waiting body. Exit 0
+ *  when every case holds, 1 otherwise. */
 public final class MediaStatusCases {
     private static int bad = 0;
 
@@ -14,10 +15,34 @@ public final class MediaStatusCases {
                               String wantIncomplete, String wantRestoring) {
         String[] got = MediaStatus.route(lines);
         String[] want = {wantLoading, wantDamaged, wantIncomplete, wantRestoring};
-        if (got == null || got.length != 4 || !Objects.equals(got[0], want[0]) || !Objects.equals(got[1], want[1])
-                || !Objects.equals(got[2], want[2]) || !Objects.equals(got[3], want[3])) {
+        if (got == null || got.length != 5 || !Objects.equals(got[0], want[0]) || !Objects.equals(got[1], want[1])
+                || !Objects.equals(got[2], want[2]) || !Objects.equals(got[3], want[3]) || got[4] != null) {
             System.out.println("  FAIL  " + label + ": route(" + lines + ") = " + Arrays.toString(got) + ", want "
                     + Arrays.toString(want));
+            bad++;
+        } else {
+            System.out.println("  ok    " + label);
+        }
+    }
+
+    /** NWP-20261207-11: route's slots 3 (restoring) and 4 (waiting). */
+    private static void checkWait(String label, List<String> lines, String wantRestoring, String wantWaiting) {
+        String[] got = MediaStatus.route(lines);
+        if (got == null || got.length != 5 || !Objects.equals(got[3], wantRestoring)
+                || !Objects.equals(got[4], wantWaiting)) {
+            System.out.println("  FAIL  " + label + ": route(" + lines + ") = " + Arrays.toString(got) + ", want slot 3 "
+                    + wantRestoring + ", slot 4 " + wantWaiting);
+            bad++;
+        } else {
+            System.out.println("  ok    " + label);
+        }
+    }
+
+    private static void checkRW(String label, String[] routed, boolean want) {
+        boolean got = MediaStatus.restoreWaiting(routed);
+        if (got != want) {
+            System.out.println("  FAIL  " + label + ": restoreWaiting(" + Arrays.toString(routed) + ") = " + got
+                    + ", want " + want);
             bad++;
         } else {
             System.out.println("  ok    " + label);
@@ -39,6 +64,27 @@ public final class MediaStatusCases {
         int got = MediaStatus.restoringPermille(done, total);
         if (got != want) {
             System.out.println("  FAIL  " + label + ": restoringPermille(" + done + ", " + total + ") = " + got
+                    + ", want " + want);
+            bad++;
+        } else {
+            System.out.println("  ok    " + label);
+        }
+    }
+
+    private static void checkLanded(String label, String reply, String want) {
+        String got = MediaStatus.landed(reply);
+        if (want == null ? got != null : !want.equals(got)) {
+            System.out.println("  FAIL  " + label + ": landed(" + reply + ") = " + got + ", want " + want);
+            bad++;
+        } else {
+            System.out.println("  ok    " + label);
+        }
+    }
+
+    private static void checkRescan(String label, String seen, String reply, boolean want) {
+        boolean got = MediaStatus.rescanAfterLanding(seen, reply);
+        if (got != want) {
+            System.out.println("  FAIL  " + label + ": rescanAfterLanding(" + seen + ", " + reply + ") = " + got
                     + ", want " + want);
             bad++;
         } else {
@@ -102,6 +148,42 @@ public final class MediaStatusCases {
         } else {
             System.out.println("  ok    T1 RESTORING_TITLE is the decided O3 words");
         }
+        // W1-W6 (NWP-20261207-11): RESTORE-WAITING fills slot 4 by exact match only, and restoreWaiting() needs a
+        // valid RESTORING line beside it.
+        String rw = "RESTORE-WAITING";
+        checkWait("W1 RESTORING then RESTORE-WAITING", Arrays.asList(rest, rw), rest, rw);
+        checkRW("W1 restoreWaiting with both lines", MediaStatus.route(Arrays.asList(rest, rw)), true);
+        checkWait("W2 padded RESTORE-WAITING before RESTORING", Arrays.asList("  RESTORE-WAITING  ", rest), rest, rw);
+        checkWait("W3 RESTORE-WAITINGX fills no slot", Arrays.asList(rest, "RESTORE-WAITINGX"), rest, null);
+        checkWait("W4 RESTORING-WAIT never fills slot 4", Arrays.asList(rest, "RESTORING-WAIT"), rest, null);
+        checkRW("W5a a lone RESTORE-WAITING is not a restore", MediaStatus.route(Collections.singletonList(rw)), false);
+        checkRW("W5b RESTORING with left 0", MediaStatus.route(Arrays.asList("RESTORING 1 2 0", rw)), false);
+        checkRW("W5c RESTORING with done > total", MediaStatus.route(Arrays.asList("RESTORING 5 2 1", rw)), false);
+        checkRW("W5d null", null, false);
+        checkRW("W5e four slots", new String[] {null, null, null, rest}, false);
+        checkRW("W6 RESTORING with no waiting line", MediaStatus.route(Collections.singletonList(rest)), false);
+        // T2: the decided O3 words for the parked restore (docs/product-decisions.md, 2026-11-02).
+        if (!"Waiting for a network".equals(MediaStatus.WAITING_BODY)) {
+            System.out.println("  FAIL  T2 WAITING_BODY = " + MediaStatus.WAITING_BODY);
+            bad++;
+        } else {
+            System.out.println("  ok    T2 WAITING_BODY is the decided O3 words");
+        }
+        // L1-L11 (NWP-20261114-34): landed() reads a GET-MEDIA-LANDED reply as a count; rescanAfterLanding() decides
+        // whether the gate starts the session's rescan, given the count it last saw.
+        checkLanded("L1 a count", "3", "3");
+        checkLanded("L2 trailing newline and spaces", " 12\n", "12");
+        checkLanded("L3 leading zeros are one count", "007", "7");
+        checkLanded("L4 empty read", "", null);
+        checkLanded("L5 null read", null, null);
+        checkLanded("L6 not a number", "IDLE", null);
+        checkLanded("L7 negative", "-1", null);
+        checkRescan("L8 a first landing in the session", "0", "1", true);
+        checkRescan("L9 the same count again", "1", "1", false);
+        checkRescan("L10 a mediad restart (count back to 0)", "3", "0", false);
+        checkRescan("L11 the restarted mediad lands (1 after 3)", "3", "1", true);
+        checkRescan("L12 a failed read changes nothing", "2", "", false);
+        checkRescan("L13 a second landing", "1", "2", true);
         if (bad != 0) {
             System.out.println(bad + " case(s) failed");
             System.exit(1);

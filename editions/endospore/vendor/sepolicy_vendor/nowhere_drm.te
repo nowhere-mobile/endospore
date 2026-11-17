@@ -1,0 +1,10 @@
+# Endospore VENDOR policy (NWP-20261116-37), wired by inject-product.sh as
+# BOARD_VENDOR_SEPOLICY_DIRS += vendor/endospore/sepolicy_vendor ONLY on a device whose generated vendor policy
+# declares mediadrm_vendor_data_file (every Pixel Endospore builds: lynx, husky/shiba, tegu, stallion, frankel).
+# A vendor policy that names a type the device does not declare fails the build, so the wiring checks first.
+#
+# Puts the device DRM store type into the public attribute vendor/endospore/sepolicy_public declares. That is the
+# whole file: the grant itself (delete-only, no file read) is in vendor/endospore/sepolicy/endospore.te, on the
+# attribute, because endospore_priv is private and the vendor policy cannot name it.
+# NOTE: no backtick and no apostrophe in these comments -- the build runs .te through m4.
+typeattribute mediadrm_vendor_data_file nowhere_drm_store_file;

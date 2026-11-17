@@ -69,6 +69,6 @@ mut "M6 SAVE-NET sent only on a change" ChooserActivity \
   's/( +)(if \(unmeteredCtx\(app\)\) pollDaemon\("SAVE-NET-UNMETERED\\n"\); else pollDaemon\("SAVE-NET-METERED\\n"\);)/$1if (uid != sweepNetUid) { $2 }/' \
   "the watcher sends SAVE-NET on every slow tick" || fails=$((fails+1))
 mut "M7 the picker gains a Cancel button" ProfileActivity \
-  's/(\.setTitle\("Save automatically"\).*?)\.setNegativeButton\("Not now", null\)/$1.setNegativeButton("Cancel", null)/s' \
+  's/(\n(\s+))(SheetDialog\.picker\(this, StorageSheets\.saveMode\(cur\[0\]\))/$1new android.app.AlertDialog.Builder(this).setNegativeButton("Cancel", null).show();$1$3/' \
   "the picker has no Cancel or OK button" || fails=$((fails+1))
 [ "$fails" -eq 0 ] && echo "== all mutations convicted" || { echo "== $fails mutation(s) not convicted"; exit 1; }

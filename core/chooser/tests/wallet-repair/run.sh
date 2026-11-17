@@ -56,14 +56,14 @@ n=$(cnt 'WalletRepairCopy\.BUTTON_LABEL' < "$PA")
 [ "$n" -eq 1 ] || { echo "  FAIL  the repair button is not created exactly once"; bad=1; }
 n=$(cnt 'WalletRepairCopy\.CONFIRM_REQUEST' < "$PA")
 [ "$n" -eq 1 ] || { echo "  FAIL  CONFIRM is not sent from exactly one place"; bad=1; }
-# The positive button, byte for byte: on the UI thread it refuses a second dialog's tap and disables the button,
-# and only then starts the thread whose first act is CONFIRM.
+# The red Repair button (slot 1 of the repairCredit sheet), byte for byte: on the UI thread it refuses a second
+# sheet's tap and disables the button, and only then starts the thread whose first act is CONFIRM.
 pos=$(printf '%s\n' \
-  '                            .setPositiveButton(WalletRepairCopy.POSITIVE, (d, w) -> {' \
-  '                                if (repair[0] == null || !repair[0].isEnabled()) return;' \
-  '                                repair[0].setEnabled(false);' \
-  '                                new Thread(() -> {' \
-  '                                    final String r = sendDaemon(WalletRepairCopy.CONFIRM_REQUEST);')
+  '                    SheetDialog.confirm(this, ReportRepairSheets.repairCredit(), new Runnable[] { null, () -> {' \
+  '                        if (repair[0] == null || !repair[0].isEnabled()) return;' \
+  '                        repair[0].setEnabled(false);' \
+  '                        new Thread(() -> {' \
+  '                            final String r = sendDaemon(WalletRepairCopy.CONFIRM_REQUEST);')
 n=$(printf '%s\n' "$body" | blk "$pos")
 [ "$n" -eq 1 ] || { echo "  FAIL  CONFIRM is not sent from the positive button that disables the button first"; bad=1; }
 # CONFIRM writes only the proof and the seen-set, never the wallet, so a repair repaints from the last GET-BILLING
@@ -71,10 +71,10 @@ n=$(printf '%s\n' "$body" | blk "$pos")
 # it would repeat that. Over the CONFIRM thread's non-comment lines, from its CONFIRM line to its start(): the body
 # is written once, by the pinned repaint; lastBill[0] and lastEnt[0] are never assigned; and CONFIRM is its only
 # daemon call. Across showStorage, a GET-BILLING request is built exactly once, in any send form.
-repaint='                                            if (lastBill[0] != null) body.setText(formatBilling(lastBill[0], lastEnt[0]));'
+repaint='                                    if (lastBill[0] != null) body.setText(formatBilling(lastBill[0], lastEnt[0]));'
 creg=$(printf '%s\n' "$body" | awk '
-  !on && $0 == "                                    final String r = sendDaemon(WalletRepairCopy.CONFIRM_REQUEST);" { on = 1 }
-  on && $0 == "                                }, \"nowhere-wallet-repair\").start();" { print "-- the CONFIRM thread ends --"; exit }
+  !on && $0 == "                            final String r = sendDaemon(WalletRepairCopy.CONFIRM_REQUEST);" { on = 1 }
+  on && $0 == "                        }, \"nowhere-wallet-repair\").start();" { print "-- the CONFIRM thread ends --"; exit }
   on && $0 !~ /^[ \t]*\/\// { print }')
 case "$creg" in *"-- the CONFIRM thread ends --") ;; *) creg= ;; esac
 if [ -z "$creg" ]; then
@@ -93,11 +93,12 @@ n=$(printf '%s\n' "$body" | cnt '"GET-BILLING')
 [ "$n" -eq 1 ] || { echo "  FAIL  showStorage does not read GET-BILLING exactly once"; bad=1; }
 n=$(cat "$PA" "$(dirname "$PA")/ChooserActivity.java" | cnt '"REPAIR-WALLET')
 [ "$n" -eq 0 ] || { echo "  FAIL  a literal REPAIR-WALLET request is built outside WalletRepairCopy"; bad=1; }
-n=$(printf '%s\n' "$body" | cnt '\.setNegativeButton\(WalletRepairCopy\.NEGATIVE')
-[ "$n" -eq 1 ] || { echo "  FAIL  the dialog has no Cancel button"; bad=1; }
-n=$(printf '%s\n' "$body" | cnt 'BUTTON_NEGATIVE\)')
-[ "$n" -eq 1 ] || { echo "  FAIL  Cancel is not looked up to be focused"; bad=1; }
-n=$(printf '%s\n' "$body" | cnt 'neg\.requestFocus\(\)')
-[ "$n" -eq 1 ] || { echo "  FAIL  Cancel is not the default"; bad=1; }
+# The offer is the shared sheet, not an AlertDialog: the green Not now (slot 0, null) is the safe way out and the
+# repair runs only from slot 1, the red-outlined Repair. fx counts the non-comment lines holding a fixed string.
+fx() { S="$1" awk '$0 !~ /^[ \t]*\/\// && index($0, ENVIRON["S"]) { n++ } END { print n + 0 }'; }
+n=$(printf '%s\n' "$body" | cnt 'AlertDialog\.Builder')
+[ "$n" -eq 0 ] || { echo "  FAIL  the repair offer still builds an AlertDialog"; bad=1; }
+n=$(printf '%s\n' "$body" | fx 'SheetDialog.confirm(this, ReportRepairSheets.repairCredit(), new Runnable[] { null, () -> {')
+[ "$n" -eq 1 ] || { echo "  FAIL  Repair is not slot 1 of the repairCredit sheet, behind the green Not now"; bad=1; }
 [ "$bad" -eq 0 ] && echo "source: ok"
 [ "$bad" -eq 0 ]

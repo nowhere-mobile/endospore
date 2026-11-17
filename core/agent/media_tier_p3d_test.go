@@ -46,17 +46,31 @@ func TestSealCarriesDeferredForwardWithoutReading(t *testing.T) {
 	}
 
 	// Simulate the session boundary the carry depends on: ON-DEVICE a seal is always preceded by a LOGIN
-	// restore, and cdcRestore seeds the blob cache with the head's chunks -- INCLUDING the Deferred ones
-	// (P3d) -- which is what lets deferredChunksKnown() pass. The plain-HTTP test store's postBlob doesn't
-	// maintain the blob cache (only the s3/cap path does), so without this restore the carry gate would be
-	// cold and the test would exercise the (safe) re-chunk fallback instead of the carry.
+	// restore, which seeds the blob cache with the head's essential chunks and LISTS the Deferred ones as not yet
+	// proved (h51 #2, NWP-20261207-02); the check after landing then marks the ones the store holds, which is
+	// what lets deferredChunksKnown() pass. The plain-HTTP test store's postBlob doesn't maintain the blob cache
+	// (only the s3/cap path does), so without this the carry gate would be cold and the test would exercise the
+	// (safe) re-chunk fallback instead of the carry.
 	blobCacheMu.Lock()
 	blobCache = map[string]bool{}
 	blobCacheMu.Unlock()
-	restoreManifest(t, base, name, pass)
+	rm, _ := restoreManifest(t, base, name, pass)
+	for _, h := range d1.Chunks {
+		if blobCacheKnown(h) {
+			t.Fatal("login restore marked a deferred chunk as stored before anything asked the store (h51 #2)")
+		}
+	}
+	state := t.TempDir()
+	if err := writeDeferredPending(state, name, pass, rm); err != nil {
+		t.Fatal(err)
+	}
+	oldProbe := deferredChunkProbe
+	deferredChunkProbe = func(string, string) (bool, error) { return true, nil }
+	t.Cleanup(func() { deferredChunkProbe = oldProbe })
+	settleDeferredPresence(base, filepath.Join(state, deferredPresenceFile(name, pass)), blobCachePath(), nil, nil)
 	for _, h := range d1.Chunks {
 		if !blobCacheKnown(h) {
-			t.Fatal("login restore did not seed the deferred chunks into the blob cache (cdcRestore P3d seeding)")
+			t.Fatal("the check after landing did not mark the present deferred chunks as stored (h51 #2)")
 		}
 	}
 

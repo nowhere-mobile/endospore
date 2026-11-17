@@ -8,8 +8,8 @@
      docs/157-apps-push.md. -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.nowhere.push"
-    android:versionCode="2"
-    android:versionName="1.1">
+    android:versionCode="3"
+    android:versionName="1.2">
   <uses-sdk android:minSdkVersion="24" android:targetSdkVersion="34"/>
 
   <!-- Reach the gateway (register/unregister + the SSE stream). Only HTTPS to the managed gateway. -->
@@ -19,6 +19,10 @@
        (the same type ntfy/other distributors use on Android 14+). -->
   <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
   <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE"/>
+  <!-- The receiver starts PushService from the background on an app's REGISTER/UNREGISTER. Android 12+ refuses
+       that unless the caller holds this permission. The platform signature grants it (Android.bp certificate
+       "platform"). Found by device-proof S6, NWP-20261203-12. -->
+  <uses-permission android:name="android.permission.START_FOREGROUND_SERVICES_FROM_BACKGROUND"/>
   <!-- The FGS status notification (mandatory for a foreground service). -->
   <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
 

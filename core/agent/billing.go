@@ -3585,6 +3585,29 @@ func payRentGenSignOut(g *gatewayClient, base, name, pass, walletPath string, se
 	return payRentGenRule(g, base, name, pass, walletPath, se, gen, renewSignOut)
 }
 
+// freeRefusalCounts is the clause a free renewal refused 402 adds to its error (NWP-20261203-19). It holds counts
+// only, so login.log -- which every in-session issue report carries -- shows the gap without the profile key.
+// U is ent.UsedBytes, the gateway's ProfileLiveBytes: every live row of the profile, which for a profile with no
+// paid rows is the free sum with nothing excluded. It is NOT the sum the gateway's free check judges: that one
+// counts free rows only and excludes the refs of the request it judges, so U+S > F is not the gateway's test.
+// F is ent.FreeBytes. S and N are the sum of the positive sizes and the count of refs: the whole renewal (the
+// footprint plus the wallet's two refs), not one batch. MiB is bytes>>20, rounded down. When the read did not
+// answer (entOK false) the clause says "unread", never a 0. Per Q008 (docs/product-decisions.md, 2026-10-22 #22)
+// the gateway's count is internal: this clause goes to login.log only and is never rendered to the user.
+func freeRefusalCounts(ent entitlementInfo, entOK bool, refs map[string]int64) string {
+	var s int64
+	for _, n := range refs {
+		if n > 0 {
+			s += n
+		}
+	}
+	names := fmt.Sprintf("this renewal names %d MiB in %d refs (NWP-20261203-19)", s>>20, len(refs))
+	if !entOK {
+		return "gateway count unread; " + names
+	}
+	return fmt.Sprintf("gateway counts %d MiB live of a %d MiB free allowance; %s", ent.UsedBytes>>20, ent.FreeBytes>>20, names)
+}
+
 // payRentGenRule is the body payRentGen and payRentGenSignOut share; rule picks only the due test.
 func payRentGenRule(g *gatewayClient, base, name, pass, walletPath string, se []byte, gen string, rule renewRule) (leaseInfo, bool, error) {
 	q, err := g.quote()
@@ -3638,8 +3661,15 @@ func payRentGenRule(g *gatewayClient, base, name, pass, walletPath string, se []
 		return leaseInfo{}, false, nil
 	}
 	freeUser := noCredit
+	// ent and entOK keep the read below for the free arm's 402 line (freeRefusalCounts, NWP-20261203-19), so there
+	// is no second /entitlement call. entOK is false when the read did not run or did not answer.
+	var ent entitlementInfo
+	entOK := false
 	if noCredit {
-		if ent, _, eerr := g.entitlement(profileRefV2(name, pass)); eerr == nil && ent.EntitledBytes > 0 {
+		var eerr error
+		ent, _, eerr = g.entitlement(profileRefV2(name, pass))
+		entOK = eerr == nil
+		if eerr == nil && ent.EntitledBytes > 0 {
 			freeUser = false
 		}
 	}
@@ -3700,10 +3730,14 @@ func payRentGenRule(g *gatewayClient, base, name, pass, walletPath string, se []
 			return leaseInfo{}, false, ferr
 		}
 		if code != http.StatusOK {
-			if finfo.Reason != "" {
-				return leaseInfo{}, false, fmt.Errorf("pay-rent: free tier unavailable for %q (HTTP %d, gateway said: %s) -- add credit", name, code, finfo.Reason)
+			counts := "" // NWP-20261203-19: the counts ride only on a 402, the quota refusal
+			if code == http.StatusPaymentRequired {
+				counts = "; " + freeRefusalCounts(ent, entOK, refs)
 			}
-			return leaseInfo{}, false, fmt.Errorf("pay-rent: free tier unavailable for %q (HTTP %d) -- add credit", name, code)
+			if finfo.Reason != "" {
+				return leaseInfo{}, false, fmt.Errorf("pay-rent: free tier unavailable for %q (HTTP %d, gateway said: %s%s) -- add credit", name, code, finfo.Reason, counts)
+			}
+			return leaseInfo{}, false, fmt.Errorf("pay-rent: free tier unavailable for %q (HTTP %d%s) -- add credit", name, code, counts)
 		}
 		for _, b := range batches[1:] {
 			_, bcode, berr := g.leaseFree(profileRefV2(name, pass), b, prior)

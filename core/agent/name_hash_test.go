@@ -50,9 +50,9 @@ func TestNameHash_CreateRefusesBeforeTheStore(t *testing.T) {
 	}
 }
 
-// TestNameHash_CreateCodeRefusesBeforeTheDrain: CREATE-CODE answers ERR-NAME before the floor, the gateway check, the
-// code check, the throttle and the drain: no store or gateway request, no staged claim, the bucket unspent.
-func TestNameHash_CreateCodeRefusesBeforeTheDrain(t *testing.T) {
+// TestNameHash_CreateCodeRefusesBeforeTheStaging: CREATE-CODE answers ERR-NAME before the floor, the gateway check, the
+// code check, the throttle and the staging: no store or gateway request, no staged claim, the bucket unspent.
+func TestNameHash_CreateCodeRefusesBeforeTheStaging(t *testing.T) {
 	dest, wpath := createCodeEnv(t, "NHCODE_NHCODE_NHCODE_NHC", 3)
 	seen := clSpy(t)
 	fundWallet(t, wpath, 4)
@@ -71,7 +71,7 @@ func TestNameHash_CreateCodeRefusesBeforeTheDrain(t *testing.T) {
 				t.Errorf("CREATE-CODE %q with %s replied %q, want ERR-NAME", n, c.what, got)
 			}
 			if _, err := os.Stat(createStagingPath(n, c.pass)); err == nil {
-				t.Errorf("CREATE-CODE %q with %s staged a claim -- the code was drained", n, c.what)
+				t.Errorf("CREATE-CODE %q with %s staged a claim -- the code was staged", n, c.what)
 			}
 		}
 	}

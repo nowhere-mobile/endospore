@@ -51,7 +51,7 @@ final class Cases {
         check(m.contains("gives that credit up"), "dialog says repairing gives that credit up");
         check(m.contains("saved again"), "dialog says new credit is saved again");
         check(m.contains("Credit this phone holds now is kept"), "dialog says the phone's own credit is kept");
-        check(WalletRepairCopy.NEGATIVE.equals("Cancel"), "negative button is Cancel");
+        check(WalletRepairCopy.NEGATIVE.equals("Not now"), "negative button is Not now");
         check(!WalletRepairCopy.POSITIVE.equals(WalletRepairCopy.NEGATIVE), "positive and negative differ");
         check(WalletRepairCopy.BUTTON_LABEL.equals("Repair stored credit"), "button label");
 

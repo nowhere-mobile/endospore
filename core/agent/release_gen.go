@@ -18,7 +18,9 @@ import (
 // 2026-10-20), handset B's cache still names them; B's next seal would publish a head naming collected chunks.
 // Nothing in a head said so. vault.ReleaseGen is that signal: each delete bumps it, and a handset whose head
 // carries a generation different from the one its cache was filled under drops the cache before it seals or
-// seeds it (pushProfile and the restore arm of main()).
+// seeds it (pushProfile and the restore arm of main()). Since NWP-20261207-03 the #de, #sys, #keys and #apps scope
+// VAULTS are checked too, each under its own head key (a seal-time prune release bumps them); a bare-shaped scope
+// head carries no generation and never reads or writes the record.
 //
 // Every file here lives beside the blob cache in the state dir (in roamd /data/nowhere/state, the RAM tmpfs mount
 // that docs/threat-model.md section 2 excludes), so it is not a durable /data/nowhere path and needs no
@@ -162,5 +164,27 @@ func relGenAtRestore(base, profile, pass, head string) {
 	}
 	if distrustBlobCacheIfReleased(blobCachePath(), relGenHeadKey(base, profile, pass), gen) {
 		fmt.Printf("restore: profile %s: a snapshot was deleted since this phone's chunk cache was filled -- the cache is dropped before this restore seeds it (release generation %d)\n", logProfile(profile), gen)
+	}
+}
+
+// relGenAtScopeRestore is relGenAtRestore for a '#' scope (NWP-20261207-03). Only a #de, #sys, #keys or #apps head that
+// is a VAULT carries a release generation; any other scope, or a bare-shaped head, returns before the record or the
+// cache is read. The cache is shared with the bare vault, so a drop here leaves the bare record over an emptier
+// cache: the safe direction.
+func relGenAtScopeRestore(base, profile, pass, head string) {
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Printf("restore: profile %s: release generation not checked (%s) -- the next seal checks it\n", logProfile(profile), logSafeErrText(r))
+		}
+	}()
+	if !relGenScope(profile) {
+		return
+	}
+	v, isV := parseVault(headBlobGet(base, head))
+	if !isV {
+		return
+	}
+	if distrustBlobCacheIfReleased(blobCachePath(), relGenHeadKey(base, profile, pass), v.ReleaseGen) {
+		fmt.Printf("restore: profile %s: a snapshot was deleted since this phone's chunk cache was filled -- the cache is dropped before this restore seeds it (release generation %d)\n", logProfile(profile), v.ReleaseGen)
 	}
 }

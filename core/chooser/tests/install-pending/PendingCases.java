@@ -60,9 +60,12 @@ public final class PendingCases {
         s.put("app.groupdep", new App(false, false, false));      // launcher-less group member
         s.put("app.placeholder2", new App(false, false, true));
 
-        List<String> retry = new ArrayList<>(), deps = new ArrayList<>();
+        // NWP-20261207-07: app.groupdep is a real group dep -- a placeholder entry point lists it, so `rides` names it.
+        Set<String> rides = new HashSet<>(Collections.singleton("app.groupdep"));
+        List<String> retry = new ArrayList<>(), deps = new ArrayList<>(), alone = new ArrayList<>();
         List<String> work = Lifted.splitAuto(s.keySet(),
-                p -> s.get(p).code, p -> s.get(p).restored, p -> s.get(p).placeholder, retry, deps);
+                p -> s.get(p).code, p -> s.get(p).restored, p -> s.get(p).placeholder, rides::contains,
+                retry, deps, alone);
 
         check("a store-installed app without the marker is NOT pending (not counted, not reinstalled)",
                 !work.contains("app.store"), work);
@@ -80,6 +83,41 @@ public final class PendingCases {
                 work.equals(Arrays.asList("app.placeholder", "app.rearchived", "app.placeholder2")), work);
         check("the restore-only list is exactly the installed, unrestored apps, in order",
                 retry.equals(Arrays.asList("app.store", "app.ours")), retry);
+        check("no app here is installed alone: the only no-placeholder app rides", alone.isEmpty(), alone);
+
+        // ---- riders: the no-code apps an entry point of the deferred keep-set will carry (NWP-20261207-07) ----
+        // Chester, NW-3b37, 2026-11-04: "Switched [the app] to auto, don't see it's getting downloaded".
+        Map<String, App> e = new LinkedHashMap<>();
+        Map<String, List<String>> edeps = new HashMap<>();
+        e.put("E1", new App(false, false, true));  edeps.put("E1", Arrays.asList("d1"));       // placeholder: carries
+        e.put("E2", new App(true, true, false));   edeps.put("E2", Arrays.asList("d2"));       // has code: never materialised again
+        e.put("E3", new App(false, false, false)); edeps.put("E3", Arrays.asList("d3"));       // no placeholder: never materialised
+        e.put("G", new App(false, false, true));   edeps.put("G", Arrays.asList("G", "d4"));   // a group: lists itself too
+        Set<String> carried = Lifted.riders(e.keySet(), p -> e.get(p).code, p -> e.get(p).placeholder,
+                p -> edeps.get(p));
+        check("riders: a placeholder entry point without code carries its deps", carried.contains("d1"), carried);
+        check("riders: an entry point with code carries nothing", !carried.contains("d2"), carried);
+        check("riders: an entry point without a placeholder carries nothing", !carried.contains("d3"), carried);
+        check("riders: a self-dep is dropped", !carried.contains("G") && carried.contains("d4"), carried);
+        check("riders: exactly the deps of the placeholder entry points without code",
+                carried.equals(new HashSet<>(Arrays.asList("d1", "d4"))), carried);
+
+        // ---- splitAuto: an orphan (no code, no placeholder, nothing to ride) is installed alone ----
+        Map<String, App> o = new LinkedHashMap<>();
+        o.put("orphan", new App(false, false, false)); // switched to Auto, placeholder gone, no entry point lists it
+        o.put("d1", new App(false, false, false));     // a real group dep: E1 above carries it
+        o.put("ph1", new App(false, false, true));     // an archived placeholder
+        List<String> oRetry = new ArrayList<>(), oDeps = new ArrayList<>(), oAlone = new ArrayList<>();
+        List<String> oWork = Lifted.splitAuto(o.keySet(),
+                p -> o.get(p).code, p -> o.get(p).restored, p -> o.get(p).placeholder, carried::contains,
+                oRetry, oDeps, oAlone);
+        check("an orphan is in the install list", oWork.contains("orphan"), oWork);
+        check("a real group dep still rides, never alone",
+                oDeps.equals(Collections.singletonList("d1")) && !oWork.contains("d1"), oWork + " / " + oDeps);
+        check("alone names only the orphan", oAlone.equals(Collections.singletonList("orphan")), oAlone);
+        check("the install list keeps input order", oWork.equals(Arrays.asList("orphan", "ph1")), oWork);
+        check("the 'Install pending apps now' count includes the orphan", oWork.size() == 2, oWork.size());
+        check("an orphan is never a restore-only retry", oRetry.isEmpty(), oRetry);
 
         System.out.println(runs + " checks, " + fails + " failed");
         if (fails > 0) System.exit(1);

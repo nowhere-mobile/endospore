@@ -28,7 +28,7 @@ func TestConcurrentSafeCmd(t *testing.T) {
 		"GET-SESSION-TYPE", "GET-OFFLINE",
 		// NWP-20260901-25 (#145 S1): pure reads of pendingReapMu/sealMu state + one tmpfs file. Serialized,
 		// a progress poll during a login or materialise froze the very bar it was feeding.
-		"SEAL-STATUS", "GET-SYNC-STATUS", "GET-SWEEP", "AUTO-SWEEP", "AUTO-SWEEP-APP",
+		"SEAL-STATUS", "GET-SYNC-STATUS", "GET-SWEEP", "AUTO-SWEEP", "AUTO-SWEEP-APP", "AUTO-SWEEP-STEP",
 		"PLACEHOLDER-OUTCOMES", // NWP-20261127-08: a sign-in sends it while it holds sessionMu
 		"TELINGEST-SEEN",       // NWP-20261129-02: a session whose seals hold sessionMu for minutes sends it
 		// NWP-20261117-27: one atomic read; a materialise or a sign-in holds sessionMu for minutes.
@@ -76,8 +76,12 @@ func TestConcurrentSafeCmd(t *testing.T) {
 		"OD-DATA-PENDING",
 		// NWP-20261118-11: asked before the switch, while GRANT-PERMS can hold sessionMu for the grant op.
 		"GET-PREFS",
+		// NWP-20261205-01: the session's last-save line, one tmpfs read and the marker (the GET-SESSION-NAME case).
+		"GET-LASTSAVE",
 		// NWP-20261117-23: the gate's media and prefetch polls, each a read of one RAM file published by rename.
 		"GET-MEDIA-STATUS", "GET-MEDIA-APP-PROGRESS", "GET-PREFETCH-METERED",
+		// NWP-20261114-34: the gate's landed-counter poll, a read of one RAM file published by rename.
+		"GET-MEDIA-LANDED",
 		// NWP-20261201-03: a file read; the SET-SEAL-HOLD case; and the gate's memory-only network report.
 		"GET-SAVE-MODE", "SET-SAVE-MODE", "SAVE-NET-UNMETERED", "SAVE-NET-METERED",
 		// NWP-20261118-06: the kept storage count; a RAM read and a goSafe start.

@@ -56,12 +56,13 @@ suite() {
   # cover a path that is actually wired (the loop itself is not liftable).
   grep -qF 'failReason = sealStatusReason;' "$f" && grep -qF 'logoffFailMessage(failWhy, refusal, failReason, this::fmtWhen)' "$f" || {
     echo "  PIN   doLogoff no longer passes the gateway's reason to logoffFailMessage" >&2; return 1; }
-  # PIN (NWP-20261013-20): every gate appearance asks for the notice, and it is cleared from the OK button -- after the
-  # user has seen it -- never at the fetch.
+  # PIN (NWP-20261013-20): every gate appearance asks for the notice, and it is cleared from the Got it button of a held
+  # sheet (NWP-20261206-17: Back and a touch outside do not close it) -- after the user has seen it -- never at the fetch.
   grep -qF 'refreshCreditLostNotice(); // NWP-20261013-20' "$g" || {
     echo "  PIN   the gate's onResume no longer asks for the lost-credit notice" >&2; return 1; }
-  grep -qF '.setPositiveButton("OK", (d, w) -> new Thread(() -> {' "$g" && grep -qF 'try { sendDaemon(creditLostClearCommand(stamp)); }' "$g" || {
-    echo "  PIN   the lost-credit notice is no longer cleared from its OK button" >&2; return 1; }
+  grep -qF 'SheetDialog.confirmHeld(' "$g" && grep -qF 'new Runnable[] { () -> new Thread(() -> {' "$g" \
+    && grep -qF 'try { sendDaemon(creditLostClearCommand(stamp)); }' "$g" || {
+    echo "  PIN   the lost-credit notice is no longer cleared from its Got it button on a held sheet" >&2; return 1; }
   [ "$(grep -cF 'creditLostClearCommand(stamp)' "$g")" = 1 ] || {
     echo "  PIN   the lost-credit notice is cleared from more than one place" >&2; return 1; }
   # PINS (NWP-20261101-08, Q070): the wiring the lifted helpers cannot cover. Captured into variables, never

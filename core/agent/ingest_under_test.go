@@ -7,65 +7,36 @@ import (
 	"testing"
 )
 
-// GET-INGEST reads the .under real dir of a mapped staging dir, never the media overlay (NWP-20261013-30).
+// GET-INGEST never reads the .under dir of a mapped staging dir: the daemon's MLS level cannot reach it on a
+// device. It reads the overlay mountpoint, for the snapshot's names only (NWP-20261203-15; was NWP-20261013-30).
+// The fixture is ingestOverlayFixture (ingest_snapshot_test.go).
 
-// ingestUnderTree builds an overlay dir holding a stub that fails any open (mode 000) and a .under dir of
-// real files, and injects a map pointing the overlay (or its parent, when viaParent) at the .under dir.
-func ingestUnderTree(t *testing.T, viaParent bool, real map[string][]byte) (overlay, under string) {
-	t.Helper()
-	old, oldFn := ingestMediaBase, ingestUndersFn
-	ingestMediaBase = t.TempDir()
-	t.Cleanup(func() { ingestMediaBase, ingestUndersFn = old, oldFn })
-	overlay = filepath.Join(ingestMediaBase, "12", ingestDir)
-	if err := os.MkdirAll(overlay, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	stub := filepath.Join(overlay, "big.vcf")
-	if err := os.WriteFile(stub, []byte("stub"), 0o000); err != nil {
-		t.Fatal(err)
-	}
-	under = filepath.Join(t.TempDir(), "under")
-	if err := os.MkdirAll(under, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	for n, b := range real {
-		if err := os.WriteFile(filepath.Join(under, n), b, 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
-	key, val := overlay, under
-	if viaParent {
-		key = filepath.Dir(overlay)
-		val = filepath.Dir(under)
-		if err := os.Rename(under, filepath.Join(val, "Imported")); err != nil {
-			t.Fatal(err)
-		}
-		under = filepath.Join(val, "Imported")
-	}
-	ingestUndersFn = func() map[string]string { return map[string]string{key: val} }
-	return overlay, under
-}
-
-func TestGetIngestReadsUnderNotOverlay(t *testing.T) {
+func TestGetIngestMappedReadsOverlayNotUnder(t *testing.T) {
 	for _, viaParent := range []bool{false, true} {
-		ingestUnderTree(t, viaParent, map[string][]byte{"small.vcf": []byte("BEGIN:VCARD\nEND:VCARD\n")})
+		plain, hidden, mapOn := ingestOverlayFixture(t, viaParent)
+		ingestWrite(t, filepath.Join(plain, "small.vcf"), []byte("BEGIN:VCARD\nEND:VCARD\n"))
+		ingestSnapshotStaged("12")
+		mapOn()
+		ingestWrite(t, filepath.Join(plain, "big.vcf"), []byte("stub"))
+		ingestWrite(t, filepath.Join(hidden, "other.vcf"), []byte("under"))
 		reply := ingestRoundTrip(t, func(c net.Conn) { handleGetIngest(c, 12*100000+10001) })
 		got := ingestReplyFiles(t, reply)
 		if len(got) != 1 || got["small.vcf"] != "BEGIN:VCARD\nEND:VCARD\n" {
-			t.Fatalf("viaParent=%v: want only the real file, got %q", viaParent, got)
+			t.Fatalf("viaParent=%v: want only the snapshot's file from the overlay path, got %q", viaParent, got)
 		}
 	}
 }
 
 func TestGetIngestMappedButUnreadableIsNone(t *testing.T) {
-	_, under := ingestUnderTree(t, false, map[string][]byte{"small.vcf": []byte("x")})
-	if err := os.RemoveAll(under); err != nil {
+	plain, hidden, mapOn := ingestOverlayFixture(t, false)
+	ingestWrite(t, filepath.Join(plain, "small.vcf"), []byte("x"))
+	ingestSnapshotStaged("12")
+	mapOn()
+	// a dead mountpoint: the plain dir is gone, and the hidden dir still holds the file. It must NOT be served.
+	if err := os.RemoveAll(plain); err != nil {
 		t.Fatal(err)
 	}
-	// the overlay path still holds a readable file: it must NOT be served as a fallback
-	if err := os.Chmod(filepath.Join(ingestMediaBase, "12", ingestDir, "big.vcf"), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	ingestWrite(t, filepath.Join(hidden, "small.vcf"), []byte("x"))
 	reply := ingestRoundTrip(t, func(c net.Conn) { handleGetIngest(c, 12*100000+10001) })
 	if reply != "NONE\n" {
 		t.Fatalf("want NONE, got %q", reply)

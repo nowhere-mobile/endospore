@@ -140,8 +140,10 @@ suite() {
   [[ "$b" == *'showGoogleAccounts();'* && "$b" != *'showPreferences();'* ]] || {
     echo "  PIN P4 a failed sign-out does not redraw showGoogleAccounts" >&2; return 1; }
   b=$(body "$p" 'private void confirmGoogleSignOut(')
-  [[ "$b" == *'.setTitle(GoogleSignOut.ROW_LABEL)'* && "$b" == *'.setMessage(GoogleSignOut.CONFIRM)'* \
-     && "$b" == *'"Sign out"'* && "$b" == *'"Cancel"'* ]] || { echo "  PIN P4 the dialog does not use ROW_LABEL and CONFIRM" >&2; return 1; }
+  # since NWP-20261206-18 the dialog is GoogleSheets.signOut() on the shared sheet, which holds ROW_LABEL and CONFIRM
+  # (test-google-sheets-java.sh pins its words and buttons)
+  [[ "$b" == *'SheetDialog.confirm(this, GoogleSheets.signOut()'* && "$b" != *'"Cancel"'* && "$b" != *'AlertDialog'* ]] || {
+    echo "  PIN P4 the sign-out does not open GoogleSheets.signOut() on the sheet" >&2; return 1; }
   b=$(body "$p" 'private void showPreferences(')
   [[ "$b" == *'addGoogleSignOutCard(ll);'* ]] || { echo "  PIN P4 showPreferences does not draw the card" >&2; return 1; }
   # P5: the file name is roamd's, the permission is declared once

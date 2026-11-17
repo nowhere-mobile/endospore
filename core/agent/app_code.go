@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -227,7 +228,7 @@ func handleMaterializeApp(conn net.Conn, dest, pkg string, stream bool) {
 		stop, done := make(chan struct{}), make(chan struct{})
 		goSafe("od-renew", func() {
 			defer close(done)
-			renewOdWhile(pkg, epoch, stop)
+			renewOdWhileSweep(pkg, epoch, stop) // NWP-20261204-05: a long fetch keeps a live sweep's lease too
 		})
 		// The renewal ends with the op, whichever way it returns -- and has EXITED before the lease is settled
 		// below, so a tick already in flight cannot re-open a lease that settling ends.
@@ -263,6 +264,40 @@ func handleMaterializeApp(conn net.Conn, dest, pkg string, stream bool) {
 	}
 }
 
+// odCensus counts one RESTORE-ODDATA request's replies for its one login.log line (NWP-20261202-27). h53 #1 makes the
+// gate's Keep-installed restores a list only if the shared reads dominate, and the odrestore worker lines name no
+// caller: phase splits them. signin = this sign-in has not passed GRANT-PERMS (the gate's Keep-installed loop and the
+// install heal its installs fire); session = the sweep, taps and heals. The gate is in memory, so a request after an
+// agent restart mid-session reads as signin. The line names no package, no profile and no reply text.
+type odCensus struct{ ran, ok, nosrc, notready, err, stopped int }
+
+func (c *odCensus) add(pkg, reply string) {
+	c.ran++
+	switch reply {
+	case "OK " + pkg:
+		c.ok++
+	case "OK NOSRC":
+		c.nosrc++
+	case "ERR-NOTREADY":
+		c.notready++
+	default:
+		c.err++
+	}
+}
+
+// odCensusPhase is read ONCE per request, before its first op: an op that arms the gate does not relabel it.
+func odCensusPhase(uid string) string {
+	if bootWakeGate.armed(uid) {
+		return "session"
+	}
+	return "signin"
+}
+
+func (c *odCensus) log(uid, form string, n int, phase string, start time.Time) {
+	fmt.Fprintf(os.Stderr, "[logind] restore-oddata user %s form=%s n=%d phase=%s ran=%d ok=%d nosrc=%d notready=%d err=%d stopped=%d %dms (NWP-20261202-27)\n",
+		uid, form, n, phase, c.ran, c.ok, c.nosrc, c.notready, c.err, c.stopped, time.Since(start).Milliseconds())
+}
+
 // handleRestoreOdData (#204): after a tap materialises an on-demand app (installApks installs the real APK), move
 // that app's held CE+DE data back from .nowhere-odhold into the now-app-owned canonical dir + re-grant its runtime
 // perms. Both were skipped at login because the app was an APK-less archived placeholder: its restored data dir
@@ -290,7 +325,10 @@ func handleRestoreOdData(conn net.Conn, dest, payload string) {
 			fmt.Fprint(conn, "OK LOCAL\n") // a throwaway/offline session has no roamed on-demand hold to restore
 			return
 		}
-		restoreOdOne(conn, dest, name, pass, uid, readRoamSessionSE(dest), pkg, "", "")
+		phase, start := odCensusPhase(uid), time.Now()
+		var c odCensus
+		c.add(pkg, restoreOdOne(conn, dest, name, pass, uid, readRoamSessionSE(dest), pkg, "", ""))
+		c.log(uid, "one", 1, phase, start)
 		return
 	}
 	// NWP-20261125-08 (h53 #1): the list form. Every name is checked BEFORE anything runs: one invalid name, a
@@ -317,6 +355,9 @@ func handleRestoreOdData(conn net.Conn, dest, payload string) {
 		return
 	}
 	seSecret := readRoamSessionSE(dest)
+	phase := odCensusPhase(uid)
+	start := time.Now()
+	var c odCensus
 	// The batch token rides line 6 (`kind`) of each op: roamd keys one shared `pm list packages -3` read on its
 	// b-part, and the op with i = n removes it. The b-part is random per request, so no other list reads it.
 	var rb [4]byte
@@ -328,13 +369,15 @@ func handleRestoreOdData(conn net.Conn, dest, payload string) {
 		if _, err := os.Stat(filepath.Join(dest, odCancelFile)); err == nil {
 			for _, p := range pkgs[i:] {
 				fmt.Fprintf(conn, "%s STOPPED\n", p)
+				c.stopped++
 			}
 			break
 		}
-		restoreOdOne(conn, dest, name, pass, uid, seSecret, pkg, fmt.Sprintf("%s.%d.%d", base, i+1, len(pkgs)), pkg+" ")
+		c.add(pkg, restoreOdOne(conn, dest, name, pass, uid, seSecret, pkg, fmt.Sprintf("%s.%d.%d", base, i+1, len(pkgs)), pkg+" "))
 		ran++
 	}
 	fmt.Fprintf(conn, "END %d\n", ran)
+	c.log(uid, "list", len(pkgs), phase, start)
 }
 
 // odRestoreWorker runs one RESTORE-ODDATA package's `odrestore` worker op. Tests replace it.
@@ -348,10 +391,11 @@ const odRestoreConnWindow = 120 * time.Second
 const odRestoreMaxList = 16
 
 // restoreOdOne fully restores one package (data, grants, declines, a11y, autofill, Keystore register: the worker's
-// `odrestore` op) and writes its reply line, lead first ("" for the one-package form, "<pkg> " in a list).
+// `odrestore` op) and writes its reply line, lead first ("" for the one-package form, "<pkg> " in a list). It returns
+// the trimmed reply for the caller's restore-oddata census (NWP-20261202-27).
 // h53 #1's rule: in a list, package i's grants land before package i+1's data moves, because one op runs at a time
 // and this reply is written before the caller starts the next package's op.
-func restoreOdOne(conn net.Conn, dest, name, pass, uid, seSecret, pkg, kind, lead string) {
+func restoreOdOne(conn net.Conn, dest, name, pass, uid, seSecret, pkg, kind, lead string) string {
 	conn.SetDeadline(time.Now().Add(odRestoreConnWindow))
 	// NWP-20260903-11: this verb now has a second caller -- the install-heal (AppInstallReceiver), which
 	// fires it WITHOUT a preceding MATERIALIZE-APP -- so the #204 seal-suppression window may be unarmed
@@ -359,12 +403,27 @@ func restoreOdOne(conn net.Conn, dest, name, pass, uid, seSecret, pkg, kind, lea
 	// Without this a periodic seal queued on workerMu ahead of us delays the reunite by a whole seal -- the
 	// exact #204 shape, on the new path. NWP-20261011-01: armed AFTER the caller's guards, which used to return
 	// with it armed and nothing left to close it.
+	epoch := odWindowEpochNow() // NWP-20261204-05: read before the arm; a reset in between leaves the renewals inert
 	armOdLease(pkg, time.Now(), odFetchLease)
 	// NWP-20261130-03: an install that bypassed materializeapp reaches here with its data still in the store. Block the
 	// app before this request can queue behind a seal.
 	stopBarrier := odLaunchBarrier(dest, name, uid, pkg)
+	// NWP-20261204-05: renew this package's lease and a live Auto sweep's lease while the op is in flight, so a data
+	// restore longer than either lease does not let a periodic seal start in the middle of the sweep (od_window.go,
+	// renewOdWhileSweep). Before it the arm above was the only renewal: 90 s for the package, nothing for the sweep.
+	stopRenew, renewDone := make(chan struct{}), make(chan struct{})
+	goSafe("odrestore-renew", func() {
+		defer close(renewDone)
+		renewOdWhileSweep(pkg, epoch, stopRenew)
+	})
+	endRenew := sync.OnceFunc(func() {
+		close(stopRenew)
+		<-renewDone
+	})
+	defer endRenew() // a panic in the op still stops the renewal
 	// pkg rides the srcUnit slot; the worker's `odrestore` op restores + reowns the hold and re-grants perms for it.
 	out := odRestoreWorker(dest, "odrestore", name, pass, uid, seSecret, kind, pkg, "", nil)
+	endRenew() // EXITED before the lease ends below, so a tick in flight cannot re-open it
 	stopBarrier()
 	// #204 (DIA-20260726-08): the grant has landed -- close the materialising window so periodic seals resume
 	// immediately (don't wait out the install lease). Paired with the open in handleMaterializeApp.
@@ -384,6 +443,7 @@ func restoreOdOne(conn net.Conn, dest, name, pass, uid, seSecret, pkg, kind, lea
 	if bootWakeAfterRestore(reply, pkg, uid) {
 		goSafe("bootwake-pkg", func() { bootWakePackage(dest, uid, pkg) })
 	}
+	return reply
 }
 
 // apkPart is one file of an on-demand app's APK set: its manifest record and where it is written.

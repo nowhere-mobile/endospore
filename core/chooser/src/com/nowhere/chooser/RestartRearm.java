@@ -23,6 +23,8 @@ package com.nowhere.chooser;
  * OPEN RESIDUALS, not closed here: (a) a restart while the screen is already off arms only at the next screen-off
  * (armIdleWatcher arms on SCREEN_OFF); (b) a restart while the session is cold-locked finds no live session, so its
  * later resume re-arms with the gate's default idle and wipe values, not the profile's.
+ * NWP-20261203-05: an ask that lands in a session CredentialService left restarting with its starts pending (the
+ * sign-in's "permissions revoked" kill) is freed by CredSvcWatch.watch, which stops that service and re-sends the ask.
  */
 final class RestartRearm {
     private RestartRearm() {}
@@ -89,6 +91,9 @@ final class RestartRearm {
                             .putExtra("relayprefs", true), android.os.UserHandle.of(uid)) != null) {
                         android.util.Log.i(TAG, "restart rearm: asked user " + uid
                                 + " to resend its lock prefs (try " + (try_ + 1) + ") (NWP-20261126-10)");
+                        // NWP-20261203-05: the ask can land in a stuck CredentialService; the watch frees it.
+                        CredSvcWatch.record(app, uid, CredSvcWatch.RELAYPREFS);
+                        CredSvcWatch.watch(app, uid, "rearm");
                         return;
                     }
                 } catch (Throwable t) { android.util.Log.w(TAG, "restart rearm: ask user " + uid, t); }

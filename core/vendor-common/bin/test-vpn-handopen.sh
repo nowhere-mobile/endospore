@@ -59,6 +59,7 @@ P=$(func vpn_preconsent_off)
 C=$(func vpn_apply_choice)
 K=$(func vpn_pick_consume)
 R=$(func vpn_deferred_retry)
+VD=$(func vpn_diag_note)   # NWP-20261202-41: vpn_deferred_retry notes each apply; the real note, as its own suites run it
 TR=$(grep -m1 -E '^VPN_APPLY_TRIES=' "$SUT")
 ARM=$(awk -v l="  odrestore)" '$0==l{on=1} on{print} on&&/^    ;;$/{exit}' "$SUT")
 # A miss is a FAIL (exit 1), not a harness error: on a roamd with no vpn_preconsent_off the suite must fail.
@@ -67,6 +68,7 @@ case "$P" in *'ACTIVATE_VPN'*) ;; *) echo "FAIL  EXTRACTION FAILED: vpn_preconse
 case "$C" in *'np.VpnAlwaysOn'*) ;; *) echo "FAIL  EXTRACTION FAILED: vpn_apply_choice in $SUT"; exit 1 ;; esac
 case "$K" in *'nowhere-vpn-pick'*) ;; *) echo "FAIL  EXTRACTION FAILED: vpn_pick_consume in $SUT"; exit 1 ;; esac
 case "$R" in *'.vpndeferred'*) ;; *) echo "FAIL  EXTRACTION FAILED: vpn_deferred_retry in $SUT"; exit 1 ;; esac
+case "$VD" in *'.vpndiag.'*) ;; *) echo "FAIL  EXTRACTION FAILED: vpn_diag_note in $SUT"; exit 1 ;; esac
 [ -n "$TR" ] || { echo "FAIL  EXTRACTION FAILED: VPN_APPLY_TRIES= in $SUT"; exit 1; }
 case "$ARM" in *'echo "OK NOSRC" > "$RES"'*) ;; *) echo "FAIL  EXTRACTION FAILED: the odrestore arm in $SUT"; exit 1 ;; esac
 
@@ -122,7 +124,7 @@ pre(){ vpn_preconsent_off 10 "$1" >> "$T/stdout"; echo "$?" >> "$T/rcs"; rec; }
 retry(){ vpn_deferred_retry 10 "$1" >> "$T/stdout"; rec; }
 EOF
 )
-BODY=$(printf '%s\n' "$CH" "$P" "$C" "$K" "$TR" "$R")
+BODY=$(printf '%s\n' "$CH" "$P" "$C" "$K" "$TR" "$VD" "$R")
 
 # session: a case root. User 10 has the chooser files dir (nowhere-prefs restored), and com.x and com.y installed.
 session() {

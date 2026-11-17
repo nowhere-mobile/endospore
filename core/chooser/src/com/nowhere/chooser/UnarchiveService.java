@@ -49,6 +49,9 @@ public class UnarchiveService extends Service {
     static final String EXTRA_SWEEP = "nowhere.unarchive.sweep"; // #130: auto-mode background-materialise sweep
     // NWP-20261117-40: sent at the end of sweepAuto, to this app only, with no extras. An open Your apps redraws on it.
     static final String ACTION_SWEEP_DONE = "com.nowhere.chooser.action.AUTO_SWEEP_DONE";
+    // NWP-20261203-23: a sweep pass starts, or the last one ended. To this app only, with no extras. Your apps redraws
+    // its install row on it, so the row offers Pause and Stop only while a sweep runs.
+    static final String ACTION_SWEEP_STATE = "com.nowhere.chooser.action.AUTO_SWEEP_STATE";
     // NWP-20261012-06: with EXTRA_SWEEP, the Keep-installed apps whose login restore the gate saw answer OK
     static final String EXTRA_WAKE = "nowhere.unarchive.wake";
     // NWP-20261112-11 (Q042): with EXTRA_SWEEP. BY_HAND: "Install pending apps now" -- the sweep runs on any network.
@@ -57,6 +60,8 @@ public class UnarchiveService extends Service {
     static final String EXTRA_RESUME = "nowhere.unarchive.resume";
     // NET_REKICK: the gate's re-kick when the network rule turns to yes mid-session -- only the sweep, nothing else.
     static final String EXTRA_NET_REKICK = "nowhere.unarchive.netrekick";
+    // NWP-20261203-18: the progress notification's Pause or Stop (HoldNotice.HOLD_PAUSE / HOLD_STOP), with the card closed.
+    static final String EXTRA_HOLD = "nowhere.unarchive.hold";
 
     /** #130: one materialise at a time, process-wide. The sweep and a user tap are separate start commands with
      *  separate worker threads, and racing two materialises of the same package (or two members of the same
@@ -67,8 +72,12 @@ public class UnarchiveService extends Service {
     // the sweep released it and re-took it straight away for its next app, so a tap could wait behind several sweep
     // items rather than one. A fair lock hands it to the longest waiter, and a releasing thread that asks again
     // queues behind it. Reentrant like the monitor it replaces.
-    private static final java.util.concurrent.locks.ReentrantLock MAT_LOCK =
-            new java.util.concurrent.locks.ReentrantLock(true);
+    // NWP-20261203-07: an OwnedLock so a report can name the thread that holds it (getOwner() is protected).
+    private static final OwnedLock MAT_LOCK = new OwnedLock();
+    static final class OwnedLock extends java.util.concurrent.locks.ReentrantLock {
+        OwnedLock() { super(true); }
+        Thread owner() { return getOwner(); }
+    }
     /** NWP-20261113-17: the SweepOutcome token of the exit that ended the last materializeAndInstall, so the Auto
      *  sweep can report where each app's call ended. Written and read under MAT_LOCK only: sweepAuto holds the lock
      *  across the call and the read, so a tap cannot overwrite it in between. */
@@ -76,6 +85,19 @@ public class UnarchiveService extends Service {
     /** NWP-20261118-05: the last materializeMember's MATERIALIZE-APP answered ERR-WORKER-BUSY, so the group's dep abort
      *  records BUSY, not FETCH_FAILED. Written and read under MAT_LOCK, like matEnd. */
     private static boolean depBusy;
+    /** NWP-20261203-03: the thread running the current Auto sweep pass, or null when no sweep runs. Set at the top of
+     *  each pass of sweepAutoJoined's loop (sweepPassBegin) and cleared in its outer finally (sweepPassEnd), both under
+     *  the SweepStall class monitor, with the pass's SweepStall.reset. A step mark (step) counts only on it, so a tap on
+     *  its own worker thread marks nothing; the watch exits once it is null; the abandon interrupts it; snapshot()
+     *  reads it with SWEEP_SINCE under SWEEP_SLOT (NWP-20261203-07). */
+    static volatile Thread SWEEP_THREAD;
+    /** NWP-20261203-03: the daemon socket the sweep thread reads now (daemon, daemonMaterialize), so the abandon can
+     *  close it: a close ends a blocked read on a LocalSocket, as DaemonSocket.connect's watchdog relies on. Set and
+     *  cleared under the SweepStall class monitor (sweepSockOwn, sweepSockRelease). */
+    static volatile LocalSocket SWEEP_SOCK;
+    /** NWP-20261203-03: the `nowhere-sweep-watch` thread, or null. Guarded by SWEEP_WATCH_LOCK. */
+    private static Thread SWEEP_WATCH;
+    private static final Object SWEEP_WATCH_LOCK = new Object();
 
     /** NWP-20260822-12: THE OUTSTANDING SET -- one queue, shared by every producer, that owns the notification.
      *
@@ -121,10 +143,24 @@ public class UnarchiveService extends Service {
      *  see any notifications" -- the download ran on, headless and killable). Refcount instead: every accepted
      *  start increments, every worker's finally decrements, and only the LAST worker out turns off the lights. */
     private static final java.util.concurrent.atomic.AtomicInteger ACTIVE = new java.util.concurrent.atomic.AtomicInteger(0);
+    /** NWP-20261203-07 (backlog: "P1: An Auto sweep stalls after its first fetch ..."): the elapsedRealtime the
+     *  running sweep's current pass started, set with SWEEP_THREAD (NWP-20261203-03's field, declared above) first in
+     *  each sweepAutoJoined pass (sweepPassBegin), the thread cleared when it ends (sweepPassEnd). Read only by
+     *  snapshot(), for the report keys sweep_state, sweep_stack and lane_stack. Every write of the pair and the
+     *  snapshot read hold SWEEP_SLOT: SweepJoin.exit() ends the walk before the outer finally clears, so a new sweep
+     *  can publish between the old one's check and its clear, and without the lock the old sweep would erase it
+     *  (every later report then reads idle through the new sweep's stall). */
+    private static final Object SWEEP_SLOT = new Object();
+    static volatile long SWEEP_SINCE;
 
     /** NWP-20261122-15 (h50 #5): true on the sweep thread of a switch-landing start, so sweepAuto may show the landing
      *  line. Set by that start only (never by a network re-kick); read and removed by sweepAuto. */
     private static final ThreadLocal<Boolean> LANDING = new ThreadLocal<>();
+    /** NWP-20261203-18, NWP-20261203-23: the card of the sweep pass that runs now, 0 for none. A Pause from the
+     *  progress notification or from Your apps' install row gives it to SweepHold.pause, so a Resume continues that
+     *  card. Set by sweepAuto, reset at the start of each pass. */
+    private static volatile long PASS_CARD;
+    static long passCard() { return PASS_CARD; }
 
     /** NWP-20260901-32: hold the CPU up for the whole materialise.
      *
@@ -223,7 +259,25 @@ public class UnarchiveService extends Service {
         final boolean netRekick = intent != null && intent.getBooleanExtra(EXTRA_NET_REKICK, false);
         final boolean resumeSweep = intent != null && intent.getBooleanExtra(EXTRA_RESUME, false);
         final String[] restoredOk = intent != null ? intent.getStringArrayExtra(EXTRA_WAKE) : null;
+        final String hold = intent != null ? intent.getStringExtra(EXTRA_HOLD) : null;
+        if (hold != null) {
+            // NWP-20261203-18: Pause or Stop from the progress notification. The sweep ends after the app in flight, as
+            // from the card. A stale action (the sweep ended, or it is held already) does nothing. A pause resumes from
+            // Your apps' "Resume installing apps" row. The re-post has no actions; with no work running, the service stops.
+            String word = HoldNotice.HOLD_PAUSE.equals(hold) ? HoldNotice.HOLD_PAUSE
+                    : HoldNotice.HOLD_STOP.equals(hold) ? HoldNotice.HOLD_STOP : "unknown";
+            if (HoldNotice.offer(SweepJoin.running(), SweepHold.state())) {
+                if (HoldNotice.HOLD_PAUSE.equals(hold)) SweepHold.pause(passCard());
+                else if (HoldNotice.HOLD_STOP.equals(hold)) SweepHold.stop();
+            }
+            android.util.Log.i("NowhereChooser", "#130 sweep: " + word + " from the notification");
+            if (ACTIVE.get() > 0) startForegroundNotice(); else stopSelfSafely();
+            return START_NOT_STICKY;
+        }
         startForegroundNotice(); // MUST be immediate (within the FGS start window), before any network work
+        // NWP-20261207-04: the failed-apps notice's "Try again"; the start is the by-hand sweep below, nothing else.
+        if (intent != null && SweepFailNotice.ACTION_RETRY.equals(intent.getAction()))
+            android.util.Log.i("NowhereChooser", "#130 sweep started by hand from the failed-apps notice (NWP-20261207-04)");
         if (sweep) {
             // #130: the auto background-materialise sweep -- no tap, no unarchiveId, no card, no launch.
             ACTIVE.incrementAndGet();
@@ -297,6 +351,16 @@ public class UnarchiveService extends Service {
                         pf.setDaemon(true);
                         pf.start();
                     } catch (Throwable t) { android.util.Log.w("NowhereChooser", "play finish start", t); }
+                    // NWP-20261205-02 (h58 #1): the one line a sign-in shows when its last save left a scope unsaved,
+                    // once per sign-in (the user serial). Its own daemon thread, as the skip notice below.
+                    try {
+                        final android.content.Context lsCtx = getApplicationContext();
+                        final String lsSerial = landingSerial();
+                        final File lsStamp = new File(getNoBackupFilesDir(), "last-save-line-shown");
+                        Thread ls = new Thread(() -> LastSaveNoticeActivity.check(lsCtx, lsSerial, lsStamp), "nowhere-last-save");
+                        ls.setDaemon(true);
+                        ls.start();
+                    } catch (Throwable t) { android.util.Log.w("NowhereChooser", "last save line start", t); }
                     try {
                         final android.content.Context appCtx = getApplicationContext();
                         Thread sn = new Thread(() -> SkipNoticeActivity.check(appCtx), "nowhere-skip-notice");
@@ -411,6 +475,7 @@ public class UnarchiveService extends Service {
                   .setProgress(0, 0, true); // indeterminate until materializeAndInstall knows the item count
                 applyRoster(nb, t, null);
             }
+            applyHoldActions(nb);
             startForeground(FG_ID, nb.build(), ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC);
         } catch (Throwable t) {
             android.util.Log.w("NowhereChooser", "startForeground unarchive", t);
@@ -576,6 +641,7 @@ public class UnarchiveService extends Service {
                 b.setProgress(0, 0, true);
             }
             applyRoster(b, title, bytes);
+            applyHoldActions(b);
             nm.notify(FG_ID, b.build());
         } catch (Throwable ignore) {}
     }
@@ -618,10 +684,29 @@ public class UnarchiveService extends Service {
         } catch (Throwable ignore) {}
     }
 
+    /** NWP-20261203-18: Pause and Stop on the progress notification while a sweep runs and nothing holds it, so the
+     *  sweep can be held with the landing card closed. notify() replaces the notification wholesale, so all four FG_ID
+     *  writers call this. The request codes keep the two PendingIntents apart: filterEquals ignores extras. A throw is
+     *  logged and never blocks the post. */
+    private void applyHoldActions(Notification.Builder b) {
+        try {
+            if (!HoldNotice.offer(SweepJoin.running(), SweepHold.state())) return;
+            b.addAction(new Notification.Action.Builder(android.R.drawable.ic_media_pause, LandingLine.PAUSE,
+                    android.app.PendingIntent.getService(this, FG_ID + 1,
+                            new Intent(this, UnarchiveService.class).putExtra(EXTRA_HOLD, HoldNotice.HOLD_PAUSE),
+                            android.app.PendingIntent.FLAG_IMMUTABLE | android.app.PendingIntent.FLAG_UPDATE_CURRENT)).build());
+            b.addAction(new Notification.Action.Builder(android.R.drawable.ic_menu_close_clear_cancel, LandingLine.STOP,
+                    android.app.PendingIntent.getService(this, FG_ID + 2,
+                            new Intent(this, UnarchiveService.class).putExtra(EXTRA_HOLD, HoldNotice.HOLD_STOP),
+                            android.app.PendingIntent.FLAG_IMMUTABLE | android.app.PendingIntent.FLAG_UPDATE_CURRENT)).build());
+        } catch (Throwable t) { android.util.Log.w("NowhereChooser", "#130 sweep: hold actions", t); }
+    }
+
     /** #84 (DIA-20260813-15): DURING a member -- a determinate bar + byte text from the daemon's streamed
      *  "PROG" frames (restoreAppCode's per-chunk writeProg, real bytes). The title keeps the member's
      *  "(n of m)" position; the bar and "12 MB of 402 MB" line are exactly where THIS app's download is. */
     private void updateNoticeBytes(String pkg, long doneB, long totalB) {
+        stepProgress(); // NWP-20261203-03: each PROG frame is progress of the step in flight
         if (totalB <= 0) return;
         // NWP-20260901-04: publish the frame for the OTHER writers to carry. The KEY is written LAST so a
         // concurrent reader that sees the new package also sees its numbers, never the previous package's.
@@ -641,6 +726,7 @@ public class UnarchiveService extends Service {
                     .setContentText(bytes)
                     .setProgress(max, cur, false);
             applyRoster(b, t, bytes);
+            applyHoldActions(b);
             nm.notify(FG_ID, b.build());
         } catch (Throwable ignore) {}
     }
@@ -670,6 +756,7 @@ public class UnarchiveService extends Service {
                     .setProgress(0, 0, true);
             // No honest number exists for a PM commit, so no body line -- the beat is named in the title.
             applyRoster(b, t, null);
+            applyHoldActions(b);
             nm.notify(FG_ID, b.build());
         } catch (Throwable ignore) {}
     }
@@ -731,6 +818,17 @@ public class UnarchiveService extends Service {
             return ai != null && ai.sourceDir != null && !ai.sourceDir.isEmpty();
         } catch (Throwable t) {
             return false;
+        }
+    }
+
+    /** NWP-20261202-38: the install a restore belongs to (OdRestoreOnce): PackageInfo.lastUpdateTime, the moment of the
+     *  materialise or of an installer's update (ReArchiveReceiver reads the same field). -1 when it cannot be read,
+     *  and OdRestoreOnce then always sends. */
+    static long installStamp(android.content.Context ctx, String pkg) {
+        try {
+            return ctx.getPackageManager().getPackageInfo(pkg, 0).lastUpdateTime;
+        } catch (Throwable t) {
+            return -1L;
         }
     }
 
@@ -904,10 +1002,12 @@ public class UnarchiveService extends Service {
      *  no unarchival report. Per-item non-fatal -- one failed download must not stop the rest (unlike the
      *  fail-fast INSIDE a single materialise, which protects an entry point from installing over a broken dep
      *  stack). A pkg with neither a placeholder nor code is a launcher-less group dep (gms/gsf) -- it
-     *  materialises with its entry point, never alone. Anything the sweep fails to land stays a plain
-     *  placeholder: the tap flow remains as the user-facing fallback. */
+     *  materialises with its entry point, never alone -- ONLY when an entry point of the deferred keep-set that has
+     *  a placeholder and no code lists it in its deps (riders). NWP-20261207-07: any other such pkg is an orphan,
+     *  and the sweep installs it alone. Anything the sweep fails to land stays a plain placeholder: the tap flow
+     *  remains as the user-facing fallback. */
     /** The AUTO apps a sweep still has to materialise: in the auto keep-set, with an archived placeholder and no
-     *  code. NWP-20261012-04: an app that already HAS code is never in it, whoever installed it -- if its restore
+     *  code, or with neither and no placeholder entry point to ride (NWP-20261207-07). NWP-20261012-04: an app that already HAS code is never in it, whoever installed it -- if its restore
      *  is unconfirmed it gets a restore-only retry instead (autoAction). NWP-20261005-02: ONE implementation, shared
      *  by the sweep and by "Your apps"' "Install pending apps now" row, so the row's count can never disagree with
      *  what a tap on it would actually do. `log` is the sweep's: the row asks quietly. Does PackageManager work --
@@ -921,17 +1021,25 @@ public class UnarchiveService extends Service {
      *  returned list, so they never count toward the "Install pending apps now" row. */
     static java.util.List<String> pendingAutoApps(android.content.Context ctx, boolean log,
                                                   java.util.List<String> restoreOnly) {
-        java.util.List<String> retry = new ArrayList<>(), groupDeps = new ArrayList<>();
+        java.util.List<String> retry = new ArrayList<>(), groupDeps = new ArrayList<>(), alone = new ArrayList<>();
+        java.util.function.Predicate<String> code = pkg -> hasInstalledCode(ctx, pkg);
+        java.util.function.Predicate<String> placeholder = pkg -> {
+            try { return ctx.getPackageManager().getArchivedPackage(pkg) != null; } catch (Throwable t) { return false; }
+        };
+        // NWP-20261207-07: a no-code, no-placeholder app rides only when a placeholder entry point without code lists
+        // it -- pendingDeps materialises exactly that list with it. On-demand entry points count: a tap carries them.
+        java.util.Set<String> ride = riders(ProfileActivity.deferredKeepSet(ctx), code, placeholder,
+                p -> ProfileActivity.appDeps(ctx, p));
         java.util.List<String> work = splitAuto(ProfileActivity.autoKeepSet(ctx),
-                pkg -> hasInstalledCode(ctx, pkg),
+                code,
                 pkg -> odRestored(ctx, pkg),
-                pkg -> {
-                    try { return ctx.getPackageManager().getArchivedPackage(pkg) != null; } catch (Throwable t) { return false; }
-                },
-                retry, groupDeps);
+                placeholder, ride::contains,
+                retry, groupDeps, alone);
         if (log) {
             for (String pkg : retry) android.util.Log.i("NowhereChooser", "#130 sweep: " + pkg + " is installed and its"
                     + " restore is unconfirmed -- restore-only retry, never a reinstall (NWP-20261012-04)");
+            if (!alone.isEmpty()) android.util.Log.i("NowhereChooser", "#130 sweep: " + alone.size() + " Auto app(s)"
+                    + " with no placeholder and no entry point to ride -- installed alone (NWP-20261207-07)");
             for (String pkg : groupDeps) android.util.Log.i("NowhereChooser", "#130 sweep: " + pkg
                     + " has no placeholder -- group dep, rides its entry point");
         }
@@ -942,22 +1050,40 @@ public class UnarchiveService extends Service {
     }
 
     /** NWP-20261012-04: pendingAutoApps' split, pure so it runs off a device (core/chooser/tests/install-pending).
-     *  Returns the apps to fetch and install, in input order; AUTO_RESTORE_ONLY apps go to `restoreOnly` and
-     *  launcher-less group deps to `groupDeps`; whole apps go nowhere. The restored marker is read only for an app
-     *  with code, and the placeholder only for one without -- autoAction ignores the other. */
+     *  Returns the apps to fetch and install, in input order; AUTO_RESTORE_ONLY apps go to `restoreOnly`; whole apps
+     *  go nowhere. NWP-20261207-07: an AUTO_GROUP_DEP app (no code, no placeholder) goes to `groupDeps` only when
+     *  `rides` names it (riders: a placeholder entry point will carry it); any other is an orphan, goes to the
+     *  returned list in input order, and also to `alone`. The restored marker is read only for an app with code, the
+     *  placeholder only for one without -- autoAction ignores the other -- and `rides` only for an AUTO_GROUP_DEP. */
     static java.util.List<String> splitAuto(Iterable<String> pkgs,
             java.util.function.Predicate<String> code, java.util.function.Predicate<String> restored,
-            java.util.function.Predicate<String> placeholder,
-            java.util.List<String> restoreOnly, java.util.List<String> groupDeps) {
+            java.util.function.Predicate<String> placeholder, java.util.function.Predicate<String> rides,
+            java.util.List<String> restoreOnly, java.util.List<String> groupDeps, java.util.List<String> alone) {
         java.util.List<String> work = new java.util.ArrayList<>();
         for (String pkg : pkgs) {
             final boolean c = code.test(pkg);
             final int a = autoAction(c, c && restored.test(pkg), !c && placeholder.test(pkg));
             if (a == AUTO_INSTALL) work.add(pkg);
             else if (a == AUTO_RESTORE_ONLY) restoreOnly.add(pkg);
-            else if (a == AUTO_GROUP_DEP) groupDeps.add(pkg);
+            else if (a == AUTO_GROUP_DEP && rides.test(pkg)) groupDeps.add(pkg);
+            else if (a == AUTO_GROUP_DEP) { work.add(pkg); alone.add(pkg); }
         }
         return work;
+    }
+
+    /** NWP-20261207-07: the no-code apps an entry point of the deferred keep-set will carry -- the union of depsOf(e),
+     *  the list pendingDeps materialises with e, over every e that has an archived placeholder and no code, e itself
+     *  excluded. An entry with code is never materialised again (AUTO_WHOLE / AUTO_RESTORE_ONLY), so it carries
+     *  nothing; its placeholder is read only when it has no code. Pure (core/chooser/tests/install-pending). */
+    static java.util.Set<String> riders(Iterable<String> entries, java.util.function.Predicate<String> code,
+            java.util.function.Predicate<String> placeholder,
+            java.util.function.Function<String, java.util.List<String>> depsOf) {
+        java.util.Set<String> out = new java.util.LinkedHashSet<>();
+        for (String e : entries) {
+            if (code.test(e) || !placeholder.test(e)) continue;
+            for (String d : depsOf.apply(e)) if (!d.equals(e)) out.add(d);
+        }
+        return out;
     }
 
     /** NWP-20261012-04 (Chester, 2026-10-12: "installed an app from Appstore, when to your apps and clicked on install
@@ -997,7 +1123,9 @@ public class UnarchiveService extends Service {
      *  every other writer does, so an unconfirmed retry is retried again by the next sweep -- and never by a
      *  reinstall. Nothing is fetched and nothing is installed here. Caller holds MAT_LOCK. */
     private boolean restoreOnlyLocked(String pkg) {
-        String rr = daemon("RESTORE-ODDATA\n" + pkg + "\n");
+        step(SweepStall.RESTORE_ONLY); // NWP-20261203-03: a restore with no fetch (the sweep's retry, a dep, a fast path)
+        // NWP-20261202-38: one restore per install (OdRestoreOnce) -- a later sender takes this one's reply
+        String rr = OdRestoreOnce.send(pkg, installStamp(this, pkg), () -> daemon("RESTORE-ODDATA\n" + pkg + "\n"), m -> android.util.Log.i("NowhereChooser", m));
         return restoreOnlyReplied(pkg, rr);
     }
 
@@ -1026,10 +1154,12 @@ public class UnarchiveService extends Service {
      *  130 s is the per-read cap (SO_TIMEOUT applies to each line), above the daemon's 120 s window per package.
      *  A tail that throws is logged and the next app's tail still runs. Caller holds MAT_LOCK. */
     private void restoreOnlyListLocked(java.util.List<String> keep) {
+        step(SweepStall.RESTORE_ONLY); // NWP-20261203-03
         java.util.Map<String, String> replies =
                 OdRestoreList.parse(DaemonSocket.roundTripLines(OdRestoreList.request(keep), 130000), keep);
         for (String pkg : keep) {
             try {
+                OdRestoreOnce.record(pkg, installStamp(this, pkg), replies.get(pkg)); // NWP-20261202-38: a later sender of this install sends nothing
                 restoreOnlyReplied(pkg, replies.get(pkg));
             } catch (Throwable t) {
                 android.util.Log.w("NowhereChooser", "#130 sweep restore-only " + pkg, t);
@@ -1050,6 +1180,7 @@ public class UnarchiveService extends Service {
         LANDING.remove();
         int flags = (byHand ? SweepJoin.BY_HAND : 0) | (landing ? SweepJoin.LANDING : 0);
         if (!SweepJoin.enter(flags)) {
+            sweepJoinedNote(); // NWP-20261203-03: login.log says which step the running sweep is in, and for how long
             android.util.Log.i("NowhereChooser", "#130 sweep: joined the running sweep -- it runs once more when it ends (NWP-20261126-04)");
             return;
         }
@@ -1057,16 +1188,159 @@ public class UnarchiveService extends Service {
         SweepWake.begin(wake);
         try {
             while (true) {
+                sweepPassBegin(); // NWP-20261203-03: this pass is watched
+                startSweepWatch();
+                PASS_CARD = 0; // NWP-20261203-18, -23: no pass inherits the card of the pass before it
+                tellSweepState(); // NWP-20261203-23: a pass starts: Your apps offers Pause and Stop
                 LANDING.set((flags & SweepJoin.LANDING) != 0);
                 int next;
                 try { sweepAuto((flags & SweepJoin.BY_HAND) != 0); }
                 catch (Throwable t) { android.util.Log.w("NowhereChooser", "#130 auto sweep", t); }
                 finally { next = SweepJoin.exit(); }
-                if (next < 0) return;
+                if (next < 0) { tellSweepState(); return; } // NWP-20261203-23: ACTION_SWEEP_DONE went out before exit()
                 android.util.Log.i("NowhereChooser", "#130 sweep: a start joined this sweep -- one more pass over a fresh list (NWP-20261126-04)");
                 flags = next;
             }
-        } finally { SweepWake.end(wake); }
+        } finally { sweepPassEnd(); SweepWake.end(wake); }
+    }
+
+    /** NWP-20261203-03: a pass starts on this thread. One step under the SweepStall class monitor, which the watch's
+     *  abandon also holds: SWEEP_THREAD (with SWEEP_SINCE, under SWEEP_SLOT for snapshot(), NWP-20261203-07), the
+     *  cleared interrupt (an abandoned pass's, so the rerun starts clean) and SweepStall.reset (a new pass number, not
+     *  abandoned). An earlier pass's abandon runs wholly before it, and its
+     *  interrupt is cleared here, or wholly after it, and finds a newer pass and does nothing. */
+    private static void sweepPassBegin() {
+        synchronized (SweepStall.class) {
+            synchronized (SWEEP_SLOT) {
+                SWEEP_SINCE = android.os.SystemClock.elapsedRealtime();
+                SWEEP_THREAD = Thread.currentThread();
+            }
+            Thread.interrupted();
+            SweepStall.reset();
+        }
+    }
+
+    /** NWP-20261203-03: the sweep that ran on this thread is over. Clears SWEEP_THREAD only while it is still this
+     *  thread: SweepJoin.exit has already let a new start own the sweep, and that start's sweepPassBegin may have set
+     *  its own thread. Under the monitor sweepPassBegin holds, so the compare and the clear are one step, and under
+     *  SWEEP_SLOT, so snapshot() never reads a cleared thread with its pass start (NWP-20261203-07). */
+    private static void sweepPassEnd() {
+        synchronized (SweepStall.class) {
+            synchronized (SWEEP_SLOT) { if (SWEEP_THREAD == Thread.currentThread()) SWEEP_THREAD = null; }
+        }
+    }
+
+    /** NWP-20261203-03: on the sweep thread, `s` becomes SWEEP_SOCK, so the abandon can close it. False (and `s` is
+     *  closed) when the pass was already abandoned: the abandon ran before this socket existed, and the call must not
+     *  then read for READ_CAP_MS. Another thread's socket is not the sweep's: true, nothing recorded. */
+    private static boolean sweepSockOwn(LocalSocket s) {
+        synchronized (SweepStall.class) {
+            if (Thread.currentThread() != SWEEP_THREAD) return true;
+            if (SweepStall.abandoned()) {
+                try { s.close(); } catch (Throwable ignore) {}
+                return false;
+            }
+            SWEEP_SOCK = s;
+            return true;
+        }
+    }
+
+    /** NWP-20261203-03: `s` is closed; it stops being SWEEP_SOCK, unless another socket already took its place. */
+    private static void sweepSockRelease(LocalSocket s) {
+        synchronized (SweepStall.class) {
+            if (s != null && SWEEP_SOCK == s) SWEEP_SOCK = null;
+        }
+    }
+
+    /** NWP-20261203-03: mark the step the sweep enters (SweepStall), for app i of n. Only on the sweep thread: a tap
+     *  runs the same materialise on its own thread and marks nothing. */
+    private static void step(String token, int i, int n) {
+        if (Thread.currentThread() != SWEEP_THREAD) return;
+        SweepStall.enter(token, i, n, android.os.SystemClock.elapsedRealtime());
+    }
+
+    /** NWP-20261203-03: {@link #step(String, int, int)} keeping the app index (the materialise sites do not know it). */
+    private static void step(String token) {
+        if (Thread.currentThread() != SWEEP_THREAD) return;
+        SweepStall.enter(token, android.os.SystemClock.elapsedRealtime());
+    }
+
+    /** NWP-20261203-03: the step moved (a PROG frame, an InstallWait tick). On the sweep thread, or on any thread while
+     *  the sweep waits for MAT_LOCK: only a MAT_LOCK holder calls this, so a long, healthy tap keeps the sweep behind it
+     *  from being abandoned. */
+    private static void stepProgress() {
+        if (Thread.currentThread() != SWEEP_THREAD && !SweepStall.LOCK.equals(SweepStall.step())) return;
+        SweepStall.progress(android.os.SystemClock.elapsedRealtime());
+    }
+
+    /** NWP-20261203-03: start the `nowhere-sweep-watch` daemon thread, unless one is alive. Every 30 s it sends what
+     *  SweepStall has due, never under MAT_LOCK; once no sweep runs it ends the last step and exits. The exit test and
+     *  the start share SWEEP_WATCH_LOCK, so a sweep that starts while the watch exits gets a new one. */
+    private static void startSweepWatch() {
+        synchronized (SWEEP_WATCH_LOCK) {
+            if (SWEEP_WATCH != null && SWEEP_WATCH.isAlive()) return;
+            Thread w = new Thread(() -> {
+                SweepStall.Sink sink = new SweepStall.Sink() {
+                    @Override public void send(String req) { sweepStallSend(req); }
+                    @Override public void abandon() { // under the SweepStall monitor, for the pass that went past HARD_MS
+                        Thread t = SWEEP_THREAD;
+                        if (t != null) t.interrupt();
+                        LocalSocket s = SWEEP_SOCK;
+                        if (s != null) try { s.close(); } catch (Throwable ignore) {}
+                        android.util.Log.w("NowhereChooser", "#130 sweep: no progress for "
+                                + (SweepStall.HARD_MS / 60000) + " min -- the pass is abandoned (NWP-20261203-03)");
+                    }
+                };
+                while (true) {
+                    long pass = SweepStall.pass();
+                    try { Thread.sleep(30_000L); } catch (InterruptedException ie) { /* re-check below */ }
+                    long now = android.os.SystemClock.elapsedRealtime();
+                    synchronized (SWEEP_WATCH_LOCK) {
+                        if (SWEEP_THREAD == null) {
+                            SWEEP_WATCH = null;
+                            SweepStall.close(pass, now);
+                            SweepStall.tick(now, sink); // the last step's `ended`, if it was reported stalled
+                            return;
+                        }
+                    }
+                    try { SweepStall.tick(now, sink); }
+                    catch (Throwable t) { android.util.Log.w("NowhereChooser", "#130 sweep watch", t); }
+                }
+            }, "nowhere-sweep-watch");
+            w.setDaemon(true);
+            SWEEP_WATCH = w;
+            w.start();
+        }
+    }
+
+    /** NWP-20261203-03: send one SweepStall.request (null sends nothing). Bounded (5 s); its reply is not read: an agent
+     *  without the verb answers an error, and nothing depends on the line landing. */
+    private static void sweepStallSend(String stepReq) {
+        if (stepReq != null) DaemonSocket.roundTrip(stepReq, 5000);
+    }
+
+    /** NWP-20261203-03: a start that joins the running sweep logs its step and age (`joined`). On the joining start's
+     *  thread, outside MAT_LOCK. Never throws. */
+    private static void sweepJoinedNote() {
+        try {
+            if (SWEEP_THREAD == null) return;
+            String st = SweepStall.step();
+            if (st == null) return;
+            long age = Math.min(SweepStall.age(android.os.SystemClock.elapsedRealtime()), SweepStall.MAX_SECS);
+            sweepStallSend(SweepStall.request(SweepStall.JOINED, st, SweepStall.i(), SweepStall.n(), age));
+        } catch (Throwable t) { android.util.Log.w("NowhereChooser", "#130 sweep: the joined note", t); }
+    }
+
+    /** NWP-20261203-07: one read of the sweep's state for the report (ProfileActivity.reportStatus). Threads and counts
+     *  only: no package name leaves this method. The thread and its pass start are read together under SWEEP_SLOT. */
+    static SweepSnapshot.Input snapshot() {
+        Thread sweep;
+        long since;
+        synchronized (SWEEP_SLOT) { sweep = SWEEP_THREAD; since = SWEEP_SINCE; }
+        int queue;
+        synchronized (Q_LOCK) { queue = Q_PENDING.size(); }
+        return new SweepSnapshot.Input(sweep, since, MAT_LOCK.owner(), MAT_LOCK.getQueueLength(), LIVE_TAPS.size(),
+                queue, ACTIVE.get());
     }
 
     /** NWP-20261128-07: the sweep's own PARTIAL lock (`nowhere:autosweep`), not reference-counted, so one acquire and
@@ -1102,6 +1376,7 @@ public class UnarchiveService extends Service {
         // NWP-20261126-02: re-arm the beta diagnostic reports at each landing (the agent's marker died with the last session).
         try { DiagReportJob.arm(this); }
         catch (Throwable t) { android.util.Log.w("NowhereChooser", "diag reports arm (NWP-20261126-02)", t); }
+        step(SweepStall.LIST, 0, 0); // NWP-20261203-03: the remembered taps and the work list are read
         final long sweepT0 = android.os.SystemClock.elapsedRealtime(); // NWP-20261126-12: the day summary's ms
         // NWP-20261122-11 (h51 #1): the taps a restarted chooser lost go first, before any Auto app and before the
         // Wi-Fi rule (a tap is the user's own request); installed, not opened. The fair MAT_LOCK still keeps a live tap
@@ -1118,8 +1393,10 @@ public class UnarchiveService extends Service {
         }
         boolean tapLaneBusy = false; // the lane stayed busy past SweepBusy.BOUND_MS: the rest wait for the next sweep
         for (int k = 0; k < remembered.size() && !tapLaneBusy && !SignOutGate.begun(); k++) {
+            if (SweepStall.abandoned()) break; // NWP-20261203-03: no progress for SweepStall.HARD_MS; the rest wait
             String pkg = remembered.get(k);
             if (!LIVE_TAPS.add(pkg)) continue; // a live tap or another sweep serves it
+            step(SweepStall.TAP, k + 1, remembered.size());
             // ERR-WORKER-BUSY ran nothing (SweepBusy, NWP-20261118-05), so a busy end keeps the line for a later sweep.
             // Busy until the first call ends: a sign-out before it also keeps the line (the sign-out's clear removes it).
             String tapEnd = SweepOutcome.BUSY;
@@ -1129,6 +1406,7 @@ public class UnarchiveService extends Service {
                 qEnqueue(java.util.Collections.singletonList(pkg));
                 while (!SignOutGate.begun()) {
                     // NWP-20261113-17's rule: MAT_LOCK is held across the call and the read of matEnd.
+                    step(SweepStall.LOCK);
                     MAT_LOCK.lock();
                     try {
                         materializeAndInstall(pkg, true);
@@ -1147,6 +1425,7 @@ public class UnarchiveService extends Service {
                     tapWaited += w;
                     android.util.Log.i("NowhereChooser", "#130 sweep: a remembered tap waits for a busy worker lane, retry "
                             + tapTries + " in " + (w / 1000) + " s");
+                    step(SweepStall.BUSY_WAIT);
                     long left = w;
                     while (left > 0 && !SignOutGate.begun()) {
                         try { Thread.sleep(Math.min(left, 1000L)); }
@@ -1169,6 +1448,14 @@ public class UnarchiveService extends Service {
             android.util.Log.i("NowhereChooser", "#130 sweep: worker lane busy on a remembered tap -- the sweep stops,"
                     + " the remembered taps and the Auto apps wait for the next sweep (h51 #1)");
             repauseResumed(); // NWP-20261201-13: a Resume this pass was to continue goes back to paused
+            return;
+        }
+        if (SweepStall.abandoned()) {
+            // NWP-20261203-03: a remembered tap made no progress for SweepStall.HARD_MS. As a busy lane, it stops the
+            // whole sweep: the remembered taps and the Auto apps wait for the next sweep.
+            android.util.Log.i("NowhereChooser", "#130 sweep: abandoned on a remembered tap -- the remembered taps and"
+                    + " the Auto apps wait for the next sweep (NWP-20261203-03)");
+            repauseResumed();
             return;
         }
         // NWP-20261201-13: a paused or stopped sweep starts no Auto app, whoever kicks it in this process (a network
@@ -1216,6 +1503,7 @@ public class UnarchiveService extends Service {
             File stamp = new File(getNoBackupFilesDir(), "landing-line-shown");
             String serial = landingSerial();
             if (LandingLine.show(landing, work.size(), readLandingStamp(stamp), serial)) {
+                step(SweepStall.CARD, 0, work.size()); // NWP-20261203-03: the card writes its stamp, reads each app's deps
                 StoreInstaller.writeAtomic(stamp, serial);
                 String[] cardRows = LandingLine.cardPkgs(work, p -> ProfileActivity.appDeps(this, p), p -> hasInstalledCode(p));
                 card = LandingLine.Sweep.begin(cardRows);
@@ -1225,6 +1513,7 @@ public class UnarchiveService extends Service {
                         .putExtra(LandingNoticeActivity.EXTRA_SWEEP, card));
             }
         } catch (Throwable t) { android.util.Log.w("NowhereChooser", "landing line", t); }
+        PASS_CARD = card; // NWP-20261203-18, -23: the card a Pause, from the notification or Your apps, keeps
         // NWP-20261012-04: BOTH lists. A profile whose only outstanding app is an installed one with an unconfirmed
         // restore (Chester's App store case) has an empty work list, and returning on that alone never retries it.
         // NWP-20261201-13: a Resume that waits for Wi-Fi closes its card, which would otherwise stay open.
@@ -1234,12 +1523,14 @@ public class UnarchiveService extends Service {
         // over work.size() -- that denominator was invisible to a concurrent tap and vice versa.
         qEnqueue(work);
         int done = 0, failed = 0;
+        int hardFailed = 0; // NWP-20261203-17: apps that ran and did not land (SweepFailNotice.hard)
         boolean cut = false; // NWP-20261201-13: Pause or Stop left apps not started
         // NWP-20261005-01: hold the periodic seal back for the WHOLE sweep, not just one app. RESTORE-ODDATA closes
         // the per-app window, and a seal that starts in the install gap before the next app holds the worker for up
         // to 47 minutes (frankel, NW-47c7b5845145: 16 of 24 apps in seven hours). The daemon caps the hold and lets
         // the lease lapse on its own if this process dies; the END is in a finally so a throw cannot leave it
         // waiting out the lease. Bounded calls (30 s): this is bookkeeping, never worth stalling the sweep for.
+        step(SweepStall.SEAL_HOLD, 0, work.size()); // NWP-20261203-03
         String began = DaemonSocket.roundTrip("AUTO-SWEEP\n1\n", 30000);
         android.util.Log.i("NowhereChooser", "#130 sweep: " + work.size() + " app(s), " + retry.size()
                 + " restore-only; seal hold -> " + (began.isEmpty() ? "<no answer>" : began));
@@ -1254,6 +1545,8 @@ public class UnarchiveService extends Service {
             for (int c = 0; c < retry.size(); c += OdRestoreList.CHUNK) {
                 if (SignOutGate.begun()) break; // NWP-20261109-06 (Q116): a sign-out stops the sweep; never queued
                 if (SweepHold.held()) break; // NWP-20261201-13: Pause or Stop; the chunk in flight has finished
+                if (SweepStall.abandoned()) break; // NWP-20261203-03: no progress for SweepStall.HARD_MS
+                step(SweepStall.LOCK, c, retry.size()); // restoreOnly*Locked mark restore-only once the lock is held
                 java.util.List<String> chunk = retry.subList(c, Math.min(c + OdRestoreList.CHUNK, retry.size()));
                 MAT_LOCK.lock();
                 try {
@@ -1286,6 +1579,17 @@ public class UnarchiveService extends Service {
                             + " app(s) not started (Q116)");
                     break;
                 }
+                if (SweepStall.abandoned()) {
+                    // NWP-20261203-03: a step made no progress for SweepStall.HARD_MS, so the watch abandoned the pass,
+                    // the sign-out stop's shape: the apps not started leave the queue and wait for the next sweep. Not
+                    // a Pause or Stop, so `cut` stays false.
+                    qDrop(SignOutGate.rest(work, i));
+                    String gone = SweepOutcome.request(i + 1, work.size(), SweepOutcome.STOPPED, 0);
+                    if (gone != null) DaemonSocket.roundTrip(gone, 5000);
+                    android.util.Log.i("NowhereChooser", "#130 sweep: abandoned after " + (SweepStall.HARD_MS / 60000)
+                            + " min without progress -- " + (work.size() - i) + " app(s) left for the next sweep (NWP-20261203-03)");
+                    break;
+                }
                 if (SweepHold.held()) {
                     // NWP-20261201-13: Pause or Stop, the sign-out stop's shape, and the app in flight has finished. The
                     // apps not started leave the queue and keep their placeholders and Auto mode.
@@ -1304,6 +1608,7 @@ public class UnarchiveService extends Service {
                 if (busyTries == 0) appT0 = android.os.SystemClock.elapsedRealtime(); // the ms cover its retries too
                 // NWP-20261113-17: MAT_LOCK is reentrant. Held across the call and the read of matEnd, so a tap cannot
                 // overwrite matEnd in between.
+                step(SweepStall.LOCK, i + 1, work.size());
                 MAT_LOCK.lock();
                 try { ok = materializeAndInstall(pkg, true); end = matEnd; }
                 catch (Throwable t) { end = SweepOutcome.ERROR; android.util.Log.w("NowhereChooser", "#130 sweep " + pkg, t); }
@@ -1318,6 +1623,7 @@ public class UnarchiveService extends Service {
                     busyWaited += w;
                     android.util.Log.i("NowhereChooser", "#130 sweep " + pkg + ": worker lane busy, retry " + busyTries
                             + " in " + (w / 1000) + " s");
+                    step(SweepStall.BUSY_WAIT, i + 1, work.size());
                     for (long left = w; left > 0 && !SignOutGate.begun() && !SweepHold.held(); left -= 1000L) {
                         try { Thread.sleep(Math.min(left, 1000L)); }
                         catch (InterruptedException ie) { Thread.currentThread().interrupt(); break; }
@@ -1326,9 +1632,11 @@ public class UnarchiveService extends Service {
                     continue;
                 }
                 if (ok) done++; else if (step == SweepBusy.Step.NEXT) failed++;
+                if (!ok && step == SweepBusy.Step.NEXT && SweepFailNotice.hard(end)) hardFailed++;
                 android.util.Log.i("NowhereChooser", "#130 sweep " + pkg + " -> " + ok);
                 // NWP-20261113-17: the outcome to login.log (AUTO-SWEEP-APP), by index and token only -- never the
                 // package. Sent after the unlock, so a slow reply never holds a tap back.
+                step(SweepStall.REPORT, i + 1, work.size());
                 String req = SweepOutcome.request(i + 1, work.size(), end, android.os.SystemClock.elapsedRealtime() - appT0);
                 if (req != null) DaemonSocket.roundTrip(req, 5000);
                 // NWP-20261126-05: the landing card ticks this app off (a failed app stays "coming back"). The package
@@ -1415,6 +1723,52 @@ public class UnarchiveService extends Service {
                 } catch (Throwable t) { android.util.Log.w("NowhereChooser", "#130 sweep: the Play Store line", t); }
             }
         }
+        // NWP-20261203-17 (Chester 2026-11-12, "Notice with a count"): a pass with an app that fetch-failed,
+        // install-failed or ended in error says how many, and a tap opens Your apps. A later pass that lands apps with
+        // none failing clears it. Its own id: the FG_ID notice goes with the service. Counts only. Draft words.
+        SweepFailNotice.Act act = SweepFailNotice.action(work.size(), done, hardFailed);
+        if (act != SweepFailNotice.Act.KEEP) {
+            try {
+                NotificationManager nm = getSystemService(NotificationManager.class);
+                if (nm != null && act == SweepFailNotice.Act.POST) {
+                    Intent open = new Intent(this, ProfileActivity.class)
+                            .putExtra(LandingLine.EXTRA_OPEN, LandingLine.OPEN_YOUR_APPS)
+                            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                    android.app.PendingIntent pi = android.app.PendingIntent.getActivity(this, SweepFailNotice.NOTICE_ID,
+                            open, android.app.PendingIntent.FLAG_IMMUTABLE | android.app.PendingIntent.FLAG_UPDATE_CURRENT);
+                    Notification.Builder b = new Notification.Builder(this, CHANNEL)
+                            .setSmallIcon(android.R.drawable.stat_sys_warning)
+                            .setContentTitle(SweepFailNotice.title(hardFailed, work.size()))
+                            .setContentText(SweepFailNotice.TEXT)
+                            .setStyle(new Notification.BigTextStyle().bigText(SweepFailNotice.TEXT))
+                            .setContentIntent(pi).setAutoCancel(true);
+                    // NWP-20261207-04: "Try again" starts the sweep by hand, the intent "Install pending apps now"
+                    // sends. Its own try: a throw here leaves the notice without the action. The tap does not
+                    // cancel the notice; the pass it starts replaces it (POST) or clears it (CANCEL).
+                    if (SweepFailNotice.offersRetry(act)) {
+                        try {
+                            // Not `retry`: sweepAuto already holds a List<String> retry (NWP-20261012-04).
+                            Intent retryTap = new Intent(this, UnarchiveService.class)
+                                    .setAction(SweepFailNotice.ACTION_RETRY)
+                                    .putExtra(EXTRA_SWEEP, true).putExtra(EXTRA_BY_HAND, true);
+                            android.app.PendingIntent rpi = android.app.PendingIntent.getForegroundService(this,
+                                    SweepFailNotice.RETRY_REQUEST, retryTap,
+                                    android.app.PendingIntent.FLAG_IMMUTABLE
+                                            | android.app.PendingIntent.FLAG_UPDATE_CURRENT);
+                            b.addAction(new Notification.Action.Builder((android.graphics.drawable.Icon) null,
+                                    SweepFailNotice.RETRY, rpi).build());
+                        } catch (Throwable t) {
+                            android.util.Log.w("NowhereChooser", "#130 sweep: the Try again action", t);
+                        }
+                    }
+                    nm.notify(SweepFailNotice.NOTICE_ID, b.build());
+                    android.util.Log.i("NowhereChooser", "#130 sweep: " + hardFailed + " of " + work.size()
+                            + " app(s) failed -- told");
+                } else if (nm != null && act == SweepFailNotice.Act.CANCEL) {
+                    nm.cancel(SweepFailNotice.NOTICE_ID);
+                }
+            } catch (Throwable t) { android.util.Log.w("NowhereChooser", "#130 sweep: the failed-apps notice", t); }
+        }
     }
 
     /** NWP-20261122-15: this sign-in's key for the landing line, the Android user's serial (new at every sign-in,
@@ -1446,7 +1800,8 @@ public class UnarchiveService extends Service {
         try {
             matEnd = SweepOutcome.ERROR; // NWP-20261113-17: an exit that records nothing reads `error`
             // placeholder=true: every caller holds one (a tap's unarchive) or a sweep work item, which pendingAutoApps
-            // admitted only with a placeholder or code. It is only read when there is no code.
+            // admitted with a placeholder, or with neither it nor code and no entry point to ride (NWP-20261207-07):
+            // true makes that orphan AUTO_INSTALL, a fresh install as a dep's is. It is only read when there is no code.
             final boolean code = hasInstalledCode(pkg);
             final int action = autoAction(code, code && odRestored(pkg), true);
             if (action == AUTO_WHOLE) {
@@ -1531,7 +1886,10 @@ public class UnarchiveService extends Service {
         // says "About". A failed or slow size read shows the size-unknown line instead. NO and TIMEOUT return before
         // qEnqueue(group) and fetch nothing -- the same path as an abandoned dep: the worker reports the unarchival
         // error, the placeholder stays, the icon returns, and the next tap asks again.
-        if (PlayFetchAsk.needsAsk(quiet, deps,
+        // NWP-20261205-12: a Your apps tap already asked and the user chose Download; take its one-shot mark so the
+        // question is not asked twice. `quiet` never takes the mark.
+        boolean asked = !quiet && PlayFetchAsk.CONFIRMED.take(pkg, System.currentTimeMillis());
+        if (!asked && PlayFetchAsk.needsAsk(quiet, deps,
                 d -> ProfileActivity.isStackMember(this, d) || ProfileActivity.GMS_PKG.equals(d))) {
             java.util.List<String> sized = new ArrayList<>(deps);
             sized.add(pkg);
@@ -1604,6 +1962,7 @@ public class UnarchiveService extends Service {
             if (Boolean.TRUE.equals(tu)) {
                 ok = true;
             } else {
+                step(SweepStall.FETCH); // NWP-20261203-03
                 rmTree(dir); // a failed FETCH-APP's leftovers must never mix into the sealed set
                 String reply = daemonMaterialize(pkg);
                 android.util.Log.i("NowhereChooser", "MATERIALIZE-APP " + pkg + " -> " + reply);
@@ -1630,6 +1989,7 @@ public class UnarchiveService extends Service {
                 // Store on this profile and none in its group keeps its placeholder. A tap asks first ("Install anyway"
                 // installs); the Auto sweep never asks. The exit is the dep abort's: the worker resets the icon.
                 // Diaspore has no gmscompat, so nothing here reads the APK or PM. A stack member never asks for itself.
+                step(SweepStall.VERSION); // NWP-20261203-03: the PackageManager reads up to the install
                 boolean endospore = false;
                 if (!ProfileActivity.isStackMember(this, pkg) && !ProfileActivity.GMS_PKG.equals(pkg)
                         && !ProfileActivity.GSF_PKG.equals(pkg) && !ProfileActivity.VENDING_PKG.equals(pkg)) {
@@ -1691,6 +2051,7 @@ public class UnarchiveService extends Service {
                         return false;
                     }
                 }
+                step(SweepStall.INSTALL); // NWP-20261203-03
                 updateNoticePhase("Installing"); // -16: the bytes are done; name the commit beat instead of sitting full
                 ok = installApks(pkg, apks);
             }
@@ -1720,7 +2081,9 @@ public class UnarchiveService extends Service {
                 // restored data (else installd would have wiped it) and pm grant no-op'd on it. Best-effort: a non-OK
                 // reply still opens the app; both sides log so a data/perm miss is diagnosable, and the daemon never
                 // destroys the hold on a failed move (recoverable on the next login+tap).
-                String rr = daemon("RESTORE-ODDATA\n" + pkg + "\n");
+                step(SweepStall.RESTORE); // NWP-20261203-03
+                // NWP-20261202-38: one restore per install (OdRestoreOnce) -- a later sender takes this one's reply
+                String rr = OdRestoreOnce.send(pkg, installStamp(this, pkg), () -> daemon("RESTORE-ODDATA\n" + pkg + "\n"), m -> android.util.Log.i("NowhereChooser", m));
                 android.util.Log.i("NowhereChooser", "RESTORE-ODDATA " + pkg + " -> " + rr);
                 // Mark ONLY on a confirmed OK ("OK <pkg>" | "OK NOSRC"), so a later sweep or tap retries the
                 // restore of anything whose restore did not land -- restore-only, never a reinstall
@@ -1867,6 +2230,13 @@ public class UnarchiveService extends Service {
         catch (Throwable t) { android.util.Log.w("NowhereChooser", "#130 sweep: tell the landing card", t); }
     }
 
+    /** NWP-20261203-23: tell an open Your apps that a sweep pass started or the last one ended. No extras: the row reads
+     *  SweepJoin.running() and SweepHold.state(). */
+    private void tellSweepState() {
+        try { sendBroadcast(new Intent(ACTION_SWEEP_STATE).setPackage(getPackageName())); }
+        catch (Throwable t) { android.util.Log.w("NowhereChooser", "#130 sweep: tell Your apps the sweep state", t); }
+    }
+
     /** NWP-20261130-09: the landing card ticks a dep off. Recorded first and broadcast after, as each outcome is. The
      *  package rides this package-local broadcast only. */
     private void cardDepLanded(String dep) {
@@ -1897,6 +2267,7 @@ public class UnarchiveService extends Service {
     private boolean materializeMember(String pkg) {
         File dir = new File(new File(getFilesDir(), ".appcode"), pkg);
         try {
+            step(SweepStall.DEP_FETCH); // NWP-20261203-03
             depBusy = false;
             String reply = daemonMaterialize(pkg); // #84: streams this dep's byte progress into the notification
             android.util.Log.i("NowhereChooser", "MATERIALIZE-APP(dep) " + pkg + " -> " + reply);
@@ -1906,6 +2277,7 @@ public class UnarchiveService extends Service {
             File[] kids = dir.listFiles();
             if (kids != null) for (File k : kids) if (k.isFile() && k.getName().endsWith(".apk")) apks.add(k);
             if (apks.isEmpty()) { android.util.Log.w("NowhereChooser", "no materialised apk for dep " + pkg); return false; }
+            step(SweepStall.DEP_INSTALL); // NWP-20261203-03
             updateNoticePhase("Installing"); // -16: name the commit beat
             boolean ok = installApks(pkg, apks);
             if (ok) {
@@ -1913,7 +2285,9 @@ public class UnarchiveService extends Service {
                     mw.write(pkg + "\n");
                 } catch (Throwable ignore) {}
                 updateNoticePhase("Setting up"); // -16: the data-restore beat
-                String rr = daemon("RESTORE-ODDATA\n" + pkg + "\n");
+                step(SweepStall.DEP_RESTORE); // NWP-20261203-03
+                // NWP-20261202-38: one restore per install (OdRestoreOnce) -- a later sender takes this one's reply
+                String rr = OdRestoreOnce.send(pkg, installStamp(this, pkg), () -> daemon("RESTORE-ODDATA\n" + pkg + "\n"), m -> android.util.Log.i("NowhereChooser", m));
                 android.util.Log.i("NowhereChooser", "RESTORE-ODDATA(dep) " + pkg + " -> " + rr);
                 if (rr != null && rr.startsWith("OK")) markOdRestored(pkg);
                 else android.util.Log.w("NowhereChooser", "RESTORE-ODDATA(dep) " + pkg + " unconfirmed -- the next tap retries the restore only");
@@ -1940,6 +2314,7 @@ public class UnarchiveService extends Service {
         boolean sawAny = false;
         try {
             if (s == null) throw new java.io.IOException("daemon connect timed out");
+            if (!sweepSockOwn(s)) throw new java.io.IOException("the sweep pass was abandoned"); // NWP-20261203-03
             s.setSoTimeout(READ_CAP_MS);
             OutputStream os = s.getOutputStream();
             os.write(("MATERIALIZE-APP-PROG\n" + pkg + "\n").getBytes("UTF-8"));
@@ -1965,6 +2340,7 @@ public class UnarchiveService extends Service {
             android.util.Log.w("NowhereChooser", "daemonMaterialize " + pkg, t);
             return null;
         } finally {
+            sweepSockRelease(s); // NWP-20261203-03
             if (s != null) try { s.close(); } catch (Throwable ignore) {}
         }
         return sawAny ? null : daemon("MATERIALIZE-APP\n" + pkg + "\n");
@@ -1975,6 +2351,7 @@ public class UnarchiveService extends Service {
         LocalSocket s = DaemonSocket.connect(); // NWP-20261005-25: bounded connect
         try {
             if (s == null) throw new java.io.IOException("daemon connect timed out");
+            if (!sweepSockOwn(s)) throw new java.io.IOException("the sweep pass was abandoned"); // NWP-20261203-03
             s.setSoTimeout(READ_CAP_MS);
             OutputStream os = s.getOutputStream();
             os.write(msg.getBytes("UTF-8"));
@@ -1985,6 +2362,7 @@ public class UnarchiveService extends Service {
             android.util.Log.w("NowhereChooser", "daemon " + msg.split("\n", 2)[0], t);
             return null;
         } finally {
+            sweepSockRelease(s); // NWP-20261203-03
             if (s != null) try { s.close(); } catch (Throwable ignore) {}
         }
     }
@@ -2090,8 +2468,11 @@ public class UnarchiveService extends Service {
                                 catch (Throwable notInstalled) { return null; } },
                         pathBefore,
                         android.os.SystemClock::elapsedRealtime,
-                        () -> android.util.Log.i("NowhereChooser", "unarchive install " + pkg
-                                + " still running (session alive) -- waiting on (NWP-20260831-03)"));
+                        () -> {
+                            stepProgress(); // NWP-20261203-03: an install the session keeps alive is progress
+                            android.util.Log.i("NowhereChooser", "unarchive install " + pkg
+                                    + " still running (session alive) -- waiting on (NWP-20260831-03)");
+                        });
                 if (outcome == InstallWait.Outcome.LANDED) st[0] = PackageInstaller.STATUS_SUCCESS;
                 if (outcome != InstallWait.Outcome.BROADCAST) stMsg[0] = InstallWait.message(outcome);
             } finally {

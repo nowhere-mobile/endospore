@@ -82,7 +82,8 @@ ADD_AFTER='  [ -n "$_reapres" ] && _reapclass=residue'
 ADDL=$(awk -v a="$ADD_AFTER" 'p {print; exit} $0 == a {p=1}' "$SUT")
 case "$ADDL" in *reap_retry_add*) ;; *) ADDL=: ;; esac
 RADDL=$(reroot "$ADDL")
-TOPL=$(awk '$0 == "[ \"$LANE\" = rw ] && userdir_recheck" {print prev; exit} {prev=$0}' "$SUT")
+# NWP-20261203-02: the base_retry_run hook (test-reap-baseline-retry.sh's) sits between the two; it is skipped here.
+TOPL=$(awk '$0 == "[ \"$LANE\" = rw ] && userdir_recheck" {print prev; exit} $0 !~ /^\[ "\$LANE" = rw \] && base_retry_run( |$)/ {prev=$0}' "$SUT")
 case "$TOPL" in '#'*|'') TOPL=: ;; *reap_retry_run*) ;; *) TOPL=: ;; esac
 
 # --- the harness -------------------------------------------------------------------------------------------------
@@ -316,7 +317,7 @@ t=$(awk '/^if \[ "\$op" = "cleanstorage" \]; then$/ {c=1} c && p {print; exit} c
 [ "$t" = '  reap_retry_run   # NWP-20261114-15 (#67)' ] && ok "P3 cleanstorage calls reap_retry_run on the line after its userdir_recheck" || no "P3 the line after cleanstorage's userdir_recheck: '$t'"
 t=$(awk 'prev != "" && $0 == "case \"$op\" in" {print prev; exit} {prev=$0}' "$SUT")
 [ "$TOPL" = '[ "$LANE" = rw ] && reap_retry_run' ] && [ "$t" = '[ "$LANE" = rw ] && userdir_recheck' ] \
-  && ok "P4 the guarded top-level call is directly above [ \"\$LANE\" = rw ] && userdir_recheck, which is directly above case \"\$op\" in" || no "P4 above userdir_recheck: '$TOPL'; above case: '$t'"
+  && ok "P4 the guarded top-level call is above [ \"\$LANE\" = rw ] && userdir_recheck (only base_retry_run's hook between), which is directly above case \"\$op\" in" || no "P4 above userdir_recheck: '$TOPL'; above case: '$t'"
 n=$(grep -v '^[[:space:]]*#' "$SUT" | grep -cE '(^|[;&|{] *|^ *)reap_retry_run( |$)')
 m=$(grep -v '^[[:space:]]*#' "$SUT" | grep -c 'reap_retry_add "\$uid"')
 [ "$n" = 2 ] && [ "$m" = 1 ] && ok "P5 reap_retry_run is called twice and reap_retry_add once" || no "P5 $n reap_retry_run call(s), $m reap_retry_add call(s)"

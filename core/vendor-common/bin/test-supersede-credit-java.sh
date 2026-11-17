@@ -6,7 +6,8 @@
 # sentence.
 # Runs core/chooser/tests/supersede-credit: the chooser's pure decision (when to ask, which reply warns), its copy, the
 # wait's limit, Cancel's way back (only to a parked session a fresh GET-COLDLOCK still names), and the wiring in
-# roamLogin and hideRestore, compiled and EXECUTED; the dialog's wait and the Cancel path are pinned byte for byte. The
+# roamLogin and hideRestore, compiled and EXECUTED; the sheet's wait and the keep path are pinned byte for byte. The
+# sheet's buttons (Keep that session, Continue) are core/vendor-common/bin/test-signin-loss-sheets-java.sh (NWP-20261206-09). The
 # daemon half (GET-PARKED-CREDIT) is the Go suite core/agent/test-warn-and-tell.sh.
 #
 # It needs a JDK, and it FAILS when there is none: a Java suite that skips without one would read green on a runner
@@ -84,7 +85,7 @@ mut "J11 hideRestore keeps the accepted session" 's/(    private void hideRestor
   "wiring: hideRestore forgets the accepted session before anything else" || fails=$((fails+1))
 mut "J12 a NEEDKEY key-wait forgets the accepted session" 's/(                restoreSrcUnit = srcAtStart;\n)/$1                supersedeLossAcceptedUid = -1;\n/' \
   "wiring: a NEEDKEY key-wait keeps the accepted session (it is the same sign-in)" || fails=$((fails+1))
-mut "J13 the warning can be dismissed with no answer" 's/(\.setMessage\(supersedeLossText\(creditLost\)\)\n\s*)\.setCancelable\(false\)/$1.setCancelable(true)/' \
+mut "J13 the warning can be dismissed with no answer" 's/shown\[0\]\.setCancelable\(false\)/shown[0].setCancelable(true)/' \
   "pinned: confirmSupersedeLoss" || fails=$((fails+1))
 mut "J14 a gate that goes away reads as Continue" 's/(shown\[0\]\.dismiss\(\); \}\);\n\s*)return false;/$1return true;/' \
   "pinned: confirmSupersedeLoss" || fails=$((fails+1))
@@ -102,21 +103,19 @@ mut "J20 Cancel goes back to the tap's snapshot" 's/backToParkedSession\(clNow, 
   "wiring: Cancel hands the form back, asks GET-COLDLOCK again, goes back only to that reply and ends the sign-in" || fails=$((fails+1))
 mut "J21 the way back ignores which session is parked" 's/return p != null && Integer\.parseInt\(p\[0\]\) == parkedUid \? p : null;/return p;/' \
   "way back: a reply naming another uid is not gone back to" || fails=$((fails+1))
-mut "J22 the copy promises a stored session's way out" 's/Cancel keeps that session\./Cancel to go back to that session: signing out of it tries to save again./' \
-  "copy: makes no promise that holds for one kind of session only" || fails=$((fails+1))
-# NWP-20261124-08: the question over every parked session; the reply picks only the credit sentence. K2/K4 anchor on the
-# credit clause's second sentence, which installOverParkedText (earlier in the file) does not carry.
+# NWP-20261124-08: the question over every parked session; the reply picks only the credit sentence. K2/K4 anchor on
+# supersedeLossLines' LOST branch. J22 (the green label's promise) is M4 of test-signin-loss-sheets-java.sh.
 mut "K1 the dialog still gated on LOST (the code before NWP-20261124-08)" 's/if \(!confirmSupersedeLoss\(parkedCreditLost\(pc\)\)\) \{/if (parkedCreditLost(pc) \&\& !confirmSupersedeLoss(true)) {/' \
   "wiring: the dialog is reached whatever GET-PARKED-CREDIT answers" || fails=$((fails+1))
 mut "K1b a gate before the question, its anchor kept" 's/(\n)(                if \(!confirmSupersedeLoss\(parkedCreditLost\(pc\)\)\) \{\n)/$1                if (parkedCreditLost(pc))$1$2/' \
   "wiring: the dialog is reached whatever GET-PARKED-CREDIT answers" || fails=$((fails+1))
-mut "K2 the credit clause shown on NONE (helper)" 's/\(creditLost \? (" That includes storage credit it hasn\x27t saved\. Credit saved before)/(true ? $1/' \
+mut "K2 the credit clause shown on NONE (helper)" 's/if \(!creditLost\) return new String\[\] \{ lost \};/if (false) return new String[] { lost };/' \
   "copy: without LOST it names no credit" || fails=$((fails+1))
 mut "K3 the credit clause shown on NONE (caller)" 's/confirmSupersedeLoss\(parkedCreditLost\(pc\)\)/confirmSupersedeLoss(true)/' \
   "wiring: the credit flag is parkedCreditLost(pc)" || fails=$((fails+1))
-mut "K4 the clause dropped on LOST (helper)" 's/\(creditLost \? (" That includes storage credit it hasn\x27t saved\. Credit saved before)/(false ? $1/' \
+mut "K4 the clause dropped on LOST (helper)" 's/if \(!creditLost\) return new String\[\] \{ lost \};/if (true) return new String[] { lost };/' \
   "copy: with LOST it carries the credit sentence" || fails=$((fails+1))
-mut "K5 the clause dropped on LOST (dialog)" 's/\.setMessage\(supersedeLossText\(creditLost\)\)/.setMessage(supersedeLossText(false))/' \
+mut "K5 the clause dropped on LOST (dialog)" 's/supersedeLossLines\(creditLost\)/supersedeLossLines(false)/' \
   "pinned: confirmSupersedeLoss" || fails=$((fails+1))
 mut "K6 Continue does not record the accepted session (a NEEDKEY retry asks twice)" 's/\n                supersedeLossAcceptedUid = supersedeColdUid;[^\n]*//' \
   "wiring: Continue records the accepted session, past the Cancel branch" || fails=$((fails+1))

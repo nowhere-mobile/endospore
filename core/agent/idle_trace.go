@@ -18,6 +18,10 @@ import "strings"
 // NWP-20261120-02: the idle cold lock's audio wait: `defer audio held=<n>`, `audio stopped`, `audio cap reached`.
 // NWP-20261124-04: `abort committed`, the gate's trace when COLD-LOCK-ABORT answers COMMITTED (ColdLockAbortReply).
 // NWP-20261128-33: `smsnotice sum= subst= pub= icon=`, a session text notice read back about 1 s after posting (MsgNoticeTrace).
+// NWP-20261203-04: `smsprobe step= u= holder= perms= up=`, `credsvc <start kind> u= id= up=` and `exitinfo u= reason= ago= up=`,
+// the sign-in chooser-kill evidence (SignInTrace). TestIdleTraceCoversSignInTraceKinds reads the start-kind words.
+// NWP-20261203-05: `credsvc-watch u= found= stuck= next= resent=` (+ err / skip), CredSvcWatch's one line per watch.
+// NWP-20261204-03: backnow drop|post|landed|cancel [drop|gate] user= at= s=, the back-online prompt's cycle (BackNowCycle).
 
 const idleTraceMaxBytes = 120
 
@@ -25,7 +29,7 @@ var idleTraceVerbs = map[string]bool{
 	"screen": true, "arm": true, "cancel": true, "probe": true, "abort": true, "armreg": true, "defer": true,
 	"fire": true, "installs": true, "pushdoze": true, "pushdoze-roam": true, "pushdoze-capture": true,
 	"pushdoze-sweep": true, "pushdoze-relay": true, "permsrelay": true, "audio": true,
-	"smsnotice": true,
+	"smsnotice": true, "smsprobe": true, "credsvc": true, "exitinfo": true, "credsvc-watch": true, "backnow": true,
 }
 
 var idleTraceWords = map[string]bool{
@@ -33,6 +37,9 @@ var idleTraceWords = map[string]bool{
 	"allusers": true, "user0-fallback": true, "veto": true, "nolock": true, "screenon": true, "latefire": true,
 	"call": true, "cap": true, "reached": true, "err": true, "play": true, "tbird": true, "xmpp": true,
 	"other": true, "installs": true, "audio": true, "stopped": true, "committed": true,
+	"claimslogin": true, "claims": true, "alarm": true, "relayprefs": true, "gosstate": true, "ingest": true,
+	"smsrole": true, "smsretry": true, "telingest": true, "pw": true,
+	"post": true, "landed": true, "cancel": true, "gate": true,
 }
 
 var idleTraceKeys = map[string]bool{
@@ -40,6 +47,8 @@ var idleTraceKeys = map[string]bool{
 	"appid": true, "ok": true, "applied": true, "dropped": true, "live": true, "n": true, "user": true,
 	"removed": true, "kept": true, "late": true, "screenon": true, "locked": true, "s": true, "held": true,
 	"tries": true, "sum": true, "subst": true, "pub": true, "icon": true,
+	"step": true, "holder": true, "perms": true, "up": true, "id": true, "reason": true, "ago": true,
+	"found": true, "stuck": true, "next": true, "resent": true, "at": true,
 }
 
 // idleTraceFilter is the charset rule: one line, cut to idleTraceMaxBytes, everything outside [a-z0-9 =_-] dropped.

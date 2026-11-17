@@ -41,7 +41,7 @@ t = t.replace('err != nil || !lst.Mode().IsRegular() {', 'err != nil || lst == n
 t = t.replace('os.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK', 'os.O_RDONLY|unix.O_NONBLOCK', 1)
 t = t.replace(' || !os.SameFile(lst, fst)', '', 1)"
 mutate "N2: the staging-dir component check is removed" TestIngestNoFollow_DirLink "
-t = t.replace('if !ingestStagingDirOK(dir, mapped) {', 'if false {', 1)"
+t = t.replace('if !ingestStagingDirOK(dir, false) {', 'if false {', 1)"
 mutate "N3: O_NONBLOCK and both regular-file checks in ingestReadStaged are removed" TestIngestNoFollow_ReadStagedFIFO "
 t = t.replace('err != nil || !lst.Mode().IsRegular() {', 'err != nil || lst == nil {', 1)
 t = t.replace('os.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK', 'os.O_RDONLY|unix.O_NOFOLLOW', 1)

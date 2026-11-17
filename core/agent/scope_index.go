@@ -3,8 +3,10 @@ package main
 import (
 	"crypto/hmac"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -255,10 +257,87 @@ func ssaidOf(idx map[string]scopeRec) string {
 	return uk
 }
 
+// scopeRoundKey records the scope legs the profile's last seal round left unsaved (NWP-20261204-01; h58 #1 in
+// docs/product-decisions.md, 2026-11-04, "two answers to harvest 58"). The scopes advance independently, so a
+// round whose #de push failed leaves a stored profile whose vault and #de come from different saves; this is
+// how the next restore knows that and says so.
+//
+// roamd's out op writes it at the end of a round that left a scope unsaved (roundRecord in main.go, the
+// round-record verb); a benign part (sys=pending-placement) and an unchanged scope never count. The next bare
+// seal that lands deletes it (pushProfile), in the same head or not at all. The bare restore reads it
+// (noteLastRound). A credential change (rotate, recover) rebuilds the index and drops it.
+//
+// The value is billRefPrefix, then "r1:", the unix second it was written, ":", and the hex of the parts
+// (`<scope>=<cause>`, comma-joined). The p2: prefix keeps an older walker safe, for the reason billRefPrefix
+// states. It holds scope and cause words only, inside the DK seal.
+const scopeRoundKey = "!round"
+
+// roundScopes are the scope words a round record may name: roamd's _note labels.
+var roundScopes = map[string]bool{"vault": true, "de": true, "media": true, "sys": true, "apps": true}
+
+// roundRec renders the !round entry for parts written at unix second t.
+func roundRec(t int64, parts string) scopeRec {
+	return scopeRec{Ref: billRefPrefix + "r1:" + strconv.FormatInt(t, 10) + ":" + hex.EncodeToString([]byte(parts))}
+}
+
+// roundOf returns the recorded round, or ok=false when the index carries none or the entry is not exactly
+// the shape roundRec writes with parts roundPartsOK accepts.
+func roundOf(idx map[string]scopeRec) (t int64, parts string, ok bool) {
+	r := billRefOf(idx, scopeRoundKey)
+	if !strings.HasPrefix(r, "r1:") {
+		return 0, "", false
+	}
+	ts, hx, found := strings.Cut(strings.TrimPrefix(r, "r1:"), ":")
+	if !found || ts == "" || strings.Trim(ts, "0123456789") != "" {
+		return 0, "", false
+	}
+	t, err := strconv.ParseInt(ts, 10, 64)
+	if err != nil {
+		return 0, "", false
+	}
+	b, err := hex.DecodeString(hx)
+	if err != nil || !roundPartsOK(string(b)) {
+		return 0, "", false
+	}
+	return t, string(b), true
+}
+
+// roundPartsOK says whether parts is 1-5 comma-separated `<scope>=<cause>` items, each scope a round scope
+// named at most once, each cause matching [a-z][a-z0-9-]{0,31}.
+func roundPartsOK(parts string) bool {
+	items := strings.Split(parts, ",")
+	if parts == "" || len(items) > len(roundScopes) {
+		return false
+	}
+	seen := map[string]bool{}
+	for _, it := range items {
+		sc, cause, found := strings.Cut(it, "=")
+		if !found || !roundScopes[sc] || seen[sc] || !roundCauseOK(cause) {
+			return false
+		}
+		seen[sc] = true
+	}
+	return true
+}
+
+// roundCauseOK says whether c matches [a-z][a-z0-9-]{0,31}.
+func roundCauseOK(c string) bool {
+	if len(c) == 0 || len(c) > 32 || c[0] < 'a' || c[0] > 'z' {
+		return false
+	}
+	for i := 1; i < len(c); i++ {
+		if ch := c[i]; !(ch >= 'a' && ch <= 'z' || ch >= '0' && ch <= '9' || ch == '-') {
+			return false
+		}
+	}
+	return true
+}
+
 // isScopeSuffix separates real scopes from the reserved keys. Every walker that does store I/O or
-// re-points a head must consult it, or it will treat the billing records and the SSAID record as scopes.
+// re-points a head must consult it, or it will treat the billing records, the round record and the SSAID
+// record as scopes.
 func isScopeSuffix(k string) bool {
-	return k != scopeBillKey && k != scopeBillPrevKey && k != scopeBillRetagKey && k != scopeBillMidKey &&
+	return k != scopeBillKey && k != scopeBillPrevKey && k != scopeBillRetagKey && k != scopeBillMidKey && k != scopeRoundKey &&
 		k != scopeSsaidKey
 }
 

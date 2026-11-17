@@ -7,53 +7,122 @@ import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Bounded round-trips to the login daemon's LocalSocket (#77). {@link LocalSocket} has NO connect timeout
  * ({@code setSoTimeout} is the READ timeout only), so a wedged daemon -- its accept loop stuck in a store
- * retry -- blocks {@code connect()} FOREVER. On the idle/wipe alarm that reached the 60s background-broadcast
- * ANR and KILLED the persistent gate process (bounded separately in {@link IdleLogoffReceiver}); on every other
- * path it silently hung the caller's worker thread: a stalled reap poll (a queued logoff never reaps), a skipped
- * 12h hard-wipe (a security backstop that never fires), or a UI action that spins with no error.
+ * retry, or the process stopped -- blocks {@code connect()} for as long as the daemon does not accept. On the
+ * idle/wipe alarm that reached the 60s background-broadcast ANR and KILLED the persistent gate process (bounded
+ * separately in {@link IdleLogoffReceiver}); on every other path it silently hung the caller's worker thread: a
+ * stalled reap poll (a queued logoff never reaps), a skipped 12h hard-wipe (a security backstop that never fires),
+ * or a UI action that spins with no error.
  *
- * {@link #connect} bounds the connect with a watchdog that closes the socket at the cap -- closing an in-flight
- * LocalSocket unblocks a stuck {@code connect()} (proven on FP3, #77) -- so no daemon call can hang forever. A
- * wedged daemon yields a "" reply / empty list and the caller retries. All callers already run off the main
- * thread, so the bounded blocking here is safe.
+ * {@link #connect} runs the connect on a helper thread and the CALLER waits at most {@link #CONNECT_CAP_MS}, so the
+ * caller's bound does not depend on anything unblocking the connect (NWP-20261203-06). The old bound closed the
+ * socket from a watchdog at the cap; that unblocked the connect on the FP3 (#77), but on lynx (S8, build
+ * 2026111001, 2026-11-11) a connect pending on a stopped daemon's FULL listen backlog ignored the close, and chooser
+ * calls hung for minutes. A wedged connect now strands one daemon thread until the daemon accepts or dies; its
+ * socket is closed when that connect returns. A connect takes one of {@link #MAX_STRANDED} slots for as long as it is
+ * pending, so at most MAX_STRANDED connects (and threads) are ever pending, however many callers arrive together.
+ * Once MAX_STRANDED abandoned connects are still pending, connect() returns null at once. A wedged daemon yields a
+ * "" reply / empty list and the caller retries. All callers already run off the main thread, so the bounded
+ * blocking here is safe.
  */
 final class DaemonSocket {
     static final String SOCKET = "nowhere_login";
     static final int CONNECT_CAP_MS = 8000; // healthy connect is instant; this only bites a wedged daemon
+    static final int MAX_STRANDED = 4; // abandoned connects still pending, past which connect() fails fast
+    static final AtomicInteger STRANDED = new AtomicInteger(); // abandoned connects whose helper thread still waits
+    static final Semaphore SLOTS = new Semaphore(MAX_STRANDED); // one per pending connect, abandoned or not
+    private static final AtomicBoolean STRANDED_WARNED = new AtomicBoolean(false); // one fail-fast log line per episode
+    private static final int PENDING = 0;
+    private static final int CONNECTED = 1;
+    private static final int FAILED = 2;
+    private static final int ABANDONED = 3;
 
     private DaemonSocket() {}
 
-    /** Connect with a bounded connect. Returns a connected socket (the caller sets its own read timeout and does
-     *  its own I/O), or null if the daemon did not accept within {@link #CONNECT_CAP_MS}. */
+    /** Connect with a bounded wait. Returns a connected socket (the caller sets its own read timeout and does its
+     *  own I/O), or null if the daemon did not accept within {@link #CONNECT_CAP_MS}, refused, or the connect could
+     *  not start: {@link #MAX_STRANDED} earlier connects are still stuck (then it returns null at once, with no socket
+     *  and no thread), or all MAX_STRANDED slots stayed taken for the whole cap. A connect holds one slot from before
+     *  its socket exists until it returns, so at most MAX_STRANDED are pending, however many callers arrive together.
+     *  The connect runs on a "nowhere-daemon-connect" daemon thread; one {@code state}, moved only by compareAndSet,
+     *  decides who owns the socket. The caller NEVER closes a socket whose connect is pending (on a real LocalSocket
+     *  the close can wait on the lock the connect holds): the helper thread closes it when its connect returns. */
     static LocalSocket connect() {
-        final LocalSocket s = new LocalSocket();
-        final AtomicBoolean settled = new AtomicBoolean(false); // whoever CAS-wins decides the socket's fate
-        Thread wd = new Thread(() -> {
-            try { Thread.sleep(CONNECT_CAP_MS); } catch (InterruptedException ignore) {}
-            if (settled.compareAndSet(false, true)) { // watchdog won -> connect still pending -> unblock it
-                try { s.close(); } catch (Throwable ignore) {}
-            }
-        });
-        wd.setDaemon(true);
-        wd.start();
+        int n = STRANDED.get();
+        if (n >= MAX_STRANDED) return refuse(n); // fail fast while wedged
+        final long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(CONNECT_CAP_MS);
+        boolean slot;
         try {
-            s.connect(new LocalSocketAddress(SOCKET, LocalSocketAddress.Namespace.RESERVED));
-            if (!settled.compareAndSet(false, true)) { // watchdog already fired + closed the socket -> treat as fail
-                try { s.close(); } catch (Throwable ignore) {}
-                return null;
-            }
-            wd.interrupt(); // connect returned in time -> stop the (sleeping) watchdog
-            return s;
-        } catch (Throwable t) {
-            settled.set(true);
-            try { s.close(); } catch (Throwable ignore) {}
+            slot = SLOTS.tryAcquire(CONNECT_CAP_MS, TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) { // counts as the cap passing
+            Thread.currentThread().interrupt();
             return null;
         }
+        if (!slot) return refuse(MAX_STRANDED); // every slot held by a connect pending for the whole cap
+        final LocalSocket s;
+        try {
+            s = new LocalSocket();
+        } catch (Throwable e) {
+            SLOTS.release();
+            return null;
+        }
+        final AtomicInteger state = new AtomicInteger(PENDING);
+        final CountDownLatch done = new CountDownLatch(1);
+        Thread t = new Thread(() -> {
+            boolean ok = false;
+            try {
+                s.connect(new LocalSocketAddress(SOCKET, LocalSocketAddress.Namespace.RESERVED));
+                ok = true;
+            } catch (Throwable e) {
+                // FAILED, or the caller has already abandoned it
+            }
+            if (state.compareAndSet(PENDING, ok ? CONNECTED : FAILED)) {
+                if (!ok) { try { s.close(); } catch (Throwable ignore) {} } // the connect threw
+                SLOTS.release(); // the connect is no longer pending
+                done.countDown();
+                return;
+            }
+            try { s.close(); } catch (Throwable ignore) {} // abandoned: the caller has gone, close it now
+            SLOTS.release();
+            if (STRANDED.decrementAndGet() < MAX_STRANDED) STRANDED_WARNED.set(false); // a stranded connect returned
+        }, "nowhere-daemon-connect");
+        t.setDaemon(true);
+        try {
+            t.start();
+        } catch (Throwable e) { // no thread: no connect is pending, so closing here cannot wait on it
+            try { s.close(); } catch (Throwable ignore) {}
+            SLOTS.release();
+            return null;
+        }
+        boolean in;
+        try {
+            in = done.await(Math.max(0L, deadline - System.nanoTime()), TimeUnit.NANOSECONDS);
+        } catch (InterruptedException e) { // counts as the cap passing
+            Thread.currentThread().interrupt();
+            in = false;
+        }
+        if (!in) {
+            STRANDED.incrementAndGet(); // before the CAS, so the helper never decrements a count not yet raised
+            if (state.compareAndSet(PENDING, ABANDONED)) return null; // the cap passed: never close s here
+            STRANDED.decrementAndGet(); // the helper settled first
+        }
+        return state.get() == CONNECTED ? s : null;
+    }
+
+    /** connect()'s refusal: null, and the episode's one count-only log line (no verb, no profile). */
+    private static LocalSocket refuse(int n) {
+        if (STRANDED_WARNED.compareAndSet(false, true)) // "connect" + "(s)": test-daemon-verb-readers.sh reads connect( as a call
+            android.util.Log.w("NowhereChooser", "daemon connect: " + n + " connect" + "(s) stuck past the "
+                    + CONNECT_CAP_MS + " ms cap -- failing fast until one returns (NWP-20261203-06)");
+        return null;
     }
 
     /** NWP-20260904-07: a LENGTH-FRAMED reply -- "OK <n>" then n bytes -- for SEAL-DELTA and friends. This is

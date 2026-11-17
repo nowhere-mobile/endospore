@@ -17,6 +17,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -1431,29 +1432,37 @@ func storedWallet(t *testing.T, name, pass string) *Wallet {
 
 const stName, stPass = "carol", "the arriving profile's passphrase"
 
-// REVIEW PROBE A: a CREATE-CODE that creates nothing -- a mistyped code -- must leave wallet.json exactly as it
-// was. At the gate that file can be a COLD-LOCKED session's, which resumes into it.
+// REVIEW PROBE A: a CREATE-CODE with a well-formed code nobody sold must leave wallet.json exactly as it was. At the
+// gate that file can be a COLD-LOCKED session's, which resumes into it. Since h55 #1 (NWP-20261207-01) such a code
+// creates a free profile and waits in its head as a pending claim, so a gone user's cold-lock marker makes the create's
+// wipe keep wallet.json (wipeAfterCreate) and the file is still there to compare.
 func TestAFailedCreateCodeTouchesNoWallet(t *testing.T) {
+	const code = "MISTYPEDMISTYPEDMISTYPED"
 	dest, wpath := createCodeEnv(t, "REALCODEREALCODEREALCODE", 3)
+	useTempUsersDir(t) // user 0 only: the marker's user 12 is gone, so the create is not refused
+	parkColdLock(t, dest)
 	fundWallet(t, wpath, 4)
 	before, _ := os.ReadFile(wpath)
 	gen := walletGeneration(wpath)
-	if got := verb(func(c net.Conn) { handleCreateCode(c, dest, stName, stPass, "MISTYPEDMISTYPEDMISTYPED") }); got != "ERR-NOCODE" {
-		t.Fatalf("CREATE-CODE with a mistyped code replied %q, want ERR-NOCODE", got)
+	if got := verb(func(c net.Conn) { handleCreateCode(c, dest, stName, stPass, code) }); !strings.HasPrefix(got, "OK ") {
+		t.Fatalf("CREATE-CODE with a mistyped well-formed code replied %q, want OK (h55 #1)", got)
 	}
 	if after, err := os.ReadFile(wpath); err != nil || string(after) != string(before) {
-		t.Errorf("a CREATE-CODE that created nothing changed wallet.json (err %v)", err)
+		t.Errorf("a CREATE-CODE changed wallet.json (err %v)", err)
 	}
 	if walletGeneration(wpath) != gen {
-		t.Error("a CREATE-CODE that created nothing bumped the wallet generation -- every in-flight writer of the session now refuses to save")
+		t.Error("a CREATE-CODE bumped the wallet generation -- every in-flight writer of the session now refuses to save")
 	}
 	if _, err := os.Stat(createStagingPath(stName, stPass)); err == nil {
-		t.Error("a code that redeemed nothing left a staged claim")
+		t.Error("the staged claim outlived the create that published it")
+	}
+	if c := storedWallet(t, stName, stPass); c == nil || !slices.Equal(c.PendingClaims, []string{code}) || c.balance() != 0 {
+		t.Errorf("carol's head holds %v, want the code once as a pending claim and no tokens", c)
 	}
 }
 
-// Every refusal a create can give comes BEFORE the code is redeemed: a CREATE-CODE refused by the enrollment
-// throttle redeems nothing, and the retry, once the throttle has passed, creates with the whole claim.
+// Every refusal a create can give comes BEFORE the code is staged: a CREATE-CODE refused by the enrollment
+// throttle stages nothing, and the retry, once the throttle has passed, creates with the code as a pending claim.
 func TestACreateCodeRefusedByTheThrottleRedeemsNothing(t *testing.T) {
 	dest, _ := createCodeEnv(t, "PAIDCODEPAIDCODEPAIDCODE", 3)
 	t.Setenv("NOWHERE_ENROLL_MAX", "1")
@@ -1463,21 +1472,22 @@ func TestACreateCodeRefusedByTheThrottleRedeemsNothing(t *testing.T) {
 	if got := verb(func(c net.Conn) { handleCreateCode(c, dest, stName, stPass, "PAIDCODEPAIDCODEPAIDCODE") }); !strings.HasPrefix(got, "RATELIMIT") {
 		t.Fatalf("CREATE-CODE against an empty enrollment bucket replied %q, want RATELIMIT", got)
 	}
-	if w, err := loadWallet(createStagingPath(stName, stPass)); err == nil && w.balance() > 0 {
-		t.Errorf("a CREATE-CODE refused by the throttle redeemed the code: %d token(s) staged", w.balance())
+	if _, err := os.Stat(createStagingPath(stName, stPass)); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("a CREATE-CODE refused by the throttle staged the code (stat err %v)", err)
 	}
 	t.Setenv("NOWHERE_ENROLL_MAX", "0") // the throttle has passed
 	if got := verb(func(c net.Conn) { handleCreateCode(c, dest, stName, stPass, "PAIDCODEPAIDCODEPAIDCODE") }); !strings.HasPrefix(got, "OK ") {
 		t.Fatalf("the retry replied %q", got)
 	}
-	if c := storedWallet(t, stName, stPass); c == nil || len(c.BlindTokens) != 3 {
-		t.Errorf("after the retry carol's head holds %v claimed token(s), want 3", c)
+	if c := storedWallet(t, stName, stPass); c == nil || !slices.Equal(c.PendingClaims, []string{"PAIDCODEPAIDCODEPAIDCODE"}) || len(c.BlindTokens) != 0 {
+		t.Errorf("after the retry carol's head holds %v, want the code once as a pending claim and no tokens", c)
 	}
 }
 
-// REVIEW PROBE B, for a refusal that comes AFTER the drain: the create's flush is refused, so nothing is created.
-// The claim stays staged for this credential, and a retry -- CREATE-CODE with the same, now spent, code, or a
-// plain CREATE -- creates with it. wallet.json is never touched, and a successful create removes the staging.
+// REVIEW PROBE B, for a refusal that comes AFTER the staging: the create's flush is refused, so nothing is created.
+// The code stays staged for this credential, and a retry -- CREATE-CODE with the same code, or a plain CREATE --
+// creates with it, and the head carries the code once. wallet.json is never touched, and a successful create removes
+// the staging.
 func TestACreateFailedAfterTheDrainKeepsTheClaimForTheRetry(t *testing.T) {
 	for _, retry := range []string{"CREATE-CODE", "CREATE"} {
 		t.Run(retry, func(t *testing.T) {
@@ -1490,8 +1500,8 @@ func TestACreateFailedAfterTheDrainKeepsTheClaimForTheRetry(t *testing.T) {
 				t.Fatalf("control: the refused create replied %q", r1)
 			}
 			staged := createStagingPath(stName, stPass)
-			if w, err := loadWallet(staged); err != nil || len(w.BlindTokens) != 3 {
-				t.Fatalf("after the failed create (%q) the claim is not staged", r1)
+			if w, err := loadWallet(staged); err != nil || !slices.Equal(w.PendingClaims, []string{"PAIDCODEPAIDCODEPAIDCODE"}) {
+				t.Fatalf("after the failed create (%q) the code is not staged", r1)
 			}
 			if after, _ := os.ReadFile(wpath); string(after) != string(before) {
 				t.Error("the failed create changed wallet.json, which is somebody else's")
@@ -1506,8 +1516,8 @@ func TestACreateFailedAfterTheDrainKeepsTheClaimForTheRetry(t *testing.T) {
 			if !strings.HasPrefix(r2, "OK ") {
 				t.Fatalf("the %s retry replied %q", retry, r2)
 			}
-			if c := storedWallet(t, stName, stPass); c == nil || len(c.BlindTokens) != 3 {
-				t.Errorf("after the %s retry carol's head holds %v, want her 3 claimed tokens", retry, c)
+			if c := storedWallet(t, stName, stPass); c == nil || !slices.Equal(c.PendingClaims, []string{"PAIDCODEPAIDCODEPAIDCODE"}) {
+				t.Errorf("after the %s retry carol's head holds %v, want her code once as a pending claim", retry, c)
 			}
 			if _, err := os.Stat(staged); err == nil {
 				t.Error("the staged claim outlived the create that published it")
@@ -1516,7 +1526,7 @@ func TestACreateFailedAfterTheDrainKeepsTheClaimForTheRetry(t *testing.T) {
 	}
 }
 
-// The staged claim belongs to the credential it was drained for. While it waits for the retry, another profile's
+// The staged claim belongs to the credential it was staged for. While it waits for the retry, another profile's
 // payRent and flush pay from wallet.json and never see it; the retry folds only the claim.
 func TestAStagedClaimIsInvisibleToOtherProfiles(t *testing.T) {
 	const nameA, passA = "alice", "the departed profile's passphrase"
@@ -1545,15 +1555,15 @@ func TestAStagedClaimIsInvisibleToOtherProfiles(t *testing.T) {
 	if underA != 0 {
 		t.Errorf("%d staged claim token(s) were presented under alice's profile", underA)
 	}
-	if a := storedWallet(t, nameA, passA); a != nil && len(a.BlindTokens) > 0 {
-		t.Errorf("alice's head holds %d staged claim token(s)", len(a.BlindTokens))
+	if a := storedWallet(t, nameA, passA); a != nil && (len(a.BlindTokens) > 0 || slices.Contains(a.PendingClaims, "PAIDCODEPAIDCODEPAIDCODE")) {
+		t.Errorf("alice's head holds %d staged claim token(s) or carol's staged code", len(a.BlindTokens))
 	}
 	if r := verb(func(c net.Conn) { handleCreate(c, dest, stName, stPass) }); !strings.HasPrefix(r, "OK ") {
 		t.Fatalf("the retry replied %q", r)
 	}
 	c := storedWallet(t, stName, stPass)
-	if c == nil || len(c.BlindTokens) != 3 {
-		t.Fatalf("carol's head holds %v, want her 3 claimed tokens", c)
+	if c == nil || !slices.Equal(c.PendingClaims, []string{"PAIDCODEPAIDCODEPAIDCODE"}) {
+		t.Fatalf("carol's head holds %v, want her code once as a pending claim", c)
 	}
 	mine := map[string]bool{}
 	for _, tk := range leftovers {

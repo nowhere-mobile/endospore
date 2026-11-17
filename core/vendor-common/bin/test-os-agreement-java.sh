@@ -22,6 +22,15 @@
 # passphrase match and before create(n, p), and the WAIT and ASK branches return; C5 lockGateForm locks the box and
 # clearSignInFields unticks it; C6 no code ticks the box.
 #
+# Since NWP-20261204-09 (docs/product-decisions.md, 2026-11-10, "three answers to harvest 63", answer 2) Profile's save
+# ceremony asks for the same acknowledgement behind the same one gate, before PROMOTE2 is sent. The cases check
+# saveStep (createStep's rule), saveAckShown and the two save refusal lines. Pins S1-S5 check ProfileActivity: S1
+# readSaveAckGate reads GET-OS-AGREEMENT once through DaemonSocket.roundTrip, never stores null and sets the box only
+# through saveAckShown; S2 showSaveCeremony resets the reply to null at entry and builds the box unticked and hidden
+# before the Save button; S3 the Save click asks saveStep after the match and empty checks and before sendPromote(pw),
+# and the WAIT and ASK branches return; S4 only sendPromote sets the save pass, so the add-credits detour sends only a
+# pass that passed the check; S5 no code ticks, logs or records the box. Mutants M1-M43.
+#
 # ⚠ IT FAILS WHEN THERE IS NO JAVAC, IT NEVER SKIPS. javac comes from PATH, else from the build host's JDK below.
 #
 #   bash test-os-agreement-java.sh            # the cases and the pins
@@ -36,6 +45,7 @@ root=$(cd "$here/../../.." && pwd)
 SRCDIR="$root/core/chooser/src/com/nowhere/chooser"
 ACT="$SRCDIR/ChooserActivity.java"
 CLS="$SRCDIR/OsAgreement.java"
+PA="$SRCDIR/ProfileActivity.java"
 RUN="$root/core/chooser/tests/os-agreement/run.sh"
 HOST_JDK=/mnt/build/lineage/prebuilts/jdk/jdk21/linux-x86/bin
 
@@ -82,13 +92,15 @@ none() {
   [ "$n" = 0 ] || { echo "  PIN $3 $n lines hold: $2 -- want 0" >&2; return 1; }
 }
 
-# suite <ChooserActivity.java> <OsAgreement.java>
+# suite <ChooserActivity.java> <OsAgreement.java> <ProfileActivity.java>
 # -> 0 pass, 1 a case or a pin failed, 2 a source is missing, 3 the class did not compile. Only 1 convicts a mutant.
 suite() {
-  local f="$1" cls="$2" rc src b lstore lhint lag lui lif lels lm lmark ladd lbody ltitle lg lok len lend lclick lchk
+  local f="$1" cls="$2" pa="$3" rc src b lstore lhint lag lui lif lels lm lmark ladd lbody ltitle lg lok len lend lclick lchk
   local lset lnext n lbuild laddb lstep lcreate lwait lask lmatch lplay span
+  local pasrc lreset lmenu lchkd lgone lsave lempty lsen lpro lw la le nall npw nnull lgo k
   [ -f "$f" ] || { echo "  FAIL missing $f" >&2; return 2; }
   [ -f "$cls" ] || { echo "  FAIL missing $cls" >&2; return 2; }
+  [ -f "$pa" ] || { echo "  FAIL missing $pa" >&2; return 2; }
   [ -f "$RUN" ] || { echo "  FAIL missing $RUN" >&2; return 2; }
   TMPDIR="$W" JAVAC="$JAVAC" JAVA="$JAVA" bash "$RUN" "$cls"; rc=$?
   case "$rc" in 0) ;; 1) return 1 ;; 3) echo "  FAIL the class did not compile" >&2; return 3 ;; *) return 2 ;; esac
@@ -265,25 +277,141 @@ suite() {
   none "$src" 'createAckBox.setChecked(true)' C6 || return 1
   n=$(printf '%s\n' "$src" | grep -cE 'createAckBox\.setChecked\([^f]' || true)
   [ "$n" = 0 ] || { echo "  PIN C6 $n lines call createAckBox.setChecked( with an argument other than false" >&2; return 1; }
+
+  # Profile's save ceremony (NWP-20261204-09), in ProfileActivity without its comment lines.
+  pasrc=$(grep -v '^[[:space:]]*//' "$pa")
+
+  # S1 readSaveAckGate: one read of the gate through roundTrip (5 s), any failure stored as "", never null; the box's
+  # visibility only through saveAckShown; ProfileActivity names the verb on that one line.
+  b=$(body "$pa" 'private void readSaveAckGate(final android.widget.CheckBox box) {')
+  [ -n "$b" ] || { echo "  PIN S1 no readSaveAckGate(final android.widget.CheckBox box) in $pa" >&2; return 1; }
+  b=$(printf '%s\n' "$b" | grep -v '^[[:space:]]*//')
+  one "$b" 'try { r = DaemonSocket.roundTrip("GET-OS-AGREEMENT\n", 5000); } catch (Throwable t) { r = ""; }' S1 >/dev/null || return 1
+  one "$b" 'saveAckReply = r == null ? "" : r;' S1 >/dev/null || return 1
+  read -r n _ <<<"$(line_of "$b" 'saveAckReply =')"
+  [ "$n" = 1 ] || { echo "  PIN S1 $n lines assign saveAckReply in readSaveAckGate, want 1" >&2; return 1; }
+  read -r n _ <<<"$(line_of "$b" 'setVisibility(')"
+  [ "$n" = 1 ] || { echo "  PIN S1 $n setVisibility( lines in readSaveAckGate, want 1" >&2; return 1; }
+  one "$b" 'box.setVisibility(OsAgreement.saveAckShown(saveAckReply) ? View.VISIBLE : View.GONE)' S1 >/dev/null || return 1
+  one "$b" '}, "nowhere-saveack").start();' S1 >/dev/null || return 1
+  none "$b" 'Log.' S1 || return 1
+  none "$b" 'sendDaemon' S1 || return 1
+  read -r n _ <<<"$(line_of "$pasrc" 'GET-OS-AGREEMENT')"
+  [ "$n" = 1 ] || { echo "  PIN S1 $n lines name GET-OS-AGREEMENT in $pa, want 1" >&2; return 1; }
+  read -r n _ <<<"$(line_of "$pasrc" 'saveAckReply =')"
+  [ "$n" = 2 ] || { echo "  PIN S1 $n lines assign saveAckReply in $pa, want 2 (the reset and the read)" >&2; return 1; }
+  read -r n _ <<<"$(line_of "$pasrc" 'saveAckReply = null')"
+  [ "$n" = 1 ] || { echo "  PIN S1 $n lines set saveAckReply to null in $pa, want 1 (the reset)" >&2; return 1; }
+
+  # S2 showSaveCeremony: the reply reset to null before the screen is built; the box built after the hint, unticked
+  # and hidden, added before the Save button, and the gate read on the next line.
+  b=$(body "$pa" 'private void showSaveCeremony() {')
+  [ -n "$b" ] || { echo "  PIN S2 no showSaveCeremony() in $pa" >&2; return 1; }
+  b=$(printf '%s\n' "$b" | grep -v '^[[:space:]]*//')
+  lreset=$(one "$b" 'saveAckReply = null;' S2) || return 1
+  lmenu=$(one "$b" 'LinearLayout ll = menuScreen("Save to your store",' S2) || return 1
+  lhint=$(one "$b" 'll.addView(hint, hlp);' S2) || return 1
+  lbuild=$(one "$b" 'final android.widget.CheckBox ack = new android.widget.CheckBox(this);' S2) || return 1
+  read -r n _ <<<"$(line_of "$b" 'android.widget.CheckBox(')"
+  [ "$n" = 1 ] || { echo "  PIN S2 $n lines build a CheckBox in showSaveCeremony, want 1" >&2; return 1; }
+  one "$b" 'ack.setText(OsAgreement.createAckText());' S2 >/dev/null || return 1
+  lchkd=$(one "$b" 'ack.setChecked(false);' S2) || return 1
+  lgone=$(one "$b" 'ack.setVisibility(View.GONE);' S2) || return 1
+  ladd=$(one "$b" 'll.addView(ack, ' S2) || return 1
+  lsave=$(one "$b" 'final Button save = accentBtn("Save");' S2) || return 1
+  [ "$lreset" -lt "$lmenu" ] && [ "$lhint" -lt "$lbuild" ] && [ "$lbuild" -lt "$lchkd" ] && [ "$lchkd" -lt "$ladd" ] \
+    && [ "$lbuild" -lt "$lgone" ] && [ "$lgone" -lt "$ladd" ] && [ "$ladd" -lt "$lsave" ] || {
+    echo "  PIN S2 order: reset at $lreset, menu at $lmenu, hint at $lhint, box at $lbuild, untick at $lchkd," \
+      "hidden at $lgone, added at $ladd, Save at $lsave" >&2; return 1; }
+  span=$(printf '%s\n' "$b" | sed -n "$((ladd + 1))p")
+  [[ "$span" =~ ^[[:space:]]*readSaveAckGate\(ack\)\;[[:space:]]*$ ]] || {
+    echo "  PIN S2 the line after the box is added is not readSaveAckGate(ack);" >&2; return 1; }
+  n=$(printf '%s\n' "$b" | grep -cE '^[[:space:]]*readSaveAckGate\(ack\);[[:space:]]*$' || true)
+  [ "$n" = 2 ] || { echo "  PIN S2 $n readSaveAckGate(ack); lines in showSaveCeremony, want 2 (build, WAIT)" >&2; return 1; }
+
+  # S3 the Save click: saveStep after the match and empty checks, before the button is disabled and sendPromote(pw);
+  # the WAIT and ASK branches each end in return.
+  lmatch=$(one "$b" 'hint.setText("• passphrases don'"'"'t match");' S3) || return 1
+  lempty=$(one "$b" 'hint.setText("• type a passphrase (or generate one)");' S3) || return 1
+  lstep=$(one "$b" 'final int ackStep = OsAgreement.saveStep(saveAckReply, ack.isChecked());' S3) || return 1
+  lw=$(one "$b" 'if (ackStep == OsAgreement.CREATE_WAIT) {' S3) || return 1
+  la=$(one "$b" 'if (ackStep == OsAgreement.CREATE_ASK) {' S3) || return 1
+  lsen=$(one "$b" 'save.setEnabled(false);' S3) || return 1
+  lpro=$(one "$b" 'sendPromote(pw);' S3) || return 1
+  [ "$lmatch" -lt "$lempty" ] && [ "$lempty" -lt "$lstep" ] && [ "$lstep" -lt "$lw" ] && [ "$lw" -lt "$la" ] \
+    && [ "$la" -lt "$lsen" ] && [ "$lsen" -lt "$lpro" ] || {
+    echo "  PIN S3 order: match at $lmatch, empty at $lempty, saveStep at $lstep, WAIT at $lw, ASK at $la," \
+      "disable at $lsen, sendPromote at $lpro" >&2; return 1; }
+  for k in "$lw" "$la"; do
+    le=$(printf '%s\n' "$b" | awk -v g="$k" 'NR > g && /^[[:space:]]*}[[:space:]]*$/ { print NR; exit }')
+    [ -n "$le" ] && [ "$le" -lt "$lsen" ] || { echo "  PIN S3 the branch at $k does not close before $lsen" >&2; return 1; }
+    span=$(printf '%s\n' "$b" | sed -n "$((le - 1))p")
+    [[ "$span" =~ ^[[:space:]]*return\;[[:space:]]*$ ]] || {
+      echo "  PIN S3 the branch at $k does not end in return;" >&2; return 1; }
+    span=$(printf '%s\n' "$b" | sed -n "${k},${le}p")
+    if [ "$k" = "$lw" ]; then
+      one "$span" 'hint.setText(OsAgreement.SAVE_WAIT_TEXT);' S3 >/dev/null || return 1
+      one "$span" 'readSaveAckGate(ack);' S3 >/dev/null || return 1
+    else
+      one "$span" 'ack.setVisibility(View.VISIBLE);' S3 >/dev/null || return 1
+      one "$span" 'hint.setText(OsAgreement.SAVE_ACK_NEED);' S3 >/dev/null || return 1
+    fi
+  done
+
+  # S4 one save pass: only sendPromote sets pendingSavePass to a pass (every other write clears it), sendPromote has one
+  # call site, and the two PROMOTE2 sends are sendPromote's and the add-credits detour's pendingSavePass.
+  read -r npw _ <<<"$(line_of "$pasrc" 'pendingSavePass = pw;')"
+  [ "$npw" = 1 ] || { echo "  PIN S4 $npw lines hold pendingSavePass = pw;, want 1" >&2; return 1; }
+  read -r nall _ <<<"$(line_of "$pasrc" 'pendingSavePass =')"
+  read -r nnull _ <<<"$(line_of "$pasrc" 'pendingSavePass = null;')"
+  [ "$nall" = $((npw + nnull)) ] || {
+    echo "  PIN S4 $nall lines assign pendingSavePass, want $((npw + nnull)) (pw once, every other null)" >&2; return 1; }
+  b=$(body "$pa" 'private void sendPromote(final String pw) {')
+  one "$b" 'pendingSavePass = pw;' S4 >/dev/null || return 1
+  read -r nall _ <<<"$(line_of "$pasrc" 'sendPromote(')"
+  read -r n _ <<<"$(line_of "$pasrc" 'private void sendPromote(')"
+  [ $((nall - n)) = 1 ] || { echo "  PIN S4 $((nall - n)) call sites of sendPromote(, want 1" >&2; return 1; }
+  one "$pasrc" 'final String sp = pendingSavePass;' S4 >/dev/null || return 1
+  read -r n _ <<<"$(line_of "$pasrc" '"PROMOTE2\n"')"
+  [ "$n" = 2 ] || { echo "  PIN S4 $n lines send PROMOTE2, want 2 (sendPromote and the add-credits detour)" >&2; return 1; }
+  one "$pasrc" 'sendDaemon("PROMOTE2\n" + pw + "\n")' S4 >/dev/null || return 1
+  one "$pasrc" 'sendDaemon("PROMOTE2\n" + sp + "\n")' S4 >/dev/null || return 1
+
+  # S5 no code ticks, logs or records the box.
+  b=$( { body "$pa" 'private void showSaveCeremony() {'; body "$pa" 'private void readSaveAckGate(final android.widget.CheckBox box) {'; } )
+  none "$b" 'ack.setChecked(true)' S5 || return 1
+  n=$(printf '%s\n' "$b" | grep -cE '(ack|box)\.setChecked\([^f]' || true)
+  [ "$n" = 0 ] || { echo "  PIN S5 $n lines tick the save box with an argument other than false" >&2; return 1; }
+  n=$(printf '%s\n' "$pasrc" | perl -ne 'print if /\bLog\./ && /\back\b|saveAck/' | wc -l)
+  [ "$n" = 0 ] || { echo "  PIN S5 $n Log lines name the save box or its reply" >&2; return 1; }
+  n=$(printf '%s\n' "$pasrc" | perl -ne 'print if /putBoolean/ && /\back\b|saveAck/' | wc -l)
+  [ "$n" = 0 ] || { echo "  PIN S5 $n putBoolean lines name the save box or its reply" >&2; return 1; }
   echo "  pins ok"
   return 0
 }
 
 echo "== $ACT"
-suite "$ACT" "$CLS" || { echo "FAILED"; exit 1; }
+echo "== $PA"
+suite "$ACT" "$CLS" "$PA" || { echo "FAILED"; exit 1; }
 [ "$MUTATE" = yes ] || exit 0
 
 echo "== mutations (each must be CONVICTED by a case or a pin: rc 1 only)"
 fails=0
-# mut <label> <target: cls|act> <perl-expr>
+# mut <label> <target: cls|act|pa> <perl-expr>
 mut() {
-  local label="$1" target="$2" expr="$3" d rc a c
-  d=$(mktemp -d -p "$W"); a="$d/ChooserActivity.java"; c="$d/OsAgreement.java"
-  cp "$ACT" "$a"; cp "$CLS" "$c"
-  if [ "$target" = cls ]; then perl -0pi -e "$expr" "$c"; else perl -0pi -e "$expr" "$a"; fi
+  local label="$1" target="$2" expr="$3" d rc a c p
+  d=$(mktemp -d -p "$W"); a="$d/ChooserActivity.java"; c="$d/OsAgreement.java"; p="$d/ProfileActivity.java"
+  cp "$ACT" "$a"; cp "$CLS" "$c"; cp "$PA" "$p"
+  case "$target" in
+    cls) perl -0pi -e "$expr" "$c" ;;
+    act) perl -0pi -e "$expr" "$a" ;;
+    pa) perl -0pi -e "$expr" "$p" ;;
+    *) echo "  BAD TARGET $target $label"; fails=$((fails+1)); return ;;
+  esac
   if [ "$target" = cls ] && cmp -s "$c" "$CLS"; then echo "  INERT     $label"; fails=$((fails+1)); return; fi
   if [ "$target" = act ] && cmp -s "$a" "$ACT"; then echo "  INERT     $label"; fails=$((fails+1)); return; fi
-  suite "$a" "$c" >/dev/null 2>"$d/err"; rc=$?
+  if [ "$target" = pa ] && cmp -s "$p" "$PA"; then echo "  INERT     $label"; fails=$((fails+1)); return; fi
+  suite "$a" "$c" "$p" >/dev/null 2>"$d/err"; rc=$?
   if [ "$rc" = 1 ]; then echo "  CONVICTED $label"
   else echo "  SURVIVED  $label (rc $rc)"; sed 's/^/      /' "$d/err" | head -5; fails=$((fails+1)); fi
 }
@@ -319,5 +447,16 @@ mut 'M29 clearSignInFields drops the untick (pin C5)' act 's/\n[ \t]*if \(create
 mut 'M30 readCreateAckGate stores a null reply (pin C1)' act 's/createAckReply = r == null \? "" : r;/createAckReply = r;/'
 mut 'M31 createAckText drops the DRAFT mark (case createAckText holds DRAFT_MARK)' cls 's/return showsDraftMark\(\) \? ACK \+ "\\n" \+ DRAFT_MARK : ACK;/return ACK;/'
 mut 'M32 setCreateMode drops the re-read (pin C2 call count; C3 also holds it)' act 's/\n[ \t]*if \(createMode\) readCreateAckGate\(\); \/\/ NWP-20261202-23: re-read at every entry//'
+mut 'M33 saveStep always goes (case saveStep("draft", false) is CREATE_ASK)' cls 's/return createStep\(gateReply, acknowledged\);/return CREATE_GO;/'
+mut 'M34 an unread gate goes at Save (case saveStep(null, false) is CREATE_WAIT)' cls 's/(static int saveStep\(String gateReply, boolean acknowledged\) \{\n)/$1        if (gateReply == null) return CREATE_GO;\n/'
+mut 'M35 saveAckShown always true (case saveAckShown("off") is false)' cls 's/(static boolean saveAckShown\(String gateReply\) \{\n\s*)return shouldShow\(gateReply\);/$1return true;/'
+mut 'M36 the saveStep line removed (pin S3)' pa 's/\n[ \t]*final int ackStep = OsAgreement\.saveStep\(saveAckReply, ack\.isChecked\(\)\);//'
+mut 'M37 the ASK branch does not return (pin S3)' pa 's/(if \(ackStep == OsAgreement\.CREATE_ASK\) \{.*?)\n[ \t]*return;/$1/s'
+mut 'M38 sendPromote(pw) moved above the saveStep line (pin S3)' pa 's/\n[ \t]*sendPromote\(pw\);//; s/(\n[ \t]*final int ackStep = OsAgreement\.saveStep)/\n            sendPromote(pw);$1/'
+mut 'M39 showSaveCeremony does not reset the reply (pin S1 assign count; S2 also holds it)' pa 's/\n[ \t]*saveAckReply = null; \/\/ NWP-20261204-09[^\n]*//'
+mut 'M40 readSaveAckGate stores a null reply (pin S1)' pa 's/saveAckReply = r == null \? "" : r;/saveAckReply = r;/'
+mut 'M41 the box built ticked (pin S2)' pa 's/ack\.setChecked\(false\);/ack.setChecked(true);/'
+mut 'M42 a second pendingSavePass set in showSaveCeremony (pin S4)' pa 's/(\n([ \t]*)save\.setEnabled\(false\);)/\n$2pendingSavePass = passF.getText().toString();$1/'
+mut 'M43 SAVE_ACK_NEED gains "&" (case SAVE_ACK_NEED holds no "&")' cls 's/(SAVE_ACK_NEED = "tick the box)/$1 \&/'
 [ "$fails" = 0 ] || { echo "FAILED: $fails mutant(s) not convicted"; exit 1; }
 echo "all mutants convicted"

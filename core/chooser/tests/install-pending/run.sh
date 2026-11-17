@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # run.sh <UnarchiveService.java> -- NWP-20261012-04: lift the pure "what does this Auto app need" decision out of the
-# chooser and run PendingCases against it under plain javac/java. autoAction and splitAuto use only java.lang and
+# chooser and run PendingCases against it under plain javac/java. autoAction, splitAuto and riders use only java.lang and
 # java.util, so the class compiles with no Android SDK. The compiler and VM come from $JAVAC / $JAVA (default: PATH);
 # core/vendor-common/bin/test-install-heal.sh is the CI entry point and finds them.
 #
@@ -15,7 +15,7 @@ here=$(cd "$(dirname "$0")" && pwd)
 D=$(mktemp -d)
 trap 'rm -rf "$D"' EXIT
 consts="AUTO_WHOLE AUTO_INSTALL AUTO_RESTORE_ONLY AUTO_GROUP_DEP"
-methods="autoAction splitAuto"
+methods="autoAction splitAuto riders"
 {
   echo "final class Lifted {"
   for c in $consts; do grep -E "^    static final int $c = [0-9]+;" "$SRC" || true; done

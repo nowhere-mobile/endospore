@@ -19,7 +19,9 @@ package com.nowhere.chooser;
  *
  * <p>Residuals. The cycle lives in the watcher's memory: a chooser restart mid-cycle leaves the notice until the
  * next drop's cycle clears it, or the session ends. A tap whose seal and every later seal fail keeps "Backing up"
- * beside "Not backed up".
+ * beside "Not backed up". The watcher logs each transition to login.log (NWP-20261204-03: {@code backnow drop},
+ * {@code post}, each new {@code landed} stamp, {@code cancel}), so a restart mid-cycle reads there as a post with no
+ * cancel and no later landed line.
  */
 final class BackNowCycle {
     static final int NOTHING = 0;
@@ -29,12 +31,16 @@ final class BackNowCycle {
     private boolean armed;      // a drop was announced and its cycle has not ended
     private boolean posted;     // the prompt was posted for this drop
     private long reconnectAt;   // unix seconds of the online tick that posted the prompt
+    private boolean landedSeen; // a GET-SEAL-LANDED stamp was read in this cycle
+    private long lastLanded;    // that stamp (-1 = an unreadable reply)
 
     /** A drop was announced (the 3-tick debounce passed). Idempotent: called on every offline tick past it. */
     void onDrop() {
         armed = true;
         posted = false;
         reconnectAt = 0;
+        landedSeen = false;
+        lastLanded = 0;
     }
 
     /** An online tick. POST once per drop, and remember when. */
@@ -82,10 +88,21 @@ final class BackNowCycle {
         return Long.parseLong(d);
     }
 
+    /** NWP-20261204-03: true the first time a stamp is read in this cycle and whenever it differs from the last one
+     *  (-1, an unreadable reply, is a value too), so the watcher logs each new landed stamp once. */
+    boolean landedChanged(long stamp) {
+        if (landedSeen && stamp == lastLanded) return false;
+        landedSeen = true;
+        lastLanded = stamp;
+        return true;
+    }
+
     /** No live session: the cycle ends with it. */
     void reset() {
         armed = false;
         posted = false;
         reconnectAt = 0;
+        landedSeen = false;
+        lastLanded = 0;
     }
 }

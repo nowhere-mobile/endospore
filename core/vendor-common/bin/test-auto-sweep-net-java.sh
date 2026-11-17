@@ -76,7 +76,7 @@ sources() {
   local r=$1 sweep start chip kick watch bad=0 out
   sweep=$(code "$r/$CH/UnarchiveService.java" "    private void sweepAuto(")
   start=$(code "$r/$CH/UnarchiveService.java" "    public int onStartCommand(Intent intent, int flags, int startId) {")
-  chip=$(code "$r/$CH/ProfileActivity.java" "    private LinearLayout installPendingRow(int n, boolean allowMetered, boolean onWifi) {")
+  chip=$(code "$r/$CH/ProfileActivity.java" "    private LinearLayout installPendingRow(int n, boolean allowMetered, boolean onWifi, int mode) {")
   kick=$(code "$r/$CH/ChooserActivity.java" "    private static void kickAutoMaterialise(")
   watch=$(code "$r/$CH/ChooserActivity.java" "    private void startSyncStatusWatcher() {")
   if [ -z "$sweep" ] || [ -z "$start" ] || [ -z "$chip" ] || [ -z "$kick" ] || [ -z "$watch" ]; then

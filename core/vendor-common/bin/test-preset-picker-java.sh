@@ -42,6 +42,7 @@ root=$(cd "$here/../../.." && pwd)
 SRC="$root/core/chooser/src/com/nowhere/chooser"
 SUT="$SRC/PresetPicker.java"
 PA="$SRC/ProfileActivity.java"
+SS="$SRC/StandbySheets.java"
 PS="$SRC/PresetSheet.java"
 CASES="$root/core/chooser/tests/preset-picker/PresetPickerCases.java"
 HOST_JDK=/mnt/build/lineage/prebuilts/jdk/jdk21/linux-x86/bin
@@ -56,7 +57,7 @@ else
   exit 2
 fi
 "$JAVAC" -version || { echo "FAIL: $JAVAC does not run" >&2; exit 2; }
-for f in "$CASES" "$PA" "$PS" "$SRC/ProfilePresets.java" "$SRC/WipeChoice.java" "$SRC/WipeOnSave.java" "$SRC/SettingsText.java"; do
+for f in "$CASES" "$PA" "$SS" "$PS" "$SRC/ProfilePresets.java" "$SRC/WipeChoice.java" "$SRC/WipeOnSave.java" "$SRC/SettingsText.java"; do
   [ -f "$f" ] || { echo "FAIL: missing $f" >&2; exit 2; }
 done
 
@@ -125,7 +126,7 @@ pins() {
   done
 
   # P3: each hand-change write path calls the guard before its writer.
-  for m in "showIdlePicker writeIdlePref(" "showIdlePicker setPref(\"holdlock\"" "showIdlePicker setPref(\"holdaudio\"" \
+  for m in "saveStandby writeIdlePref(" "saveStandby setPref(key" \
            "showWipePicker writeWipePref(" \
            "showConfiguration cfgPut(CFG_MEDIA_DEFAULT" "appDefaultRow cfgPut(key" "showReclaimDialog setReclaimIdleMs("; do
     writer=${m#* }; b=$(meth "$paf" "${m%% *}")
@@ -165,9 +166,9 @@ pins() {
     || { echo "  FAIL  P6 PresetPicker.RECLAIM_FILE is not the file reclaimIdleMs and setReclaimIdleMs use" >&2; bad=1; }
   [ "$(sconst "$pp" CUSTOM_FILE)" = "nowhere-preset-custom" ] && [ "$(sconst "$pp" LAST_FILE)" = "nowhere-preset-last" ] \
     || { echo "  FAIL  P6 the saved-Custom or last-shown file name changed" >&2; bad=1; }
-  want=$(meth "$paf" showIdlePicker | sed -nE 's/^ *int cur = ([0-9]+);$/\1/p')
+  want=$(code "$SS" | sed -nE 's/^ *static final int DEFAULT_MINUTES = ([0-9]+);$/\1/p')
   [ -n "$want" ] && [ "$(sconst "$pp" IDLE_DEFAULT)" = "$want" ] \
-    || { echo "  FAIL  P6 PresetPicker.IDLE_DEFAULT is '$(sconst "$pp" IDLE_DEFAULT)', showIdlePicker's default is '$want'" >&2; bad=1; }
+    || { echo "  FAIL  P6 PresetPicker.IDLE_DEFAULT is '$(sconst "$pp" IDLE_DEFAULT)', StandbySheets.DEFAULT_MINUTES is '$want'" >&2; bad=1; }
   has "$pa" "static final long RECLAIM_DEFAULT_MS = RECLAIM_3D;" && has "$pa" "static final long RECLAIM_1D = 24L * 60 * 60 * 1000;" \
     && has "$pa" "static final long RECLAIM_3D = 3 * RECLAIM_1D;" && [ "$(sconst "$pp" RECLAIM_DEFAULT)" = "$((3 * 24 * 60 * 60 * 1000))" ] \
     || { echo "  FAIL  P6 PresetPicker.RECLAIM_DEFAULT is not RECLAIM_DEFAULT_MS (RECLAIM_3D)" >&2; bad=1; }
@@ -311,7 +312,7 @@ mut "M11 guardAction asks on a no-op change"     class 's/\n *if \(unchanged\(cu
 mut "M12 guardAction re-saves an unchanged Custom" class 's/\n *if \(Objects\.equals\(h\.savedCustomAfter, savedCustom\)\) return new Guard\(Action\.WRITE_ONLY, null\);//' || fails=$((fails+1))
 mut "M13 presetGuard decides with handChange"    pa    's/(private void presetGuard\(.*?)PresetPicker\.guardAction\(/${1}ProfilePresets.handChange(/s' || fails=$((fails+1))
 mut "M14 presetGuard's WRITE_ONLY arm saves"     pa    's/(case WRITE_ONLY:\n *write\.run\(\);)/$1\n                presetSaveCustom(g.save);/' || fails=$((fails+1))
-mut "M15 the idle Save runs without the guard"   pa    's/presetGuard\(PresetPicker\.change\("idle", String\.valueOf\(mins\[idx\]\),\n *"holdlock", holdBox\.isChecked\(\) \? "" : "0",\n *"holdaudio", audioBox\.isChecked\(\) \? "" : "0"\), \(\) -> \{(.*?)\}, \(\) -> showSecurity\(\)\);/{$1}/s' || fails=$((fails+1))
+mut "M15 the idle Save runs without the guard"   pa    's/presetGuard\(PresetPicker\.change\(key, value\), \(\) -> \{(.*?)\n( *)\}, undo\);/{$1\n$2}/s' || fails=$((fails+1))
 mut "M16 applyPreset does not tell the gate"     pa    's/\n *if \(prefs\) sendLivePrefs\(\);//' || fails=$((fails+1))
 mut "M17 the card shown for a throwaway"        class 's/return !local \|\| offline;/return true;/' || fails=$((fails+1))
 mut "M18 the card hidden offline"                class 's/return !local \|\| offline;/return !local;/' || fails=$((fails+1))

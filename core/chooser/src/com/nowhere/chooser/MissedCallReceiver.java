@@ -43,6 +43,9 @@ public final class MissedCallReceiver extends BroadcastReceiver {
 
     static final int DROP = 0;         // nothing to do
     static final int SCRUB_RESET = 1;  // delete user 0's call log, then zero Telecom's count
+    /** NWP-20261204-12: every broadcast this process received since it started, whatever plan() makes of it. A gate
+     *  issue report carries it bucketed (GateNoticeEvidence): it says whether Telecom delegated the miss at all. */
+    static final java.util.concurrent.atomic.AtomicInteger RECEIVED = new java.util.concurrent.atomic.AtomicInteger();
 
     /** What to do with one broadcast. action: the intent's; userId: the user this process runs in; count: the
      *  EXTRA_COUNT, or -1 when absent. A count of 0 is Telecom's dismiss -- the answer to our own cancel -- and needs
@@ -56,6 +59,7 @@ public final class MissedCallReceiver extends BroadcastReceiver {
 
     @Override
     public void onReceive(Context ctx, Intent intent) {
+        RECEIVED.incrementAndGet();
         final int count = intent == null ? -1 : intent.getIntExtra(EXTRA_COUNT, -1);
         final int plan = plan(intent == null ? null : intent.getAction(),
                 android.os.Process.myUserHandle().getIdentifier(), count);

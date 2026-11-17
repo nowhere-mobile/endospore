@@ -3,9 +3,10 @@
 #
 # WHY. build-device.sh --release prompts once per device, only after that device's own `m`. So N devices cost N attended
 # prompts spread over hours, and a wrong passphrase shows only after the first device's ~17 minutes of signing. Nothing
-# checked for other processes of the signing user, which can read /dev/shm/release_keys.* and a child's environment
-# mid-sitting. Decided 2026-10-30 ("every release is proved on a canary first ...", "thinking about all 17") and
-# 2026-11-01 (h52 #4, "twenty-two answers to harvests 50, 51 and 52 ..."), docs/product-decisions.md.
+# checked for other processes of the signing user, which can read /dev/shm/generate-release.* (release_keys.* on an
+# older tree) and a child's environment mid-sitting. Decided 2026-10-30 ("every release is proved on a canary first ...",
+# "thinking about all 17") and 2026-11-01 (h52 #4, "twenty-two answers to harvests 50, 51 and 52 ..."),
+# docs/product-decisions.md.
 #
 # HOW. Build each device unattended first (`VARIANT=user OUT_DIR=<out> build-device.sh <dev> <BN>`). This script never
 # runs `m`. It then, in this order:
@@ -75,8 +76,8 @@ MY_UID=$(id -u)
 # passphrase in every child's environment: unset both first, so PW is a fresh unexported shell variable.
 unset PW password
 PW=""; CHILD=""; SWEPT=""; T=""; ARMED=""
-own_key_dirs() {   # this uid's decrypted-key dirs in SHM; another uid's are never touched
-  find "$SHM" -mindepth 1 -maxdepth 1 -user "$MY_UID" \( -name 'release_keys.*' -o -name 'decrypt_keys.*' \) -print 2>/dev/null
+own_key_dirs() {   # this uid's decrypted-key dirs in SHM, the current and an older tree's names; never another uid's
+  find "$SHM" -mindepth 1 -maxdepth 1 -user "$MY_UID" \( -name 'generate-release.*' -o -name 'decrypt-keys.*' -o -name 'release_keys.*' -o -name 'decrypt_keys.*' \) -print 2>/dev/null
 }
 sweep_keys() {     # rm -rf, not a shred: accepted by name (h52 #4); /dev/shm is memory
   local d
@@ -222,11 +223,19 @@ check_stale_key_dirs() {   # 2f: a key dir left by a sitting that died without i
   s=$(own_key_dirs)
   [ -z "$s" ] || refuse - stale-keys "stale key dir(s) of this user in $SHM: $(printf '%s' "$s" | tr '\n' ' ')-- a sitting died without its sweep; remove them"
 }
-check_upstream_gate() {    # 2g: what this script relies on in the GrapheneOS tree's script/
-  local a b
+check_upstream_gate() {    # 2g: what this script relies on in the GrapheneOS tree's script/: the current strings
+  local a b                #     (grapheneos-2026110200), else an older tree's; any other is refused (NWP-20261205-05)
   a=$(cat "$TREE/script/decrypt-keys" 2>/dev/null); b=$(cat "$TREE/script/generate-release.sh" 2>/dev/null)
-  case "$a" in *"-v password"*) ;; *) refuse - upstream-gate "an upstream sync changed the password gate or the key dir; re-read them before signing (script/decrypt-keys has no '-v password')"; return ;; esac
-  case "$b" in *"/dev/shm/release_keys."*) ;; *) refuse - upstream-gate "an upstream sync changed the password gate or the key dir; re-read them before signing (script/generate-release.sh has no '/dev/shm/release_keys.')" ;; esac
+  case "$a" in
+    *'"${password+defined}" = defined'*) ;;
+    *'-v password'*) ;;
+    *) refuse - upstream-gate "an upstream sync changed the password gate or the key dir; re-read them before signing (script/decrypt-keys has neither '\"\${password+defined}\" = defined' nor '-v password')"; return ;;
+  esac
+  case "$b" in
+    *'/dev/shm/generate-release.'*) ;;
+    *'/dev/shm/release_keys.'*) ;;
+    *) refuse - upstream-gate "an upstream sync changed the password gate or the key dir; re-read them before signing (script/generate-release.sh has neither '/dev/shm/generate-release.' nor '/dev/shm/release_keys.')" ;;
+  esac
 }
 
 case "$MIN_GIB" in '' | *[!0-9]*) usage "SIGN_MIN_TMP_GIB '$MIN_GIB' is not a number" ;; esac

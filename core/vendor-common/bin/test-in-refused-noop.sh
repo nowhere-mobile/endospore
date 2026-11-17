@@ -158,7 +158,7 @@ od_fetch_data() { return 0; }; od_listed() { return 1; }; od_block_app() { retur
 _sum0=0; _sumt=0   # set above the `in` arm in the script (NWP-20261130-08); this harness runs the arm alone under set -u
 sleep() { return 0; }
 for t in usb_host relabel_launcher remap_media_db insert_deferred_media remap_per_pkg _tlog _ssum acct_restore remap_tree reown_ext_appdata \
-         keystore_push keystore_restore ks_signin_reset hold_ondemand od_parked_report reap_stale_ondemand reap_orphan_provisioned restorecon \
+         keystore_push keystore_fetch keystore_restore ks_signin_reset hold_ondemand od_parked_report reap_stale_ondemand reap_orphan_provisioned restorecon \
          uiderrors_floor_take uiderrors_floor_commit tz_surface sroam_surface; do
   eval "$t() { :; }"
 done

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # test-create-live-java.sh [--mutate] -- NWP-20261116-09 (h46 #5): a create the daemon refuses with ERR-LIVE (a roamed
-# session is still open) says so, in the decided words, and offers Restart and Cancel, never the blank a wrong
+# session is still open) says so, in the decided words, and offers Restart and Not now, never the blank a wrong
 # passphrase shows. Runs core/chooser/tests/create-live: the chooser's reading of ERR-LIVE, its words (against
 # docs/product-decisions.md), the place of its branch in roamLogin, and its Restart, compiled and EXECUTED.
 # NWP-20261117-11 (#54): also the gate's reading of ERR-NAME (a name holding '#'), its branch and its words (M7-M11).
@@ -56,7 +56,7 @@ mut "M4 the ERR-LIVE branch moved below the blank failure" "s/($BRANCH)(.*?)(   
   "L3 the ERR-LIVE branch is after" || fails=$((fails+1))
 mut "M5 the words say reboot, not restart" 's/restart the phone\. Anything that session/reboot the phone. Anything that session/' \
   "L2 createLiveText is the decided h46 #5 words" || fails=$((fails+1))
-mut "M6 Restart no longer calls rebootForCreateOverLive" 's/setPositiveButton\("Restart", \(d, w\) -> rebootForCreateOverLive\(\)\)/setPositiveButton("Restart", (d, w) -> {})/' \
+mut "M6 Restart no longer calls rebootForCreateOverLive" 's/new Runnable\[\] \{ null, \(\) -> rebootForCreateOverLive\(\) \}/new Runnable[] { null, () -> {} }/' \
   "L4 showCreateOverLiveSession's Restart calls rebootForCreateOverLive" || fails=$((fails+1))
 NBRANCH='                if \(createReplyBadName\(cr\)\) \{.*?\n                \}\n'
 mut "M7 createReplyBadName is always false" 's/(private static boolean createReplyBadName\(String cr\) \{\n)/$1        if (true) return false;\n/' \

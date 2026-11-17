@@ -42,8 +42,8 @@ mut "M2 the marker check removed" reap_lists.go \
 mut "M3 the .coldlock check removed" reap_lists.go \
   "$(one "r'\tif _, err := os\.Lstat\(filepath\.Join\(dest, \"\.coldlock\"\)\); [^\n]*\n[^\n]*\n\t\}\n'" "''")"
 scoped() { echo "(lambda m: (lambda r: s[:m.start()] + r[0] + s[m.end():] if r[1] == $2 else None)(re.subn(r'strings\.HasPrefix\(name,', 'strings.Contains(name,', m.group(0))) if m else None)(re.search(r'func $1\(.*?\n\}\n', s, re.S))"; }
-mut "M4 isSessionFileList's prefix match as strings.Contains (L1: xscancache.1, xheal-handled-1)" reap_lists.go \
-  "$(scoped isSessionFileList 2)"
+mut "M4 isSessionFileList's prefix match as strings.Contains (L1: xscancache.1, xheal-handled-1, xapps-not-restored-1)" reap_lists.go \
+  "$(scoped isSessionFileList 3)"
 mut "M4b isSessionCache's prefix match as strings.Contains (L1: xcontentcache.1, xsealcount.1)" reap_lists.go \
   "$(scoped isSessionCache 1)"
 mut "M5 directories removed too" reap_lists.go \
@@ -64,4 +64,6 @@ mut "M12 the kept branch's early return dropped (L8, L2)" reap_lists.go \
   "$(one "r'\t\treturn 0, true\n'" "''")"
 mut "M13 the IsRegular guard deleted (L1: groupcache.d, mnochange.link)" reap_lists.go \
   "$(one "r'(?s)fi, err := os\.Lstat\(p\)(.*?)\t\tif !fi\.Mode\(\)\.IsRegular\(\) \{\n\t\t\tcontinue\n\t\t\}\n'" "r'_, err := os.Lstat(p)\1'")"
+mut "M14 apps-not-restored- dropped from isSessionFileList (L1)" reap_lists.go \
+  "$(one "r' \|\|\n\t\tstrings\.HasPrefix\(name, \"apps-not-restored-\"\)'" "''")"
 [ "$fails" -eq 0 ] && echo "== all mutations convicted" || { echo "== $fails mutation(s) not convicted"; exit 1; }

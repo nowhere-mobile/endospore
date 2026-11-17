@@ -4,8 +4,10 @@
 # WHY COMMITTED. The screen only relabelled its button, so a user who suspected the PIN was gone could not check; and
 # "Remove PIN" destroys a roamed credential. Neither regresses loudly (no build break, no log line), so the source
 # of the PIN screen is pinned: the PIN-STATUS callback writes "A PIN is set for this profile." for SET and
-# "No PIN is set." for NONE, only while the status line is empty and in MUTED, and the Remove click opens an
-# AlertDialog titled "Remove PIN?" with "Keep it" / "Remove" before any SET-PIN is sent.
+# "No PIN is set." for NONE, only while the status line is empty and in MUTED, and the Remove click opens the shared
+# sheet, SheetDialog.confirm(this, KeyPinSheets.removePin(), ...), with no AlertDialog.Builder, nothing on the sheet's
+# button 0 and the SET-PIN clear thread on its button 1 (null, () -> new Thread): no SET-PIN is sent before "Remove".
+# The sheet's title and button words are pinned in core/vendor-common/bin/test-key-pin-sheets-java.sh (NWP-20261206-16).
 #
 #   bash test-pin-status-line.sh            # the invariants
 #   bash test-pin-status-line.sh --mutate   # ... plus mutants that must each be CONVICTED
@@ -23,11 +25,11 @@ check() {
     r=$(region "$1")
     if [ -z "$r" ]; then echo "FAIL PIN screen Remove/PIN-STATUS region not found"; return 1; fi
     dlg=${r%%\"nowhere-clear-pin\"*}
-    case "$dlg" in *"new android.app.AlertDialog.Builder(this)"*) ;; *) echo "FAIL Remove PIN opens no AlertDialog"; fails=1 ;; esac
-    case "$dlg" in *'.setTitle("Remove PIN?")'*) ;; *) echo "FAIL dialog title is not \"Remove PIN?\""; fails=1 ;; esac
-    case "$dlg" in *'.setNegativeButton("Keep it"'*) ;; *) echo "FAIL dialog lost \"Keep it\""; fails=1 ;; esac
-    case "$dlg" in *'.setPositiveButton("Remove"'*) ;; *) echo "FAIL dialog lost \"Remove\""; fails=1 ;; esac
-    case "${dlg%%.setPositiveButton*}" in *'SET-PIN'*) echo "FAIL SET-PIN sent before the confirm"; fails=1 ;; esac
+    case "$dlg" in *'SheetDialog.confirm(this, KeyPinSheets.removePin()'*) ;; *) echo "FAIL Remove PIN opens no KeyPinSheets.removePin() sheet"; fails=1 ;; esac
+    case "$dlg" in *'AlertDialog.Builder'*) echo "FAIL Remove PIN still builds an AlertDialog"; fails=1 ;; esac
+    case "$dlg" in *'new Runnable[] { null, () -> new Thread(() -> {'*) ;;
+        *) echo "FAIL the clear thread is not on the sheet's button 1 with button 0 null"; fails=1 ;; esac
+    case "${dlg%%null, () -> new Thread*}" in *'SET-PIN'*) echo "FAIL SET-PIN sent before the confirm"; fails=1 ;; esac
     cb=${r#*\"nowhere-clear-pin\"}
     case "$cb" in *'"A PIN is set for this profile."'*) ;; *) echo "FAIL SET status sentence missing"; fails=1 ;; esac
     case "$cb" in *'"No PIN is set."'*) ;; *) echo "FAIL NONE status sentence missing"; fails=1 ;; esac
@@ -52,8 +54,8 @@ mutant() { # name, sed expression
     local o; o=$(check "$m")
     if [ $? -ne 0 ]; then echo "  ok    convicted: $name"; else echo "  FAIL  survived: $name"; bad=1; fi
 }
-mutant "dialog builder removed" 's/new android.app.AlertDialog.Builder(this)/new android.app.AlertDialog.Builder(this) \/\/ gone/;s/\.setTitle("Remove PIN?")/.setTitle("Remove?")/'
-mutant "Keep it button removed" 's/\.setNegativeButton("Keep it", (d, w) -> {})\r\?$/.setNeutralButton("Cancel", (d, w) -> {})/;/Remove PIN?/,/nowhere-clear-pin/s/setNegativeButton("Keep it"/setNeutralButton("Cancel"/'
+mutant "dialog builder removed" 's/SheetDialog\.confirm(this, KeyPinSheets\.removePin(),/SheetDialog.confirm(this, null,/'
+mutant "Keep it button removed" 's/new Runnable\[\] { null, () -> new Thread(() -> {/new Runnable[] { () -> new Thread(() -> {/'
 mutant "SET sentence dropped" 's/"A PIN is set for this profile."/""/'
 mutant "NONE sentence dropped" 's/"No PIN is set."/""/'
 mutant "empty-status guard dropped" 's/(has || "NONE".equals(ps)) \&\& msg.getText().length() == 0/(has || "NONE".equals(ps))/'

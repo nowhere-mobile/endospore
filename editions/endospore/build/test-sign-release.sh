@@ -6,7 +6,9 @@
 # (NOWHERE_KEYS_HOME is the world's own keyshome/, never the host's), plus recording
 # stubs of make-web-package.sh, ota-field-guard.sh and check-patch-markers.py; and a tree holding stub build/envsetup.sh,
 # script/finalize.sh, script/decrypt-keys, script/generate-release.sh, fixture keys and target-files zips (python3
-# zipfile). Stub openssl, tmux and ps come first on PATH. The ps stub prints ONLY a fabricated table: its own row, its
+# zipfile). The stub decrypt-keys and generate-release.sh carry the current GrapheneOS tree's lines (the
+# ${password+defined} gate, /dev/shm/generate-release. and their own decrypt-keys.* dir); S1o rewrites them to an
+# older tree's (-v password, /dev/shm/release_keys.). Stub openssl, tmux and ps come first on PATH. The ps stub prints ONLY a fabricated table: its own row, its
 # caller's real ancestor chain and the rows a case plants, never the runner's other processes. The guard cases run under
 # every shell found (bash, sh, dash, mksh). No real key, no real passphrase.
 #
@@ -81,16 +83,28 @@ EOF
 $PWENV
 echo "fin pw-env=\$(pwenv) password-set=\$(pwset) out=\$OUT_DIR" >> "\$FX_LOG"
 EOF
-  printf '#!/bin/bash\n# stub\nif [[ ! -v password ]]; then\n  read -rsp "Enter key passphrase: " password\nfi\n' > "$X/tree/script/decrypt-keys"
+  # NWP-20261205-05: the gate as grapheneos-2026110200 writes it. The prompt is a log line and exit 1, so a regression
+  # cannot hang on stdin. Its own decrypt-keys.* dir is left for the wrapper's sweep.
+  cat > "$X/tree/script/decrypt-keys" <<'EOF'
+#!/bin/bash
+# stub of script/decrypt-keys (grapheneos-2026110200); it decrypts into its own /dev/shm/decrypt-keys.XXXX
+if [[ "${password+defined}" = defined ]]; then
+  :
+else
+  echo "decrypt-keys prompted" >> "$FX_LOG"; exit 1
+fi
+mktemp -d "$SIGN_SHM_DIR/decrypt-keys.XXXXXXXX" >/dev/null || exit 1
+EOF
   cat > "$X/tree/script/generate-release.sh" <<'EOF'
 #!/usr/bin/env bash
-# stub of script/generate-release.sh; the real one decrypts into /dev/shm/release_keys.XXXXXXXXXX
+# stub of script/generate-release.sh; the real one decrypts into /dev/shm/generate-release.XXXXXXXXXX
 DEV=$1; BN=$2
 pwset=no; [ "${password+x}" = x ] && pwset=yes
 pwok=no; [ "${password:-}" = "$(cat "$FX_PWFILE")" ] && pwok=yes
-stale=$(find "$SIGN_SHM_DIR" -mindepth 1 -maxdepth 1 -name 'release_keys.*' | wc -l)
+stale=$(find "$SIGN_SHM_DIR" -mindepth 1 -maxdepth 1 \( -name 'generate-release.*' -o -name 'decrypt-keys.*' -o -name 'release_keys.*' -o -name 'decrypt_keys.*' \) | wc -l)
 echo "gen $DEV $BN password-set=$pwset password-ok=$pwok out=$OUT_DIR bdt=$BUILD_DATETIME gen-start-stale=$stale" >> "$FX_LOG"
-K=$(mktemp -d "$SIGN_SHM_DIR/release_keys.XXXXXXXX") || exit 1
+K=$(mktemp -d "$SIGN_SHM_DIR/generate-release.XXXXXXXX") || exit 1
+bash script/decrypt-keys || exit 1
 R="releases/$BN/release-$DEV-$BN"; mkdir -p "$R"
 printf '{"device":"%s"}\n' "$DEV" > "$R/$DEV-manifest-$BN.json"
 [ "$DEV" = "${FX_GEN_FAIL:-}" ] && exit 1
@@ -256,6 +270,17 @@ case_S1() {      # two devices, one prompt, the passphrase only in generate-rele
   chk lacks "$X/out" "$FXPW"
   chk test "$(ls -A "$TMPDIR")" = "$before"
 }
+case_S1o() {     # NWP-20261205-05: an older tree (-v password, /dev/shm/release_keys.) is still recognised and signs
+  local X n
+  X=$(world "$1" "$2" husky frankel) || { WHY="world"; return; }; CX="$X"
+  old_tree "$X"
+  run "$X" "$X/pw" "$BN" "$(head7 "$X")" husky frankel
+  chk test "$RC" = 0
+  n=$(grep -c -F "$PROMPT" "$X/err"); chk test "$n" = 1
+  chk has "$X/log" "gen husky $BN password-set=yes password-ok=yes out=out-husky bdt=$BDT gen-start-stale=0"
+  chk has "$X/log" "gen frankel $BN password-set=yes password-ok=yes out=out-frankel bdt=$BDT gen-start-stale=0"
+  chk shm_empty "$X"
+}
 case_S3() {      # an inherited exported PW (and password) never carries the passphrase to a child (RF-001)
   local X n
   X=$(world "$1" "$2" husky) || { WHY="world"; return; }; CX="$X"
@@ -317,8 +342,22 @@ su_O1() { XENV=(NOWHERE_OTA_STORE_CONF=); }
 su_O2() { XENV=(FX_OFG_FAIL=frankel); }
 su_T1() { XENV=(SIGN_MIN_TMP_GIB=999999999); }
 su_F1() { mkdir -p "$1/shm/release_keys.stale1"; }
+su_F2() { mkdir -p "$1/shm/generate-release.stale1"; }
+su_F3() { mkdir -p "$1/shm/decrypt-keys.stale1"; }
 su_G1() { printf '#!/bin/bash\nread -rsp "Enter key passphrase: " password\n' > "$1/tree/script/decrypt-keys"; }
-su_G2() { sed -i 's#/dev/shm/release_keys\.#/run/keys.#' "$1/tree/script/generate-release.sh"; }
+su_G2() { sed -i 's#/dev/shm/generate-release\.#/run/keys.#' "$1/tree/script/generate-release.sh"; chk lacks "$1/tree/script/generate-release.sh" /dev/shm/; }
+su_G3() {        # the current-tree stub with a colon before +defined}: the empty-sensitive test (AGENTS.md "Leave password UNSET")
+  local f="$1/tree/script/decrypt-keys"
+  sed -i 's/+defined}/:+defined}/' "$f"
+  chk has "$f" ':+defined}'
+  chk lacks "$f" '"${password+defined}" = defined'
+}
+old_tree() {     # <X>: an older tree's strings: the -v gate and no own dir; keys under /dev/shm/release_keys.
+  printf '#!/bin/bash\n# stub\nif [[ ! -v password ]]; then\n  read -rsp "Enter key passphrase: " password\nfi\n' > "$1/tree/script/decrypt-keys"
+  sed -i 's#/generate-release\.#/release_keys.#g' "$1/tree/script/generate-release.sh"
+  chk lacks "$1/tree/script/generate-release.sh" /dev/shm/generate-release.
+  chk has "$1/tree/script/generate-release.sh" /dev/shm/release_keys.
+}
 su_V1() { printf '900003 1 claude\n' > "$1/plant"; }
 su_KH2() { rm -rf "$1/tree/keys"; }
 su_KH3() { mkdir -p "$1/keyshome"; cp -a "$1/tree/keys/husky" "$1/keyshome/"; printf 'another-root\n' > "$1/keyshome/husky/avb_pkmd.bin"; }
@@ -337,8 +376,11 @@ case_R() {       # <S> <G> <id>
     O2) refusal "$1" "$2" "frankel: the OTA stamp 0.9.9 is not above the field's" su_O2 ;;
     T1) refusal "$1" "$2" "the sitting needs 999999999" su_T1 ;;
     F1) refusal "$1" "$2" "release_keys.stale1" su_F1 ;;
+    F2) refusal "$1" "$2" "generate-release.stale1" su_F2 ;;
+    F3) refusal "$1" "$2" "decrypt-keys.stale1" su_F3 ;;
     G1) refusal "$1" "$2" "an upstream sync changed the password gate or the key dir" su_G1 ;;
     G2) refusal "$1" "$2" "an upstream sync changed the password gate or the key dir" su_G2 ;;
+    G3) refusal "$1" "$2" "an upstream sync changed the password gate or the key dir" su_G3 ;;
     V1) refusal "$1" "$2" "pid 900003 claude" su_V1 ;;
     KH2) refusal "$1" "$2" "husky: no usable keys/husky (keys-home.sh, above)" su_KH2 ;;
     KH3) refusal "$1" "$2" "keys/husky/avb_pkmd.bin differs from the keys home's" su_KH3 ;;
@@ -365,7 +407,7 @@ case_K2() {      # a missing id_ed25519 warns and still signs
   chk test "$RC" = 0
   chk has "$X/err" "WARNING: keys/husky/id_ed25519 is MISSING"
 }
-case_X1() {      # a failing device: the other still signs, its key dir swept first
+case_X1() {      # a failing device: the other still signs, its key dirs (generate-release.*, decrypt-keys.*) swept first
   local X n
   X=$(world "$1" "$2" husky frankel) || { WHY="world"; return; }; CX="$X"
   XENV=(FX_GEN_FAIL=husky)
@@ -627,11 +669,12 @@ plain() {
   local c sh
   WHY=""; case_usage "$SIGN" "$GUARD"; report "U1-U5 usage errors exit 2 with no prompt"
   WHY=""; case_S1 "$SIGN" "$GUARD"; report "S1 two devices: one prompt, password only for generate-release, one bundle, key dirs swept"
+  WHY=""; case_S1o "$SIGN" "$GUARD"; report "S1o an older tree's strings (-v password, /dev/shm/release_keys.) are still recognised: both devices sign"
   WHY=""; case_S3 "$SIGN" "$GUARD"; report "S3 an inherited exported PW or password reaches no child"
   WHY=""; case_S2 "$SIGN" "$GUARD"; report "S2 an explicit out dir is the one signed"
   WHY=""; case_P1 "$SIGN" "$GUARD"; report "P1 a wrong passphrase on the second device's key: nothing signed, the key named"
   WHY=""; case_P2 "$SIGN" "$GUARD"; report "P2 an empty passphrase is refused before any key is tried"
-  for c in R1 R2 R3 R4 R5 R6 R7 K1 KH2 KH3 O1 O2 T1 F1 G1 G2 V1; do
+  for c in R1 R2 R3 R4 R5 R6 R7 K1 KH2 KH3 O1 O2 T1 F1 F2 F3 G1 G2 G3 V1; do
     WHY=""; case_R "$SIGN" "$GUARD" "$c"; report "$c preflight refusal, named, no prompt"
   done
   WHY=""; case_K2 "$SIGN" "$GUARD"; report "K2 a missing id_ed25519 warns and still signs"
@@ -676,11 +719,20 @@ convict() {      # <id> <sign-src> <guard-src>: runs the signature case and sets
     M2) case_S1 "$S" "$G"; if [ -z "$WHY" ]; then VERDICT=SURVIVED; elif grep -E '^(fin|mwp) ' "$CX/log" | grep -q 'pw-env=yes'; then VERDICT=CONVICTED; else VERDICT=BROKEN; fi ;;
     M12) case_S3 "$S" "$G"; if [ -z "$WHY" ]; then VERDICT=SURVIVED; elif grep -E '^(fin|mwp) ' "$CX/log" | grep -q 'pw-env=yes'; then VERDICT=CONVICTED; else VERDICT=BROKEN; fi ;;
     M3) case_P1 "$S" "$G"; if [ -z "$WHY" ]; then VERDICT=SURVIVED; elif grep -q '^gen ' "$CX/log"; then VERDICT=CONVICTED; else VERDICT=BROKEN; fi ;;
-    M4|M9|M7|M8|M10)
-        case "$M" in M4) c=F1 ;; M9) c=G1 ;; M7) c=R1 ;; M8) c=R5 ;; M10) c=R4 ;; esac
+    M4|M9|M7|M8|M10|M23|M24)
+        case "$M" in M4) c=F1 ;; M9) c=G1 ;; M7) c=R1 ;; M8) c=R5 ;; M10) c=R4 ;; M23) c=G1 ;; M24) c=G2 ;; esac
         case_R "$S" "$G" "$c"
         if [ -z "$WHY" ]; then VERDICT=SURVIVED
         elif has "$CX/err" "$PROMPT" || grep -q '^gen husky' "$CX/log"; then VERDICT=CONVICTED; else VERDICT=BROKEN; fi ;;
+    # M22: husky (FX_GEN_FAIL) leaves one generate-release.* and one decrypt-keys.*; neither old name matches them.
+    M22) case_X1 "$S" "$G"; up=$(grep '^gen frankel' "$CX/log" 2>/dev/null)
+         if [ -z "$WHY" ]; then VERDICT=SURVIVED
+         elif case "$up" in *gen-start-stale=2*) true ;; *) false ;; esac && ! shm_empty "$CX"; then VERDICT=CONVICTED; else VERDICT=BROKEN; fi ;;
+    M25) case_R "$S" "$G" G3
+         if [ -z "$WHY" ]; then VERDICT=SURVIVED
+         elif has "$CX/tree/script/decrypt-keys" ':+defined}' && { has "$CX/err" "$PROMPT" || grep -q '^gen husky' "$CX/log"; }; then VERDICT=CONVICTED; else VERDICT=BROKEN; fi ;;
+    M26|M27) case_S1o "$S" "$G"; if [ -z "$WHY" ]; then VERDICT=SURVIVED
+         elif [ "$RC" = 1 ] && has "$CX/err" "an upstream sync changed the password gate or the key dir" && noprompt "$CX"; then VERDICT=CONVICTED; else VERDICT=BROKEN; fi ;;
     M6) case_H1 "$S" "$G"; if [ -z "$WHY" ]; then VERDICT=SURVIVED; elif lacks "$CX/err" "$TERMLINE"; then VERDICT=CONVICTED; else VERDICT=BROKEN; fi ;;
     M13) case_KH1 "$S" "$G"; if [ -z "$WHY" ]; then VERDICT=SURVIVED; elif has "$CX/err" "keys/husky/*.pk8 is MISSING"; then VERDICT=CONVICTED; else VERDICT=BROKEN; fi ;;
     M15) case_PF1 "$S" "$G"; if [ -z "$WHY" ]; then VERDICT=SURVIVED; elif has "$CX/err" "$PROMPT" || grep -q '^ossl ' "$CX/log"; then VERDICT=CONVICTED; else VERDICT=BROKEN; fi ;;
@@ -756,6 +808,28 @@ EOF
 REFUSED=1; why=$(grep -v '^pid [0-9]' "$T/session.err" | tr '\n' ' ' | sed 's/ *$//')
 EOF
 )" 'REFUSED=1; why=""'
+  # NWP-20261205-05: the current GrapheneOS tree's strings, and an older tree's beside them
+  mutant M22 sign "$(cat <<'EOF'
+find "$SHM" -mindepth 1 -maxdepth 1 -user "$MY_UID" \( -name 'generate-release.*' -o -name 'decrypt-keys.*' -o -name 'release_keys.*' -o -name 'decrypt_keys.*' \) -print 2>/dev/null
+EOF
+)" "$(cat <<'EOF'
+find "$SHM" -mindepth 1 -maxdepth 1 -user "$MY_UID" \( -name 'release_keys.*' -o -name 'decrypt_keys.*' \) -print 2>/dev/null
+EOF
+)"
+  mutant M23 sign "$(cat <<'EOF'
+*) refuse - upstream-gate "an upstream sync changed the password gate or the key dir; re-read them before signing (script/decrypt-keys has neither '\"\${password+defined}\" = defined' nor '-v password')"; return ;;
+EOF
+)" '*) ;;'
+  mutant M24 sign "$(cat <<'EOF'
+*) refuse - upstream-gate "an upstream sync changed the password gate or the key dir; re-read them before signing (script/generate-release.sh has neither '/dev/shm/generate-release.' nor '/dev/shm/release_keys.')" ;;
+EOF
+)" '*) ;;'
+  mutant M25 sign "$(cat <<'EOF'
+*'"${password+defined}" = defined'*) ;;
+EOF
+)" '*password*defined*) ;;'
+  mutant M26 sign "*'-v password'*) ;;" ''
+  mutant M27 sign "*'/dev/shm/release_keys.'*) ;;" ''
 }
 
 echo "test-sign-release.sh (shells:$SHELLS)"

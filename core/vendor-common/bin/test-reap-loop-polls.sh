@@ -66,8 +66,11 @@ build_body() {
 cat > "$W/stubs.sh" <<'EOF'
 _TICK=0
 userdir_recheck() { :; }; reap_retry_run() { :; }; reap_retry_add() { :; }; userdir_pending_add() { :; }
+base_retry_add() { :; }; base_retry_run() { BASE_CLEARED=0; BASE_LEFT=0; }   # NWP-20261203-02
 loc_release() { :; }; md_release() { :; }; dt_release() { :; }; dr_release() { :; }; hs_release() { :; }
 ks_reap_clear() { :; }; stop_mediad() { :; }; log_scrub() { :; }; bt_reset() { return 0; }
+reap_pm_census() { RPC_LINE=unread; }   # NWP-20261203-01: test-reap-pm-census.sh runs the real one
+drm_wipe() { DRM_LINE=""; }   # NWP-20261203-08: the DRM store wipe is test-drm-wipe.sh's, not this suite's
 keystore_push() { KS_VERDICT=sealed; }
 sleep() { _TICK=$((_TICK + 1)); echo "$_TICK" > "$ROOT/sim/ticks"; if [ -f "$ROOT/sim/ev.$_TICK" ]; then . "$ROOT/sim/ev.$_TICK"; fi; return 0; }
 getprop() { [ "$1" = sys.system_server.start_count ] && echo 5; return 0; }
@@ -220,9 +223,9 @@ static_pins() {
   if has "$prev" '#' && has "$prev" '(polls + loop) x 0.25 s'; then echo "  ok    pin: the comment above it states (polls + loop) x 0.25 s"
   else echo "  FAIL  pin: the comment above it states (polls + loop) x 0.25 s"; ok=1; fi
   prev=$(printf '%s\n' "$op" | grep 'reap-ledger 2>/dev/null' | grep 'uid=\$uid class=' || true)
-  if has "$prev" ' userdir=$_udf census:$_udc"' && hasnt "$prev" 'loop=' && hasnt "$prev" 'cap='; then
-    echo "  ok    pin: the reap-ledger row is unchanged (userdir=\$_udf census:, no loop= or cap=)"
-  else echo "  FAIL  pin: the reap-ledger row is unchanged"; ok=1; fi
+  if has "$prev" ' userdir=$_udf census:$_udc fw=$_rp_fw pm:$_rp_pm$_kswf"' && hasnt "$prev" 'loop=' && hasnt "$prev" 'cap='; then
+    echo "  ok    pin: the reap-ledger row keeps userdir=\$_udf census:, then fw= and pm: (NWP-20261203-01) and \$_kswf (NWP-20261203-22), no loop= or cap="
+  else echo "  FAIL  pin: the reap-ledger row keeps userdir=\$_udf census:, then fw= and pm: and \$_kswf, no loop= or cap="; ok=1; fi
   return $ok
 }
 

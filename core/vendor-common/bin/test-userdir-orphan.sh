@@ -211,12 +211,15 @@ suite() {  # suite <roamd.sh> [quiet] -> 0 all ok, 1 a case failed, 2 the harnes
       KS_CREDS="$STATE/ks-creds"; KS_EXPORT="$ROOT/ks-export"; KS_MAP="$ROOT/ks-map"; KS_KEEP="$ROOT/ks-keep"; KS_CENSUS="$ROOT/ks-census"
       DE_PARK_ROOT="$STATE/coldde"   # as roamd defines it (checked at extraction)
       stop_mediad() { :; }; bt_reset() { return 0; }; log_scrub() { :; }
+      drm_wipe() { DRM_LINE=""; }   # NWP-20261203-08: the DRM store wipe is test-drm-wipe.sh's, not this suite's
       loc_release() { :; }   # NWP-20261016-45: the location globals are test-locglobals.sh's, not this suite's
       md_release() { :; }    # NWP-20261026-05: mobile data is test-mobiledata's, not this suite's
       dt_release() { :; }    # NWP-20261027-05: the device toggles are test-devtoggles's, not this suite's
       dr_release() { :; }    # NWP-20261028-07: data roaming is test-dataroaming's, not this suite's
       hs_release() { :; }    # NWP-20261028-10: the hotspot is test-hotspot-release's, not this suite's
       ks_reap_clear() { :; } # NWP-20261114-18: the keystore staging clear is test-reap-ks-staging's, not this suite's
+      reap_pm_census() { RPC_LINE=unread; }   # NWP-20261203-01: test-reap-pm-census.sh runs the real one
+      base_retry_add() { :; }; base_retry_run() { BASE_CLEARED=0; BASE_LEFT=0; }   # NWP-20261203-02: test-reap-baseline-retry.sh's
       keystore_push() { if [ -f "$ROOT/sim/kshook" ]; then . "$ROOT/sim/kshook"; fi; KS_VERDICT=sealed; }
       sim_stubs
       eval "$RF"
@@ -235,6 +238,8 @@ suite() {  # suite <roamd.sh> [quiet] -> 0 all ok, 1 a case failed, 2 the harnes
       dr_boot() { DR_BOOT=stub; }     # NWP-20261028-07: the data-roaming suite runs the real one
       hs_release() { HS_VERDICT="OK RELEASED"; }   # NWP-20261028-10: the hotspot suite runs the real one
       bootsweep_plog_line() { BS_PLOG=" stub"; }   # NWP-20261201-36: test-bootsweep-plog.sh runs the real one
+      reap_pm_census() { RPC_LINE=unread; }   # NWP-20261203-01: test-reap-pm-census.sh runs the real one
+      base_retry_add() { :; }; base_retry_run() { BASE_CLEARED=0; BASE_LEFT=0; }   # NWP-20261203-02: test-reap-baseline-retry.sh runs the real ones
       # stat -c %u answers 1000 (system) unless sim/owner says "<path> <uid>". chown, chmod and restorecon fail
       # for a path listed in sim/ownfail, sim/chmodfail and sim/rcfail respectively, and each leaves a line in
       # sim/calls whether or not it fails. (A test host cannot chown, nor relabel.)
@@ -310,7 +315,7 @@ suite() {  # suite <roamd.sh> [quiet] -> 0 all ok, 1 a case failed, 2 the harnes
       _ms() { echo 0; }
       _sum0=0; _sumt=0   # set above the `in` arm in the script (NWP-20261130-08); this harness runs the arm alone under set -u
       for t in stop_mediad usb_host relabel_launcher remap_media_db insert_deferred_media remap_per_pkg _tlog _ssum acct_restore remap_tree reown_ext_appdata \
-               keystore_push keystore_restore ks_signin_reset hold_ondemand od_parked_report reap_stale_ondemand reap_orphan_provisioned restorecon \n               uiderrors_floor_take uiderrors_floor_commit tz_surface sroam_surface; do  # NWP-20261010-06: the report's sign-in floor
+               keystore_push keystore_fetch keystore_restore ks_signin_reset hold_ondemand od_parked_report reap_stale_ondemand reap_orphan_provisioned restorecon \n               uiderrors_floor_take uiderrors_floor_commit tz_surface sroam_surface; do  # NWP-20261010-06: the report's sign-in floor
         eval "$t() { :; }"
       done
       in_scope_tokens() { printf '+de +media'; }   # NWP-20261113-15: the IN line's scope tokens
@@ -738,7 +743,7 @@ suite() {  # suite <roamd.sh> [quiet] -> 0 all ok, 1 a case failed, 2 the harnes
       eqv "$(cat "$R/out11/settings_ssaid.xml" "$R/out11/app_idle_stats.xml" 2>/dev/null)" TARGETTARGET
   chk new "R4a the reap line says link, not atanchor" has "$cl" " userdir=anchor:ok,polls:0,after:0,link "
   chk new "R4a one ledger row, flagged link, with census:none" \
-      eqv "$(rows "$R/data/nowhere/reap-ledger" '^[0-9]* uid=11 class=clean keys=sealed survives: userdir=anchor:ok,polls:0,after:0,link census:none$')" 1
+      eqv "$(rows "$R/data/nowhere/reap-ledger" '^[0-9]* uid=11 class=clean keys=sealed survives: userdir=anchor:ok,polls:0,after:0,link census:none fw=unknown pm:unread$')" 1
   chk new "R4a the ledger names none of the target's files" \
       eqv "$(hasnt "$ldg" settings_ssaid.xml && echo S)$(hasnt "$ldg" app_idle_stats.xml && echo A)" SA
   chk guard "R4a the reply is OK" eqv "$(cat "$R/res" 2>/dev/null)" OK
@@ -752,7 +757,7 @@ suite() {  # suite <roamd.sh> [quiet] -> 0 all ok, 1 a case failed, 2 the harnes
   chk guard "R4b a link rm cannot remove is still there, and its target untouched" \
       eqv "$([ -L "$R/$U/11" ] && echo L)$(cat "$R/out11/settings_ssaid.xml" 2>/dev/null)" LTARGET
   chk new "R4b the ledger row says left,link and remains:link, with census:none" \
-      eqv "$(rows "$R/data/nowhere/reap-ledger" ' userdir=anchor:ok,polls:0,after:0,left,link census:none remains:link$')" 1
+      eqv "$(rows "$R/data/nowhere/reap-ledger" ' userdir=anchor:ok,polls:0,after:0,left,link census:none remains:link fw=unknown pm:unread$')" 1
   chk new "R4b neither the ledger nor roam.log names the target's file" \
       eqv "$(hasnt "$ldg" settings_ssaid.xml && echo D)$(hasnt "$lg" settings_ssaid.xml && echo L)" DL
   command rm -rf "$R"
@@ -1471,7 +1476,7 @@ if [ "$MUTATE" = yes ] && [ "$BASE" = no ]; then
   mutate 'R4: a removed link is not flagged (_ud_link unset)' \
     's@^    _ud_link=1; _ud_left=""; _ud_gone=1; return 0$@    _ud_left=""; _ud_gone=1; return 0@' 'R4a the reap line says link' 'R4a one ledger row'
   mutate 'R4: the ledger forgets a link (the link clause is dropped)' \
-    's@ \|\| \[ -n "\$_ud_link" \]; then$@; then@' 'R4a one ledger row'
+    's@ \|\| \[ -n "\$_ud_link" \] \|\| \[ "\$_rp_fw" = restart \]@ || [ "$_rp_fw" = restart ]@' 'R4a one ledger row'
   mutate 'R4: the remains: census follows a link the rm left' \
     's@if \[ -L "/data/system/users/\$uid" \]; then _udc="\$_udc remains:link"; else @if false; then :; else @' \
     'R4b the ledger row says' 'R4b neither the ledger'

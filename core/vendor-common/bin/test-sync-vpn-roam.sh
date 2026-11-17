@@ -33,6 +33,9 @@
 # sees no mark. The -e capture guards read a directory as present, so no case asserts on a capture. Each site's bare
 # ': >' form is a mutant that must be convicted under every shell.
 #
+# NWP-20261202-39: ready_cases, under every shell found, each line tagged [<sh>]: vpn_apply's readiness gate (F1-F4).
+# Its mutants M1-M4 print one verdict per shell and are convicted only by the cases each one names.
+#
 #   bash test-sync-vpn-roam.sh                      # the cases
 #   bash test-sync-vpn-roam.sh --mutate             # ... plus mutations that must each CONVICT the suite
 #   MUTJOBS=8 bash test-sync-vpn-roam.sh --mutate   # the same, 8 mutants at a time; verdicts print in order
@@ -103,7 +106,7 @@ print() { local nl=1; while [ $# -gt 0 ]; do case "$1" in -rn|-nr) nl=0; shift ;
 EOS
 )
 
-FN_NAMES="vpn_seal_capture vpn_choice vpn_apply vpn_apply_choice vpn_pick_consume vpn_deferred_retry sync_capture_valid sync_answer sync_fp sync_run
+FN_NAMES="vpn_seal_capture vpn_choice vpn_diag_note vpn_apply vpn_apply_choice vpn_pick_consume vpn_deferred_retry sync_capture_valid sync_answer sync_fp sync_run
   sync_take_pend sync_keep_lines sync_apply_once sync_apply sync_apply_retry sync_seal_capture qn"
 extract_fns() {  # $1 = script -> the functions, or failure
   local f="$1" out n prog="/^VPN_APPLY_TRIES=/p; /^SYNC_TIMEOUT=/p; /^SYNC_APPLY_TRIES=/p;"
@@ -289,9 +292,7 @@ vpn_choice '$FILES/nowhere-vpn-pick' '$FILES/nowhere-vpn' '$FILES/nowhere-prefs'
   [ "$(cat "$T/apargs" 2>/dev/null)" = "10 com.r defer" ] && ok "vpnup: the first sign-in after this ships applies the old pref, armed at first connect" || no "vpnup: legacy pref -> '$(cat "$T/apargs" 2>/dev/null)'"
   done_fx
 
-  fresh; rm -f "$FILES/nowhere-prefs"; printf 'app=com.x\nlockdown=1\n' > "$FILES/nowhere-vpn"; vpnup
-  [ "$(cat "$T/res")" = NOTREADY ] && [ ! -e "$T/apargs" ] && ok "vpnup: CE dir not restored -> NOTREADY" || no "vpnup: ran before the restore"
-  done_fx
+  # NWP-20261202-39: the readiness gate's cases F1-F4 run under every shell, in ready_cases.
   fresh; printf 'app=com.x\nlockdown=1\n' > "$FILES/nowhere-vpn"; vpnup
   [ "$(cat "$T/res")" = NOTREADY ] && [ ! -e "$T/apargs" ] && ok "vpnup: VPN app not provisioned -> NOTREADY" || no "vpnup: ran before the app existed"
   done_fx
@@ -846,11 +847,71 @@ $(printf '%s\n' "$GBLK" | sed "s#/data/#$T/data/#g")"
   [ "$x" = 0 ]
 }
 
+# ready_cases <script> <shell> [quiet] -> 0 iff vpn_apply's readiness gate behaved under that shell (NWP-20261202-39,
+# the row "A profile created with no VPN logs vpnup ... gave up after 45 tries"). vpnup runs only after `in` answered
+# OK, and nowhere-prefs is first written at a profile's first sign-out or pref change, so only the chooser CE dir is a
+# readiness gate. F1/F2 failed on main (NOTREADY); F3/F4 pin the NOTREADY cases main already had. Each line is tagged
+# [<sh>] and names its case; bash runs as bash --posix, as in trunc_cases. Every name it assigns is local.
+ready_cases() {
+  local f="$1" sh="$2" quiet="${3:-}" psh p=0 x=0 FNS VPNUP T U FILES
+  psh="$sh"; [ "$sh" = bash ] && psh="bash --posix"
+  ok(){ p=$((p+1)); [ -n "$quiet" ] || printf '  ok    [%s] %s\n' "$sh" "$1"; }
+  no(){ x=$((x+1)); printf '  FAIL  [%s] %s\n' "$sh" "$1"; }   # also in quiet mode: verdict reads the case ids
+
+  FNS=$(extract_fns "$f") || { no "EXTRACTION FAILED -- a sync/vpn function moved in $f"; return 1; }
+  VPNUP=$(arm "$f" vpnup)
+  has vpn_apply "$VPNUP" || { no "EXTRACTION FAILED -- the vpnup arm"; return 1; }
+  rfresh() {
+    T=$(mktemp -d -p "$W") || exit 2; U="$T/data/user/10"; FILES="$U/com.nowhere.chooser/files"
+    mkdir -p "$FILES" "$T/state" "$T/live" "$T/fw"
+    : > "$T/fw/nowhere-vpnao.jar"; : > "$T/fw/nowhere-syncroam.jar"
+    printf 'tz=\nlocale=en-US\n' > "$FILES/nowhere-prefs"
+  }
+  # rvpnup: as suite's vpnup, under $psh. $psh is unquoted on purpose: for bash it is two words, "bash --posix".
+  rvpnup() {
+    T="$T" U="$U" LOG="$T/log" STATE="$T/state" RES="$T/res" SYNC_USER_ROOT="$T/data/user" VPN_USER_ROOT="$T/data/user" \
+      SYNC_FP_ROOT="$T/data" NOWHERE_VPN_JAR="$T/fw/nowhere-vpnao.jar" NOWHERE_SYNC_JAR="$T/fw/nowhere-syncroam.jar" \
+      APMODE=ok SETFAIL=0 SYNCOUT="" SYNCRC=0 TIMEOUTRC="" PICKWRITE="" \
+      $psh -c "name='$PROF'; uid=10; USERDIR='$U'
+$STUBS
+$FNS
+$VPNUP" >/dev/null 2>&1
+  }
+  rres() { cat "$T/res" 2>/dev/null; }
+  rlogged() { grep -qF -- "$1" "$T/log" 2>/dev/null; }
+
+  rfresh; rm -f "$FILES/nowhere-prefs"; rvpnup
+  if [ "$(rres)" = "OK NONE" ] && [ -e "$T/state/.vpnapplied.10" ] && [ ! -e "$T/apargs" ] && rlogged 'none for user 10 (from none)'; then
+    ok "F1 a new profile (no nowhere-prefs, no VPN) -> OK NONE at its first try, marked, nothing called"
+  else no "F1 a new profile answered '$(rres)', marker $([ -e "$T/state/.vpnapplied.10" ] && echo set || echo absent)"; fi
+  rm -rf "$T"
+  rfresh; rm -f "$FILES/nowhere-prefs"; mkdir -p "$U/com.r"; printf 'app=com.r\nlockdown=0\n' > "$FILES/nowhere-vpn-pick"; rvpnup
+  if [ "$(rres)" = "OK APPLIED" ] && [ "$(cat "$T/apargs" 2>/dev/null)" = "10 com.r 0" ] && [ ! -e "$FILES/nowhere-vpn-pick" ]; then
+    ok "F2 a pick with no nowhere-prefs is applied and consumed"
+  else no "F2 a pick with no nowhere-prefs answered '$(rres)' / '$(cat "$T/apargs" 2>/dev/null)'"; fi
+  rm -rf "$T"
+  rfresh; rm -rf "$U/com.nowhere.chooser"; rvpnup
+  if [ "$(rres)" = NOTREADY ] && [ ! -e "$T/apargs" ] && [ ! -e "$T/state/.vpnapplied.10" ] && ! rlogged 'none for user 10'; then
+    ok "F3 the user's chooser CE dir absent -> NOTREADY, no marker, nothing called"
+  else no "F3 ran without the chooser CE dir ('$(rres)')"; fi
+  rm -rf "$T"
+  rfresh; printf 'tz=\n' > "$FILES/nowhere-prefs"; rvpnup
+  if [ "$(rres)" = NOTREADY ] && [ ! -e "$T/state/.vpnapplied.10" ] && [ ! -e "$T/apargs" ]; then
+    ok "F4 an existing nowhere-prefs with no locale= line -> NOTREADY, no marker"
+  else no "F4 a malformed nowhere-prefs answered '$(rres)'"; fi
+  rm -rf "$T"
+
+  [ -n "$quiet" ] || printf '  [%s] (%d ok, %d failed)\n' "$sh" "$p" "$x"
+  [ "$x" = 0 ]
+}
+
 echo "== as committed =="
 suite "$SUT"; RC=$?
 for s in $SHELLS; do
   echo "== truncation failure branches as committed [$s] =="
   trunc_cases "$SUT" "$s" || RC=1
+  echo "== vpnup readiness gate as committed [$s] =="
+  ready_cases "$SUT" "$s" || RC=1
 done
 [ "$MUTATE" = no ] && { echo; [ "$RC" = 0 ] && echo "suite passed" || echo "suite FAILED"; exit $RC; }
 [ "$RC" = 0 ] || { echo; echo "suite already failing -- fix that before mutating"; exit $RC; }
@@ -865,12 +926,24 @@ apply_mut() {  # $1 dest, $2.. sed args
   ! cmp -s "$d" "$SUT"
 }
 # verdict <mutant|control|trunc> <label> <sed args...> -> one line, or one line per shell for trunc (judged by
-# trunc_cases). A mutant or a trunc mutant must be CONVICTED; a control must SURVIVE.
+# trunc_cases). verdict ready <label> <case ids> <sed args...> -> one line per shell, judged by ready_cases: CONVICTED
+# only when every named case fails under that shell, and the line names the failing cases. A mutant, a trunc mutant
+# and a ready mutant must be CONVICTED; a control must SURVIVE.
 verdict() {
-  local kind="$1" l="$2" m tag="" sh; shift 2; m=$(mktemp -p "$W") || exit 2
+  local kind="$1" l="$2" m tag="" sh ids="" out got id miss; shift 2; m=$(mktemp -p "$W") || exit 2
+  [ "$kind" = ready ] && { ids="$1"; shift; }
   [ "$kind" = control ] && tag="CONTROL: "
   if ! apply_mut "$m" "$@"; then
     printf '  ⚠ NOT APPLIED  %s%s -- sed failed or changed nothing; NOT a conviction\n' "$tag" "$l"; rm -f "$m"; return
+  fi
+  if [ "$kind" = ready ]; then
+    for sh in $SHELLS; do
+      out=$(ready_cases "$m" "$sh" quiet); got=$(sed -n 's/^  FAIL  \[[^]]*\] \(F[0-9]\) .*/\1/p' <<<"$out" | tr '\n' ' ')
+      miss=""; for id in $ids; do case " $got" in *" $id "*) ;; *) miss="$miss $id" ;; esac; done
+      if [ -z "$miss" ]; then printf '  convicted   %s [%s] by %s\n' "$l" "$sh" "${got% }"
+      else printf '  ⚠ SURVIVED  %s [%s] -- not convicted by%s (failed: %s)\n' "$l" "$sh" "$miss" "${got:-none}"; fi
+    done
+    rm -f "$m"; return
   fi
   if [ "$kind" = trunc ]; then
     for sh in $SHELLS; do
@@ -890,7 +963,7 @@ verdict() {
 MN=0; EXP=0; MTMP=$(mktemp -d -p "$W") || exit 2
 queue() {
   MN=$((MN + 1))
-  if [ "$1" = trunc ]; then EXP=$((EXP + NSH)); else EXP=$((EXP + 1)); fi
+  case "$1" in trunc|ready) EXP=$((EXP + NSH)) ;; *) EXP=$((EXP + 1)) ;; esac
   if [ "${MUTJOBS:-1}" -gt 1 ]; then
     while [ "$(jobs -rp | wc -l)" -ge "$MUTJOBS" ]; do command sleep 0.2; done
     verdict "$@" > "$MTMP/$MN.res" &
@@ -901,6 +974,7 @@ queue() {
 mutant() { queue mutant "$@"; }
 control() { queue control "$@"; }
 truncmut() { queue trunc "$@"; }
+readymut() { queue ready "$@"; }
 mutant "grant applies sync BEFORE acct_reload" \
   -e '/^      sync_apply "\$uid"   # NWP-20261010-15: STRICTLY after acct_reload/d' \
   -e 's/^      acct_reload "\$uid"$/      sync_apply "$uid"\n      acct_reload "$uid"/'
@@ -1054,6 +1128,15 @@ mutant "the staging status is ignored (S-W3: the helper runs)" \
   -e '/^sync_seal_capture() {$/,/^}$/s/^  if \[ "\$_rc" != 0 \]; then$/  if false; then/'
 mutant "a count of 0 keeps the record (S-W4)" \
   -e '/^sync_take_pend() {$/,/^}$/s/^    rm -f "\$_bd\/nowhere-sync-pending.tmp" "\$_bd\/nowhere-sync-pending" 2>\/dev\/null$/    rm -f "$_bd\/nowhere-sync-pending.tmp" 2>\/dev\/null/'
+# NWP-20261202-39: vpn_apply's readiness gate (F1-F4), under every shell; each must fail the cases it names.
+readymut "M1 the old gate: an absent nowhere-prefs is NOTREADY again (F1, F2)" "F1 F2" \
+  -e '/^vpn_apply() {$/,/^}$/s/^  if \[ -f "\$_vf\/nowhere-prefs" \] && ! grep -q "^locale="/  if [ ! -f "$_vf\/nowhere-prefs" ] || ! grep -q "^locale="/'
+readymut "M2 the chooser CE dir test is removed (F3)" "F3" \
+  -e '/^vpn_apply() {$/,/^}$/s/^  \[ -d "\$_ud\/com.nowhere.chooser" \] || { printf .NOTREADY.; return 0; }/  :/'
+readymut "M3 an existing nowhere-prefs with no locale= line is accepted (F4)" "F4" \
+  -e '/^vpn_apply() {$/,/^}$/s/^  if \[ -f "\$_vf\/nowhere-prefs" \] && ! grep -q "^locale=" "\$_vf\/nowhere-prefs" 2>\/dev\/null; then$/  if false; then/'
+readymut "M4 OK NONE no longer marks .vpnapplied (F1)" "F1" \
+  -e '/^vpn_apply() {$/,/^}$/{/^  if \[ -z "\$_pkg" \]; then$/,/printf .OK NONE./{/^    ( : > "\$STATE\/.vpnapplied.\$_uid" ) 2>>"\$LOG"$/d;}}'
 # NWP-20261121-13: one site's subshell reverted to the bare ': >', scoped to its function or arm and to that line.
 truncmut "V1 vpn_apply's NONE .vpnapplied truncation is bare again" \
   -e '/^vpn_apply() {$/,/^}$/{/^  if \[ -z "\$_pkg" \]; then$/,/printf .OK NONE./s#( : > \("[^"]*"\) ) 2>>"\$LOG"#: > \1 2>>"$LOG"#;}'

@@ -3,13 +3,14 @@ package main
 import (
 	"net/http"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 
 	"net"
 )
 
-// NWP-20261101-10 (Q122): a create that fails after CREATE-CODE drained the code answers "<verb> STAGED" while the
+// NWP-20261101-10 (Q122): a create that fails after CREATE-CODE staged the code answers "<verb> STAGED" while the
 // claim sits staged for the asker's own name and passphrase, so the gate can say the credit is held until a restart.
 // Without a staged claim the reply is the bare verb, as before.
 
@@ -21,10 +22,14 @@ func TestCreateStagedReplyFailureAfterTheDrainSaysStaged(t *testing.T) {
 	refuseLeasesOf(csrName, csrPass, http.StatusInternalServerError)
 	got := verb(func(c net.Conn) { handleCreateCode(c, dest, csrName, csrPass, "PAIDCODEPAIDCODEPAIDCODE") })
 	if got != "BLANK STAGED" && got != "NOCREDIT STAGED" {
-		t.Fatalf("a create that failed after the drain replied %q, want BLANK STAGED or NOCREDIT STAGED", got)
+		t.Fatalf("a create that failed after the staging replied %q, want BLANK STAGED or NOCREDIT STAGED", got)
 	}
 	if _, err := os.Stat(createStagingPath(csrName, csrPass)); err != nil {
 		t.Fatalf("the reply says STAGED but no claim is staged: %v", err)
+	}
+	// NWP-20261207-01 (h53 #6): what is staged is the code itself, as a pending claim.
+	if w, err := loadWallet(createStagingPath(csrName, csrPass)); err != nil || !slices.Equal(w.PendingClaims, []string{"PAIDCODEPAIDCODEPAIDCODE"}) {
+		t.Fatalf("the staged claim does not hold the code as its one pending claim (err %v)", err)
 	}
 	// The retry with the same credential still creates with it: the reply changed nothing it relies on.
 	capStoreLeaseStatus = nil

@@ -43,7 +43,7 @@ PY
   fi
 }
 mut "E1 manifestBlobsStrict swallows a fetch panic" 'err = errManifestUnreadable\n' '_ = errManifestUnreadable\n'
-mut "E2 the keep set skips History" 'for _, h := range kept\.History \{(?=\n\t\t\tif err)' 'for _, h := range []headSnap{} {'
+mut "E2 the keep set skips History" 'for _, h := range kept\.History \{(?=\n\t\tif err)' 'for _, h := range []headSnap{} {'
 mut "E3 Deferred chunks ignored" 'for _, d := range m\.Deferred \{' 'for _, d := range map[string]deferredFile{} {'
 mut "E4 the batch size is 4097" 'releaseBatchMax = 4096' 'releaseBatchMax = 4097'
 mut "E5 blobCacheEvict leaves the in-memory set" 'delete\(blobCache, h\)' '_ = h'

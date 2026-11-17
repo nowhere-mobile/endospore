@@ -6,7 +6,8 @@
 # to two hours while audio plays) behind ChooserActivity.sHoldLockForAudio, a constant true that nothing set. So a
 # Hardened, Isolated or Zero profile, whose preset says the audio wait is Off (docs/product-decisions.md 2026-11-01,
 # "before the idle cold lock, a session can wait for app installs and for audio playing ..."), still kept the phone
-# decrypted past standby while music played, and no user could turn the hold off. Now showIdlePicker has the box,
+# decrypted past standby while music played, and no user could turn the hold off. Now showIdlePicker has the box
+# (StandbySheets.boxes; since NWP-20261206-04 it saves on its toggle through saveStandby),
 # setPref/prefsText write holdaudio=0 when it is Off (absent = On), sendLivePrefs carries it to PrefsLiveReceiver, and
 # applyRoamedPrefs (sign-in) and applyLivePrefs (a live Save) set sHoldLockForAudio from RoamedPrefs.parse. Drop one
 # link and the box says Off while the gate still holds, with green CI.
@@ -40,6 +41,7 @@ CH="$SRC/ChooserActivity.java"
 RV="$SRC/PrefsLiveReceiver.java"
 PP="$SRC/PresetPicker.java"
 PPS="$SRC/ProfilePresets.java"
+SS="$SRC/StandbySheets.java"
 CASES="$root/core/chooser/tests/audio-hold-pref/AudioHoldPrefCases.java"
 HOST_JDK=/mnt/build/lineage/prebuilts/jdk/jdk21/linux-x86/bin
 
@@ -53,7 +55,7 @@ else
   exit 2
 fi
 "$JAVAC" -version || { echo "FAIL: $JAVAC does not run" >&2; exit 2; }
-for f in "$CASES" "$RP" "$PA" "$CH" "$RV" "$PP" "$PPS" "$SRC/WipeOnSave.java" "$SRC/WipeChoice.java" \
+for f in "$CASES" "$RP" "$PA" "$CH" "$RV" "$PP" "$PPS" "$SS" "$SRC/WipeOnSave.java" "$SRC/WipeChoice.java" \
          "$SRC/SettingsText.java" "$SRC/MobileData.java"; do
   [ -f "$f" ] || { echo "FAIL: missing $f" >&2; exit 2; }
 done
@@ -130,15 +132,17 @@ lifted() {
   return 0
 }
 
-# pins <PrefsLiveReceiver> <ChooserActivity> <ProfileActivity> -> 0 when the wiring holds, 1 otherwise.
+# pins <PrefsLiveReceiver> <ChooserActivity> <ProfileActivity> <StandbySheets> -> 0 when the wiring holds, 1 otherwise.
 pins() {
-  local rv="$1" ch="$2" pa="$3" bad=0 rcv alp arp sip slp g n arm s l
+  local rv="$1" ch="$2" pa="$3" ss="$4" bad=0 rcv alp arp sip ssb sst slp g n arm s l
   rcv=$(code "$rv")
   alp=$(mbody "$ch" 'static void applyLivePrefs\(')
   arp=$(mbody "$ch" 'private void applyRoamedPrefs\(')
   sip=$(mbody "$pa" 'private void showIdlePicker\(')
+  ssb=$(mbody "$pa" 'private void saveStandby\(')
+  sst=$(code "$ss")
   slp=$(mbody "$pa" 'private boolean sendLivePrefs\(')
-  for n in alp arp sip slp; do [ -n "${!n}" ] || { echo "  FAIL  pins: $n body not found" >&2; bad=1; }; done
+  for n in alp arp sip ssb sst slp; do [ -n "${!n}" ] || { echo "  FAIL  pins: $n body not found" >&2; bad=1; }; done
   # S1: the receiver names the extra and reads it once.
   [ "$(count "$rcv" 'EXTRA_HOLDAUDIO = "nowhere\.prefs\.holdaudio"')" -eq 1 ] \
     && [ "$(count "$rcv" 'intent\.getStringExtra\(EXTRA_HOLDAUDIO\)')" -eq 1 ] \
@@ -156,17 +160,26 @@ pins() {
     && [ "$(count "$arp" 'RoamedPrefs\.parse\(idle, wipe, wipesaved, holdlock, holdaudio, ')" -eq 1 ] \
     && [ "$(count "$arp" 'sHoldLockForAudio = rp\.holdAudio;')" -eq 1 ] \
     || { echo "  FAIL  S3 applyRoamedPrefs does not read holdaudio= into sHoldLockForAudio through RoamedPrefs.parse" >&2; bad=1; }
-  # S4: the picker: the heading, both boxes, the default, one guard call with both keys, three writes, one send.
-  for s in '"Before standby, wait for:"' 'holdBox\.setText\("app installs"\);' 'audioBox\.setText\("audio playing"\);' \
-           '^ *audioBox\.setChecked\(!"0"\.equals\(readPrefValue\("holdaudio"\)\)\);$' \
-           '^ *"holdaudio", audioBox\.isChecked\(\) \? "" : "0"\), \(\) -> \{$' \
-           '^ *final boolean audioOk = setPref\("holdaudio", audioBox\.isChecked\(\) \? "" : "0"\);$' \
-           '^ *if \(idleOk && holdOk && audioOk\) live = sendLivePrefs\(\);$' \
-           'holdWrap\.addView\(audioBox, '; do
+  # S4: the picker: the heading, both boxes, the default, each box saved on its toggle through one guard call with its
+  # own key, one write, one send only when it landed.
+  for s in '^ *static final String WAIT_HEAD = "Before standby, wait for:";$' \
+           '^ *static final String\[\] BOX_KEYS = \{ "holdlock", "holdaudio" \};$' \
+           '^ *static final String\[\] BOX_LABELS = \{ "app installs", "audio playing" \};$' \
+           '!"0"\.equals\(holdlock\), !"0"\.equals\(holdaudio\)\)\);$' \
+           '^ *return on \? "" : "0";$'; do
+    [ "$(count "$sst" "$s")" -eq 1 ] || { echo "  FAIL  S4 StandbySheets does not hold exactly one '$s'" >&2; bad=1; }
+  done
+  for s in 'SheetDialog\.pickerWithBoxes\(' \
+           'StandbySheets\.boxes\(readPrefValue\("holdlock"\), readPrefValue\("holdaudio"\)\)' \
+           'saveStandby\(StandbySheets\.BOX_KEYS\[i\], StandbySheets\.boxValue\(on\), '; do
     [ "$(count "$sip" "$s")" -eq 1 ] || { echo "  FAIL  S4 showIdlePicker does not hold exactly one '$s'" >&2; bad=1; }
   done
-  [ "$(count "$sip" 'PresetPicker\.change\(')" -eq 1 ] \
-    || { echo "  FAIL  S4 showIdlePicker does not save through one PresetPicker.change call" >&2; bad=1; }
+  for s in '^ *presetGuard\(PresetPicker\.change\(key, value\), \(\) -> \{$' 'setPref\(key, value\)' \
+           '^ *if \(ok\) live = sendLivePrefs\(\);$' 'sendLivePrefs\('; do
+    [ "$(count "$ssb" "$s")" -eq 1 ] || { echo "  FAIL  S4 saveStandby does not hold exactly one '$s'" >&2; bad=1; }
+  done
+  [ "$(count "$ssb" 'PresetPicker\.change\(')" -eq 1 ] \
+    || { echo "  FAIL  S4 saveStandby does not save through one PresetPicker.change call" >&2; bad=1; }
   # S5: the live send carries the value nowhere-prefs holds.
   [ "$(count "$slp" 'EXTRA_HOLDAUDIO, readPrefValue\("holdaudio"\)')" -eq 1 ] \
     || { echo "  FAIL  S5 sendLivePrefs does not carry EXTRA_HOLDAUDIO, readPrefValue(\"holdaudio\")" >&2; bad=1; }
@@ -177,9 +190,9 @@ pins() {
 }
 
 # suite <RoamedPrefs> <ProfileActivity> <ChooserActivity> <PrefsLiveReceiver> <PresetPicker> <ProfilePresets>
-#   -> 0 pass, 1 a case or pin failed, 2 extraction failed, 3 did not compile.
+#   <StandbySheets> -> 0 pass, 1 a case or pin failed, 2 extraction failed, 3 did not compile.
 suite() {
-  local rp="$1" pa="$2" ch="$3" rv="$4" pp="$5" pps="$6" d o out rc
+  local rp="$1" pa="$2" ch="$3" rv="$4" pp="$5" pps="$6" ss="$7" d o out rc
   d=$(mktemp -d -p "$W") || return 3
   o="$d/src/com/nowhere/chooser"
   mkdir -p "$o"
@@ -192,18 +205,18 @@ suite() {
   echo "$out"
   rm -rf "$d"
   [ "$rc" -eq 0 ] || return 1
-  pins "$rv" "$ch" "$pa"
+  pins "$rv" "$ch" "$pa" "$ss"
 }
 
 echo "== holdaudio= ($SRC)"
-suite "$RP" "$PA" "$CH" "$RV" "$PP" "$PPS" || { echo "FAILED"; exit 1; }
+suite "$RP" "$PA" "$CH" "$RV" "$PP" "$PPS" "$SS" || { echo "FAILED"; exit 1; }
 echo "pins: ok"
 [ "$MUTATE" = yes ] || exit 0
 
 command -v perl >/dev/null 2>&1 || { echo "FAIL: --mutate needs perl, and there is none -- refusing to report" >&2; exit 1; }
 echo "== mutations (each must be CONVICTED -- a mutant that does not apply, extract or compile proves nothing)"
-mut() { # mut <label> <RP|PA|CH|RV|PP|PPS> <perl-expr>
-  local d c rc orig why rp="$RP" pa="$PA" ch="$CH" rv="$RV" pp="$PP" pps="$PPS"
+mut() { # mut <label> <RP|PA|CH|RV|PP|PPS|SS> <perl-expr>
+  local d c rc orig why rp="$RP" pa="$PA" ch="$CH" rv="$RV" pp="$PP" pps="$PPS" ss="$SS"
   d=$(mktemp -d -p "$W") || return 1
   case "$2" in
     RP) orig="$RP"; c="$d/RoamedPrefs.java"; rp="$c" ;;
@@ -212,12 +225,13 @@ mut() { # mut <label> <RP|PA|CH|RV|PP|PPS> <perl-expr>
     RV) orig="$RV"; c="$d/PrefsLiveReceiver.java"; rv="$c" ;;
     PP) orig="$PP"; c="$d/PresetPicker.java"; pp="$c" ;;
     PPS) orig="$PPS"; c="$d/ProfilePresets.java"; pps="$c" ;;
+    SS) orig="$SS"; c="$d/StandbySheets.java"; ss="$c" ;;
     *) echo "  ERROR     $1 -- unknown file $2"; rm -rf "$d"; return 1 ;;
   esac
   cp "$orig" "$c"
   if ! perl -0pi -e "$3" "$c"; then echo "  ERROR     $1 -- perl failed on the mutation"; rm -rf "$d"; return 1; fi
   if cmp -s "$orig" "$c"; then echo "  INERT     $1 -- the mutation changed nothing"; rm -rf "$d"; return 1; fi
-  why=$(suite "$rp" "$pa" "$ch" "$rv" "$pp" "$pps" 2>&1); rc=$?
+  why=$(suite "$rp" "$pa" "$ch" "$rv" "$pp" "$pps" "$ss" 2>&1); rc=$?
   rm -rf "$d"
   case "$rc" in
     1) echo "  CONVICTED $1 --$(printf '%s\n' "$why" | grep -m1 'FAIL' | sed 's/^ *FAIL//')"; return 0 ;;
@@ -234,9 +248,9 @@ mut "U5 PresetPicker does not read the key" PP 's/(else if \(k\.equals\("holdaud
 mut "U6 applyLivePrefs does not set sHoldLockForAudio" CH 's/\n *sHoldLockForAudio = v\.holdAudio;//' || fails=$((fails+1))
 mut "U7 applyRoamedPrefs does not set sHoldLockForAudio" CH 's/\n *sHoldLockForAudio = rp\.holdAudio;//' || fails=$((fails+1))
 mut "U8 applyRoamedPrefs does not read holdaudio=" CH 's/\n *else if \(l\.startsWith\("holdaudio="\)\) holdaudio = l\.substring\(10\)\.trim\(\);//' || fails=$((fails+1))
-mut "U9 the idle Save sends without the audio write" PA 's/if \(idleOk && holdOk && audioOk\) live = sendLivePrefs\(\);/if (idleOk \&\& holdOk) live = sendLivePrefs();/' || fails=$((fails+1))
+mut "U9 a toggle sends without its write landing" PA 's/if \(ok\) live = sendLivePrefs\(\);/live = sendLivePrefs();/' || fails=$((fails+1))
 mut "U10 sendLivePrefs drops the extra" PA 's/\n *\.putExtra\(PrefsLiveReceiver\.EXTRA_HOLDAUDIO, readPrefValue\("holdaudio"\)\)//' || fails=$((fails+1))
-mut "U11 the box starts Off" PA 's/audioBox\.setChecked\(!"0"\.equals\(readPrefValue\("holdaudio"\)\)\);/audioBox.setChecked("1".equals(readPrefValue("holdaudio")));/' || fails=$((fails+1))
-mut "U12 the Save writes the box inverted" PA 's/(final boolean audioOk = setPref\("holdaudio", audioBox\.isChecked\(\) \? )"" : "0"\);/$1"0" : "");/' || fails=$((fails+1))
+mut "U11 the box starts Off" SS 's/!"0"\.equals\(holdaudio\)/"1".equals(holdaudio)/' || fails=$((fails+1))
+mut "U12 a toggle writes the box inverted" SS 's/return on \? "" : "0";/return on ? "0" : "";/' || fails=$((fails+1))
 mut "U13 PresetPicker routes holdaudio to no file" PP 's/ \|\| key\.equals\("holdaudio"\)//' || fails=$((fails+1))
 [ "$fails" -eq 0 ] && echo "PASS: 13 of 13 mutants convicted" || { echo "== $fails mutant(s) not convicted"; exit 1; }

@@ -1,0 +1,8 @@
+version 0.5.58
+previous 0.5.57
+- Photos and videos still waiting to download now show in Gallery a minute or two after sign-in.
+- Confirmations and warnings open as one new sheet style: amber for a caution, red when something is erased.
+- Auto apps install more reliably after sign-in, and a notice with Try again says when some could not be fetched.
+- If your last save left something unsaved, a card after sign-in now says so.
+- Sign-out removes offline video licences left on the phone, so streaming apps may ask you to download again.
+- A call back from an emergency number now rings even after someone has signed in.

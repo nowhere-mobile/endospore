@@ -12,10 +12,12 @@ final class BindingsRepair {
     static final String ROW_SUMMARY = "Keep the bindings that can be read, drop the damaged ones";
     static final String TITLE = "Repair SIM bindings?";
 
-    /** What a repair does, said before it runs. */
-    static final String CONFIRM = "Repair keeps every SIM binding this phone can still read and drops the damaged ones. "
-            + "Afterwards, a SIM with no binding is not this phone's own line until you mark it so, and its texts and "
-            + "calls can't be kept until it is bound or marked.";
+    /** What a repair does, said before it runs: the sheet's context sentence, then its one "what happens" line
+     *  (GateNoticeSheets.repairBindings). CONFIRM is the two joined, the text the dialog said before the sheet. */
+    static final String CONFIRM_CONTEXT = "Repair keeps every SIM binding this phone can still read and drops the damaged ones.";
+    static final String CONFIRM_AFTER = "Afterwards, a SIM with no binding is not this phone's own line until you mark it so, and "
+            + "its texts and calls can't be kept until it is bound or marked.";
+    static final String CONFIRM = CONFIRM_CONTEXT + " " + CONFIRM_AFTER;
 
     static final String REPAIRED = "SIM bindings repaired: the damaged ones were dropped. Bind again any SIM that lost its binding.";
     static final String REPLACED = "SIM bindings replaced: bind each SIM again.";

@@ -88,7 +88,9 @@ final class OdDataBarrierHost implements OdDataBarrier.Seam {
             try {
                 String r = "";
                 try {
-                    r = DaemonSocket.roundTrip("RESTORE-ODDATA\n" + pkg + "\n", 130000).trim();
+                    // NWP-20261202-38: sendShared, never send -- this retry runs only while the data is out, so a
+                    // landed OK must not stop it; it only shares a restore of this app already in flight
+                    r = OdRestoreOnce.sendShared(pkg, UnarchiveService.installStamp(ctx, pkg), () -> DaemonSocket.roundTrip("RESTORE-ODDATA\n" + pkg + "\n", 130000), m -> Log.i(TAG, m));
                 } catch (Throwable t) {
                     Log.w(TAG, "od-barrier retry " + pkg, t);
                 }

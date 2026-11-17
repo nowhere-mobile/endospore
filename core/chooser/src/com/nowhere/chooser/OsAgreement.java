@@ -75,6 +75,24 @@ final class OsAgreement {
         return showsDraftMark() ? ACK + "\n" + DRAFT_MARK : ACK;
     }
 
+    // ---- SAVE (NWP-20261204-09) ----------------------------------------------------------------------------------
+    // docs/product-decisions.md, 2026-11-10, "three answers to harvest 63: a claim lapses after 60 minutes, the
+    // lost-passphrase acknowledgement also guards Profile's save, and a "None" default app roams in a later slice",
+    // answer 2: Profile's save ceremony asks for the same acknowledgement (ACK) before a device-local profile is saved
+    // to the store (PROMOTE2), with the same DRAFT text and behind the same one gate (PRODUCTION_APPROVED). One rule:
+    // saveStep is createStep, with its codes. No second flip. Nothing about the acknowledgement is recorded, sent or
+    // logged.
+
+    /** What a Save tap does: {@link #createStep}'s rule and its CREATE_WAIT / CREATE_ASK / CREATE_GO codes. */
+    static int saveStep(String gateReply, boolean acknowledged) {
+        return createStep(gateReply, acknowledged);
+    }
+
+    /** True when the save ceremony shows the acknowledgement box: the gate shows the text. */
+    static boolean saveAckShown(String gateReply) {
+        return shouldShow(gateReply);
+    }
+
     // ---- THE TEXT (DRAFT) ----------------------------------------------------------------------------------------
     static final String TITLE = "Before you set up this phone";
 
@@ -113,4 +131,10 @@ final class OsAgreement {
 
     /** Create refused: the gate is not read yet (DRAFT). */
     static final String CREATE_WAIT_TEXT = "one moment, then tap Create profile again";
+
+    /** Save refused: the box is not ticked (DRAFT). */
+    static final String SAVE_ACK_NEED = "tick the box to confirm you understand, then tap Save";
+
+    /** Save refused: the gate is not read yet (DRAFT). */
+    static final String SAVE_WAIT_TEXT = "one moment, then tap Save again";
 }

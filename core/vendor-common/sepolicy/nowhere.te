@@ -127,6 +127,18 @@ allow endospore_priv nowhere_data_file:file relabelfrom;
 allow nowhere system_file:dir r_dir_perms;
 allow nowhere system_file:file r_file_perms;
 
+# /data/anr, READ ONLY (NWP-20261205-11; backlog: "The login daemon's SELinux domain has no rule on
+# `anr_data_file`, so on an enforcing build the session's `/data/anr` snapshot is never taken and no issue report
+# carries an anr section"; docs/product-decisions.md 2026-11-14, F12). The login daemon (u:r:nowhere:s0) lists
+# /data/anr at sign-in (recordAnrSeen in core/agent/report_issue.go) and reads the new traces' headers into an
+# issue report (anrHeaders). With no rule both are denied on an enforcing build: on lynx 2026102201, 2026-10-24,
+# every sign-in logged `anr snapshot not taken (open /data/anr: permission denied)`.
+# READ ONLY: no write, no unlink, no lnk_file. The boot sweep's delete stays endospore_priv's in
+# editions/endospore/vendor/sepolicy/endospore.te. The policy compile on the build host (the neverallow check)
+# and an enforcing sign-in with no `anr snapshot not taken` line are the proof. Pinned by test-login-anr-read.sh.
+allow nowhere anr_data_file:dir r_dir_perms;
+allow nowhere anr_data_file:file r_file_perms;
+
 # Network: the agent does S3 over TLS (TCP) + DNS (UDP) to roam state to/from the store.
 net_domain(nowhere)
 
@@ -446,3 +458,11 @@ dontaudit nowhere_chooser default_prop:file { read open getattr map };
 # (system_public_prop) + grant the confined gate domain read. See property_contexts (ro.nowhere.brand).
 system_public_prop(nowhere_brand_prop)
 allow nowhere_chooser nowhere_brand_prop:file { read open getattr map };
+
+# NWP-20261203-13: the push gateway (nowhere.gateway_url). nowhere_login.sh (this domain, which already execs setprop)
+# sets it at boot from the merged conf; NowherePush (platform_app, PushService.gatewayBase) reads it. Nothing else sets
+# or reads it. See property_contexts (nowhere.gateway_url). The read is the brand prop's allow form, so the file still
+# ends on a statement closed by ";" (test-chooser-service-finds.sh appends a neverallow to a copy of it).
+system_public_prop(nowhere_gateway_prop)
+set_prop(nowhere, nowhere_gateway_prop)
+allow platform_app nowhere_gateway_prop:file { read open getattr map };

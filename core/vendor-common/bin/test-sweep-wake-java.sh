@@ -13,7 +13,8 @@
 #   W8  begin(A), begin(B), end(A), end(B) (the SweepJoin gap), and the same with the ends swapped: each releases its
 #       own lock and logs its own held time (A 800 ms, B 500 ms), so B's begin does not overwrite A's start.
 #   P1  sweepAutoJoined: the SweepJoin.enter if-block is followed by the lock, SweepWake.begin, `try {` and the
-#       `while (true)` loop, and the method ends with `finally { SweepWake.end(<lock>); }`.
+#       `while (true)` loop, and the method ends with `finally { SweepWake.end(<lock>); }`, which may first
+#       end the sweep pass (`finally { sweepPassEnd(); SweepWake.end(<lock>); }`, NWP-20261203-03) and nothing else.
 #   P2  no SweepWake before SweepJoin.enter(; exactly one SweepWake.begin( and one SweepWake.end( in the method.
 #   P3  sweepWakeLock: PARTIAL_WAKE_LOCK tagged "nowhere:autosweep", setReferenceCounted(false), a catch (Throwable,
 #       SystemClock.elapsedRealtime(), no `return null`, and its only exit returns the one anonymous SweepWake.Lock.
@@ -85,7 +86,7 @@ sources() {
   pin P1 "sweepAutoJoined takes the lock and begins right after the SweepJoin.enter block, wraps the while (true) loop in a try, and ends it in that try's finally" '
       $c =~ /if \(!SweepJoin\.enter\(\w+\)\) \{[^{}]*\breturn;\s*\}\s*SweepWake\.Lock (\w+) = sweepWakeLock\(\);\s*SweepWake\.begin\(\1\);\s*try \{\s*while \(true\) \{(.*)\z/s or exit 1;
       my ($v, $rest) = ($1, $2);
-      $rest =~ /\}\s*finally \{ SweepWake\.end\(\Q$v\E\); \}\s*\z/s or exit 1;
+      $rest =~ /\}\s*finally \{ (?:sweepPassEnd\(\); )?SweepWake\.end\(\Q$v\E\); \}\s*\z/s or exit 1;
       exit 0;' <<<"$joined" || bad=1
   pin P2 "no SweepWake before SweepJoin.enter(, and one SweepWake.begin( and one SweepWake.end( in sweepAutoJoined" '
       my $en = index($c, "SweepJoin.enter(");
@@ -150,7 +151,7 @@ mut() { # mut <label> <path under the root> <perl-expr> <check the mutant must f
 S=$CH/SweepWake.java
 U=$CH/UnarchiveService.java
 fails=0
-mut "M1 the finally's end removed" "$U" 's/\} finally \{ SweepWake\.end\(wake\); \}/} finally { }/' P1 || fails=$((fails+1))
+mut "M1 the finally's end removed" "$U" 's/\} finally \{ sweepPassEnd\(\); SweepWake\.end\(wake\); \}/} finally { sweepPassEnd(); }/' P1 || fails=$((fails+1))
 mut "M2 the timeout changed" "$S" 's/= 2L \* 60 \* 60 \* 1000;/= 25L * 60 * 1000;/' W1 || fails=$((fails+1))
 mut "M3 the isHeld guard removed" "$S" 's/if \(l\.isHeld\(\)\) \{/if (true) {/' W3 || fails=$((fails+1))
 mut "M4 the begin call removed from sweepAutoJoined" "$U" 's/\n[ \t]*SweepWake\.begin\(wake\);//' P1 || fails=$((fails+1))

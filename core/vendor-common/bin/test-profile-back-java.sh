@@ -15,7 +15,7 @@
 #   P5 every `loggingOff = true;` is followed by syncBackCallback() (the field and the `= false` writes excluded);
 #   P6 Help saves its own target when a topic opens, the topic's card Back is the target, and close restores it;
 #   P7 enableOnBackInvokedCallback="true" is on ProfileActivity's element only (not <application>, not the gate's),
-#      and excludeFromRecents="true" stays;
+#      and excludeFromRecents is gone from ProfileActivity's element and still "true" on the gate's (NWP-20261203-20);
 #   P8 finishOfflineMedia's late link does not leave pendingBack set for the next screen.
 #
 # ⚠ IT FAILS WHEN THERE IS NO JAVAC, IT NEVER SKIPS. javac comes from PATH, else from the build host's JDK below;
@@ -175,8 +175,8 @@ source_check() {
   [ -n "$t" ] || { echo "  PIN   P7 no ProfileActivity element in the manifest"; bad=1; }
   [ "$(count "$t" 'android:enableOnBackInvokedCallback="true"')" = 1 ] || {
     echo "  PIN   P7 ProfileActivity does not carry enableOnBackInvokedCallback=\"true\""; bad=1; }
-  [ "$(count "$t" 'android:excludeFromRecents="true"')" = 1 ] || {
-    echo "  PIN   P7 ProfileActivity lost excludeFromRecents=\"true\" (not this slice's change)"; bad=1; }
+  [ "$(count "$t" 'excludeFromRecents')" = 0 ] || {
+    echo "  PIN   P7 ProfileActivity still carries excludeFromRecents (h59 #6: it shows in Recents)"; bad=1; }
   t=$(tag "$mf" '<application')
   [ -n "$t" ] || { echo "  PIN   P7 no <application> element in the manifest"; bad=1; }
   [ "$(count "$t" 'enableOnBackInvokedCallback')" = 0 ] || {
@@ -185,6 +185,8 @@ source_check() {
   [ -n "$t" ] || { echo "  PIN   P7 no ChooserActivity element in the manifest"; bad=1; }
   [ "$(count "$t" 'enableOnBackInvokedCallback')" = 0 ] || {
     echo "  PIN   P7 ChooserActivity carries enableOnBackInvokedCallback"; bad=1; }
+  [ "$(count "$t" 'android:excludeFromRecents="true"')" = 1 ] || {
+    echo "  PIN   P7 ChooserActivity lost excludeFromRecents=\"true\""; bad=1; }
 
   # P8 the late Offline media link joins a shown screen: it must not leave a parent for the next one.
   i=$(idx "$offm" 'offlineMediaBackLink();'); j=$(idx "$offm" 'pendingBack = null;')

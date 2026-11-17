@@ -199,16 +199,19 @@ func TestPushGuard_EveryRefusalInPushProfileNamesAReason(t *testing.T) {
 			continue
 		}
 		if !refusalReasonFinal(why) && why != "unreadable-head" && why != "aftergate-no-carry" && why != "mounts-unread" &&
-			why != "unfetched-unknown" && why != "unfetched-dropped" {
+			why != "unfetched-unknown" && why != "unfetched-dropped" && why != "deferred-missing" && why != "deferred-unchecked" {
 			t.Errorf("reason %q is classed RETRY by accident -- classify it in refusalReasonFinal", why)
 		}
 		found[why]++
 	}
 	want := map[string]int{"deleted": 1, "unreadable-head": 1, "blind": 1, "stale-base": 2, "no-receipt": 2, "shrink": 2, "apps-vanished": 1,
 		"mounts-unread": 1, "locks-changed": 1, "locks-changed-key": 1, "unlock-lost": 1, "unlock-lost-key": 1,
-		"unfetched-unknown": 1, "unfetched-dropped": 2, "aftergate-no-carry": 1}
-	if refusals != 19 {
-		t.Errorf("pushProfile has %d refusal sites, want 19 -- a new guard needs a reason and a class", refusals)
+		"unfetched-unknown": 1, "unfetched-dropped": 2, "aftergate-no-carry": 1,
+		// h51 #2 (NWP-20261207-02): one site sets "deferred-missing", then "deferred-unchecked" when nothing was missing;
+		// the scan credits the nearer line. Both are RETRY: the restore page re-run fills the gap.
+		"deferred-unchecked": 1}
+	if refusals != 20 {
+		t.Errorf("pushProfile has %d refusal sites, want 20 -- a new guard needs a reason and a class", refusals)
 	}
 	for k, n := range want {
 		if found[k] != n {

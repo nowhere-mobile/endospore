@@ -200,6 +200,13 @@ IFS= read -r -d '' P_AZ <<'EOF'
                 // thread -- the messaging rule is PackageManager work. A row kept later this visit asks on its own.
                 keepRowWake.clear(); // the map outlives the visit: a stale entry would paint an old default
                 for (String p : pkgs) if (keptNow.contains(p)) keepRowWake.put(p, UnarchiveService.wakeOnRestore(this, p));
+                // NWP-20261205-12: which rows' icons fetch on a tap, here and not per row on the UI thread -- the code
+                // and archive reads are PackageManager work, as keepRowWake's. The rule is nApps' Download rule.
+                keepRowFetch.clear(); // the set outlives the visit, as keepRowWake does
+                final java.util.Set<String> kept = deferredKeepSet(this); // read ONCE
+                for (String p : pkgs)
+                    if (StoreService.mayMaterializeOwn(UnarchiveService.hasInstalledCode(this, p), archivedHere(this, p), kept.contains(p)))
+                        keepRowFetch.add(p);
             } catch (Throwable ignore) {}
 EOF
 IFS= read -r -d '' P_EMPTY <<'EOF'
@@ -381,9 +388,8 @@ IFS= read -r -d '' P_PICK <<'EOF'
         if (checked < 0 && hasIcon) checked = 0; // as before: a mode word it does not know reads as Off
 EOF
 IFS= read -r -d '' P_PICK2 <<'EOF'
-                .setSingleChoiceItems(items, checked, (d, which) -> {
-                    d.dismiss();
-                    applyKeepMode(pkg, modes.get(which)[1], sideloaded, paint, preview, onChange);
+        SheetDialog.picker(this, KeepModeSheets.picker(String.valueOf(keptLabel(pkg)), items, checked),
+                which -> applyKeepMode(pkg, modes.get(which)[1], sideloaded, paint, preview, onChange));
 EOF
 IFS= read -r -d '' P_MODEWORDS <<'EOF'
     static final String MODE_INSTALLED = "installed";

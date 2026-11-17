@@ -95,18 +95,9 @@ func snapshotReleaseSet(base string, dk []byte, removed headSnap, kept *vault) (
 			}
 		}
 	}
-	keep := map[string]bool{}
-	if kept != nil {
-		if kept.Manifest != "" {
-			if err := manifestBlobsStrict(base, dk, kept.Manifest, keep); err != nil {
-				return nil, err
-			}
-		}
-		for _, h := range kept.History {
-			if err := manifestBlobsStrict(base, dk, h.Manifest, keep); err != nil {
-				return nil, err
-			}
-		}
+	keep, err := manifestKeepSet(base, dk, kept)
+	if err != nil {
+		return nil, err
 	}
 	free := map[string]bool{}
 	if err := manifestBlobsStrict(base, dk, removed.Manifest, free); err != nil {
@@ -116,6 +107,27 @@ func snapshotReleaseSet(base string, dk []byte, removed headSnap, kept *vault) (
 		delete(free, k)
 	}
 	return free, nil
+}
+
+// manifestKeepSet is every blob key kept.Manifest and each kept.History entry names. Any manifest that cannot be read
+// returns (nil, err): a skipped KEPT manifest would put its chunks in a release set. A nil kept keeps nothing. Both
+// release paths use it: snapshotReleaseSet and the seal's prune release (seal_prune_release.go, NWP-20261204-06).
+func manifestKeepSet(base string, dk []byte, kept *vault) (map[string]bool, error) {
+	keep := map[string]bool{}
+	if kept == nil {
+		return keep, nil
+	}
+	if kept.Manifest != "" {
+		if err := manifestBlobsStrict(base, dk, kept.Manifest, keep); err != nil {
+			return nil, err
+		}
+	}
+	for _, h := range kept.History {
+		if err := manifestBlobsStrict(base, dk, h.Manifest, keep); err != nil {
+			return nil, err
+		}
+	}
+	return keep, nil
 }
 
 // workerBlobCachePath is the file the seal WORKERS use: blobCachePath() when NOWHERE_BLOBCACHE is set, else the

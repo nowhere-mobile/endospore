@@ -71,8 +71,11 @@ build_body() {
 cat > "$W/stubs.sh" <<'EOF'
 _TICK=0
 userdir_recheck() { :; }; reap_retry_run() { :; }; reap_retry_add() { :; }; userdir_pending_add() { :; }
+base_retry_add() { :; }; base_retry_run() { BASE_CLEARED=0; BASE_LEFT=0; }   # NWP-20261203-02
 loc_release() { :; }; md_release() { :; }; dt_release() { :; }; dr_release() { :; }; hs_release() { :; }
 ks_reap_clear() { :; }; stop_mediad() { :; }; log_scrub() { :; }; bt_reset() { return 0; }
+reap_pm_census() { RPC_LINE=unread; }   # NWP-20261203-01: test-reap-pm-census.sh runs the real one
+drm_wipe() { DRM_LINE=""; }   # NWP-20261203-08: the DRM store wipe is test-drm-wipe.sh's, not this suite's
 keystore_push() { KS_VERDICT=sealed; }
 sleep() { _TICK=$((_TICK + 1)); echo "$_TICK" > "$ROOT/sim/ticks"; if [ -f "$ROOT/sim/ev.$_TICK" ]; then . "$ROOT/sim/ev.$_TICK"; fi; return 0; }
 getprop() {
@@ -157,7 +160,7 @@ case_R1() {  # empty husk, counts equal -> removed, class not husk
   chk "RES is OK" eqv "$(rd "$R/res")" OK
   chk "class=clean" has "$(clean_line "$R")" 'class=clean'
   chk "log: removed (count unchanged)" has "$(husk_line "$R")" 'reap husk user 11: removed (count unchanged)'
-  chk "start_count read twice" eqv "$(rd "$R/sim/gpn")" 2
+  chk "start_count read three times" eqv "$(rd "$R/sim/gpn")" 3
   chk "rmdir called on users/11 once" eqv "$(rd "$R/sim/rmdir.calls")" "$U"
   chk "the log line names no path" hasnt "$(husk_line "$R")" '/'
 }
@@ -181,13 +184,13 @@ case_R3() {  # count unknown (empty, non-numeric, second read empty) -> kept
 }
 case_R4() {  # a non-empty dir -> never touched by the rmdir step; the rm path as today
   # R4a: rm cannot clear it while the loop runs (the refusal lifts at the 2nd start-count read, which the real
-  # code never makes for a non-empty dir -- so a block that skipped the emptiness test and used rm -rf would
-  # delete the file).
+  # code makes for a non-empty dir only at the reap's end, after every rm (NWP-20261203-01) -- so a block that
+  # skipped the emptiness test and used rm -rf would delete the file).
   mkroot; ssc "$R" 5 5; : > "$U/settings_secure.xml"; echo "$U" > "$R/sim/refuse-loop"
   run "$R" "$1" "$2"; common "$R"
   chk "R4a: the file is still there" present "$U/settings_secure.xml"
   chk "R4a: no rmdir" eqv "$(rd "$R/sim/rmdir.calls")" ""
-  chk "R4a: start_count read once" eqv "$(rd "$R/sim/gpn")" 1
+  chk "R4a: start_count read twice" eqv "$(rd "$R/sim/gpn")" 2
   chk "R4a: class=residue" has "$(clean_line "$R")" 'class=residue'
   chk "R4a: log: kept (not empty)" has "$(husk_line "$R")" 'kept (not empty)'
   chk "R4a: the log line names no file" hasnt "$(husk_line "$R")" 'settings_'

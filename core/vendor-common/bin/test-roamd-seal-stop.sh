@@ -84,6 +84,7 @@ EOF
     printf 'bt_reset(){ echo bt_reset >> "$T/calls"; return 0; }\n'
     printf 'acct_seal(){ echo acct_seal >> "$T/calls"; return %s; }\n' "$5"
     printf 'appcode_seal(){ echo appcode_seal >> "$T/calls"; return %s; }\n' "$6"
+    printf 'round_record() { :; }\n'   # NWP-20261204-01 (h58 #1): its own suite is core/agent/test-round-record.sh
     printf 'op=out\ncase "$op" in\n%s\nesac\n' "$ARM"
   } > "$T/run.sh"
   "$1" "$T/run.sh" >/dev/null 2>&1

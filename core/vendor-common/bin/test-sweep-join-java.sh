@@ -19,7 +19,8 @@
 #   P2  sweepAuto( is called only inside sweepAutoJoined: once there, and nowhere else in the file.
 #   P3  sweepAutoJoined reads and removes LANDING, then calls SweepJoin.enter (its false branch returns) before any
 #       sweepAuto call, then the SweepWake lock lines and `try {` (NWP-20261128-07), and in its loop catches Throwable
-#       around each pass and calls SweepJoin.exit in that try's finally.
+#       around each pass and calls SweepJoin.exit in that try's finally. After the last exit it calls tellSweepState()
+#       and returns (NWP-20261203-23: Your apps drops its Pause and Stop).
 #
 # It needs a JDK, and it FAILS when there is none. javac/java come from PATH, then the build VM's prebuilt JDK 21.
 # --mutate re-runs it against broken copies, each of which must FAIL a named check. A mutant that does not apply
@@ -115,7 +116,7 @@ $joined" || bad=1
       exit 1 unless $-[0] > $en;
       $c =~ /if \(!SweepJoin\.enter\(\w+\)\) \{[^{}]*\breturn;\s*\}\s*SweepWake\.Lock (\w+) = sweepWakeLock\(\);\s*SweepWake\.begin\(\1\);\s*try \{\s*(?:while \(true\)|for \(;;\)) \{(.*)\z/s or exit 1;
       my $loop = $2;
-      $loop =~ /\btry \{ sweepAuto\([^;]*\); \}\s*catch \(Throwable \w+\) \{[^}]*\}\s*finally \{ (\w+) = SweepJoin\.exit\(\); \}\s*if \(\1 < 0\) return;/s
+      $loop =~ /\btry \{ sweepAuto\([^;]*\); \}\s*catch \(Throwable \w+\) \{[^}]*\}\s*finally \{ (\w+) = SweepJoin\.exit\(\); \}\s*if \(\1 < 0\) \{ tellSweepState\(\); return; \}/s
         or exit 1;
       exit 0;' <<<"$joined" || bad=1
   return "$bad"

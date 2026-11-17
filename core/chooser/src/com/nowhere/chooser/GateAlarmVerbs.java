@@ -12,6 +12,7 @@ final class GateAlarmVerbs {
     static final String[] VERBS = {
         "ui-silence-empty", "ui-silence-ok", "ui-silence-refused",
         "consume", "consume-past", "armed", "armed-inexact", "armed-err",
+        "fired-roamed-running", "fired-roamed-stopped", "fired-roamed-none", "fired-roamed-err",
     };
 
     /**
@@ -51,5 +52,15 @@ final class GateAlarmVerbs {
     static String arm(boolean exactOk, boolean inexactOk) {
         if (exactOk) return "armed";
         return inexactOk ? "armed-inexact" : "armed-err";
+    }
+
+    /**
+     * NWP-20261204-07: at a gate-alarm fire, whether a roamed user was running, only stopped, or absent. A
+     * RELATION, as ui-guard-other: the counts never reach the wire. A failed read wins; then any running user.
+     */
+    static String roamed(int secondary, int running, boolean err) {
+        if (err) return "fired-roamed-err";
+        if (running > 0) return "fired-roamed-running";
+        return secondary > 0 ? "fired-roamed-stopped" : "fired-roamed-none";
     }
 }

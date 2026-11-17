@@ -18,7 +18,8 @@
 #   S2 showConfiguration's media lambda reads back after its cfgPut and, on false, toasts NOT_SAVED and redraws;
 #   S3 appDefaultRow's lambda does the same;
 #   S4 showWipePicker toasts NOT_SAVED on a failed read-back and reaches "applies next sign-in" only when saved;
-#   S5 showIdlePicker toasts NOT_SAVED when any of its three writes failed and reaches its text only when all landed
+#   S5 saveStandby (Auto standby's card tap and box toggle, NWP-20261206-04) toasts NOT_SAVED and runs its undo when
+#      its write failed, and reaches StandbySheets.toast and its landed action only when the write landed
 #      (NWP-20261129-15).
 #
 # ⚠ IT FAILS WHEN THERE IS NO JAVAC, IT NEVER SKIPS. javac comes from PATH, else from the build host's JDK below;
@@ -168,25 +169,22 @@ pins() {
     bad=1
   }
 
-  # S5: the Auto standby toast follows its three writes (NWP-20261129-15).
-  b=$(meth "$paf" showIdlePicker)
-  [ -n "$b" ] || { echo "  FAIL  S5 showIdlePicker( not found" >&2; return 1; }
+  # S5: the Auto standby toast follows its one write (NWP-20261129-15; saveStandby since NWP-20261206-04).
+  b=$(meth "$paf" saveStandby)
+  [ -n "$b" ] || { echo "  FAIL  S5 saveStandby( not found" >&2; return 1; }
   ok=1
-  wr=$(first_line "$b" "if (idleOk && holdOk && audioOk) live = sendLivePrefs();")
-  n=$(printf '%s\n' "$b" | grep -nF -- 'if (!(idleOk && holdOk && audioOk)) android.widget.Toast.makeText(this, SettingLanded.NOT_SAVED,' | cut -d: -f1)
-  [ "$(printf '%s\n' "$n" | grep -c .)" -eq 1 ] && [ -n "$wr" ] && [ "$n" -gt "$wr" ] || ok=0
-  e=$(printf '%s\n' "$b" | grep -nF -- '"Auto standby when idle: "')
-  if [ "$(printf '%s\n' "$e" | grep -c .)" -ne 1 ] || ! [[ "$e" =~ ^[0-9]+:\ *else\  ]]; then
-    ok=0
-  else
-    e=${e%%:*}
-    [ -n "$n" ] && [ "$e" -gt "$n" ] || ok=0
-    has "$(printf '%s\n' "$b" | sed -n "${e},$((e + 1))p")" "applies next sign-in" || ok=0
-    s=$(printf '%s\n' "$b" | sed -n "$((e + 1)),\$p" | grep -nE '^ *showSecurity\(\);$' | head -1)
-    [ -n "$s" ] || ok=0
-  fi
+  wr=0
+  for s in "if (ok) live = sendLivePrefs();" "if (!ok) {" \
+           "android.widget.Toast.makeText(this, SettingLanded.NOT_SAVED, android.widget.Toast.LENGTH_LONG).show();" \
+           "undo.run();" "} else {" "StandbySheets.toast(toastIdx, live)" "landed.run();"; do
+    [ "$(count "$b" "$s")" -eq 1 ] || { ok=0; break; }
+    n=$(first_line "$b" "$s")
+    [ "$n" -gt "$wr" ] || { ok=0; break; }
+    wr=$n
+  done
+  [ "$(count "$b" "SettingLanded.NOT_SAVED")" -eq 1 ] || ok=0
   [ "$ok" -eq 1 ] || {
-    echo "  FAIL  S5 showIdlePicker does not toast NOT_SAVED on a failed write and the Auto standby text only when all landed" >&2
+    echo "  FAIL  S5 saveStandby does not toast NOT_SAVED on a failed write and the Auto standby text only when it landed" >&2
     bad=1
   }
   [ "$bad" -eq 0 ]
@@ -242,5 +240,5 @@ mut "K8 landed is true on a null after"              class 's/if \(change == nul
 mut "K9 NOT_SAVED says it applies"                   class 's/static final String NOT_SAVED = "[^"]*";/static final String NOT_SAVED = "Saved — applies next sign-in.";/' || fails=$((fails+1))
 mut "K10 landed ignores a differing value"           class 's/if \(!Objects\.equals\(e\.getValue\(\), after\.get\(e\.getKey\(\)\)\)\) return false;//' || fails=$((fails+1))
 mut "K11 the wipe read-back is gone"                 pa    's/(\n *)final boolean saved = SettingLanded\.landed\(PresetPicker\.change\("wipe", String\.valueOf\(idx\)\),\n *presetCurrent\(\)\);/$1final boolean saved = true;/' || fails=$((fails+1))
-mut "K12 the idle Save's not-saved branch removed"    pa    's/(\n *)if \(!\(idleOk && holdOk && audioOk\)\) android\.widget\.Toast\.makeText\(this, SettingLanded\.NOT_SAVED,\n *android\.widget\.Toast\.LENGTH_LONG\)\.show\(\);\n *else (android\.widget\.Toast\.makeText\(this, "Auto standby when idle: ")/$1$2/' || fails=$((fails+1))
+mut "K12 saveStandby's not-saved branch removed"     pa    's/\n *android\.widget\.Toast\.makeText\(this, SettingLanded\.NOT_SAVED, android\.widget\.Toast\.LENGTH_LONG\)\.show\(\);\n *undo\.run\(\);//' || fails=$((fails+1))
 [ "$fails" -eq 0 ] && echo "== all 12 mutations convicted" || { echo "== $fails mutation(s) not convicted"; exit 1; }

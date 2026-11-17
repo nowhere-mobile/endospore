@@ -209,13 +209,20 @@ func TestPlayPushFrozenClockStepBackHoldsFiring(t *testing.T) {
 	}
 }
 
-// healthFixture replaces the checks' seams and clears the results, restoring all of them when the test ends. The
-// clock it returns is the one healthNow reads.
+// healthFixture replaces the checks' seams and clears the results and the recorded Fixes, restoring all of them when
+// the test ends. The clock it returns is the one healthNow reads.
 func healthFixture(t *testing.T, replies ...string) (clock *time.Time, sent *[][3]string, logged *[]string) {
 	t.Helper()
 	prevEn, prevProbe, prevNow, prevLog, prevState := healthEnabled, healthProbeWorker, healthNow, healthLog, healthState
+	healthFixState.Lock()
+	prevFixUID, prevFixAt := healthFixState.uid, healthFixState.at
+	healthFixState.uid, healthFixState.at = "", map[string]time.Time{}
+	healthFixState.Unlock()
 	t.Cleanup(func() {
 		healthEnabled, healthProbeWorker, healthNow, healthLog, healthState = prevEn, prevProbe, prevNow, prevLog, prevState
+		healthFixState.Lock()
+		healthFixState.uid, healthFixState.at = prevFixUID, prevFixAt
+		healthFixState.Unlock()
 	})
 	c, s, l := ppfT0, [][3]string{}, []string{}
 	healthEnabled, healthState = true, nil
@@ -444,7 +451,7 @@ func TestMergeHealthSessionScope(t *testing.T) {
 	healthState.results[0] = healthBadResult(*clock)
 	st := map[string]string{"keep": "k"}
 	mergeHealth(st, "38", false)
-	if got := st["health_play_push_frozen"]; got != "FIRING age=30 adj=920 state=CAC bound=0 bad_for=1170" {
+	if got := st["health_play_push_frozen"]; got != "FIRING age=30 adj=920 state=CAC bound=0 bad_for=1170 fix=none" {
 		t.Errorf("health_play_push_frozen = %q", got)
 	}
 	if st["health_checks"] != "4" || st["keep"] != "k" {
@@ -464,9 +471,9 @@ func TestMergeHealthKnownFieldsOnly(t *testing.T) {
 		r    healthRuleResult
 		want string
 	}{
-		{healthRuleResult{verdict: healthUnmeasured}, "UNMEASURED"},
-		{healthRuleResult{verdict: healthNotApplicable, checkedAt: *clock}, "NOT-APPLICABLE age=0"},
-		{healthRuleResult{verdict: healthClear, checkedAt: *clock, fields: true, adj: 200, state: "-", bound: true}, "CLEAR age=0 adj=200 bound=1"},
+		{healthRuleResult{verdict: healthUnmeasured}, "UNMEASURED fix=none"},
+		{healthRuleResult{verdict: healthNotApplicable, checkedAt: *clock}, "NOT-APPLICABLE age=0 fix=none"},
+		{healthRuleResult{verdict: healthClear, checkedAt: *clock, fields: true, adj: 200, state: "-", bound: true}, "CLEAR age=0 adj=200 bound=1 fix=none"},
 	} {
 		healthState.results[0] = c.r
 		st := map[string]string{}

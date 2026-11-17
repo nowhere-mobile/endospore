@@ -113,6 +113,7 @@ pidof() { :; }
 pkg_live_pids() { :; }
 reown_restored() { :; }
 od_relabel() { :; }
+od_label_watched() { reown_restored "$2"; od_relabel "$1" "$2"; }
 cutoff_prog() { :; }
 od_watched() { shift; "$@" 2>&1; }
 grant_perms_for() { :; }

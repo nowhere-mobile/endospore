@@ -131,6 +131,7 @@ type landerInput struct {
 	unders    map[string]string                                                           // absolute mountpoint -> hidden real directory
 	stop      func() bool                                                                 // asked between files only
 	sleep     func(time.Duration) bool                                                    // false: stop
+	onPark    func(parked bool)                                                           // once per pass that sleeps, before it: true when it parked (NWP-20261207-11)
 	fetch     func(base string, key []byte, m chunkManifest, r essRegion) ([]byte, error) // default fetchEssSpan
 	onDamaged func(rel string)                                                            // once per corrupt rel
 	onStart   func(pending []string)                                                      // once, before any fetch, also with an empty set
@@ -164,6 +165,9 @@ type landerCounts struct {
 //     between the two costs no fetch.
 //   - Passes repeat over the pending rels. After a pass that landed anything the wait is 30 s; otherwise it doubles, to
 //     a 10 min cap. A skip is not a landing.
+//   - A pass that sleeps calls onPark first (NWP-20261207-11, §6): true when it PARKED, that is it landed none and at
+//     least one fetch failed transiently. A pass whose only failures are link refusals, corrupt spans or write errors
+//     does not park: none of them is the network.
 //
 // A rel's digest is recorded after its rename (or its skip) and before the next fetch (NWP-20261130-17): a kill between
 // the rename and the digest is the present-skip above, and a landing the user deletes during a later fetch stays
@@ -180,6 +184,9 @@ func landBackground(in landerInput, m chunkManifest) landerCounts {
 	}
 	if in.sleep == nil {
 		in.sleep = func(d time.Duration) bool { time.Sleep(d); return true }
+	}
+	if in.onPark == nil {
+		in.onPark = func(bool) {}
 	}
 	if in.onDamaged == nil {
 		in.onDamaged = func(string) {}
@@ -219,6 +226,7 @@ func landBackground(in landerInput, m chunkManifest) landerCounts {
 	wait := landerWaitMin
 	for len(pending) > 0 {
 		before := c.landed
+		transient := 0 // NWP-20261207-11: fetches this pass that failed and may succeed later
 		stopped := false
 		var next []string
 		for i, rel := range pending {
@@ -247,6 +255,7 @@ func landBackground(in landerInput, m chunkManifest) landerCounts {
 				if isCorruptErr(err) {
 					damaged(rel)
 				} else {
+					transient++
 					next = append(next, rel)
 				}
 				continue
@@ -290,6 +299,7 @@ func landBackground(in landerInput, m chunkManifest) landerCounts {
 		if c.landed > before {
 			wait = landerWaitMin
 		}
+		in.onPark(c.landed == before && transient > 0)
 		if !in.sleep(wait) {
 			break
 		}

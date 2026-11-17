@@ -97,6 +97,7 @@ EOF
     printf 'SYSM=%s; APPSM=%s\n' "${SYSM:-push}" "${APPSM:-push}"
     printf 'acct_seal(){ echo "acct_seal ${NOWHERE_PUSH_STAT:-unset}" >> "$T/calls"; [ "$SYSM" = skip ] && return 0; ACCT_PUSHED=1; [ "$SYSM" = push ] && [ -n "${NOWHERE_PUSH_STAT:-}" ] && echo "kib=44 up=1 local=2" > "$NOWHERE_PUSH_STAT"; return 0; }\n'
     printf 'appcode_seal(){ echo "appcode_seal ${NOWHERE_PUSH_STAT:-unset}" >> "$T/calls"; [ "$APPSM" = skip ] && return 0; [ "$APPSM" = push ] && echo "kib=55 up=1 local=2" > "$STATE/pushstat.apps"; APPCODE_PUSH_MS=$APM; return 0; }\n'
+    printf 'round_record() { :; }\n'   # NWP-20261204-01 (h58 #1): its own suite is core/agent/test-round-record.sh
     printf 'op=out\ncase "$op" in\n%s\nesac\n' "$ARM"
   } > "$T/run.sh"
   "$1" "$T/run.sh" >/dev/null 2>&1

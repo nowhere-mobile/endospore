@@ -1,27 +1,64 @@
-# The Release Desk, read-only (stage 4)
+# The Release Desk (stages 4 and 5)
 
-Design: `docs/release-desk.md` §4, §5.4, §5.5 and §7 stage 4. Work ID
-`NWP-20261202-24`.
+Design: `docs/release-desk.md` §4, §5.4, §5.5 and §7 stages 4 and 5. Work IDs
+`NWP-20261202-24` (stage 4) and `NWP-20261205-04` (stage 5). The private socket is stage 5, part 1
+(`NWP-20261205-06`).
 
 The Release Desk is a page on the build host. The operator reaches it over the tailnet through `tailscale serve`.
-In stage 4 the Desk does these things:
+The Desk does these things:
 
 - It lists the releases that the maintainer opened, with the state of each release.
 - It runs `sign-release.sh --preflight-only` and shows one line for each check, green, amber or red.
+- It signs the device images through `sign-release.sh` (stage 5, below).
 - It runs `verify-release.sh` and shows pass or fail for each device.
 - It gives each waiting installer manifest to the Manifest Signer.
 - It receives each signature and places it only after its own three checks (§5.4).
 
-**Stage 5 is not built.** The page has no passphrase field, no Sign button and no "Retry this device" button. The
-Desk never runs `sign-release.sh` without `--preflight-only`. Sign the device images in a terminal, as
-`docs/release-runbook.md` says.
+## Sign the device images (stage 5)
+
+The release page shows one passphrase field and a Sign button only when both of these are true:
+
+- The last preflight is ready.
+- The Desk serves on its private Unix socket: `make_server` marks that server `private`. Over loopback TCP, the
+  Desk shows no field and answers Sign with 403. Until the private socket is installed, every Desk is TCP and
+  every Sign answers 403.
+
+When the operator presses Sign, the Desk does these things:
+
+1. It starts `setsid --ctty bash sign-release.sh <BN> <commit> <dev>[:<out>]...` as its own child. The child gets a
+   pseudo-terminal as its controlling terminal, as tmux gives it today. Echo is off on that terminal. `setsid` is
+   from util-linux and execs in place, so the script stays a child of the Desk (`sitting-guard.sh` allows ancestors).
+2. It copies the script's output to `results/<BN>/sign.out` (mode 0600).
+3. It writes the passphrase to the terminal once, after the script prints its prompt. If the script stops before
+   the prompt, the Desk never writes the passphrase.
+4. It shows each device as waiting, signing, signed or failed, and the session's result: signed, some failed,
+   wrong passphrase, refused before the prompt, timed out, or ended without a result.
+
+A failed device shows "Retry this device" with its own passphrase field. Retry runs the script for that device
+alone. A Retry that meets a wrong passphrase, or a refusal before the prompt, leaves the device failed.
+
+The passphrase rules:
+
+- The Desk holds the passphrase only in memory, between the button press and the write to the terminal.
+- The Desk never writes it to a file, a log line, a URL or a reply. It is never on the child's argv.
+- The child's environment never holds `password` or `PW`. The Desk removes both.
+- The Desk refuses an empty passphrase, a passphrase longer than 1024 bytes, and any control character (400). The
+  script's own refusal of an empty passphrase stays.
+
+A session holds the Desk's one child slot until the script ends, so preflight, verify and signatures answer 409
+while it runs. A session that runs longer than 7200 seconds per device gets TERM on its process group. The script's
+TERM trap removes the key dirs. The Desk does the same when it cannot go on, for example when `sign.out` cannot be
+written. It keeps the child slot until the script exits, or until 60 seconds after TERM, when it sends KILL and waits.
+A session is "signed" only when every device of the release is signed, so a Retry of one device does not hide another
+failed device. If the Desk itself dies, the kernel sends HUP to the session, and the script's HUP
+trap removes the key dirs.
 
 ## Files
 
 | File | What it is |
 | --- | --- |
 | `release_desk.py` | The Desk: `open` (the maintainer) and `serve` (systemd). Python 3, standard library only. |
-| `nowhere-release-desk.socket` | The systemd user socket: `127.0.0.1:8770`, loopback only. |
+| `nowhere-release-desk.socket` | The systemd user socket: `%t/nowhere-release-desk.sock` (`/run/user/<uid>/nowhere-release-desk.sock`), a Unix socket, mode 0600. |
 | `nowhere-release-desk.service` | The systemd user service: `serve --idle 900`. It stops after 15 idle minutes. |
 | `test_release_desk.py` | The suite. Run it plain and with `--mutate`. |
 
@@ -42,11 +79,22 @@ when nobody is logged in.
    `(cd core/agent && CGO_ENABLED=0 GOOS=linux go build -o /tmp/agent_host .)`.
    Without it, the Desk refuses every signature with `agent missing`.
 5. Start the socket:
-   `systemctl --user daemon-reload && systemctl --user enable --now nowhere-release-desk.socket`
+   `systemctl --user daemon-reload && systemctl --user enable --now nowhere-release-desk.socket`.
+   Then `systemctl --user status nowhere-release-desk.socket` shows
+   `Listen: /run/user/<uid>/nowhere-release-desk.sock (Stream)`.
 
-**Chester's root step:** `tailscale serve --bg --https=443 http://127.0.0.1:8770`. Tailscale then sends the
-caller's login in the `Tailscale-User-Login` header and the tailnet name in `Host`. The Desk refuses a request
-without both (403).
+**Chester's root step:**
+
+1. Run `tailscale serve --help` and make sure that it lists a `unix:` target.
+2. Run `tailscale serve --bg --https=443 unix:/run/user/<uid of the signing user>/nowhere-release-desk.sock`.
+
+Tailscale then sends the caller's login in the `Tailscale-User-Login` header and the tailnet name in `Host`. The
+Desk refuses a request without both (403). On the Unix socket, the Desk accepts only the tailnet name in `Host`.
+
+If `tailscale serve` has no `unix:` target, use the old TCP socket. In `nowhere-release-desk.socket`, replace the
+two lines `ListenStream=%t/nowhere-release-desk.sock` and `SocketMode=0600` with `ListenStream=127.0.0.1:8770`.
+Then run `tailscale serve --bg --https=443 http://127.0.0.1:8770`. The Desk is then usable READ-ONLY. Stage 5's Sign
+stays refused on a TCP port, because the Desk does not mark a TCP port private.
 
 ## Open a release (the maintainer)
 
@@ -83,21 +131,30 @@ The Desk refuses a different signature when a `.sig` file is already there. It w
 ## State and log
 
 - `NOWHERE_DESK_STATE` (default `~/.local/state/nowhere-release-desk`, mode 0700) holds the open releases, the last
-  preflight and verify output, and the handout hashes.
+  preflight and verify output, the handout hashes, and each release's signing session: `results/<BN>/sign.json`
+  (the device states and the result) and `results/<BN>/sign.out` (the script's output). Neither holds the
+  passphrase.
 - `log.jsonl` in that directory is append-only. Each line has the time, the Tailscale login, the action, the build
   number, the device and the result. It never holds manifest bytes, signature bytes or a child's output.
 - Other settings: `ENDOSPORE_TREE` and `ENDOSPORE_REPO` (the same defaults as `sign-release.sh`), `NOWHERE_AGENT`
   (default `/tmp/agent_host`).
 
-The Desk runs one child at a time: a preflight, a verify or a signature check. It answers a second request with
-409 "busy".
+The Desk runs one child at a time: a preflight, a verify, a signature check or a signing session. It answers a
+second request with 409 "busy".
 
 ## Known limits
 
-- **Loopback.** Any local user of the build host can connect to `127.0.0.1:8770` and send a false
-  `Tailscale-User-Login` header. In stage 4 that user can only run a preflight or a verify, or send a signature that
-  must still pass the three checks. Stage 5 adds the passphrase and must close this, for example with a Unix socket
-  for `tailscale serve`.
+- **The socket.** The Desk listens on a Unix socket in `/run/user/<uid>`. That directory is mode 0700 and the
+  socket is mode 0600. Only the signing user and root can connect. No other local user can send a false
+  `Tailscale-User-Login` header. There is no port that another user can take while the Desk is down, because no
+  other user can make a file in `/run/user/<uid>`. This does not close root: root on the build host can connect to
+  the socket and can read the memory of every process. The TCP fallback (`127.0.0.1:8770`) keeps the old limit:
+  any local user can connect to it or take the port. For this reason the Desk does not mark a TCP port private.
+  Stage 5 adds the passphrase, so the Desk refuses Sign (403) and shows no passphrase field unless the server is
+  marked private, which only the Unix socket sets.
+- **The signing output.** The Desk reads the device lines of `sign-release.sh` (`== <dev>: finalize`,
+  `== <dev> RELEASE DONE`, `sign-release: <dev> FAILED`, and the summary) and its prompt. The suite pins each literal
+  against the real script.
 - **The preflight's output.** The Desk reads the `PREFLIGHT` lines of `sign-release.sh --preflight-only` from
   standard output. If the script writes them elsewhere, every preflight shows red. The stub in the suite pins the
   line format.
@@ -107,5 +164,5 @@ The Desk runs one child at a time: a preflight, a verify or a signature check. I
     python3 editions/endospore/release-desk/test_release_desk.py
     python3 editions/endospore/release-desk/test_release_desk.py --mutate
 
-The suite runs the real handler on 127.0.0.1 against stub scripts and a stub agent. `--mutate` breaks one guard at a
+The suite runs the real handler on 127.0.0.1 and on a Unix socket, against stub scripts and a stub agent. `--mutate` breaks one guard at a
 time and requires the named test to fail.

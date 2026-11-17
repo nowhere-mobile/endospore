@@ -66,9 +66,13 @@ public final class CreateLiveCases {
 
         // ---- L4: the dialog's Restart reboots, off the UI thread, after asking what it costs ----
         String dialog = body(src, "private void showCreateOverLiveSession() {");
-        check("L4 showCreateOverLiveSession names Restart", dialog.contains("\"Restart\""), dialog);
+        // NWP-20261206-07: the dialog is a sheet; its labels live in GateParkedSheets, and slot 1 (Restart) reboots.
+        String sheets = new String(Files.readAllBytes(Paths.get(args[1], "core/chooser/src/com/nowhere/chooser/GateParkedSheets.java")),
+                StandardCharsets.UTF_8);
+        check("L4 showCreateOverLiveSession names Restart", sheets.contains("RESTART = \"Restart\"")
+                && dialog.contains("GateParkedSheets.createLive(createLiveText())"), dialog);
         check("L4 showCreateOverLiveSession's Restart calls rebootForCreateOverLive",
-                dialog.contains("setPositiveButton(\"Restart\", (d, w) -> rebootForCreateOverLive())"), dialog);
+                dialog.contains("new Runnable[] { null, () -> rebootForCreateOverLive() }"), dialog);
         String reboot = body(src, "private void rebootForCreateOverLive() {");
         check("L4 rebootForCreateOverLive runs on a new Thread", reboot.contains("new Thread"), reboot);
         check("L4 rebootForCreateOverLive asks TEL-PENDING", reboot.contains("TEL-PENDING"), reboot);

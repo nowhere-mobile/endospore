@@ -15,6 +15,7 @@
                 app.startServiceAsUser(new android.content.Intent(app, CredentialService.class).putExtra("smsrole", true),
                         android.os.UserHandle.of(uid));
             } catch (Throwable t) { android.util.Log.w("NowhereChooser", "#148 sms role kick", t); }
+            CredSvcWatch.record(getApplicationContext(), uid, CredSvcWatch.SMSROLE); // NWP-20261203-05: re-sent if the service is stuck
             repairSmsRoleLater(uid, "cede");
             grantMessagingRestrictedRead(uc); // #150: also grant now for the common case where the role is already held (idempotent)
         } catch (Throwable t) { android.util.Log.w("NowhereChooser", "#148 cedeSmsToMessagingInRoamedUser", t); }

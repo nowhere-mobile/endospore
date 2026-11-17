@@ -42,12 +42,12 @@ PY
     echo "  SURVIVED  $label"; fails=$((fails+1))
   fi
 }
-mut "G1 the pushProfile call removed" main.go '!strings\.Contains\(profile, "#"\) && distrustBlobCacheIfReleased\(blobCachePath\(\), ref, relGen\)' 'false'
+mut "G1 the pushProfile call removed" main.go '\(!strings\.Contains\(profile, "#"\) \|\| \(v != nil && relGenScope\(profile\)\)\) && distrustBlobCacheIfReleased\(blobCachePath\(\), ref, relGen\)' 'false'
 mut "G2 the comparison is < instead of !=" release_gen.go 'seen != gen' 'seen < gen'
 mut "G3 the restore call removed" main.go '\t\t\trelGenAtRestore\(base, profile, pass, restoredHead\)\n' '\n'
 mut "G4 the restore only records" release_gen.go 'if distrustBlobCacheIfReleased\(blobCachePath\(\), relGenHeadKey\(base, profile, pass\), gen\) \{' 'if relGenRecord(blobCachePath(), relGenHeadKey(base, profile, pass), gen) != nil {'
 mut "G5 blobCacheDrop leaves the in-memory set" release_gen.go '\tblobCache = nil\n' '\t_ = blobCache\n'
 mut "G6 carryForward drops the field" main.go '\tnv\.ReleaseGen = old\.ReleaseGen[^\n]*\n' '\n'
-mut "G7 the check runs for scope seals too" main.go '!strings\.Contains\(profile, "#"\) && distrustBlobCacheIfReleased' 'distrustBlobCacheIfReleased'
+mut "G7 the check runs for bare-shaped scope heads too" main.go '\(!strings\.Contains\(profile, "#"\) \|\| \(v != nil && relGenScope\(profile\)\)\) && distrustBlobCacheIfReleased' 'distrustBlobCacheIfReleased'
 mut "G8 the restore check runs for scope restores too" main.go 'if strings\.IndexByte\(profile, '"'"'#'"'"'\) < 0 \{\n\t\t\trelGenAtRestore\(base, profile, pass, restoredHead\)\n\t\t\}' 'relGenAtRestore(base, profile, pass, restoredHead)'
 [ "$fails" -eq 0 ] && echo "== all mutations convicted" || { echo "== $fails mutation(s) not convicted"; exit 1; }

@@ -49,6 +49,8 @@ final class LandingLine {
     static final String PAUSED_LINE = "Paused. The rest wait until you resume.";
     static final String STOPPED_LINE = "Stopped. The rest install when you tap them.";
     static final String RESUME_ROW = "Resume installing apps";
+    /** NWP-20261203-23: Your apps' row while a sweep runs, beside Pause and Stop. A draft for Chester. */
+    static final String RUNNING_ROW = "Installing apps";
     /** The glyphs beside READY and COMING (the mockup's tick and clock). Text, not emoji, so they take the text colour. */
     static final String TICK = "✓";
     static final String CLOCK = "◷";

@@ -120,7 +120,7 @@ sources() {
   pin S1 "the version check runs on the quiet path only, after the Play-need check and right before installApks" '
     my $n = () = $c =~ /OlderCopy\.older\(/g; exit 1 unless $n == 1;
     my $d = index($c, "PlayNeed.decide("); exit 1 if $d < 0;
-    $c =~ /\n([ \t]*)if \(quiet\) \{\n(.*?)\n\1\}\n\s*updateNoticePhase\("Installing"\);\s*\n\s*ok = installApks\(pkg, apks\);/s
+    $c =~ /\n([ \t]*)if \(quiet\) \{\n(.*?)\n\1\}\n\s*(?:step\(SweepStall\.INSTALL\);\s*)?updateNoticePhase\("Installing"\);\s*\n\s*ok = installApks\(pkg, apks\);/s
       or exit 1;
     my ($open, $body) = ($-[0], $2);
     exit 1 if $open < $d;
@@ -249,7 +249,7 @@ mut "K3 the quiet guard dropped" "$U" 's/\n(\s*)if \(quiet\) \{(\n\s*long fetche
 mut "K4 the OLDER_COPY add removed" "$U" 's/^[ \t]*OLDER_COPY\.add\(pkg\);\n//m' S2 || fails=$((fails+1))
 mut "K5 the sweepAuto filter removed" "$U" 's/^[ \t]*if \(work\.removeAll\(OLDER_COPY\)\)[^;]*;\n//m' S3 || fails=$((fails+1))
 mut "K6 matEnd set to INSTALL_FAILED instead" "$U" 's/matEnd = SweepOutcome\.OLDER_COPY;/matEnd = SweepOutcome.INSTALL_FAILED;/' S2 || fails=$((fails+1))
-mut "K7 the check moved after installApks" "$U" 's/(\n[ \t]*if \(quiet\) \{\n[ \t]*long fetchedVc.*?\n(\s*)\}\n)(\s*updateNoticePhase\("Installing"\);[^\n]*\n\s*ok = installApks\(pkg, apks\);\n)/\n$3$1/s' S1 || fails=$((fails+1))
+mut "K7 the check moved after installApks" "$U" 's/(\n[ \t]*if \(quiet\) \{\n[ \t]*long fetchedVc.*?\n(\s*)\}\n)(\s*(?:step\(SweepStall\.INSTALL\);[^\n]*\n\s*)?updateNoticePhase\("Installing"\);[^\n]*\n\s*ok = installApks\(pkg, apks\);\n)/\n$3$1/s' S1 || fails=$((fails+1))
 mut "K8 the filter applied to retry instead" "$U" 's/if \(work\.removeAll\(OLDER_COPY\)\)/if (retry.removeAll(OLDER_COPY))/' S3 || fails=$((fails+1))
 mut "M1 installerToRecord records the chooser's own package" "$A" 's/ && !current\.equals\(own\)\) return current;/) return current;/' C2 || fails=$((fails+1))
 mut "M2 playCount ignores playOnProfile" "$O" 's/if \(!playOnProfile \|\| metaTexts == null\)/if (metaTexts == null)/' C3 || fails=$((fails+1))

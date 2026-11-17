@@ -19,15 +19,16 @@
 #   H9  the empty-work return ends a non-zero card, and the card is told.
 #   H10 a Resume continues its card: sweepAuto takes it from SweepHold, calls Sweep.resume and shows no new card.
 #   H11 the card paints Resume, the held lines and the inert buttons, its Resume starts EXTRA_SWEEP + EXTRA_RESUME, and
-#       both layouts have the row.
-#   H12 installPendingRow reads RESUME_ROW only while PAUSED, and its tap stays a by-hand start.
+#       both layouts have the row, just after the one Got it (NWP-20261203-28).
+#   H12 installPendingRow labels through HoldRow.label(mode), HoldRow.mode reads PAUSED as PAUSED and STOPPED as
+#       INSTALL (NWP-20261203-23), and the Install tap stays a by-hand start.
 #   H13 a sweep that stops on a busy remembered tap puts a waiting Resume back to paused, on the card too, and tells it.
 #   H14 the completion broadcast follows the close of the card, and the card closes only on Sweep.done.
 #
 # It needs a JDK, and it FAILS when there is none: a Java suite that skips without one would read green on a runner
 # that never ran it. javac/java come from PATH, then the build VM's prebuilt JDK 21.
 #
-# --mutate re-runs it against broken copies of the eight files, each of which must FAIL a named check. A mutant that
+# --mutate re-runs it against broken copies of the nine files, each of which must FAIL a named check. A mutant that
 # does not apply (INERT) or does not compile (BROKEN) counts as a failure, never a pass.
 #
 #   bash test-sweep-hold-java.sh            # the cases and the source checks
@@ -141,11 +142,12 @@ h5() { # h5 <root>
 
 # sources <root>: H1-H13 over <root>'s chooser sources. Every check prints its own line and the next one still runs.
 sources() {
-  local r=$1 sweep start svc pause stop resume hold render row notice repause bad=0
+  local r=$1 sweep start svc pause stop resume hold render row holdmode notice repause bad=0
   sweep=$(code "$r/$CH/UnarchiveService.java" "    private void sweepAuto(boolean byHand) {")
   start=$(code "$r/$CH/UnarchiveService.java" "    public int onStartCommand(Intent intent, int flags, int startId) {")
   repause=$(code "$r/$CH/UnarchiveService.java" "    private void repauseResumed() {")
-  row=$(code "$r/$CH/ProfileActivity.java" "    private LinearLayout installPendingRow(int n, boolean allowMetered, boolean onWifi) {")
+  row=$(code "$r/$CH/ProfileActivity.java" "    private LinearLayout installPendingRow(int n, boolean allowMetered, boolean onWifi, int mode) {")
+  holdmode=$(code "$r/$CH/HoldRow.java" "    static int mode(")
   pause=$(code "$r/$CH/LandingNoticeActivity.java" "    private void tapPause() {")
   stop=$(code "$r/$CH/LandingNoticeActivity.java" "    private void tapStop() {")
   resume=$(code "$r/$CH/LandingNoticeActivity.java" "    private void tapResume() {")
@@ -233,7 +235,7 @@ $svc" || bad=1
   if [ -z "$resume" ] || [ -z "$hold" ] || [ -z "$render" ]; then
     echo "FAIL H11 tapResume, addHoldRow or render not found"; bad=1
   else
-    pin H11 "the card paints Resume, the held lines and the inert buttons, its Resume starts the sweep with EXTRA_RESUME and not by hand, and both layouts have the row" '
+    pin H11 "the card paints Resume, the held lines and the inert buttons, its Resume starts the sweep with EXTRA_RESUME and not by hand, and both layouts have the row, just after the one Got it (NWP-20261203-28)" '
         my ($res, $hold, $ren, $f) = split /\n<<<SPLIT>>>\n/, $c, 4;
         exit 1 unless $res =~ /putExtra\(UnarchiveService\.EXTRA_SWEEP, true\)\s*\.putExtra\(UnarchiveService\.EXTRA_RESUME, true\)/;
         exit 1 if $res =~ /EXTRA_BY_HAND|SweepHold\./;
@@ -245,8 +247,8 @@ $svc" || bad=1
         exit 1 unless $ren =~ /holdLine\.setText\(line != null \? line : LandingLine\.KEEP\);\s*return;/;
         exit 1 unless $ren =~ /headline\.setText\(LandingLine\.headline\(got, pkgs\.length\)\);\s*if \(line != null\) headline\.setText\(line\);/;
         my $n = () = $f =~ /^\s*addHoldRow\(card\);/mg; exit 1 unless $n == 2;
-        exit 1 unless $f =~ /card\.addView\(gotIt, lp\);\s*addHoldRow\(card\);/;
-        exit 1 unless $f =~ /card\.addView\(moreRow\);\s*addHoldRow\(card\);/;
+        my $g = () = $f =~ /addGotIt\(card\);\s*addHoldRow\(card\);/g; exit 1 unless $g == 2;
+        my $m = () = $f =~ /card\.addView\(moreRow\);\s*addGotIt\(card\);\s*addHoldRow\(card\);/g; exit 1 unless $m == 1;
         exit 0;' <<<"$resume
 <<<SPLIT>>>
 $hold
@@ -256,11 +258,16 @@ $render
 $notice" || bad=1
   fi
 
-  pin H12 "installPendingRow reads RESUME_ROW only while PAUSED, and its tap stays a by-hand start" '
-      exit 1 unless $c =~ /lab\.setText\(SweepHold\.state\(\) == SweepHold\.State\.PAUSED \? LandingLine\.RESUME_ROW : "Install pending apps now"\);/;
-      exit 1 unless $c =~ /putExtra\(UnarchiveService\.EXTRA_SWEEP, true\)\s*\.putExtra\(UnarchiveService\.EXTRA_BY_HAND, true\)/;
-      exit 1 if $c =~ /EXTRA_RESUME/;
-      exit 0;' <<<"$row" || bad=1
+  pin H12 "installPendingRow labels through HoldRow.label(mode), HoldRow.mode reads PAUSED as PAUSED and STOPPED as INSTALL, and the Install tap stays a by-hand start" '
+      my ($r, $m) = split /\n<<<SPLIT>>>\n/, $c, 2;
+      exit 1 unless $r =~ /lab\.setText\(HoldRow\.label\(mode\)\);/;
+      exit 1 unless $r =~ /putExtra\(UnarchiveService\.EXTRA_SWEEP, true\)\s*\.putExtra\(UnarchiveService\.EXTRA_BY_HAND, true\)/;
+      exit 1 if $r =~ /EXTRA_RESUME/;
+      exit 1 unless $m =~ /if \(s == SweepHold\.State\.PAUSED\) return PAUSED;/;
+      exit 1 unless $m =~ /if \(s == SweepHold\.State\.STOPPED\) return INSTALL;/;
+      exit 0;' <<<"$row
+<<<SPLIT>>>
+$holdmode" || bad=1
 
   pin H13 "a sweep that stops on a busy remembered tap puts a waiting Resume back to paused, on the card too, and tells the card" '
       my ($s, $h) = split /\n<<<SPLIT>>>\n/, $c, 2;
@@ -302,7 +309,7 @@ mut() { # mut <label> <file name under $CH> <perl-expr> <check the mutant must f
   d=$(mktemp -d -p "$W")
   mkdir -p "$d/$CH"
   for n in SweepHold.java SweepJoin.java LandingLine.java SweepOutcome.java SignOutGate.java UnarchiveService.java \
-           LandingNoticeActivity.java ProfileActivity.java; do cp "$ROOT/$CH/$n" "$d/$CH/$n"; done
+           LandingNoticeActivity.java ProfileActivity.java HoldRow.java; do cp "$ROOT/$CH/$n" "$d/$CH/$n"; done
   f="$d/$CH/$2"
   if ! perl -0pi -e "$3" "$f"; then echo "  ERROR     $1 -- perl failed"; rm -rf "$d"; return 1; fi
   if cmp -s "$ROOT/$CH/$2" "$f"; then echo "  INERT     $1 -- the mutation changed nothing"; rm -rf "$d"; return 1; fi
@@ -349,10 +356,10 @@ mut "M27 a resume shows a new card" "$U" 's/^[ \t]*landing = false;\n//m' H10 ||
 mut "M28 a resume does not tell the card" "$U" 's/^[ \t]*cardResumed\(card\);\n//m' H10 || fails=$((fails+1))
 mut "M29 the card's Resume starts by hand" "$C" 's/UnarchiveService\.EXTRA_RESUME/UnarchiveService.EXTRA_BY_HAND/' H11 || fails=$((fails+1))
 mut "M30 a paused card keeps the Pause word" "$C" 's/paused \? LandingLine\.RESUME : LandingLine\.PAUSE/LandingLine.PAUSE/' H11 || fails=$((fails+1))
-mut "M31 the big layout has no row" "$C" 's/(card\.addView\(moreRow\);\n)[ \t]*addHoldRow\(card\);\n/$1/' H11 || fails=$((fails+1))
-mut "M32 the small layout has no row" "$C" 's/(card\.addView\(gotIt, lp\);\n)[ \t]*addHoldRow\(card\);\n/$1/' H11 || fails=$((fails+1))
-mut "M33 the Your apps label ignores the hold" "$P" 's/SweepHold\.state\(\) == SweepHold\.State\.PAUSED \? LandingLine\.RESUME_ROW : //' H12 || fails=$((fails+1))
-mut "M34 the Your apps label reads Resume on a stop" "$P" 's/SweepHold\.State\.PAUSED \? LandingLine\.RESUME_ROW/SweepHold.State.STOPPED ? LandingLine.RESUME_ROW/' H12 || fails=$((fails+1))
+mut "M31 the big layout has no row" "$C" 's/(card\.addView\(moreRow\);\n[ \t]*addGotIt\(card\);\n)[ \t]*addHoldRow\(card\);\n/$1/' H11 || fails=$((fails+1))
+mut "M32 the small layout has no row" "$C" 's/(holdLine = keep;\n\s*addGotIt\(card\);\n)[ \t]*addHoldRow\(card\);\n/$1/' H11 || fails=$((fails+1))
+mut "M33 the Your apps row reads a pause as INSTALL" HoldRow.java 's/(State\.PAUSED\) return )PAUSED;/$1INSTALL;/' H12 || fails=$((fails+1))
+mut "M34 the Your apps row reads a stop as PAUSED" HoldRow.java 's/(State\.STOPPED\) return )INSTALL;/$1PAUSED;/' H12 || fails=$((fails+1))
 mut "M35 a stopped card says the paused line" "$L" 's/return stopped \? STOPPED_LINE : null;/return stopped ? PAUSED_LINE : null;/' "W2 a stopped card" || fails=$((fails+1))
 mut "M36 a card with every app landed keeps the held line" "$L" 's/^[ \t]*if \(landed == total\) return null;\n//m' "W3 a paused card with every app landed" || fails=$((fails+1))
 mut "M37 begin keeps paused" "$L" 's/(done = false;\n\s*)paused = false;\n/$1/' "S6 begin after a pause resets paused" || fails=$((fails+1))

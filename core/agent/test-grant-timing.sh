@@ -13,7 +13,9 @@
 #   A  a full run leaves one line of the exact shape with bundles=2, no .tmp, OK in $RES, and both TIMING lines
 #      in roam.log unchanged;
 #   B  a run cut off before its end (grant_perms_for exits) leaves no earlier grant-timing file;
-#   C  an unset uid counts 0 bundles.
+#   C  an unset uid counts 0 bundles;
+#   D  the arm drops an earlier session's $STATE/od-grow-timing (od_watched's du timings, NWP-20261202-34): an app's
+#      data size is a profile fact, so a report never carries an earlier session's sizes.
 # --mutate breaks each guard in turn on a COPY (the roamd script or the Go package); each mutant must be CONVICTED
 # (the shell ones under every shell; the Go ones by a real `--- FAIL`). One that fails to apply or compile is a failure.
 set -uo pipefail
@@ -112,6 +114,14 @@ shellsuite() {
     no "C an unset uid wrote '$line', want bundles=0"
   fi
 
+  # ---- D: the arm drops an earlier session's od-grow-timing (NWP-20261202-34) ----
+  T=$(mktemp -d -p "$W") || return 2
+  prep "$T" 10 ':'
+  printf 'v=1 vols=3 reads=9 du_ms=9 max_ms=9 kib=9\n' > "$T/state/od-grow-timing"
+  "$sh_" "$T/run.sh" >/dev/null 2>&1
+  [ ! -e "$T/state/od-grow-timing" ] && ok "D the grant arm drops the last session's od-grow-timing" \
+    || no "D the earlier od-grow-timing survived: '$(cat "$T/state/od-grow-timing" 2>/dev/null)'"
+
   [ -n "$quiet" ] || printf '  [%s] (%d ok, %d failed)\n' "$sh_" "$p" "$x"
   [ "$x" = 0 ]
 }
@@ -165,4 +175,6 @@ smut "m2 bundles counted after the sweep" \
 mut "m3 the deviceScope guard dropped" report_issue.go 'if !deviceScope \{(\n\t+for k, v := range grantTimingStatus)' 'if true {\1'
 mut "m4 the reader accepts a non-digit value" grant_timing.go 'bundles=\(\[0-9\]\{1,9\}\)' 'bundles=([^ ]{1,9})'
 smut "m5 the top-of-arm rm removed" -e '/^    if \[ -n "\${STATE:-}" \]; then rm -f "\$STATE\/grant-timing" 2>\/dev\/null; fi$/d'
-[ "$fails" -eq 0 ] && echo "== all 5 mutations convicted" || { echo "== $fails mutation(s) not convicted"; exit 1; }
+smut "m6 the od-grow-timing rm removed (D)" \
+  -e '/^    if \[ -n "\${STATE:-}" \]; then rm -f "\$STATE\/od-grow-timing" 2>\/dev\/null; fi$/d'
+[ "$fails" -eq 0 ] && echo "== all 6 mutations convicted" || { echo "== $fails mutation(s) not convicted"; exit 1; }

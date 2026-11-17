@@ -431,7 +431,7 @@ func TestExistsRefusalsGiveANextStep(t *testing.T) {
 	}{
 		{"ChooserActivity.java", `cr.startsWith("EXISTS")`, "return;", true, ""},
 		{"PromoteCopy.java", `"ERR-EXISTS".equals(r)) return "`, `";`, true, ""},
-		{"ProfileActivity.java", `case EXISTS:`, ".show();", false, "PromoteCopy.text(r)"},
+		{"ProfileActivity.java", `case EXISTS:`, "break;", false, "PromoteCopy.text(r)"},
 	} {
 		b, err := os.ReadFile(filepath.Join(dir, c.file))
 		if err != nil {

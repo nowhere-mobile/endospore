@@ -3,7 +3,7 @@
 # parked On-demand and Auto packages and lists them per scope; fetch-oddata places one package's data into its hold by
 # those spans; the seal walk leaves out a listed package's directories whatever they hold, so the carry keeps its stored
 # span; only the done marker proves a placement; the plan entry and the marker stay until the list line is off; a sign-out
-# stops a download between chunks; the #72 receipt the skip restore earns admits a seal while packages are listed; OD-DATA-PENDING answers the chooser's launch barrier without a worker lane). --mutate breaks a COPY of the package in the
+# stops a download between chunks; the #72 receipt the skip restore earns admits a seal while packages are listed; OD-DATA-PENDING answers the chooser's launch barrier without a worker lane; an absent keep file is nothing to skip, and only an unreadable one logs the failure (NWP-20261202-42)). --mutate breaks a COPY of the package in the
 # suite's temp root, one guard at a time, so the source tree is never edited. Each mutant must be CONVICTED by a
 # `--- FAIL` line of the test named for it; one that does not apply, does not compile, or fails without that line counts
 # as a failure.
@@ -88,7 +88,7 @@ mut "B5 odblock rides the RW lane (RF-011)" main.go TestOdBarrier_Lane \
 mut "B6 the barrier carries the passphrase onto the RO lane (RF-011)" unfetched_fetch.go TestOdBarrier_DelayedWorkerAndFailedFetch \
   'try\(dest, "odblock", name, "", uid' 'try(dest, "odblock", name, name, uid'
 mut "B7 a busy barrier stops the restore (RF-011)" app_code.go TestOdBarrier_BusyStillRestores \
-  'stopBarrier := odLaunchBarrier\(dest, name, uid, pkg\)' 'stopBarrier := odLaunchBarrier(dest, name, uid, pkg); if odBarrierNeeded(dest, uid, pkg) { stopBarrier(); return }'
+  'stopBarrier := odLaunchBarrier\(dest, name, uid, pkg\)' 'stopBarrier := odLaunchBarrier(dest, name, uid, pkg); if odBarrierNeeded(dest, uid, pkg) { stopBarrier(); return "" }'
 mut "B8 a busy barrier is tried only once (RF-011)" unfetched_fetch.go TestOdBarrier_BusyRetriesWhileRestoreWaits \
   'if out != workerBusy \{\n\t\treturn func\(\) \{\}\n\t\}' 'if out != "" { return func() {} }'
 mut "B9 the tries outlive the restore (RF-011)" unfetched_fetch.go TestOdBarrier_TriesEndWithTheRestore \
@@ -125,6 +125,12 @@ mut "F22 the list failure is wrapped with its path (RF-010)" unfetched_fetch.go 
   '&odScopedErr\{scope: scopes\[i\]\.scope \+ " list unreadable", err: rerr\}' 'fmt.Errorf("%s list unreadable: %w", scopes[i].scope, rerr)'
 mut "F23 the plan failure is wrapped with its path (RF-010)" unfetched_fetch.go TestFetchOdData_FailureLineHasNoPath \
   'fmt\.Errorf\("plan unreadable: %s", errCode\(perr\)\)' 'fmt.Errorf("plan unreadable: %w", perr)'
+mut "F24 absent counts as unreadable (NWP-20261202-42)" unfetched_fetch.go TestUnfetchedRestore_NoKeepFileIsNothingToSkip \
+  'if errors\.Is\(err, fs\.ErrNotExist\) \{\n\t\treturn map\[string\]bool\{\}, true, true\n\t\}\n\t' ''
+mut "F25 every keep error counts as absent (NWP-20261202-42)" unfetched_fetch.go TestUnfetchedRestore_UnreadableKeepLogsFailure \
+  'if errors\.Is\(err, fs\.ErrNotExist\) \{\n\t\treturn map\[string\]bool\{\}, true, true' $'if err != nil {\n\t\treturn map[string]bool{}, true, true'
+mut "F26 the shipped-list failure is read as absent (NWP-20261202-42)" unfetched_fetch.go TestUnfetchedRestore_UnreadableKeepLogsFailure \
+  'sb, err := os\.ReadFile\(shippedPath\)\n\tif err != nil \{\n\t\treturn nil, false, false' $'sb, err := os.ReadFile(shippedPath)\n\tif err != nil {\n\t\treturn map[string]bool{}, true, true'
 mut "P1 the verb answers NO for a listed package (2b)" unfetched_fetch.go TestOdDataPending_Reply \
   'if parseUnfetched\(b\)\[pkg\] \{\n\t\t\treturn odPendingYes' 'if parseUnfetched(b)[pkg] {
 			return odPendingNo'

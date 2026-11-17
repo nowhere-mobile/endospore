@@ -206,6 +206,116 @@ func TestUnfetchedRestore_OffRestoresAll(t *testing.T) {
 	}
 }
 
+// ufRestoreWith seals files as scope, then restores the head with the skip on, after set has changed the env. The env
+// before set is ufRestoreHead's: both lists empty, a shipped list naming ufShip, the keep file the restore itself writes.
+func ufRestoreWith(t *testing.T, scope string, files map[string][]byte, set func(t *testing.T, dir string)) (ufEnv, string) {
+	t.Helper()
+	base, m, _ := psSeal(t, scope, files)
+	if len(m.PkgSpan) == 0 {
+		t.Fatalf("fixture: the %s head has no span index", scope)
+	}
+	dir := t.TempDir()
+	for _, f := range []string{odUnfetchedCE, odUnfetchedDE} {
+		if err := os.WriteFile(filepath.Join(dir, f), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(dir, "shipped"), []byte(ufShip+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dest := t.TempDir()
+	t.Setenv("NOWHERE_PARK_KEEP", filepath.Join(dest, chooserPkg, "files", "nowhere-appkeep"))
+	t.Setenv("NOWHERE_PARK_SHIPPED", filepath.Join(dir, "shipped"))
+	t.Setenv("NOWHERE_UNFETCHED_LIST", filepath.Join(dir, odUnfetchedCE))
+	set(t, dir)
+	key, _, ok := resolveKey(base, scope, unfPass)
+	if !ok {
+		t.Fatalf("no %s head", scope)
+	}
+	out := captureStdout(t, func() { restoreSkippingParked(base, key, scope, m, dest) })
+	return ufEnv{base, scope, dir, dest}, out
+}
+
+// ufAssertNothingSkipped checks that the restore put every sealed file in place byte for byte, listed nothing and wrote
+// no plan.
+func ufAssertNothingSkipped(t *testing.T, e ufEnv, files map[string][]byte) {
+	t.Helper()
+	got := psRegularFiles(t, e.dest)
+	for rel, b := range files {
+		if !bytes.Equal(got[rel], b) {
+			t.Errorf("%s was not restored byte for byte", rel)
+		}
+	}
+	for _, f := range []string{odUnfetchedCE, odUnfetchedDE} {
+		if l := ufReadList(t, filepath.Join(e.dir, f)); len(l) != 0 {
+			t.Errorf("%s = %v, want empty", f, l)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(e.dir, odPlanCE)); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the restore wrote a plan (stat err %v)", err)
+	}
+}
+
+// NWP-20261202-42: a profile with no keep file keeps nothing, so the sign-in skips nothing and says so; it does not log
+// the read failure. With no keep file the shipped list is not needed either.
+func TestUnfetchedRestore_NoKeepFileIsNothingToSkip(t *testing.T) {
+	cases := []struct {
+		name, scope string
+		set         func(t *testing.T, dir string)
+	}{
+		{"nokeep", "ufnokeepfile", func(t *testing.T, dir string) {}},
+		{"nokeepnoship", "ufnokeepnoship", func(t *testing.T, dir string) {
+			t.Setenv("NOWHERE_PARK_SHIPPED", filepath.Join(dir, "no-such-shipped"))
+		}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			files := ufFiles()
+			delete(files, chooserPkg+"/files/nowhere-appkeep")
+			e, out := ufRestoreWith(t, c.scope, files, c.set)
+			ufAssertNothingSkipped(t, e, files)
+			if !strings.Contains(out, "unfetched: no keep file -> nothing to skip") {
+				t.Errorf("no nothing-to-skip line:\n%s", out)
+			}
+			if strings.Contains(out, "could not be read") {
+				t.Errorf("an absent keep file was logged as a read failure:\n%s", out)
+			}
+			if !strings.Contains(out, "unfetched: 0 package(s) skipped") {
+				t.Errorf("no summary line with 0 packages:\n%s", out)
+			}
+		})
+	}
+}
+
+// NWP-20261202-42: a keep file that exists but cannot be read, or a shipped list that cannot be read, still logs the
+// failure, and the restore still skips nothing.
+func TestUnfetchedRestore_UnreadableKeepLogsFailure(t *testing.T) {
+	cases := []struct {
+		name, scope string
+		set         func(t *testing.T, dir string)
+	}{
+		{"noshipped", "ufunreadnoship", func(t *testing.T, dir string) {
+			t.Setenv("NOWHERE_PARK_SHIPPED", filepath.Join(dir, "no-such-shipped"))
+		}},
+		{"keepisdir", "ufunreadkeepdir", func(t *testing.T, dir string) {
+			t.Setenv("NOWHERE_PARK_KEEP", t.TempDir())
+		}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			files := ufFiles()
+			e, out := ufRestoreWith(t, c.scope, files, c.set)
+			ufAssertNothingSkipped(t, e, files)
+			if !strings.Contains(out, "the keep or shipped list could not be read -> nothing skipped") {
+				t.Errorf("no read-failure line:\n%s", out)
+			}
+			if strings.Contains(out, "nothing to skip") {
+				t.Errorf("a read failure was logged as an absent keep file:\n%s", out)
+			}
+		})
+	}
+}
+
 // A package fetched after the skip is byte-equal, in content and mode, to what hold_ondemand parks from a full restore.
 func TestFetchOdData_RoundTripByteEqual(t *testing.T) {
 	for _, scope := range []string{"ufrt", "ufrt#de"} {

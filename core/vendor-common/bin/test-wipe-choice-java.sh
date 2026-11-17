@@ -88,8 +88,8 @@ pins() {
   sp=$(mbody "$f" 'private void showWipePicker\(')
   wp=$(mbody "$f" 'private boolean writeWipePref\(')
   [ -n "$sp" ] && [ -n "$wp" ] || { echo "  FAIL  pins: showWipePicker or writeWipePref not found" >&2; return 1; }
-  [ "$(count "$sp" 'setSingleChoiceItems\(WipeChoice\.LABELS, sel')" -eq 1 ] \
-    || { echo "  FAIL  pins: showWipePicker does not offer WipeChoice.LABELS" >&2; bad=1; }
+  [ "$(count "$sp" 'SheetDialog\.picker\(this, SecuritySheets\.wipe\(sel\), idx ->')" -eq 1 ] \
+    || { echo "  FAIL  pins: showWipePicker does not offer SecuritySheets.wipe(sel) on a sheet" >&2; bad=1; }
   [ "$(count "$sp" 'WipeChoice\.selected\(readPrefValue\("wipe"\), readPrefValue\(WipeOnSave\.PREF\)\)')" -eq 1 ] \
     || { echo "  FAIL  pins: showWipePicker does not highlight from WipeChoice.selected(" >&2; bad=1; }
   [ "$(count "$sp" 'if \(writeWipePref\(idx\)\) live = sendLivePrefs\(\);')" -eq 1 ] \

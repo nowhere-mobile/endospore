@@ -12,6 +12,7 @@ import (
 	"path"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -441,6 +442,8 @@ var _ = (fs.FileReader)((*mediaRangeHandle)(nil))
 var _ = (fs.FileReleaser)((*mediaRangeHandle)(nil))
 
 func (h *mediaRangeHandle) Read(ctx context.Context, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
+	t0 := time.Now()
+	defer func() { mediaIOStub(time.Since(t0)) }() // NWP-20261205-08: one stub read per call, on every return path
 	p, err := h.f.srv.ensureRange(h.f.rel, off, int64(len(dest)))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "mediad: %v\n", errCode(err))
@@ -700,6 +703,7 @@ func runMediad(args []string) {
 	goSafeTag.Store("[mediad]") // NWP-20261014-66: a goroutine this daemon recovers says whose it was
 	stateDir := os.Getenv("NOWHERE_STATE")
 	if stateDir != "" {
+		os.Remove(filepath.Join(stateDir, mediaIOFile)) // NWP-20261205-08: an earlier mediad's counts never reach this session's report
 		// DIA-20260816-13: truncate the overlay map before ANY scope appends to it. A SIGKILL'd previous
 		// instance (ctl.stop is a SIGKILL) leaves its lines behind, and a stale mountpoint->hidden pair is
 		// worse than none: the walk would read a dir that is no longer bound.
@@ -707,6 +711,9 @@ func runMediad(args []string) {
 		// NWP-20261201-14: a run with no mounts can leave a DAMAGED name for the session. Only a served scope cleared
 		// the file before, so a later sign-in that serves nothing would relay another profile's file name.
 		os.Remove(filepath.Join(stateDir, mediaProgressFile))
+		// NWP-20261114-34: each mediad start counts its own landings from 1. The gate compares numbers, not sizes, so
+		// a restart mid-session still reads as new work, and a previous session's count is never relayed.
+		os.Remove(filepath.Join(stateDir, mediaLandedFile))
 	}
 
 	// NWP-20261006-10: never serve a profile into a session it does not open in (tied to another phone's chip): its
@@ -726,8 +733,11 @@ func runMediad(args []string) {
 	// #129: also serve the EXTERNAL-media scope when the launcher passed it (only if /data/media/<uid> exists).
 	// Same key/vault, a DIFFERENT store ref (name#media) + userDir (/data/media/<uid>): its Deferred index holds
 	// the offline maps, and serveMediaScope's Tier-2 prefetch re-materializes them to disk after login.
+	var mediaMounts int
 	if len(args) >= 7 {
-		allMounts = append(allMounts, serveMediaScope(base, name+"#media", pass, args[5], args[6], stateDir)...)
+		ext := serveMediaScope(base, name+"#media", pass, args[5], args[6], stateDir)
+		mediaMounts = len(ext)
+		allMounts = append(allMounts, ext...)
 	}
 	ch := make(chan os.Signal, 1)
 	signal.Notify(ch, syscall.SIGTERM, syscall.SIGINT)
@@ -742,6 +752,13 @@ func runMediad(args []string) {
 		return
 	}
 	dlog("mediad: serving %d overlay(s) total for %q", len(allMounts), name)
+	announceMediaOverlays(stateDir, mediaMounts)
+	// NWP-20261205-08: publish the read-latency counts (numbers only) for the in-session issue report.
+	if stateDir != "" {
+		if u, err := strconv.Atoi(filepath.Base(userDir)); err == nil && u >= 0 {
+			goSafeLoop("media iostat", func() { mediaIOPublish(stateDir, u) })
+		}
+	}
 
 	// Serve until told to stop; then unmount every overlay + drop its bind, so no stale FUSE mount is left
 	// behind. NEVER blanket-abort /sys/fs/fuse/connections -- that kills Android's own storage FUSE (spike).
@@ -847,6 +864,7 @@ func serveMediaScope(base, name, pass, userDir, cacheDir, stateDir string) []med
 		os.Remove(srv.progPath)
 		srv.appProgPath = filepath.Join(st, mediaAppProgFile) // #129 P5: per-app Tier-2 progress for the ring
 		os.Remove(srv.appProgPath)
+		srv.stateDir = st // NWP-20261114-34: the media.landed counter; runMediad resets it once per start
 	}
 
 	hideBase := filepath.Join(cacheDir, ".under")
@@ -942,7 +960,7 @@ func serveMediaScope(base, name, pass, userDir, cacheDir, stateDir string) []med
 			syscall.Unmount(hidden, syscall.MNT_DETACH)
 			continue
 		}
-		server, err := fs.Mount(target, root, mediaMountOptions())
+		server, err := mediaMountServe(target, root, mediaMountOptions()) // NWP-20261205-08: fs.Mount plus the read-latency map
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "mediad: mount %q failed: %v\n", target, errCode(err))
 			syscall.Unmount(hidden, syscall.MNT_DETACH)

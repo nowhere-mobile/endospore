@@ -3,10 +3,13 @@ package main
 import (
 	"bytes"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -218,11 +221,128 @@ func TestTieSlotsSealsThisPhonesLabel(t *testing.T) {
 		t.Errorf("the other slots changed in the tie:\n got %+v\nwant %+v", rest, want)
 	}
 	enc := serializeVault(v)
-	if bytes.Contains(enc, []byte(label)) || bytes.Contains(enc, []byte("Ivy")) {
-		t.Errorf("the encoded vault holds the label in the clear: %s", enc)
+	for _, f := range clearLabelFindings(enc, label) {
+		t.Errorf("the encoded vault holds the label in the clear: %s", f)
 	}
 	if !bytes.Contains(enc, []byte(`"label_sealed"`)) {
 		t.Errorf("the encoded vault has no label_sealed field: %s", enc)
+	}
+}
+
+// slotBase64Keys are the keyslot fields that hold base64 (main.go `type keyslot`). A clear label must not hide in one:
+// each must decode, and its decoded bytes must not hold the label.
+var slotBase64Keys = map[string]bool{"wrapped": true, "cred_id": true, "salt": true, "label_sealed": true}
+
+// clearLabelFindings decodes an encoded vault and returns one finding per place that holds label in the clear
+// (NWP-20261206-01). It never searches a base64 field as text: random base64 holds a short word of the label now and
+// then ("Ivy" is three base64 characters), and that made TestTieSlotsSealsThisPhonesLabel fail at random. A base64
+// field must decode, and its bytes must not hold the label. Every other string field must not hold the label, nor a
+// word of it of three or more letters, in any case. The whole vault must not hold the label nor its JSON-escaped
+// form: both hold a space, which standard base64 never holds.
+func clearLabelFindings(enc []byte, label string) []string {
+	var out []string
+	if !bytes.HasPrefix(enc, vaultMagic) {
+		return append(out, "no vault magic")
+	}
+	var v struct {
+		Slots []map[string]any `json:"slots"`
+	}
+	if err := json.Unmarshal(enc[len(vaultMagic):], &v); err != nil {
+		return append(out, "the vault does not decode: "+err.Error())
+	}
+	var words []string
+	for _, w := range strings.FieldsFunc(label, func(r rune) bool { return r == ' ' || r == '\'' }) {
+		if len(w) >= 3 {
+			words = append(words, strings.ToLower(w))
+		}
+	}
+	for i, s := range v.Slots {
+		keys := make([]string, 0, len(s))
+		for k := range s {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			str, isStr := s[k].(string)
+			if slotBase64Keys[k] {
+				if !isStr {
+					out = append(out, fmt.Sprintf("slot %d %s is not a string", i, k))
+					continue
+				}
+				raw, err := base64.StdEncoding.DecodeString(str)
+				if err != nil {
+					out = append(out, fmt.Sprintf("slot %d %s does not decode as base64: %q", i, k, str))
+					continue
+				}
+				if bytes.Contains(raw, []byte(label)) {
+					out = append(out, fmt.Sprintf("slot %d %s decodes to bytes that hold the label", i, k))
+				}
+				continue
+			}
+			if !isStr {
+				continue
+			}
+			if strings.Contains(str, label) {
+				out = append(out, fmt.Sprintf("slot %d %s holds the label: %q", i, k, str))
+				continue
+			}
+			for _, w := range words {
+				if strings.Contains(strings.ToLower(str), w) {
+					out = append(out, fmt.Sprintf("slot %d %s holds the label word %q: %q", i, k, w, str))
+				}
+			}
+		}
+	}
+	j, _ := json.Marshal(label)
+	for _, needle := range [][]byte{[]byte(label), j[1 : len(j)-1]} {
+		if bytes.Contains(enc, needle) {
+			out = append(out, fmt.Sprintf("the encoded vault holds %q", needle))
+		}
+	}
+	return out
+}
+
+// TestClearLabelFindingsIgnoresBase64Noise (NWP-20261206-01): random base64 that holds "Ivy" gives no finding, and a
+// clear label gives one in a clear field, in a word of a clear field, in a base64 field that only encodes it, and in
+// a base64 field that does not decode.
+func TestClearLabelFindingsIgnoresBase64Noise(t *testing.T) {
+	const label = "Ivy's Pixel"
+	// ciWrapped is the wrapped value the task quotes from the #3280 CI replay of 2026-11-14. As quoted it holds no
+	// "Ivy", so ivyWrapped is the same value with "+jV3A" changed to "+IvyA": it carries the "+Ivy" of the failed run
+	// and is still valid base64 of 60 bytes.
+	const ciWrapped = "4XmcsrGksY5pWhTaLe5nNpdKFBigamsWhTkYpzhD+jV3A55NhUTxSQ9KjbfxVuYHHyWMThvIym5m2vor"
+	const ivyWrapped = "4XmcsrGksY5pWhTaLe5nNpdKFBigamsWhTkYpzhD+IvyA55NhUTxSQ9KjbfxVuYHHyWMThvIym5m2vor"
+	dk := randBytes(32)
+	noise := &vault{V: 2, Slots: []keyslot{
+		{Kind: "se", Wrapped: ciWrapped, LabelSealed: sealSlotLabel(dk, label)},
+		{Kind: "recovery", Wrapped: ivyWrapped},
+	}}
+	enc := serializeVault(noise)
+	if !bytes.Contains(enc, []byte("Ivy")) {
+		t.Fatalf("the noise vault does not reproduce the flake: no \"Ivy\" in %s", enc)
+	}
+	if f := clearLabelFindings(enc, label); len(f) != 0 {
+		t.Errorf("base64 noise gave findings: %q", f)
+	}
+	for _, c := range []struct {
+		name string
+		slot keyslot
+		want string
+	}{
+		{"clear label field", keyslot{Kind: "se", Wrapped: ciWrapped, Label: label}, "label holds the label"},
+		{"label word in transport", keyslot{Kind: "fido2", Wrapped: ciWrapped, Transport: "Ivy"}, "holds the label word"},
+		{"unsealed base64 label", keyslot{Kind: "se", Wrapped: ciWrapped, LabelSealed: base64.StdEncoding.EncodeToString([]byte(label))}, "decodes to bytes that hold the label"},
+		{"wrapped does not decode", keyslot{Kind: "se", Wrapped: label}, "does not decode"},
+		{"wrapped does not decode, no full label", keyslot{Kind: "se", Wrapped: "Ivy-Pixel!"}, "does not decode"},
+	} {
+		f := clearLabelFindings(serializeVault(&vault{V: 2, Slots: []keyslot{c.slot}}), label)
+		hit := false
+		for _, s := range f {
+			hit = hit || strings.Contains(s, c.want)
+		}
+		if !hit {
+			t.Errorf("%s: no finding holds %q: %q", c.name, c.want, f)
+		}
 	}
 }
 

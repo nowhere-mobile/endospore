@@ -138,6 +138,8 @@ public class CredentialService extends Service {
 
     @Override public int onStartCommand(Intent intent, int flags, int startId) {
         ACTIVE.incrementAndGet();
+        ChooserActivity.idleTrace("credsvc " + SignInTrace.startKind(x -> intent != null && intent.getBooleanExtra(x, false))
+                + " u=" + android.os.UserHandle.myUserId() + " id=" + startId + " up=" + android.os.SystemClock.uptimeMillis()); // NWP-20261203-04
         // #135 delivery v2: a "telingest" start (fired by the gate right after the login switch) pulls this
         // user's decrypted telephony rows from the daemon and inserts them into OUR OWN providers with a
         // verify-first retry (see TelIngest -- the su:s0 worker could never verify, per DIA-56). It rides in
@@ -252,9 +254,12 @@ public class CredentialService extends Service {
         // service for the same B4 reason as the branches above: a NEW manifest component does not register
         // over a pinned-fingerprint reflash without a data wipe, and this service is already started AS
         // the roamed user.
+        // NWP-20261203-05: one Ingest.run per process at a time. CredSvcWatch can re-send this start while a first run
+        // still works (the service came up between its second read and its stop); a second worker would pass the same
+        // receipt and exists checks and insert every contact and event twice.
         if (intent != null && intent.getBooleanExtra("ingest", false)) {
             new Thread(() -> {
-                try { Ingest.run(this); } finally { finishUnit(); }
+                try { CredSvcWatch.runOnce(CredSvcWatch.INGEST, () -> Ingest.run(this)); } finally { finishUnit(); }
             }, "nowhere-ingest").start();
             return START_NOT_STICKY;
         }

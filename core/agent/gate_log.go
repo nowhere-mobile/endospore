@@ -86,6 +86,8 @@ var gateLogVerbs = map[string]bool{
 	"ui-auto-snooze": true, "ui-auto-dismiss": true,
 	// NWP-20261128-35: the gate window's two light-bar appearance bits at first focus, in light mode (0, 8, 16 or 24)
 	"bars-light": true,
+	// NWP-20261204-07: at a gate-alarm fire, whether a roamed user was running, stopped or absent -- a relation, as ui-guard-other; never a user id or a count
+	"fired-roamed-running": true, "fired-roamed-stopped": true, "fired-roamed-none": true, "fired-roamed-err": true,
 	// the record of a rejection -- never the rejected text itself
 	"trace-unknown": true,
 }

@@ -4,6 +4,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -69,20 +70,20 @@ func TestCreateIsRefusedWhileAColdLockIsParked(t *testing.T) {
 		t.Error("a refused create enrolled the profile")
 	}
 	if _, err := os.Stat(createStagingPath(stName, stPass)); err == nil {
-		t.Error("a refused CREATE-CODE staged a claim -- the code was drained")
+		t.Error("a refused CREATE-CODE staged a claim -- the code was staged")
 	}
 	if b, err := os.ReadFile(wpath); err != nil || string(b) != string(walletBefore) || walletGeneration(wpath) != gen {
 		t.Errorf("a refused create touched the parked session's wallet (err %v)", err)
 	}
 
-	// The session resumes (its marker goes), and the same code creates the profile with every token it carried: the
-	// refusals redeemed nothing and charged no enrollment.
+	// The session resumes (its marker goes), and the same code creates the profile carrying the code as its one pending
+	// claim (h53 #6, NWP-20261207-01): the refusals staged nothing and charged no enrollment.
 	os.Remove(filepath.Join(dest, ".coldlock"))
 	if got := verb(func(c net.Conn) { handleCreateCode(c, dest, stName, stPass, "PAIDCODEPAIDCODEPAIDCODE") }); !strings.HasPrefix(got, "OK ") {
 		t.Fatalf("CREATE-CODE once the cold lock is gone replied %q, want OK", got)
 	}
-	if w := storedWallet(t, stName, stPass); w == nil || len(w.BlindTokens) != 3 {
-		t.Errorf("the profile created after the refusals holds %v, want the code's 3 tokens", w)
+	if w := storedWallet(t, stName, stPass); w == nil || !slices.Equal(w.PendingClaims, []string{"PAIDCODEPAIDCODEPAIDCODE"}) || w.balance() != 0 {
+		t.Errorf("the profile created after the refusals holds %v, want the code once as a pending claim and no tokens", w)
 	}
 }
 

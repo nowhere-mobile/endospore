@@ -539,6 +539,9 @@ var opaqueAllowed = map[string][]string{
 	// The Auto sweep's per-app outcome: SweepOutcome.request(i, n, token, ms) builds "AUTO-SWEEP-APP\n<i>\n<n>\n<token>\n<ms>\n",
 	// sent once per app and once for a sign-out's stop (NWP-20261113-17).
 	"UnarchiveService.java#sweepAuto": {"AUTO-SWEEP-APP"},
+	// The Auto sweep's stalled steps: SweepStall.request(kind, step, i, n, secs) builds
+	// "AUTO-SWEEP-STEP\n<kind>\n<step>\n<i>\n<n>\n<secs>\n", sent by sweepStallSend (NWP-20261203-03).
+	"UnarchiveService.java#sweepStallSend": {"AUTO-SWEEP-STEP"},
 	// The Auto sweep's restore-only retries: OdRestoreList.request(keep) builds "RESTORE-ODDATA\n<pkg> <pkg>...\n" for
 	// 2..OdRestoreList.CHUNK apps in one request (NWP-20261128-16).
 	"UnarchiveService.java#restoreOnlyListLocked": {"RESTORE-ODDATA"},
@@ -658,13 +661,14 @@ func verbIn(l []string, s string) bool {
 // NWP-20261201-10 reads it and P12a of harvest 62 (the check runner) adds its arm. An entry has no effect once
 // handleLogin has the arm: both TestDaemonVerbs and TestGatePollersNeverWaitOnTheSession then judge the verb in full.
 // MEDIA-RESTART: NWP-20261202-26 sends it from MediaFixReceiver and M12a of harvest 63 adds its arm.
-var chooserVerbsAwaitingArm = map[string]bool{"GET-HEALTH": true, "MEDIA-RESTART": true}
+// GET-LASTSAVE: sent by NWP-20261205-02's LastSaveNoticeActivity; harvest 66's M06 gate-verb task adds its arm.
+var chooserVerbsAwaitingArm = map[string]bool{"GET-HEALTH": true, "GET-LASTSAVE": true, "MEDIA-RESTART": true}
 
 // senderFiles are the chooser files that touch the daemon socket. A file that starts to and is not here fails.
 var senderFiles = map[string]bool{
 	"AppInstallReceiver.java": true, "BackupNowReceiver.java": true, "ChooserActivity.java": true, "HealthFixReceiver.java": true,
-	"CredentialService.java": true, "DaemonSocket.java": true, "DiagReportJob.java": true, "DozeAppsMirror.java": true, "GateAlarmActivity.java": true, "GateTrace.java": true,
-	"IdleLogoffReceiver.java": true, "Ingest.java": true, "MediaFixReceiver.java": true, "NfcFido2.java": true, "OdDataBarrierHost.java": true, "OtaUpdate.java": true,
+	"CredentialService.java": true, "DaemonSocket.java": true, "DiagReportJob.java": true, "DozeAppsMirror.java": true, "EmergencyWindow.java": true, "GateAlarmActivity.java": true, "GateTrace.java": true,
+	"IdleLogoffReceiver.java": true, "Ingest.java": true, "LastSaveNoticeActivity.java": true, "MediaFixReceiver.java": true, "NfcFido2.java": true, "OdDataBarrierHost.java": true, "OtaUpdate.java": true,
 	"OtaTimeReceiver.java": true, "OtaWakeReceiver.java": true, "ProfileActivity.java": true, "ReloginReceiver.java": true,
 	"SkipNoticeActivity.java": true, "SmsDeliverReceiver.java": true, "StoreService.java": true, "TelArrival.java": true, "TelIngest.java": true,
 	"UnarchiveService.java": true, "WifiMirror.java": true,

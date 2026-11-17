@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
 # test-wallet-repair-java.sh [--mutate] -- Profile > Storage's warned wallet repair, run under javac (NWP-20261103-06).
 #
-# WHY THIS IS COMMITTED. The agent's REPAIR-WALLET verb (NWP-20261103-03) is reachable only from a screen, and Q153
-# says that screen offers it only when the stored wallet is proven DAMAGED, behind a dialog that says what is given up,
-# with Cancel the default. WalletRepairCopy (pure, java.lang only) holds the reply classifier and the copy and is
-# compiled here with its cases; source checks over showStorage pin, byte for byte, that the CHECK runs on the plan
-# thread and the button is created only under the DAMAGED verdict, that CONFIRM is sent only from the dialog's positive
-# button after it disables the button, and that a repair repaints the summary only from the last GET-BILLING reply:
-# the CONFIRM thread's one body write is the pinned repaint from lastBill[0], it never assigns lastBill[0] or
-# lastEnt[0], CONFIRM is its only daemon call, and showStorage builds one GET-BILLING request in any send form.
+# WHY THIS IS COMMITTED. The agent's REPAIR-WALLET verb (NWP-20261103-03) is reachable only from a screen, and Q153 says
+# that screen offers it only when the stored wallet is proven DAMAGED, behind a dialog that says what is given up, with
+# the safe way out the default: since NWP-20261206-06 an amber sheet whose green Not now only closes it and whose
+# red-outlined Repair runs the CONFIRM (ReportRepairSheets.repairCredit). WalletRepairCopy (pure, java.lang only) holds
+# the reply classifier and the copy and is compiled here with its cases; source checks over showStorage pin, byte for
+# byte, that the CHECK runs on the plan thread and the button is created only under the DAMAGED verdict, that CONFIRM is
+# sent only from the sheet's red Repair button (slot 1, never the green slot 0) after it disables the button, and that a
+# repair repaints the summary only from the last GET-BILLING reply: the CONFIRM thread's one body write is the pinned
+# repaint from lastBill[0], it never assigns lastBill[0] or lastEnt[0], CONFIRM is its only daemon call, and showStorage
+# builds one GET-BILLING request in any send form.
 #
 # ⚠ IT FAILS WHEN THERE IS NO JAVAC, IT NEVER SKIPS. javac comes from PATH, else from the build host's JDK below.
 #
@@ -83,4 +85,5 @@ mut "U6 a repair re-reads GET-BILLING" screen 's/(\n( *)final String r = sendDae
 mut "U7 a second dialog sends a second CONFIRM" screen 's/\n *if \(repair\[0\] == null \|\| !repair\[0\]\.isEnabled\(\)\) return;(\n *repair\[0\]\.setEnabled\(false\);)/$1/' || fails=$((fails+1))
 mut "U8 a repair repaints from a fresh or empty bill" screen 's/if \(lastBill\[0\] != null\) body\.setText\(formatBilling\(lastBill\[0\], lastEnt\[0\]\)\);(\n *\} else \{)/lastBill[0] = ""; body.setText(formatBilling("", lastEnt[0]));$1/' || fails=$((fails+1))
 mut "U9 a repair re-reads GET-BILLING through sendDaemonReply" screen 's/(\n( *)final String r = sendDaemon\(WalletRepairCopy\.CONFIRM_REQUEST\);)/$1\n${2}final String bill = WalletRepairCopy.repaired(r) ? sendDaemonReply("GET-BILLING\\n").text.trim() : null;/' || fails=$((fails+1))
+mut "U10 the repair runs from the green slot" screen 's/ReportRepairSheets\.repairCredit\(\), new Runnable\[\] \{ null, \(\) -> \{/ReportRepairSheets.repairCredit(), new Runnable[] { () -> {/' || fails=$((fails+1))
 [ "$fails" -eq 0 ] && echo "== all mutations convicted" || { echo "== $fails mutation(s) not convicted"; exit 1; }

@@ -44,14 +44,14 @@ public final class InstallParkedCases {
         int cl = l.indexOf("GET-COLDLOCK");
         check("listener reads GET-COLDLOCK", cl >= 0, "absent");
         check("listener does not send OTA-APPLY itself (it runs in the start body)", !l.contains("OTA-APPLY"), "present");
-        String pre = src.substring(Math.max(0, at - 1200), at);
-        int body = pre.indexOf("final Runnable startInstall");
-        check("start body is where OTA-APPLY is sent", body >= 0 && pre.indexOf("OTA-APPLY", body) > body, "absent");
+        int body = src.lastIndexOf("final Runnable startInstall", at);
+        int ap = body < 0 ? -1 : src.indexOf("OTA-APPLY", body);
+        check("start body is where OTA-APPLY is sent", body >= 0 && ap > body && ap < at, "absent");
         check("listener reads before it starts", cl >= 0 && l.indexOf("startInstall") > cl, "order");
         check("a parked answer asks before starting",
                 l.contains("confirmInstallOverParked(parsed, lost, startInstall)"), "absent");
         check("the no-parked path starts at once",
-                l.contains("if (!installAsksFirst(cl)) {\n                runOnUiThread(startInstall);"), "absent");
+                l.contains("if (!installAsksFirst(cl)) {\n                    runOnUiThread(startInstall);"), "absent");
         check("unanswered read is held as empty", l.contains("String cl = \"\";"), "absent");
         check("credit read only for a named session", l.contains("if (parseColdLock(cl) != null) {"), "absent");
         System.out.println(fails == 0 ? "OK" : fails + " FAILED");

@@ -1,4 +1,5 @@
 public void onReceive(Context ctx, Intent intent) {
+        RECEIVED.incrementAndGet();
         final int count = intent == null ? -1 : intent.getIntExtra(EXTRA_COUNT, -1);
         final int plan = plan(intent == null ? null : intent.getAction(),
                 android.os.Process.myUserHandle().getIdentifier(), count);

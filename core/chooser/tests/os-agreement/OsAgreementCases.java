@@ -8,7 +8,10 @@ import java.util.Locale;
  * licence and claims nothing beyond docs/privacy-claims.md §3. Since NWP-20261202-23 (docs/product-decisions.md
  * 2026-11-10, item 2) they also check the create form's acknowledgement: createStep waits on an unread gate, asks while
  * a draft reply's box is unticked and goes on every other reply; createAckShown only in create mode; createAckText
- * carries ACK and the DRAFT mark; the two refusal lines claim nothing about privacy. Exits 1 on any failure.
+ * carries ACK and the DRAFT mark; the two refusal lines claim nothing about privacy. Since NWP-20261204-09
+ * (docs/product-decisions.md 2026-11-10, "three answers to harvest 63", answer 2) they check Profile's save ceremony:
+ * saveStep is createStep's rule, saveAckShown is shouldShow, and the two save refusal lines name the box and Save.
+ * Exits 1 on any failure.
  */
 public class OsAgreementCases {
     private static int failures = 0;
@@ -59,6 +62,7 @@ public class OsAgreementCases {
             {"AGREE", OsAgreement.AGREE}, {"ACK", OsAgreement.ACK}, {"ACCEPT", OsAgreement.ACCEPT},
             {"VERSION", OsAgreement.VERSION},
             {"CREATE_ACK_NEED", OsAgreement.CREATE_ACK_NEED}, {"CREATE_WAIT_TEXT", OsAgreement.CREATE_WAIT_TEXT},
+            {"SAVE_ACK_NEED", OsAgreement.SAVE_ACK_NEED}, {"SAVE_WAIT_TEXT", OsAgreement.SAVE_WAIT_TEXT},
         };
         for (String[] t : texts) check(t[0] + " is set", t[1] != null && !t[1].trim().isEmpty());
 
@@ -138,11 +142,45 @@ public class OsAgreementCases {
         check("CREATE_WAIT_TEXT names the Create profile button: " + show(OsAgreement.CREATE_WAIT_TEXT),
                 OsAgreement.CREATE_WAIT_TEXT != null && OsAgreement.CREATE_WAIT_TEXT.contains("Create profile"));
         for (String[] t : new String[][] {{"CREATE_ACK_NEED", OsAgreement.CREATE_ACK_NEED},
-                {"CREATE_WAIT_TEXT", OsAgreement.CREATE_WAIT_TEXT}}) {
+                {"CREATE_WAIT_TEXT", OsAgreement.CREATE_WAIT_TEXT}, {"SAVE_ACK_NEED", OsAgreement.SAVE_ACK_NEED},
+                {"SAVE_WAIT_TEXT", OsAgreement.SAVE_WAIT_TEXT}}) {
             for (String claim : new String[] {"nothing of yours", "do not know who you are", "anonymous", "guarantee",
                     "cannot be hacked", "private", "encrypt", "wipe"}) {
                 check(t[0] + " makes no privacy claim (\"" + claim + "\")", !lower(t[1]).contains(claim));
             }
+        }
+
+        // Profile's save ceremony (NWP-20261204-09): the same ACK, the same one gate, createStep's rule. A null reply is
+        // "not read yet": with the gate off, Save waits and re-reads, ticked or not.
+        check("saveStep(null, false) is CREATE_WAIT", OsAgreement.saveStep(null, false) == OsAgreement.CREATE_WAIT);
+        check("saveStep(null, true) is CREATE_WAIT", OsAgreement.saveStep(null, true) == OsAgreement.CREATE_WAIT);
+        check("saveStep(\"draft\", false) is CREATE_ASK", OsAgreement.saveStep("draft", false) == OsAgreement.CREATE_ASK);
+        check("saveStep(\"draft\", true) is CREATE_GO", OsAgreement.saveStep("draft", true) == OsAgreement.CREATE_GO);
+        check("saveStep(\" draft\\n\", false) is CREATE_ASK",
+                OsAgreement.saveStep(" draft\n", false) == OsAgreement.CREATE_ASK);
+        for (String r : new String[] {"off", "", "ERR"}) {
+            check("saveStep(" + show(r) + ", false) is CREATE_GO", OsAgreement.saveStep(r, false) == OsAgreement.CREATE_GO);
+        }
+        for (String[] set : new String[][] {{null}, draftReplies, otherReplies}) {
+            for (String r : set) {
+                for (boolean t : new boolean[] {false, true}) {
+                    check("one rule: saveStep(" + show(r) + ", " + t + ") is createStep's",
+                            OsAgreement.saveStep(r, t) == OsAgreement.createStep(r, t));
+                }
+            }
+        }
+        check("saveAckShown(\"draft\") is true", OsAgreement.saveAckShown("draft"));
+        for (String r : new String[] {"off", "", null}) {
+            check("saveAckShown(" + show(r) + ") is false", !OsAgreement.saveAckShown(r));
+        }
+        check("SAVE_ACK_NEED names the box and Save: " + show(OsAgreement.SAVE_ACK_NEED),
+                lower(OsAgreement.SAVE_ACK_NEED).contains("box")
+                        && OsAgreement.SAVE_ACK_NEED != null && OsAgreement.SAVE_ACK_NEED.contains("Save"));
+        check("SAVE_WAIT_TEXT names Save: " + show(OsAgreement.SAVE_WAIT_TEXT),
+                OsAgreement.SAVE_WAIT_TEXT != null && OsAgreement.SAVE_WAIT_TEXT.contains("Save"));
+        for (String[] t : new String[][] {{"SAVE_ACK_NEED", OsAgreement.SAVE_ACK_NEED},
+                {"SAVE_WAIT_TEXT", OsAgreement.SAVE_WAIT_TEXT}}) {
+            check(t[0] + " holds no \"&\": " + show(t[1]), t[1] != null && !t[1].contains("&"));
         }
 
         if (failures > 0) {

@@ -29,10 +29,11 @@ import android.widget.TextView;
  * NWP-20261126-05 (docs/product-decisions.md 2026-11-03, "the Auto sweep's landing notice is a checklist card, and
  * Profile Help's cards show where to tap", option D): a rounded card {@link LandingLine#WIDTH_SHARE} of the screen wide,
  * in the gate's light or dark look, titled {@link LandingLine#TITLE}. Up to {@link LandingLine#ROWS_MAX} apps: one row
- * per app with its state, then {@link LandingLine#KEEP} and one filled {@link LandingLine#GOT_IT} button. From
- * {@code ROWS_MAX + 1}: the headline count, a bar, at most {@link LandingLine#ROWS_BIG} rows and "+<n> more", which
- * opens Your apps. Fixed slots, so the card keeps one size and never scrolls. The rules and words are LandingLine's.
- * A row's name is fixed at its first paint (NWP-20261201-31).
+ * per app with its state, then {@link LandingLine#KEEP}. From {@code ROWS_MAX + 1}: the headline count, a bar, at most
+ * {@link LandingLine#ROWS_BIG} rows and "+<n> more", which opens Your apps. Both sizes then end with one filled
+ * {@link LandingLine#GOT_IT} button above Pause and Stop (NWP-20261203-28, docs/product-decisions.md 2026-11-12 "the
+ * Auto sweep's landing card has "Got it" at every size"). Fixed slots, so the card keeps one size and never scrolls.
+ * The rules and words are LandingLine's. A row's name is fixed at its first paint (NWP-20261201-31).
  *
  * sweepAuto records each app outcome and the end in {@link LandingLine.Sweep} (its id rides {@link #EXTRA_SWEEP}),
  * and each dep that lands (NWP-20261130-09), then sends {@link #ACTION_APP} (package-local; the package never goes to
@@ -42,8 +43,9 @@ import android.widget.TextView;
  * window it leaves the rows and counts in "+<n> more" until the window reaches it near the end (LandingLine.rows). The
  * card closes
  * {@link LandingLine#CLOSE_AFTER_MS} after its sweep ends: apps a joined rerun pass fetches after it show only in the
- * notification and Your apps. The notification stays the record. Dismissible, not pinned: no lock task. Got it, Back
- * and the close {@link LandingLine#CLOSE_AFTER_MS} after the sweep close it; a tap outside does not (NWP-20261201-32).
+ * notification and Your apps. The notification stays the record. Dismissible, not pinned: no lock task. Got it, Back,
+ * "+<n> more" (which opens Your apps) and the close {@link LandingLine#CLOSE_AFTER_MS} after the sweep close it; a tap
+ * outside does not (NWP-20261201-32). None of them pauses or stops the sweep.
  *
  * NWP-20261201-34 (docs/product-decisions.md, 2026-11-09 "eight answers to harvest 62 ...", #3): each row reads ready,
  * installing or coming back. sweepAuto and the dep loop record each start in LandingLine.Sweep, then send
@@ -133,19 +135,7 @@ public class LandingNoticeActivity extends Activity {
             card.addView(keep);
             holdLine = keep;
 
-            Button gotIt = new Button(this);
-            gotIt.setText(LandingLine.GOT_IT);
-            gotIt.setAllCaps(false);
-            gotIt.setTextColor(look.onAccent);
-            GradientDrawable fill = new GradientDrawable();
-            fill.setColor(look.accent);
-            fill.setCornerRadius(dp(12));
-            gotIt.setBackground(fill);
-            gotIt.setOnClickListener(v -> finish());
-            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
-                    LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
-            lp.topMargin = dp(20);
-            card.addView(gotIt, lp);
+            addGotIt(card);
             addHoldRow(card);
         } else {
             headline = new TextView(this);
@@ -174,6 +164,7 @@ public class LandingNoticeActivity extends Activity {
                 finish();
             });
             card.addView(moreRow);
+            addGotIt(card);
             addHoldRow(card);
         }
 
@@ -221,6 +212,26 @@ public class LandingNoticeActivity extends Activity {
         if (closing) return;
         closing = true;
         handler.postDelayed(this::finish, LandingLine.CLOSE_AFTER_MS);
+    }
+
+    /**
+     * NWP-20261203-28 (docs/product-decisions.md 2026-11-12, "the Auto sweep's landing card has "Got it" at every
+     * size"): the filled Got it, in both layouts, above the Pause/Stop row. It only closes the card: the sweep goes on.
+     */
+    private void addGotIt(LinearLayout card) {
+        Button gotIt = new Button(this);
+        gotIt.setText(LandingLine.GOT_IT);
+        gotIt.setAllCaps(false);
+        gotIt.setTextColor(look.onAccent);
+        GradientDrawable fill = new GradientDrawable();
+        fill.setColor(look.accent);
+        fill.setCornerRadius(dp(12));
+        gotIt.setBackground(fill);
+        gotIt.setOnClickListener(v -> finish());
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        lp.topMargin = dp(20);
+        card.addView(gotIt, lp);
     }
 
     /** NWP-20261201-13: one row of two text buttons, in both layouts. render() paints them. */

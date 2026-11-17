@@ -369,6 +369,23 @@ allow endospore_priv {
 allow endospore_priv anr_data_file:dir { getattr search open read write remove_name rmdir };
 allow endospore_priv anr_data_file:{ file lnk_file } { getattr unlink };
 
+# /data/vendor/mediadrm (NWP-20261203-08; docs/product-decisions.md 2026-11-10, item 2). The DRM store keeps every
+# session's offline licenses and per-app, per-origin certificates in one device-wide tree, so they outlive the session.
+# roamd's reap (cleanstorage, drm_wipe) removes the *.lic and cert<origin>.bin files in IDM1013/L1 and IDM1013/L3 at
+# every sign-out and keeps the device's own provisioning files.
+# THE GRANT IS ON AN ATTRIBUTE, NOT ON THE TYPE (NWP-20261116-37). The store is labelled mediadrm_vendor_data_file,
+# which is NOT a platform type: each Pixel declares it in its own generated vendor policy, and this private policy
+# compiles without that in view. Naming the type here (NWP-20261203-08 did, calling it a public platform type) fails
+# every Endospore build with "unknown type mediadrm_vendor_data_file". So vendor/endospore/sepolicy_public declares
+# the public attribute nowhere_drm_store_file, vendor/endospore/sepolicy_vendor puts the device type into it, and
+# inject-product.sh wires that vendor dir only on a device that declares the type. On any other device the attribute
+# is empty and these two lines reach nothing; drm_wipe then reads UNREACHABLE there.
+# DELETE-ONLY, DELIBERATELY: getattr + unlink on the files, and NO file read -- drm_wipe classifies by name and never
+# opens a license or a certificate. No rmdir: the directories belong to the CDM, and the wipe never removes one.
+# The policy compile on the build host is the gate.
+allow endospore_priv nowhere_drm_store_file:dir { getattr search open read write remove_name };
+allow endospore_priv nowhere_drm_store_file:{ file lnk_file } { getattr unlink };
+
 # ROUND 2 (still DIA-20260808-06). The first pass fixed the parents, /data/media and both vendor trees, and
 # the new REAP-INCOMPLETE line then named exactly what was still standing:
 #   REAP-INCOMPLETE user 10 survives: /data/system_ce/10 /data/system_de/10 /data/misc_ce/10

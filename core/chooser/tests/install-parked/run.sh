@@ -8,7 +8,7 @@ JAVAC="${JAVAC:-javac}"; JAVA="${JAVA:-java}"
 here=$(cd "$(dirname "$0")" && pwd)
 D=$(mktemp -d)
 trap 'rm -rf "$D"' EXIT
-methods="parseColdLock parkedCreditLost installAsksFirst installOverParkedTitle installOverParkedText"
+methods="parseColdLock parkedCreditLost installAsksFirst installOverParkedTitle installOverParkedContext installOverParkedLines installOverParkedText"
 {
   echo "final class Lifted {"
   for m in $methods; do

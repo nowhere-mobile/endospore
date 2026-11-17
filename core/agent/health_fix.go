@@ -62,6 +62,19 @@ func healthFixLast(uid, id string) (time.Time, bool) {
 	return at, ok
 }
 
+// healthFixAge is the issue report's read of a Fix (NWP-20261205-03): whole seconds from this session's last Fix of
+// rule id to now, never negative. A report is a read, so it never calls healthFixForUIDLocked: that call resets the
+// state for another uid, and a report that ever asked for one would forget the live session's Fixes.
+func healthFixAge(uid, id string, now time.Time) (int64, bool) {
+	healthFixState.Lock()
+	defer healthFixState.Unlock()
+	at, ok := healthFixState.at[id]
+	if !ok || healthFixState.uid != uid {
+		return 0, false
+	}
+	return healthClampS(now.Sub(at)), true
+}
+
 // handleHealthFix runs a rule's Fix. The caller is the gate or the live session's own user (the notice's button fires
 // in that user); any other caller is refused before the argument is read. Only an OK is recorded: ERR-WORKER-BUSY means
 // `am` did not run, and recording it would offer Sign out for a Fix that never happened.

@@ -2,7 +2,7 @@
 # user, started by nowhere-release-desk.socket. It exits after 900 s with no request and no child.
 # The tailnet name stays out of the repo: the env file holds one line, NOWHERE_DESK_NAME=<tailnet name>.
 [Unit]
-Description=Nowhere Release Desk, read-only (stage 4, NWP-20261202-24)
+Description=Nowhere Release Desk, read-only, on its private socket (stage 4, NWP-20261202-24; NWP-20261205-06)
 Requires=nowhere-release-desk.socket
 
 [Service]

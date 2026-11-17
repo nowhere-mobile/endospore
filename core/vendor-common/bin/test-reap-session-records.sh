@@ -62,17 +62,20 @@ build_body() {
 # normal path; sleep returns at once.
 cat > "$W/stubs.sh" <<'EOF'
 userdir_recheck() { :; }; reap_retry_run() { :; }; reap_retry_add() { :; }; userdir_pending_add() { :; }
+base_retry_add() { :; }; base_retry_run() { BASE_CLEARED=0; BASE_LEFT=0; }   # NWP-20261203-02
 loc_release() { :; }; md_release() { :; }; dt_release() { :; }; dr_release() { :; }; hs_release() { :; }
 ks_reap_clear() { :; }; stop_mediad() { :; }; log_scrub() { :; }; bt_reset() { return 0; }
+reap_pm_census() { RPC_LINE=unread; }   # NWP-20261203-01: test-reap-pm-census.sh runs the real one
+drm_wipe() { DRM_LINE=""; }   # NWP-20261203-08: the DRM store wipe is test-drm-wipe.sh's, not this suite's
 keystore_push() { KS_VERDICT=sealed; }
 sleep() { return 0; }
 getprop() { [ "$1" = sys.system_server.start_count ] && echo 5; return 0; }
 EOF
 
-# The seven per-uid names, for uid <u>.
-names() { printf '%s\n' ".declined.$1" ".granted.$1" ".a11ydone.$1" ".autofilldone.$1" "od-unparked.$1" "od-unparked.$1.tmp" ".odbatch3.$1.b1234abcd"; }
+# The eight per-uid names, for uid <u>.
+names() { printf '%s\n' ".declined.$1" ".granted.$1" ".a11ydone.$1" ".autofilldone.$1" "od-unparked.$1" "od-unparked.$1.tmp" ".odcopied.$1" ".odbatch3.$1.b1234abcd"; }
 
-# mkroot: uid 10 removed; user 0's record present; the seven names planted for uid 10, 100 and 11; uid 10's
+# mkroot: uid 10 removed; user 0's record present; the eight names planted for uid 10, 100 and 11; uid 10's
 # cutoff record.
 mkroot() {
   local u n
@@ -110,7 +113,7 @@ rd() { cat "$1" 2>/dev/null || true; }
 left() { local n o=""; for n in $(names "$2"); do if [ -e "$1/state/$n" ]; then o="$o $n"; fi; done; printf '%s' "$o"; }
 missing() { local n o=""; for n in $(names "$2"); do if [ ! -e "$1/state/$n" ]; then o="$o $n"; fi; done; printf '%s' "$o"; }
 
-case_R1() {  # the reap of uid 10 takes all seven of its names
+case_R1() {  # the reap of uid 10 takes all eight of its names
   local l
   mkroot; run "$R" "$1" "$2"
   chk "stderr is empty: $(rd "$R/stderr" | head -3)" eqv "$(rd "$R/stderr")" ""

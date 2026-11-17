@@ -10,6 +10,9 @@
 # built only in doDeleteSnapshot, the list is refreshed on EVERY reply (a refresh behind an OK would leave a stale row
 # after NOSNAP), the dialog text comes from SnapshotCopy, and no "delete all" exists.
 #
+# NWP-20261205-14: the delete ask is a sheet. confirmDeleteSnapshot shows HistorySheets.delete(label), whose title,
+# context and lines come from SnapshotCopy; the context and the two lines, joined by spaces, are the earlier message.
+#
 # NWP-20261116-22: doRollback renders every ROLLBACK reply through SnapshotCopy.rolledBack / rollbackReply and holds no
 # reply literal of its own. A lost reply ("") to ROLLBACK or DELETE-SNAPSHOT says the change may have landed: the daemon
 # can roll the head and queue the unsaved reap after the reply is lost. The code pin reads every reply handleRollback
@@ -28,6 +31,7 @@ for a in "$@"; do case "$a" in --mutate) MUTATE=yes ;; *) echo "usage: $0 [--mut
 here=$(cd "$(dirname "$0")" && pwd)
 DIR="$here/src/com/nowhere/chooser"
 SC="$DIR/SnapshotCopy.java"
+HS="$DIR/HistorySheets.java"
 PA="$DIR/ProfileActivity.java"
 MAIN="$here/../agent/main.go"
 RUN="$here/tests/snapshot-copy/run.sh"
@@ -80,7 +84,7 @@ rollback_codes() {
 
 # suite <SnapshotCopy.java> <ProfileActivity.java> <main.go> -> 0 pass, 1 a case or a pin failed, 3 compile.
 suite() {
-  local sc="$1" pa="$2" go="$3" db cdb rb n codes
+  local sc="$1" pa="$2" go="$3" db cdb hdb rb n codes k
   [ -f "$sc" ] || { echo "  PIN   SnapshotCopy.java does not exist" >&2; return 1; }
   n=$(grep -c 'DELETE-SNAPSHOT\\n' "$pa")
   [ "$n" -eq 1 ] || { echo "  PIN   (a) DELETE-SNAPSHOT is built $n times, want once" >&2; return 1; }
@@ -90,9 +94,13 @@ suite() {
   printf '%s\n' "$db" | perl -0ne 'exit(/runOnUiThread\(\(\) -> \{\s*android\.widget\.Toast\.makeText\(this, SnapshotCopy\.deleteReply\(r\)[^\n]*\n\s*showSnapshots\(\);/ ? 0 : 1)' \
     || { echo "  PIN   (b) doDeleteSnapshot does not refresh the list after the toast on every reply" >&2; return 1; }
   cdb=$(body "$pa" 'private void confirmDeleteSnapshot(')
-  case "$cdb" in *'setTitle(SnapshotCopy.confirmTitle())'*) ;; *) echo "  PIN   (c) title not from SnapshotCopy" >&2; return 1 ;; esac
-  case "$cdb" in *'setMessage(SnapshotCopy.confirmMessage(label))'*) ;; *) echo "  PIN   (c) message not from SnapshotCopy" >&2; return 1 ;; esac
+  case "$cdb" in *'HistorySheets.delete(label)'*) ;; *) echo "  PIN   (c) the sheet is not HistorySheets.delete(label)" >&2; return 1 ;; esac
   case "$cdb" in *'doDeleteSnapshot(version)'*) ;; *) echo "  PIN   (c) Delete does not call doDeleteSnapshot" >&2; return 1 ;; esac
+  [ -f "$HS" ] || { echo "  PIN   (c) HistorySheets.java does not exist" >&2; return 1; }
+  hdb=$(body "$HS" 'static PopupSheet.Confirm delete(')
+  for k in 'SnapshotCopy.confirmTitle()' 'SnapshotCopy.confirmContext(label)' 'SnapshotCopy.confirmLines()'; do
+    case "$hdb" in *"$k"*) ;; *) echo "  PIN   (c) HistorySheets.delete does not take $k" >&2; return 1 ;; esac
+  done
   pin "$pa" "(c) the Restore a snapshot rows do not wire confirmDeleteSnapshot(ver, when)" \
     'private void showSnapshots\(\).*?confirmDeleteSnapshot\(ver, when\).*?private static String snapDate' || return 1
   n=$(grep -ci 'delete all' "$pa")
@@ -155,4 +163,5 @@ mut "R3 rolledBack by startsWith(\"OK\")" sc 's/(static boolean rolledBack\(Stri
 mut "R4 doRollback renders a reply literal again" pa 's/SnapshotCopy\.rollbackReply\(r\)/(r.startsWith("BUSY") ? "A save is running — try again in a moment." : SnapshotCopy.rollbackReply(r))/' || fails=$((fails+1))
 mut "R5 handleRollback writes a new reply code" go 's/(func handleRollback\(conn [^\n]*\n)/$1\tif verStr == "x" {\n\t\tfmt.Fprint(conn, "ERR-NEW\\n")\n\t\treturn\n\t}\n/' || fails=$((fails+1))
 mut "R6 a lost DELETE-SNAPSHOT reply read as a connection failure" sc 's/"The phone didn.t answer, so the delete may or may not have happened\.[^;]*;/"Couldn'"'"'t delete it — check your connection and try again.";/' || fails=$((fails+1))
+mut "D6 the delete ask shows the restore sheet" pa 's/HistorySheets\.delete\(label\)/HistorySheets.rollback(label)/' || fails=$((fails+1))
 [ "$fails" -eq 0 ] && echo "== all mutations convicted" || { echo "== $fails mutation(s) not convicted"; exit 1; }

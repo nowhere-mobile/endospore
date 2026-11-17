@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // NWP-20261029-04: the release generation (release_gen.go). Every test uses its OWN profile name, and a private
@@ -180,6 +181,9 @@ func relGenOverlap(a, b map[string]bool) int {
 	return n
 }
 
+// relGenSealMtime is the mtime every seal of TestReleaseGenDropsTheCacheBeforeASeal gives its file.
+var relGenSealMtime = time.Unix(1700000000, 0)
+
 // (d)
 func TestReleaseGenDropsTheCacheBeforeASeal(t *testing.T) {
 	capFixture(t)
@@ -192,7 +196,14 @@ func TestReleaseGenDropsTheCacheBeforeASeal(t *testing.T) {
 	seal := func(what string) map[string]bool {
 		t.Helper()
 		d := t.TempDir()
-		if err := os.WriteFile(filepath.Join(d, "f.txt"), []byte("payload "+name), 0o600); err != nil {
+		f := filepath.Join(d, "f.txt")
+		if err := os.WriteFile(f, []byte("payload "+name), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		// One fixed mtime for every seal: the manifest records it, so seals that straddle a second boundary would
+		// differ, and the bare seal-time release (NWP-20261204-06) would then drop createVault's snapshot and bump
+		// the generation before the delete below. Seen in CI, 2026-11-15 (NWP-20261207-03).
+		if err := os.Chtimes(f, relGenSealMtime, relGenSealMtime); err != nil {
 			t.Fatal(err)
 		}
 		l.take()

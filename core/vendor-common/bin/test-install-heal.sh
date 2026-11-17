@@ -18,6 +18,11 @@
 #      2026-10-12: "installed an app from Appstore, when to your apps and clicked on install - its reinstalling it".
 #      The decision (autoAction) and the sweep's split (splitAuto) are pure and run under javac
 #      (core/chooser/tests/install-pending); their call sites are pinned here.
+#   5. NWP-20261207-07: an Auto app with no code and no placeholder is a group dep ONLY when an entry point of the
+#      deferred keep-set that has a placeholder and no code lists it in its deps (riders, pure, under javac). Any
+#      other such app is an orphan: splitAuto puts it in the install list, so the sweep installs it and "Install
+#      pending apps now" counts it. Chester, NW-3b37, 2026-11-04: "Switched [the app] to auto, don't see it's getting
+#      downloaded".
 # No compiler sees most of this: Go, Java and shell each hold a part of the contract.
 #
 # ⚠ THE JAVAC HALF FAILS WHEN THERE IS NO JAVAC, IT NEVER SKIPS. javac comes from PATH, else from the build host's
@@ -114,8 +119,8 @@ echo "== chooser: an app that has code is never fetched or reinstalled (NWP-2026
 TMPDIR="$W" bash "$PENDING_RUN" "$UNARCH" > "$W/pending.out" 2>&1; prc=$?
 sed 's/^/  /' "$W/pending.out"
 case "$prc" in
-  0) ok "autoAction + splitAuto: the cases pass under javac" ;;
-  1) no "autoAction / splitAuto: a case failed (above)" ;;
+  0) ok "autoAction + splitAuto + riders: the cases pass under javac" ;;
+  1) no "autoAction / splitAuto / riders: a case failed (above)" ;;
   *) echo "EXTRACTION OR COMPILE FAILED: install-pending run.sh rc=$prc" >&2; exit 2 ;;
 esac
 # meth <name> -- one method of UnarchiveService.java, from its signature to its closing brace at 4 spaces.
@@ -131,13 +136,21 @@ for v in PEND SWEEP MAI DEPS MLOCK RONLY RTAIL RLIST; do
   [ -n "${!v}" ] || { echo "EXTRACTION FAILED: $v" >&2; exit 2; }
 done
 # 4a. The row and the sweep both read the list splitAuto returns, fed by the real code and restored reads.
+#     NWP-20261207-07: and by the real riders -- the deps of the DEFERRED keep-set's entry points, through appDeps.
 if grep -qF 'java.util.List<String> work = splitAuto(ProfileActivity.autoKeepSet(ctx),' <<<"$PEND" \
-   && grep -qF 'pkg -> hasInstalledCode(ctx, pkg),' <<<"$PEND" \
+   && grep -qF 'java.util.function.Predicate<String> code = pkg -> hasInstalledCode(ctx, pkg);' <<<"$PEND" \
    && grep -qF 'pkg -> odRestored(ctx, pkg),' <<<"$PEND" \
    && grep -qF 'if (restoreOnly != null) restoreOnly.addAll(retry);' <<<"$PEND"; then
   ok "pendingAutoApps splits on code + the restored marker and hands the restore-only apps out separately"
 else
   no "pendingAutoApps no longer splits through splitAuto on the real reads -- an installed app can count as pending"
+fi
+if grep -qF 'java.util.Set<String> ride = riders(ProfileActivity.deferredKeepSet(ctx), code, placeholder,' <<<"$PEND" \
+   && grep -qF 'p -> ProfileActivity.appDeps(ctx, p));' <<<"$PEND" \
+   && grep -qF 'placeholder, ride::contains,' <<<"$PEND"; then
+  ok "pendingAutoApps files a no-placeholder app as a group dep only when a deferred entry point's deps carry it (NWP-20261207-07)"
+else
+  no "pendingAutoApps' riders are not the deferred keep-set's appDeps -- an orphan Auto app is never installed, or a real dep is fetched alone"
 fi
 # 4b. The sweep retries the restore-only apps in chunks of OdRestoreList.CHUNK (NWP-20261128-16), under MAT_LOCK,
 #     re-checking the REAL state under the lock, and never queues them as downloads. A chunk left with one app goes
@@ -183,7 +196,7 @@ else
 fi
 # 4e. The restore-only retry fetches and installs nothing, and marks only on OK. NWP-20261128-16: the one-name request
 #     (restoreOnlyLocked) and the list (restoreOnlyListLocked) both hand each app's reply to restoreOnlyReplied.
-if grep -qF 'String rr = daemon("RESTORE-ODDATA\n" + pkg + "\n");' <<<"$RONLY" \
+if grep -qF 'String rr = OdRestoreOnce.send(pkg, installStamp(this, pkg), () -> daemon("RESTORE-ODDATA\n" + pkg + "\n"), ' <<<"$RONLY" \
    && grep -qF 'return restoreOnlyReplied(pkg, rr);' <<<"$RONLY" \
    && grep -qF 'boolean ok = rr != null && rr.startsWith("OK");' <<<"$RTAIL" \
    && grep -qF 'if (ok) markOdRestored(pkg);' <<<"$RTAIL"; then
@@ -276,6 +289,19 @@ if [ "$MUTATE" = yes ]; then
          's@return placeholder ? AUTO_INSTALL : AUTO_GROUP_DEP;@return AUTO_GROUP_DEP;@'
   mutate "splitAuto: restore-only apps counted as pending" UNARCH \
          's@else if (a == AUTO_RESTORE_ONLY) restoreOnly.add(pkg);@else if (a == AUTO_RESTORE_ONLY) work.add(pkg);@'
+  # NWP-20261207-07: each files an orphan as a group dep, fetches a real dep alone, or carries from the wrong entry.
+  mutate "O1 splitAuto: every no-placeholder app is a group dep again (the bug) -- case 'an orphan is in the install list'" UNARCH \
+         's@else if (a == AUTO_GROUP_DEP && rides.test(pkg)) groupDeps.add(pkg);@else if (a == AUTO_GROUP_DEP) groupDeps.add(pkg);@'
+  mutate "O2 splitAuto: rides ignored, a real dep fetched alone -- case 'a real group dep still rides, never alone'" UNARCH \
+         's@a == AUTO_GROUP_DEP && rides.test(pkg)@a == AUTO_GROUP_DEP \&\& false@'
+  mutate "O3 riders: an entry point with code carries -- case 'riders: an entry point with code carries nothing'" UNARCH \
+         's@if (code.test(e) || !placeholder.test(e)) continue;@if (!code.test(e) \&\& !placeholder.test(e)) continue;@'
+  mutate "O4 riders: a self-dep kept -- case 'riders: a self-dep is dropped'" UNARCH \
+         's@for (String d : depsOf.apply(e)) if (!d.equals(e)) out.add(d);@for (String d : depsOf.apply(e)) out.add(d);@'
+  mutate "O5 pendingAutoApps: every no-placeholder app rides -- pin 4a riders" UNARCH \
+         's@placeholder, ride::contains,@placeholder, p -> true,@'
+  mutate "O6 pendingAutoApps: riders over the Auto keep-set only (an on-demand placeholder carries nothing) -- pin 4a riders" UNARCH \
+         's@riders(ProfileActivity.deferredKeepSet(ctx),@riders(ProfileActivity.autoKeepSet(ctx),@'
   mutate "pendingAutoApps: the restored marker is not consulted" UNARCH \
          's@pkg -> odRestored(ctx, pkg),@pkg -> false,@'
   mutate "pendingAutoApps: restore-only apps dropped, not retried" UNARCH \

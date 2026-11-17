@@ -54,7 +54,7 @@ final class PresetPicker {
     static final String LOC_ON = "Suggested: Location on";
     static final String LOC_OFF = "Suggested: Location off";
 
-    /** showIdlePicker's `int cur = 15;` (IDLE_LOGOFF_MS) when no idle= is set. */
+    /** StandbySheets.DEFAULT_MINUTES (IDLE_LOGOFF_MS) when no idle= is set. */
     static final String IDLE_DEFAULT = "15";
     /** cfg's and cfgStatic's fallbacks: media on-demand, nApps auto, every other store off. */
     static final String MEDIA_DEFAULT = "ondemand";
@@ -205,7 +205,7 @@ final class PresetPicker {
         return Collections.unmodifiableMap(out);
     }
 
-    /** showIdlePicker: an empty or unparseable idle= highlights 15 minutes; a number shows as that number. */
+    /** As StandbySheets.current reads idle=: an empty or unparseable idle= is 15 minutes; a number shows as that number. */
     private static String idle(String v) {
         if (v.isEmpty()) return IDLE_DEFAULT;
         try {

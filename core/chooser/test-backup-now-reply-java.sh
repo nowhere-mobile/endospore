@@ -69,24 +69,24 @@ suite() {
   local br="$1" rx="$2" ch="$3" pa="$4" mg="$5"
   [ -f "$br" ] || { echo "  PIN   BackupNowReply.java does not exist" >&2; return 1; }
   pin "$rx" "decide() does not read the reply through BackupNowReply.action" \
-    'private static void decide\(Context ctx, String reply, long reconnectAt\) \{.*?BackupNowReply\.action\(reply\)' || return 1
+    'private static void decide\(Context app, int uid, String reply, long reconnectAt\) \{.*?BackupNowReply\.action\(reply\)' || return 1
   pin "$rx" "the watchdog's abandon does not decide (finish.accept(null))" \
     'Thread\.sleep\(CONNECT_CAP_MS\).*?s\.close\(\); \} catch \(Throwable ignore\) \{\}\s*finish\.accept\(null\);' || return 1
   pin "$rx" "the worker does not decide with the daemon's reply" \
     'finally \{\s*try \{ s\.close\(\); \} catch \(Throwable ignore\) \{\}\s*finish\.accept\(got\[0\]\);' || return 1
   pin "$rx" "finish does not decide exactly once, behind the done compareAndSet" \
-    'finish = r -> \{\s*if \(done\.compareAndSet\(false, true\)\) \{ decide\(ctx, r, reconnectAt\); pr\.finish\(\); \}' || return 1
+    'finish = r -> \{\s*if \(done\.compareAndSet\(false, true\)\) \{ decide\(app, uid, r, reconnectAt\); pr\.finish\(\); \}' || return 1
   pin "$rx" "postBackNowRefused is not called only on PROMPT" \
-    'else if \(a == BackupNowReply\.PROMPT\) ChooserActivity\.postBackNowRefused\(ctx, BackupNowReply\.body\(reply\), reconnectAt\);' || return 1
+    'else if \(a == BackupNowReply\.PROMPT\) ChooserActivity\.postBackNowRefused\(app, uid, BackupNowReply\.body\(reply\), reconnectAt\);' || return 1
   pin "$rx" "clearBackNowNotice is not called only on CLEAR" \
-    'if \(a == BackupNowReply\.CLEAR\) ChooserActivity\.clearBackNowNotice\(ctx\);' || return 1
+    'if \(a == BackupNowReply\.CLEAR\) ChooserActivity\.clearBackNowNotice\(app, uid\);' || return 1
   [ "$(grep -c 'clearBackNowNotice(\|postBackNowRefused(' "$rx")" = 2 ] || { echo "  PIN   the receiver calls the notice helpers somewhere else" >&2; return 1; }
   pin "$ch" "postSavingNotice does not create the channel before notify" \
-    'static void postSavingNotice\(Context uc, int uid\) \{(?:(?!static void).)*?createBackNowChannel\(nm\);(?:(?!static void).)*?nm\.notify\(NOTIF_BACKNOW_ID' || return 1
+    'static void postSavingNotice\(Context app, int uid\) \{(?:(?!static void).)*?createBackNowChannel\(nm\);(?:(?!static void).)*?nm\.notify\(NOTIF_BACKNOW_ID' || return 1
   pin "$ch" "postBackNowRefused does not create the channel before notify" \
-    'static void postBackNowRefused\(Context uc, String body, long reconnectAt\) \{(?:(?!static void).)*?createBackNowChannel\(nm\);(?:(?!static void).)*?nm\.notify\(NOTIF_BACKNOW_ID' || return 1
+    'static void postBackNowRefused\(Context app, int uid, String body, long reconnectAt\) \{(?:(?!static void).)*?createBackNowChannel\(nm\);(?:(?!static void).)*?nm\.notify\(NOTIF_BACKNOW_ID' || return 1
   pin "$ch" "postBackNowRefused's notification has no Back up now action on the BackupNowReceiver" \
-    'static void postBackNowRefused\(Context uc, String body, long reconnectAt\) \{.*?new Intent\(uc, BackupNowReceiver\.class\)(?:(?!static void).)*?\.addAction\((?:(?!static void).)*?nm\.notify\(' || return 1
+    'static void postBackNowRefused\(Context app, int uid, String body, long reconnectAt\) \{(?:(?!static void).)*?android\.app\.PendingIntent pi = backNowTapIntent\(app, uid, reconnectAt\);(?:(?!static void).)*?\.addAction\((?:(?!static void).)*?nm\.notify\(' || return 1
   pin "$ch" "createBackNowChannel does not create NOTIF_BACKNOW_CHANNEL" \
     'private static void createBackNowChannel\(.*?new android\.app\.NotificationChannel\(\s*NOTIF_BACKNOW_CHANNEL, "Back online".*?nm\.createNotificationChannel\(ch\)' || return 1
   # NWP-20261201-09: the reconnect stamp, the joined tap on the Profile screen, and the daemon that ignores the stamp.
@@ -96,9 +96,11 @@ suite() {
     'os\.write\(\("BACKUP\\n" \+ \(reconnectAt > 0 \? "AFTER " \+ reconnectAt \+ "\\n" : ""\)\)\.getBytes\("UTF-8"\)\);' || return 1
   [ "$(grep -c 'os\.write(' "$rx")" = 1 ] || { echo "  PIN   A2 the receiver writes to the socket somewhere else" >&2; return 1; }
   pin "$ch" "A3 postBackNowNotice does not put the stamp on the BackupNowReceiver intent" \
-    'static void postBackNowNotice\(Context app, int uid, long reconnectAt, String body\) \{(?:(?!static void).)*?Intent tap = new Intent\(uc, BackupNowReceiver\.class\);\s*if \(reconnectAt > 0\) tap\.putExtra\(BackupNowReceiver\.EXTRA_RECONNECT_AT, reconnectAt\);\s*android\.app\.PendingIntent pi = android\.app\.PendingIntent\.getBroadcast\(uc, 0,\s*tap,' || return 1
+    'static void postBackNowNotice\(Context app, int uid, long reconnectAt, String body\) \{(?:(?!static void).)*?android\.app\.PendingIntent pi = backNowTapIntent\(app, uid, reconnectAt\);' || return 1
+  pin "$ch" "A3 backNowTapIntent does not put the stamp on the BackupNowReceiver intent" \
+    'static android\.app\.PendingIntent backNowTapIntent\(Context app, int uid, long reconnectAt\) \{\s*Intent tap = new Intent\(app, BackupNowReceiver\.class\);(?:(?!static ).)*?if \(reconnectAt > 0\) tap\.putExtra\(BackupNowReceiver\.EXTRA_RECONNECT_AT, reconnectAt\);\s*return android\.app\.PendingIntent\.getBroadcast\(app, uid,\s*tap,' || return 1
   pin "$ch" "A4 postBackNowRefused does not put the stamp on the BackupNowReceiver intent" \
-    'static void postBackNowRefused\(Context uc, String body, long reconnectAt\) \{(?:(?!static void).)*?Intent tap = new Intent\(uc, BackupNowReceiver\.class\);\s*if \(reconnectAt > 0\) tap\.putExtra\(BackupNowReceiver\.EXTRA_RECONNECT_AT, reconnectAt\);\s*android\.app\.PendingIntent pi = android\.app\.PendingIntent\.getBroadcast\(uc, 0,\s*tap,' || return 1
+    'static void postBackNowRefused\(Context app, int uid, String body, long reconnectAt\) \{(?:(?!static void).)*?android\.app\.PendingIntent pi = backNowTapIntent\(app, uid, reconnectAt\);' || return 1
   pin "$pa" "A5 doBackup's OK arm does not accept a joined reply" \
     'final boolean joined = BackupNowReply\.joins\(r\);(?:\s*\/\/[^\n]*)?\s*if \(r\.startsWith\("OK"\) \|\| joined\) \{' || return 1
   pin "$pa" "A6 a joined reply does not skip the verdict arm" \
@@ -136,15 +138,15 @@ fails=0
 mut "Q1 every BUSY read as SAVING (case action [BUSY login])" br 's/f\.equals\("OK"\) \|\| joins\(reply\)/f.equals("OK") || f.startsWith("BUSY")/' || fails=$((fails+1))
 mut "Q2 LOCAL read as PROMPT"                 br 's/f\.equals\("NONE"\) \|\| f\.equals\("LOCAL"\)/f.equals("NONE")/' || fails=$((fails+1))
 mut "Q3 the watchdog path makes no decision"  rx 's/(Thread\.sleep\(CONNECT_CAP_MS\).*?)finish\.accept\(null\);/$1/s' || fails=$((fails+1))
-mut "Q4 postSavingNotice creates no channel"  ch 's/(static void postSavingNotice\(Context uc, int uid\) \{.*?)createBackNowChannel\(nm\);/$1/s' || fails=$((fails+1))
-mut "Q5 the refused prompt has no action"     ch 's/(static void postBackNowRefused\(Context uc, String body, long reconnectAt\) \{.*?)\.addAction\(new android\.app\.Notification\.Action\.Builder\(\s*\(android\.graphics\.drawable\.Icon\) null, "Back up now", pi\)\.build\(\)\)\s*/$1/s' || fails=$((fails+1))
+mut "Q4 postSavingNotice creates no channel"  ch 's/(static void postSavingNotice\(Context app, int uid\) \{.*?)createBackNowChannel\(nm\);/$1/s' || fails=$((fails+1))
+mut "Q5 the refused prompt has no action"     ch 's/(static void postBackNowRefused\(Context app, int uid, String body, long reconnectAt\) \{.*?)\.addAction\(new android\.app\.Notification\.Action\.Builder\(\s*\(android\.graphics\.drawable\.Icon\) null, "Back up now", pi\)\.build\(\)\)\s*/$1/s' || fails=$((fails+1))
 mut "Q6 joins ignores seal-in-flight (case action [BUSY seal-in-flight])" br 's/f\.equals\("BUSY seal-in-flight"\) \|\| //' || fails=$((fails+1))
 mut "Q7 joins accepts a longer seal-in-flight token (case action [BUSY seal-in-flightx])" br 's/f\.equals\("BUSY seal-in-flight"\)/f.startsWith("BUSY seal-in-flight")/' || fails=$((fails+1))
 mut "Q8 joins accepts seal-runx (case action [BUSY seal-runx])" br 's/f\.startsWith\("BUSY seal-run:"\)/f.startsWith("BUSY seal-run")/' || fails=$((fails+1))
 mut "Q9 the AFTER line is always sent (pin A2)"   rx 's/\(reconnectAt > 0 \? "AFTER " \+ reconnectAt \+ "\\n" : ""\)/"AFTER " + reconnectAt + "\\n"/' || fails=$((fails+1))
 mut "Q10 the extra is not read (pin A1)"          rx 's/intent\.getLongExtra\(EXTRA_RECONNECT_AT, 0\)/0L/' || fails=$((fails+1))
-mut "Q11 the extra is dropped from postBackNowNotice (pin A3)" ch 's/(static void postBackNowNotice\(Context app, int uid, long reconnectAt, String body\) \{(?:(?!static void).)*?)\n\s*if \(reconnectAt > 0\) tap\.putExtra\([^\n]*/$1/s' || fails=$((fails+1))
-mut "Q12 the extra is dropped from postBackNowRefused (pin A4)" ch 's/(static void postBackNowRefused\(Context uc, String body, long reconnectAt\) \{(?:(?!static void).)*?)\n\s*if \(reconnectAt > 0\) tap\.putExtra\([^\n]*/$1/s' || fails=$((fails+1))
+mut "Q11 the extra is dropped from backNowTapIntent (pin A3)" ch 's/(static android\.app\.PendingIntent backNowTapIntent\(Context app, int uid, long reconnectAt\) \{(?:(?!static ).)*?)\n\s*if \(reconnectAt > 0\) tap\.putExtra\([^\n]*/$1/s' || fails=$((fails+1))
+mut "Q12 the extra is dropped from postBackNowRefused (pin A4)" ch 's/(static void postBackNowRefused\(Context app, int uid, String body, long reconnectAt\) \{(?:(?!static void).)*?)backNowTapIntent\(app, uid, reconnectAt\)/$1backNowTapIntent(app, uid, 0L)/s' || fails=$((fails+1))
 mut "Q13 the refused prompt drops the stamp (the PROMPT-arm pin)" rx 's/BackupNowReply\.body\(reply\), reconnectAt\)/BackupNowReply.body(reply), 0L)/' || fails=$((fails+1))
 mut "Q14 doBackup refuses a joined reply (pin A5)" pa 's/if \(r\.startsWith\("OK"\) \|\| joined\) \{/if (r.startsWith("OK")) {/' || fails=$((fails+1))
 mut "Q15 a joined reply prints the verdict (pin A6)" pa 's/if \(joined\) \{\n.*?loadSealDelta\(\);\n\s*return;\n\s*\}\n\s*//s' || fails=$((fails+1))

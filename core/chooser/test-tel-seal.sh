@@ -543,6 +543,9 @@ pin "NowhereCallControlService.onCallAdded" "$(body "$CC" 'public void onCallAdd
                                 getApplicationContext().getSystemService(android.telephony.TelephonyManager.class);
                         if (to != null && !to.isEmpty() && tm != null && tm.isEmergencyNumber(to)) {
                             sLastEmergencyOutboundAt = System.currentTimeMillis();
+                            // NWP-20261115-18 (Q047): and the login daemon, whose mark survives a user switch.
+                            // Fire-and-forget on its own thread; no number goes on the wire.
+                            EmergencyWindow.tell();
                             // No number in the log line: this is user-0's logcat and the number is the
                             // emergency service, but the FACT of the call is still the user's business.
                             android.util.Log.i("NowhereChooser",

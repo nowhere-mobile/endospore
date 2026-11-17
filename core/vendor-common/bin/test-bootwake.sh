@@ -16,6 +16,7 @@
 #   bash test-bootwake.sh --mutate   # ... plus mutations that must each CONVICT the suite under every shell
 #
 # NWP-20261128-37 (the B cases, N mutants): the log line also says how pm's receiver listing parsed.
+# NWP-20261202-35 (the F cases, F-M mutants): the log line also counts the boot sends that finished delivery.
 set -uo pipefail
 
 MUTATE=no; SUT=""
@@ -75,7 +76,9 @@ n=$(nleft "$RA")
 #   pm list packages --user U -U --show-stopped        -> one line per $ROOT/pk/<name>; nothing if $ROOT/listfail
 #   pm query-receivers --user U ... -a <ACTION>        -> $ROOT/rcv.LOCKED or $ROOT/rcv.BOOT
 #   pm unstop --user U <pkg>                           -> sets $ROOT/pk/<pkg> to false
-#   am broadcast --user U -p <pkg> ... -a <ACTION>     -> recorded; the scratch files' modes snapshotted
+#   am broadcast --user U -p <pkg> ... -a <ACTION>     -> recorded; the scratch files' modes snapshotted; prints
+#                                                         "Broadcast completed: result=0", or nothing when
+#                                                         $ROOT/silent holds the line "<pkg> LOCKED" or "<pkg> BOOT"
 STUBS=$(cat <<'EOF'
 vpn_deferred_retry(){ :; }   # NWP-20261130-04: test-vpn-apply-on-install.sh runs the real one in this arm
 timeout(){ shift 3; echo "via-timeout $1 $2" >> "$ROOT/tcalls"; "$@"; }
@@ -112,7 +115,16 @@ am(){
         shift
       done
       echo "broadcast $_st_p $_st_r $_st_a user=$_st_u stopped=$_st_i" >> "$ROOT/calls"
-      for _st_f in "$STATE"/.cutoff.10.bootwake*; do [ -e "$_st_f" ] && stat -c %a "$_st_f" >> "$ROOT/modes"; done ;;
+      for _st_f in "$STATE"/.cutoff.10.bootwake*; do [ -e "$_st_f" ] && stat -c %a "$_st_f" >> "$ROOT/modes"; done
+      # NWP-20261202-35: the token file's own mode at each send (none: it does not exist yet).
+      if [ -e "$STATE/.cutoff.10.bootwake.out" ]; then stat -c %a "$STATE/.cutoff.10.bootwake.out" >> "$ROOT/omodes"
+      else echo none >> "$ROOT/omodes"; fi
+      _st_s=no; _st_k=other
+      case "$_st_a" in android.intent.action.LOCKED_BOOT_COMPLETED) _st_k=LOCKED ;; android.intent.action.BOOT_COMPLETED) _st_k=BOOT ;; esac
+      if [ -e "$ROOT/silent" ]; then
+        while IFS= read -r _st_l; do [ "$_st_l" = "$_st_p $_st_k" ] && _st_s=yes; done < "$ROOT/silent"
+      fi
+      if [ "$_st_s" = no ]; then echo "Broadcasting: Intent { act=$_st_a }"; echo "Broadcast completed: result=0"; fi ;;
     *) echo "unexpected am $*" >> "$ROOT/calls" ;;
   esac
   return 0
@@ -151,6 +163,8 @@ run() {
     printf "ROOT='%s'; uid=10; STATE=\"\$ROOT/state\"; RES=\"\$ROOT/res\"; LOG=\"\$ROOT/log\"; srcunit='%s'; op=bootwake\n" "$d" "$s"
     printf "NOWHERE_CUTOFF_BUDGET='%s'; NOWHERE_CUTOFF_PAR=8; ACCT_AUTH_PKG=com.google.android.gms\n" "$b"
     printf '%s\n' "$STUBS" "$BODY"
+    # NWP-20261202-35: the arm clears CUTOFF_BOOTOUT, so the next op of the worker sends as cutoffwake does.
+    printf '%s\n' 'printf '"'"'probe CUTOFF_BOOTOUT=[%s]\n'"'"' "${CUTOFF_BOOTOUT:-}" > "$ROOT/probe"'
   } > "$d/run.sh" || return 2
   "$SHP" "$d/run.sh" >/dev/null 2>>"$d/stderr"
 }
@@ -169,6 +183,9 @@ bt() { printf 'broadcast %s 200 %s user=10 stopped=yes' "$1" "$BB"; }
 bwline() { grep -m1 '^\[roamd\] bootwake user 10: ' "$1/log"; }
 pl() { printf 'pm listed %s component line(s), %s no-receivers line(s), %s other line(s) (NWP-20261128-37)' "$1" "$2" "$3"; }
 # fixtures <root> <LOCKED file> <BOOT file>: both receiver listings from files of the case (an empty file: no output).
+# NWP-20261202-35: the clause of the sends that finished delivery.
+sf() { printf 'sends finished: LOCKED_BOOT_COMPLETED %s of %s, BOOT_COMPLETED %s of %s (NWP-20261202-35)' "$1" "$3" "$2" "$3"; }
+noout() { [ ! -e "$1/state/.cutoff.10.bootwake.out" ]; }
 fixtures() { cp "$2" "$1/rcv.LOCKED" && cp "$3" "$1/rcv.BOOT"; }
 noform() { [ ! -e "$1/state/.cutoff.10.bootwake.form" ]; }
 herr() { local e; e=$(grep -m1 -E 'not found|unbound variable|syntax error|bad substitution' "$1/stderr" 2>/dev/null); printf '%s' "$e"; }
@@ -270,7 +287,7 @@ cases() {
   d=$(session); run "$d"; BL=$(bwline "$d")
   # 5 + 6 component lines (com.dup 3 times, com.car.key twice: before the dedup), 3 other (the header, -evil, the
   # line with a blank); the answer still counts 7 declaring packages.
-  case "$BL" in *"(NWP-20261114-01); $(pl 11 0 3) "*) e=yes ;; *) e=no ;; esac
+  case "$BL" in *"(NWP-20261114-01); $(pl 11 0 3); "*) e=yes ;; *) e=no ;; esac
   { [ "$e" = yes ] && [ "$(res "$d")" = "BOOTWAKE $CAND $DECL" ]; } \
     && ok "(B1) component lines counted before the dedup: $(pl 11 0 3), BOOTWAKE $CAND $DECL" \
     || no "(B1) line [$BL], answer [$(res "$d")]"
@@ -281,7 +298,7 @@ cases() {
     || no "(B8) B1 line [$BL] scrubbed to [$S]"
 
   d=$(session); fixtures "$d" "$fx/none" "$fx/none"; run "$d"; BL=$(bwline "$d")
-  case "$BL" in *"(NWP-20261114-01); $(pl 0 2 0) "*) e=yes ;; *) e=no ;; esac
+  case "$BL" in *"(NWP-20261114-01); $(pl 0 2 0); "*) e=yes ;; *) e=no ;; esac
   { [ "$e" = yes ] && [ "$(res "$d")" = "BOOTWAKE 0 0" ] && [ "$(sends "$d")" = 0 ]; } \
     && ok "(B2) No receivers found twice: $(pl 0 2 0), BOOTWAKE 0 0, nothing sent" \
     || no "(B2) line [$BL], answer [$(res "$d")], $(sends "$d") call(s)"
@@ -292,7 +309,7 @@ cases() {
     || no "(B8) B2 line [$BL] scrubbed to [$S]"
 
   d=$(session); fixtures "$d" "$fx/odd.L" "$fx/odd.B"; run "$d"; BL=$(bwline "$d")
-  case "$BL" in *"(NWP-20261114-01); $(pl 0 0 10) "*) e=yes ;; *) e=no ;; esac
+  case "$BL" in *"(NWP-20261114-01); $(pl 0 0 10); "*) e=yes ;; *) e=no ;; esac
   { [ "$e" = yes ] && [ "$(res "$d")" = "BOOTWAKE 0 0" ] && [ "$(sends "$d")" = 0 ]; } \
     && ok "(B3) an unknown listing form: $(pl 0 0 10), nothing sent" \
     || no "(B3) line [$BL], answer [$(res "$d")], $(sends "$d") call(s)"
@@ -301,7 +318,7 @@ cases() {
   noform "$d" && ok "(B6) B3 leaves no .form file" || no "(B6) B3 left a .form file"
 
   d=$(session); fixtures "$d" "$fx/empty" "$fx/empty"; run "$d"; BL=$(bwline "$d")
-  case "$BL" in *"(NWP-20261114-01); $(pl 0 0 0) "*) e=yes ;; *) e=no ;; esac
+  case "$BL" in *"(NWP-20261114-01); $(pl 0 0 0); "*) e=yes ;; *) e=no ;; esac
   { [ "$e" = yes ] && [ "$(res "$d")" = "BOOTWAKE 0 0" ]; } \
     && ok "(B7) pm printed nothing: $(pl 0 0 0), BOOTWAKE 0 0" || no "(B7) line [$BL], answer [$(res "$d")]"
   noform "$d" && ok "(B6) B7 leaves no .form file" || no "(B6) B7 left a .form file"
@@ -311,7 +328,7 @@ cases() {
 
   # B4: the form path is a directory; the op answers and sends as without it, and the line shows ? counts.
   d=$(session); mkdir "$d/state/.cutoff.10.bootwake.form"; run "$d"; BL=$(bwline "$d")
-  case "$BL" in *"(NWP-20261114-01); $(pl '?' '?' '?') "*) e=yes ;; *) e=no ;; esac
+  case "$BL" in *"(NWP-20261114-01); $(pl '?' '?' '?'); "*) e=yes ;; *) e=no ;; esac
   { [ "$e" = yes ] && [ "$(res "$d")" = "BOOTWAKE $CAND $DECL" ] && [ "$(sends "$d")" = $((UNST + 2 * CAND)) ] \
     && [ -z "$(herr "$d")" ]; } \
     && ok "(B4) an unwritable form file: BOOTWAKE $CAND $DECL, $((UNST + 2 * CAND)) sends, $(pl '?' '?' '?')" \
@@ -322,6 +339,69 @@ cases() {
     && ok "(B6) B4 leaves only the planted directory, empty" || no "(B6) B4 state [$s]"
   bad=""; for k in $NAMES -evil; do case "$BL" in *"$k"*) bad="$bad $k" ;; esac; done
   [ -z "$bad" ] && ok "(B5) B4's line names no package" || no "(B5) B4's line names:$bad"
+
+  # NWP-20261202-35: the line counts, per action, the boot sends whose `am broadcast` printed "Broadcast completed",
+  # so a report tells a send that ran from one that timed out. Counts only, and the reap scrub keeps the line.
+  echo "== [$SH] the sends that finished delivery (NWP-20261202-35) =="
+  local ow
+  d=$(session); run "$d"; BL=$(bwline "$d")
+  case "$BL" in *"(NWP-20261114-01); $(pl 11 0 3); $(sf 4 4 4) "[A-Z]*) e=yes ;; *) e=no ;; esac
+  [ "$e" = yes ] && ok "(F1) the standard session: ...; $(pl 11 0 3); $(sf 4 4 4) <date>" || no "(F1) line [$BL]"
+  [ "$(res "$d")" = "BOOTWAKE $CAND $DECL" ] && ok "(F7) F1's answer is unchanged: BOOTWAKE $CAND $DECL" \
+    || no "(F7) F1's answer [$(res "$d")]"
+  ow=$(grep -vx 600 "$d/omodes" 2>/dev/null)
+  { [ -s "$d/omodes" ] && [ "$(grep -c . "$d/omodes")" = "$(grep -c '^broadcast ' "$d/calls")" ] && [ -z "$ow" ]; } \
+    && ok "(F4) F1: the .out file exists at 0600 at every one of the $((2 * CAND)) sends" \
+    || no "(F4) F1: .out modes at the sends [$(tr '\n' ' ' < "$d/omodes" 2>/dev/null)]"
+  noout "$d" && ok "(F5) F1 leaves no .out file" || no "(F5) F1 left $(ls -Ad "$d/state/.cutoff.10.bootwake.out")"
+  [ "$(cat "$d/probe" 2>/dev/null)" = "probe CUTOFF_BOOTOUT=[]" ] && ok "(F6) after the arm, CUTOFF_BOOTOUT is empty" \
+    || no "(F6) after the arm: [$(cat "$d/probe" 2>/dev/null)]"
+  S=$(printf '%s\n' "$BL" | sed -E "$LOG_SCRUB_SED")
+  bad=""; for k in $NAMES -evil; do case "$(cat "$d/log")" in *"$k"*) bad="$bad $k" ;; esac; done
+  { [ "$e" = yes ] && [ "$S" = "$BL" ] && [ -z "$bad" ]; } \
+    && ok "(F8) the reap scrub leaves F1's line byte-identical, and the log names no package" \
+    || no "(F8) F1 line [$BL] scrubbed to [$S], names:$bad"
+
+  d=$(session); echo "com.clock BOOT" > "$d/silent"; run "$d"; BL=$(bwline "$d")
+  case "$BL" in *"; $(sf 4 3 4) "[A-Z]*) e=yes ;; *) e=no ;; esac
+  { [ "$e" = yes ] && [ "$(res "$d")" = "BOOTWAKE $CAND $DECL" ]; } \
+    && ok "(F2) one silent BOOT_COMPLETED send: $(sf 4 3 4), BOOTWAKE $CAND $DECL" \
+    || no "(F2) line [$BL], answer [$(res "$d")]"
+  S=$(printf '%s\n' "$BL" | sed -E "$LOG_SCRUB_SED")
+  bad=""; for k in $NAMES -evil; do case "$(cat "$d/log")" in *"$k"*) bad="$bad $k" ;; esac; done
+  { [ "$e" = yes ] && [ "$S" = "$BL" ] && [ -z "$bad" ]; } \
+    && ok "(F8) the reap scrub leaves F2's line byte-identical, and the log names no package" \
+    || no "(F8) F2 line [$BL] scrubbed to [$S], names:$bad"
+  d=$(session); echo "com.car.key LOCKED" > "$d/silent"; run "$d"; BL=$(bwline "$d")
+  case "$BL" in *"; $(sf 3 4 4) "[A-Z]*) e=yes ;; *) e=no ;; esac
+  [ "$e" = yes ] && ok "(F2) one silent LOCKED_BOOT_COMPLETED send: $(sf 3 4 4)" || no "(F2) line [$BL]"
+
+  d=$(session); run "$d" com.car.key; BL=$(bwline "$d")
+  case "$BL" in *"; $(sf 1 1 1) "[A-Z]*) e=yes ;; *) e=no ;; esac
+  { [ "$e" = yes ] && [ "$(res "$d")" = "BOOTWAKE 1 $DECL" ]; } \
+    && ok "(F3) the one-package pass: $(sf 1 1 1), BOOTWAKE 1 $DECL" || no "(F3) line [$BL], answer [$(res "$d")]"
+  ow=$(grep -vx 600 "$d/omodes" 2>/dev/null)
+  { [ "$(grep -c . "$d/omodes" 2>/dev/null)" = 2 ] && [ -z "$ow" ]; } \
+    && ok "(F4) F3: the .out file exists at 0600 at both sends, the first one included" \
+    || no "(F4) F3: .out modes at the sends [$(tr '\n' ' ' < "$d/omodes" 2>/dev/null)]"
+  noout "$d" && ok "(F5) F3 leaves no .out file" || no "(F5) F3 left a .out file"
+
+  d=$(session); ( : > "$d/listfail" ); run "$d"
+  { noout "$d" && [ ! -s "$d/omodes" ] && [ "$(res "$d")" = ERR-LIST ]; } \
+    && ok "(F5) the ERR-LIST branch never creates the .out file" || no "(F5) ERR-LIST: answer [$(res "$d")], .out or omodes present"
+  d=$(session); run "$d" -evil
+  { noout "$d" && [ "$(res "$d")" = ERR-PKG ]; } && ok "(F5) the ERR-PKG branch never creates the .out file" \
+    || no "(F5) ERR-PKG: answer [$(res "$d")], .out present"
+
+  # F9: the .out path is a directory. The create fails in its subshell; the op still answers and sends.
+  d=$(session); mkdir "$d/state/.cutoff.10.bootwake.out"; run "$d"; BL=$(bwline "$d")
+  case "$BL" in *"; $(sf '?' '?' 4) "[A-Z]*) e=yes ;; *) e=no ;; esac
+  { [ "$e" = yes ] && [ "$(res "$d")" = "BOOTWAKE $CAND $DECL" ] && [ "$(sends "$d")" = $((UNST + 2 * CAND)) ] \
+    && [ -z "$(herr "$d")" ]; } \
+    && ok "(F9) an unwritable .out file: BOOTWAKE $CAND $DECL, $((UNST + 2 * CAND)) sends, $(sf '?' '?' 4)" \
+    || no "(F9) line [$BL], answer [$(res "$d")], $(sends "$d") call(s), stderr [$(herr "$d")]"
+  { [ -d "$d/state/.cutoff.10.bootwake.out" ] && [ -z "$(ls -A "$d/state/.cutoff.10.bootwake.out")" ]; } \
+    && ok "(F9) the planted directory is left as it was, empty" || no "(F9) the planted directory changed"
 }
 
 # Parse first, then every case, under each shell.
@@ -376,9 +456,9 @@ if [ "$MUTATE" = yes ]; then
     'cutoff_run unstop "$uid" "$_bf.u" "$(( $(date +%s) + CUTOFF_BUDGET ))"' 'cutoff_run unstop "$uid" "$_bf.u" 9999999999'
   mutate "the boot deadline is a far one" \
     'cutoff_run boot "$uid" "$_bf" "$(( $(date +%s) + CUTOFF_BUDGET ))"' 'cutoff_run boot "$uid" "$_bf" 9999999999'
-  mutate "the log names a package" '          rm -f "$_bf" "$_bf.u" "$_bf.form"   # the scratch goes at the end too' \
-    '          cat "$_bf" >> "$LOG"; rm -f "$_bf" "$_bf.u" "$_bf.form"   # the scratch goes at the end too'
-  mutate "the scratch file is left" '          rm -f "$_bf" "$_bf.u" "$_bf.form"   # the scratch goes at the end too
+  mutate "the log names a package" '          rm -f "$_bf" "$_bf.u" "$_bf.form" "$_bf.out"   # the scratch goes at the end too' \
+    '          cat "$_bf" >> "$LOG"; rm -f "$_bf" "$_bf.u" "$_bf.form" "$_bf.out"   # the scratch goes at the end too'
+  mutate "the scratch file is left" '          rm -f "$_bf" "$_bf.u" "$_bf.form" "$_bf.out"   # the scratch goes at the end too
 ' ''
   # NWP-20261128-37: the parse counts. N1's line holds a real tab, as roamd's does.
   TB=$(printf '\t')
@@ -391,11 +471,29 @@ if [ "$MUTATE" = yes ]; then
   N3B='      case "$_o" in *" $_p "*) continue ;; esac
 '
   mutate "N3 parsed is counted after the dedup" "$N3A$N3B" "$N3B$N3A"
-  mutate "N4 the form scratch is not removed" 'rm -f "$_bf" "$_bf.u" "$_bf.form"   # the scratch goes at the end too' \
-    'rm -f "$_bf" "$_bf.u"   # the scratch goes at the end too'
+  mutate "N4 the form scratch is not removed" 'rm -f "$_bf" "$_bf.u" "$_bf.form" "$_bf.out"   # the scratch goes at the end too' \
+    'rm -f "$_bf" "$_bf.u" "$_bf.out"   # the scratch goes at the end too'
   mutate "N5 the counts are dropped from the line" \
     '; pm listed $_bfp component line(s), $_bfn no-receivers line(s), $_bfo other line(s)' ''
   mutate "N6 the no-receivers words are written quoted" '$_bfn no-receivers line(s)' '$_bfn \"No receivers found\" line(s)'
+  # NWP-20261202-35: the counts of the sends that finished delivery.
+  E2='rm -f "$_bf" "$_bf.u" "$_bf.form" "$_bf.out"   # the scratch goes at the end too'
+  # The four lines from the L token to the B token, read from the script, and the same lines with L and B swapped.
+  TOK=$(grep -A3 -F 'then echo L+ >> "$CUTOFF_BOOTOUT"' "$SUT" | head -4)
+  TOKS=$(printf '%s\n' "$TOK" | sed 's/echo L\([+-]\)/echo X\1/g; s/echo B\([+-]\)/echo L\1/g; s/echo X/echo B/g')
+  # Convicted by F2 (a silent BOOT send reads 3 of 4 under LOCKED).
+  mutate "F-M1 the L and B tokens swapped" "$TOK" "$TOKS"
+  # Convicted by F2 (the silent BOOT send counts: 4 of 4).
+  mutate "F-M2 + is written regardless of the output" 'else echo B- >> "$CUTOFF_BOOTOUT"' 'else echo B+ >> "$CUTOFF_BOOTOUT"'
+  # Convicted by F6 (the probe reads the .out path).
+  mutate "F-M3 the clear line is removed" '          CUTOFF_BOOTOUT=
+' ''
+  # Convicted by F5 and (m) (the .out file is left).
+  mutate "F-M4 the .out file is dropped from the end rm" "$E2" 'rm -f "$_bf" "$_bf.u" "$_bf.form"   # the scratch goes at the end too'
+  # Convicted by F1 (the /dev/null pair writes no token: 0 of 4).
+  mutate "F-M5 the opt-in path is ignored" 'elif [ -z "${CUTOFF_BOOTOUT:-}" ]; then' 'elif :; then'
+  # Convicted by F4 (F3's first send finds no .out file).
+  mutate "F-M6 the empty create is dropped" '( : > "$_bf.out" ) 2>/dev/null; ' ''
   rm -rf "$M"
 fi
 

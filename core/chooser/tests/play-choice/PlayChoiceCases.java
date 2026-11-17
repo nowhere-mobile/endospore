@@ -170,11 +170,12 @@ public class PlayChoiceCases {
     eq("offered: offline", false, PlayChoice.offered(true, "STORED", true));
     eq("offered: session type unknown yet", false, PlayChoice.offered(true, "", false));
 
-    // the Off warning drafts
-    eq("OFF_MESSAGE", "Turning Google Play off removes Play Store from this profile at the next save. Your Google account"
-        + " is signed out here, and apps that sign in with it will ask again.", PlayChoice.OFF_MESSAGE);
+    // the Off warning drafts: the sheet's context and its line, joined = the dialog's message before NWP-20261206-18
+    eq("OFF_CONTEXT", "Turning Google Play off removes Play Store from this profile at the next save.", PlayChoice.OFF_CONTEXT);
+    eq("OFF_LINE", "Your Google account is signed out here, and apps that sign in with it will ask again.", PlayChoice.OFF_LINE);
+    eq("OFF_CONTEXT + OFF_LINE", "Turning Google Play off removes Play Store from this profile at the next save. Your Google account"
+        + " is signed out here, and apps that sign in with it will ask again.", PlayChoice.OFF_CONTEXT + " " + PlayChoice.OFF_LINE);
     eq("OFF_CONFIRM", "Turn off", PlayChoice.OFF_CONFIRM);
-    eq("OFF_CANCEL", "Cancel", PlayChoice.OFF_CANCEL);
 
     System.out.println(fails == 0 ? "cases passed" : "cases FAILED (" + fails + ")");
     System.exit(fails == 0 ? 0 : 1);

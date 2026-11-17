@@ -13,8 +13,9 @@
 # applyPendingRow asks PendingRow.action.
 # NWP-20261117-40: the end of an auto sweep redraws an open Your apps, so the suite reads UnarchiveService too:
 # (g) sweepAuto sends ACTION_SWEEP_DONE once, scoped with setPackage(getPackageName()), inside a try, after its
-# "#130 sweep done" log statement; (h) showYourApps registers one receiver for it with RECEIVER_NOT_EXPORTED, only
-# under an isAttachedToWindow() check, and ll's detach listener unregisters it; (i) the receiver measures the sizes in
+# "#130 sweep done" log statement; (h) showYourApps registers two receivers, sweepDone for ACTION_SWEEP_DONE and
+# sweepState for ACTION_SWEEP_STATE (NWP-20261203-23), each with RECEIVER_NOT_EXPORTED, each under its own
+# isAttachedToWindow() check, and a detach listener in that check unregisters it; (i) the receiver measures the sizes in
 # `new Thread(` and, on the UI thread, checks ll is attached, then sizes.putAll, updateSummary.run() and a
 # refreshPendingRow under `MODE_PENDING.get() == 0`; (j) sizes.putAll( is written only inside a runOnUiThread body.
 # NWP-20261119-30: a sweep's end rebuilds the row at an unchanged count and redraws each app row's size line. The cases
@@ -196,29 +197,45 @@ else:
         if line.strip() != 'try {':
             bad.append('(g) the sweep-done broadcast is not inside a try')
 
-# (h) one receiver, not exported, registered only while ll is attached, unregistered when ll detaches
+# (h) two receivers, sweepDone and sweepState (NWP-20261203-23): each not exported, registered only while ll is
+# attached (each in its own guard), and unregistered by a detach listener in that guard
 sya = body('private void showYourApps() {')
-if sya.count('UnarchiveService.ACTION_SWEEP_DONE') != 1:
-    bad.append('(h) showYourApps names UnarchiveService.ACTION_SWEEP_DONE %d times, not once'
-               % sya.count('UnarchiveService.ACTION_SWEEP_DONE'))
+WANT = {'UnarchiveService.ACTION_SWEEP_DONE': 'sweepDone', 'UnarchiveService.ACTION_SWEEP_STATE': 'sweepState'}
+for act in WANT:
+    if sya.count(act) != 1:
+        bad.append('(h) showYourApps names %s %d times, not once' % (act, sya.count(act)))
 regs = list(re.finditer(r'(?<![A-Za-z0-9_])registerReceiver\(', sya))
-if len(regs) != 1:
-    bad.append('(h) showYourApps calls registerReceiver %d times, not once' % len(regs))
+if len(regs) != 2:
+    bad.append('(h) showYourApps calls registerReceiver %d times, not twice' % len(regs))
 else:
-    r_at = regs[0].start()
-    call = sya[r_at:sya.find(';', r_at)]
-    if 'UnarchiveService.ACTION_SWEEP_DONE' not in call or 'RECEIVER_NOT_EXPORTED' not in call:
-        bad.append('(h) the receiver is not registered for ACTION_SWEEP_DONE with RECEIVER_NOT_EXPORTED')
-    guarded = False
-    for m in re.finditer(r'if \(ll\.isAttachedToWindow\(\)\) \{', sya):
-        g = braced(sya, m.end() - 1)
-        if g and m.end() - 1 < r_at < m.end() - 1 + len(g): guarded = True
-    if not guarded:
-        bad.append('(h) the receiver is registered without an isAttachedToWindow() check')
-    la = sya.find('ll.addOnAttachStateChangeListener(', r_at)
-    det = sya.find('public void onViewDetachedFromWindow(', la) if la >= 0 else -1
-    if la < 0 or det < 0 or 'unregisterReceiver(sweepDone)' not in braced(sya, det):
-        bad.append('(h) ll has no detach listener that unregisters the receiver')
+    guards = [(m.end() - 1, braced(sya, m.end() - 1)) for m in re.finditer(r'if \(ll\.isAttachedToWindow\(\)\) \{', sya)]
+    seen, used = set(), set()
+    for r in regs:
+        r_at = r.start()
+        call = sya[r_at:sya.find(';', r_at)]
+        v = re.match(r'registerReceiver\((\w+),', call)
+        act = [a for a in WANT if a in call]
+        if not v or len(act) != 1 or WANT[act[0]] != v.group(1) or 'RECEIVER_NOT_EXPORTED' not in call:
+            bad.append('(h) a receiver is not sweepDone/ACTION_SWEEP_DONE or sweepState/ACTION_SWEEP_STATE'
+                       ' with RECEIVER_NOT_EXPORTED')
+            continue
+        name = v.group(1)
+        seen.add(name)
+        g = [(s0, b) for s0, b in guards if b and s0 < r_at < s0 + len(b)]
+        if not g:
+            bad.append('(h) %s is registered without an isAttachedToWindow() check' % name)
+            continue
+        s0, b = max(g)  # the innermost guard around this call
+        if s0 in used:
+            bad.append('(h) %s shares its isAttachedToWindow() guard with the other receiver' % name)
+        used.add(s0)
+        rest = b[r_at - s0:]
+        la = rest.find('ll.addOnAttachStateChangeListener(')
+        det = rest.find('public void onViewDetachedFromWindow(', la) if la >= 0 else -1
+        if la < 0 or det < 0 or ('unregisterReceiver(%s)' % name) not in braced(rest, det):
+            bad.append('(h) ll has no detach listener that unregisters %s' % name)
+    if seen != set(WANT.values()):
+        bad.append('(h) showYourApps does not register both sweepDone and sweepState')
 
 # (i) the receiver: measured off the UI thread, drawn on it, only while ll is attached
 RCV = 'final android.content.BroadcastReceiver sweepDone = new android.content.BroadcastReceiver() {'
@@ -374,6 +391,8 @@ mutant "G2 setPackage dropped" us '(new Intent\(ACTION_SWEEP_DONE\))\.setPackage
 mutant "H1 receiver exported" pa '(UnarchiveService\.ACTION_SWEEP_DONE\).*?)RECEIVER_NOT_EXPORTED' '\1RECEIVER_EXPORTED'
 mutant "H2 detach unregister removed" pa 'try \{ unregisterReceiver\(sweepDone\); \} catch \(Throwable ignore\) \{\}' ''
 mutant "H3 registration not guarded by attach" pa 'if \(ll\.isAttachedToWindow\(\)\) \{(\s*// [^\n]*)?(\s*final android\.content\.BroadcastReceiver sweepDone)' '{\2'
+mutant "H4 sweepState detach unregister removed" pa 'try \{ unregisterReceiver\(sweepState\); \} catch \(Throwable ignore\) \{\}' ''
+mutant "H5 sweepState receiver exported" pa '(UnarchiveService\.ACTION_SWEEP_STATE\).*?)RECEIVER_NOT_EXPORTED' '\1RECEIVER_EXPORTED'
 mutant "I1 attached check dropped" pa '\n[^\n]*if \(!ll\.isAttachedToWindow\(\)\) return; // sweep done[^\n]*' ''
 mutant "I2 updateSummary.run() dropped" pa '(sizes\.putAll\(fresh\);[^\n]*\n\s*)updateSummary\.run\(\);' '\1'
 mutant "I3 recount outside MODE_PENDING" pa '(sizes\.putAll\(fresh\);.*?)if \(MODE_PENDING\.get\(\) == 0\) refreshPendingRow\(' '\1refreshPendingRow('

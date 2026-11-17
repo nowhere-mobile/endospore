@@ -122,6 +122,7 @@ final class TelIngest {
         for (int pass = 0; pass < passes; pass++) {
             verified = 0;
             final TelSub.Sims sims = activeSims(ctx);
+            seen.defaultSms = defaultSmsSub(); // NWP-20261204-11: the default SMS SIM this pass, for the read-back line
             for (int i = 1; i < reply.size(); i++) {
                 if (deliver(ctx, reply.get(i), insertedThisRun, notified, unknown, sims, tally, seen)) { verified++; everOk[i] = true; }
             }
@@ -402,6 +403,16 @@ final class TelIngest {
         }
     }
 
+    /** NWP-20261204-11: the default SMS subscription, which MmsProvider checks the addr and part inserts against
+     *  (they carry no sub_id). -1 when there is none or the read throws. It is counted, never logged. */
+    private static int defaultSmsSub() {
+        try {
+            return android.telephony.SubscriptionManager.getDefaultSmsSubscriptionId();
+        } catch (Throwable t) {
+            return -1;
+        }
+    }
+
     /** NWP-20261130-01: read back each SMS and MMS that landed and has not read back yet, through the provider the
      *  session's Messages reads, under the same per-user filter. Only a lookup that found the row sets readOk; a
      *  blind or failed lookup counts in unknown. */
@@ -552,7 +563,8 @@ final class TelIngest {
      *  (content://mms, msg_box=inbox, m_type=RETRIEVE_CONF, date in SECONDS, sub_id the row's SIM's subscription, as an
      *  SMS, NWP-20261130-01, ~~sub_id=-1 so the read-filter's INVALID clause lets the roamed Messaging show it~~
      *  (superseded by the 2026-11-06 decision)), the FROM address row,
-     *  then each part (text/smil -&gt; the "text" column; media -&gt; the bytes via openOutputStream). Dedup
+     *  then each part (text/smil -&gt; the "text" column; media -&gt; the bytes via openOutputStream). A text-only MMS
+     *  saves its parts first, under a placeholder id, and moves them to the pdu in one update (NWP-20261204-10). Dedup
      *  via insertedThisRun within a run, and across sessions by the message id it stamps (mmsExists,
      *  NWP-20261006-07). OP_WRITE_SMS (ensureSmsWrite, run())
      *  authorises the mms write too. A lookup that did not complete inserts nothing (unknown, NWP-20261112-21). */
@@ -588,42 +600,22 @@ final class TelIngest {
                 } catch (Throwable ignore) {}
             }
 
-            ContentValues pdu = new ContentValues();
-            pdu.put("date", when / 1000L); // MMS date is SECONDS (SMS date is ms) -- wrong scale => wrong day
-            pdu.put("msg_box", 1);         // MESSAGE_BOX_INBOX
-            pdu.put("read", 0);
-            pdu.put("seen", 0);
-            pdu.put("m_type", 132);        // PduHeaders.MESSAGE_TYPE_RETRIEVE_CONF
-            pdu.put("ct_t", "application/vnd.wap.multipart.related");
-            int sub = TelSub.file(pdu, TelSub.rowTag(f), sims); // NWP-20261130-01: its SIM's subscription, as an SMS
-            pdu.put("m_id", mmsKey(when)); // NWP-20261006-07: names this delivery, so a redelivery finds it (mmsExists)
-            if (threadId > 0) pdu.put("thread_id", threadId); // join the sender's conversation (fixes attribution + notify)
-            if (!subject.isEmpty()) { pdu.put("sub", subject); pdu.put("sub_cs", 106); }
-            Uri mmsUri = ctx.getContentResolver().insert(Uri.parse("content://mms"), pdu);
-            if (mmsUri == null) return false;
-            seen.inserted("mms", when); // NWP-20261129-02
-            tally.inserted(sub); // NWP-20261130-01: the batch line
-            long id = android.content.ContentUris.parseId(mmsUri);
-
-            // FROM address (type 137) so Messaging attributes the sender; charset 106 = UTF-8.
-            ContentValues addr = new ContentValues();
-            addr.put("address", from.isEmpty() ? "insert-address-token" : from);
-            addr.put("type", 137);
-            addr.put("charset", 106);
-            Uri addrUri = null; // NWP-20261129-02: still non-fatal; a throw counts as not inserted
-            try { addrUri = ctx.getContentResolver().insert(Uri.parse("content://mms/" + id + "/addr"), addr); } catch (Throwable ignore) {}
-            seen.addr(addrUri != null);
-
+            // Decode the parts and decide the hint BEFORE the pdu insert (no provider call): a text-only MMS is
+            // written parts first, so the plan needs every part's type.
             int n = parts == null ? 0 : parts.length();
             StringBuilder preview = new StringBuilder();
             boolean hasMedia = false;
             String mediaLabel = null; // #150: label the notice by the media KIND, not a hardcoded "Photo"
+            String[] cts = new String[n + 1];
+            String[] names = new String[n + 1];
+            byte[][] datas = new byte[n + 1][];
             for (int i = 0; i < n; i++) {
                 org.json.JSONObject p = parts.getJSONObject(i);
                 String ct = p.optString("ct", "application/octet-stream");
-                String name = p.optString("name", "");
                 byte[] data = android.util.Base64.decode(p.optString("data", ""), android.util.Base64.NO_WRAP);
-                seen.part(insertMmsPart(ctx, id, i, ct, name, data));
+                cts[i] = ct;
+                names[i] = p.optString("name", "");
+                datas[i] = data;
                 if (ct.startsWith("text/plain")) {
                     String s = new String(data, java.nio.charset.StandardCharsets.UTF_8).trim();
                     if (!s.isEmpty()) { if (preview.length() > 0) preview.append(' '); preview.append(s); }
@@ -637,14 +629,87 @@ final class TelIngest {
             // #150: a DEGRADED MMS (e.g. over-cap -> media dropped by the seal, note="too-large") arrives with
             // no parts. Render the reason as a text part so the thread isn't a blank bubble and the in-session
             // notice says something useful instead of a bare "New message".
-            if (!note.isEmpty() && preview.length() == 0 && !hasMedia) {
-                String hint = "too-large".equals(note)
+            boolean hint = MmsIngestPlan.hint(note, preview.length() > 0, hasMedia);
+            if (hint) {
+                String text = "too-large".equals(note)
                         ? "[Attachment too large to download]"
                         : "[Message couldn't be downloaded]";
-                seen.part(insertMmsPart(ctx, id, n, "text/plain", "hint.txt",
-                        hint.getBytes(java.nio.charset.StandardCharsets.UTF_8)));
-                preview.append(hint);
+                cts[n] = "text/plain";
+                names[n] = "hint.txt";
+                datas[n] = text.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                preview.append(text);
             }
+            int total = hint ? n + 1 : n;
+            boolean textOnly = MmsIngestPlan.textOnly(java.util.Arrays.asList(cts).subList(0, total));
+
+            ContentValues pdu = new ContentValues();
+            pdu.put("date", when / 1000L); // MMS date is SECONDS (SMS date is ms) -- wrong scale => wrong day
+            pdu.put("msg_box", 1);         // MESSAGE_BOX_INBOX
+            pdu.put("read", 0);
+            pdu.put("seen", 0);
+            pdu.put("m_type", 132);        // PduHeaders.MESSAGE_TYPE_RETRIEVE_CONF
+            pdu.put("ct_t", "application/vnd.wap.multipart.related");
+            int sub = TelSub.file(pdu, TelSub.rowTag(f), sims); // NWP-20261130-01: its SIM's subscription, as an SMS
+            pdu.put("m_id", mmsKey(when)); // NWP-20261006-07: names this delivery, so a redelivery finds it (mmsExists)
+            if (threadId > 0) pdu.put("thread_id", threadId); // join the sender's conversation (fixes attribution + notify)
+            if (!subject.isEmpty()) { pdu.put("sub", subject); pdu.put("sub_cs", 106); }
+            pdu.put("text_only", textOnly ? 1 : 0); // NWP-20261204-10: as PduPersister sets it
+            // NWP-20261204-10, row "An inbound text MMS is delivered but shows an empty balloon in the Messaging
+            // app". Messaging imports an MMS when its pdu lands, so a pdu with no parts yet can import as an empty
+            // balloon. That is a hypothesis; the handset check in the row decides it. AOSP's PduPersister.persist
+            // saves the parts under a placeholder message id first, inserts the pdu, then moves the parts to it in
+            // one update. A text-only MMS is written the same way here. A refused placeholder part, or an update
+            // that does not move every part, falls back to today's order (parts after the pdu, under its id). A
+            // media MMS keeps today's order: openOutputStream's lookup is not proven to see a part with no pdu.
+            long ph = MmsIngestPlan.placeholderMid(when);
+            boolean[] ok = new boolean[total];
+            boolean early = false;
+            if (textOnly) {
+                deleteMmsParts(ctx, ph); // an earlier attempt of this same unacknowledged delivery that died midway
+                early = true;
+                for (int k = 0; k < total && early; k++) {
+                    ok[k] = insertMmsPart(ctx, ph, k, cts[k], names[k], datas[k]);
+                    early = ok[k];
+                }
+                if (!early) deleteMmsParts(ctx, ph); // a refused part: this message takes today's order
+            }
+            Uri mmsUri = ctx.getContentResolver().insert(Uri.parse("content://mms"), pdu);
+            if (mmsUri == null && early) deleteMmsParts(ctx, ph);
+            if (mmsUri == null) return false;
+            seen.inserted("mms", when); // NWP-20261129-02
+            tally.inserted(sub); // NWP-20261130-01: the batch line
+            seen.mmsDefault(sub, sims.subIds); // NWP-20261204-11: "... an MMS delivered into a session can arrive without
+            // its sender or its parts on a two-SIM phone" -- was it filed off the default SMS SIM, or that SIM unseen
+            long id = android.content.ContentUris.parseId(mmsUri);
+            if (early) {
+                int moved = -1;
+                try {
+                    ContentValues mv = new ContentValues();
+                    mv.put("mid", id);
+                    moved = ctx.getContentResolver().update(Uri.parse("content://mms/" + ph + "/part"), mv, null, null);
+                } catch (Throwable ignore) {}
+                if (moved != total) {
+                    android.util.Log.w("NowhereChooser", "mms parts-first: moved " + moved + " of " + total
+                            + ", re-inserting under the message");
+                    deleteMmsParts(ctx, ph);
+                    deleteMmsParts(ctx, id); // a partial move left some under id: re-inserting all must not duplicate
+                    early = false;
+                }
+            }
+
+            // FROM address (type 137) so Messaging attributes the sender; charset 106 = UTF-8.
+            ContentValues addr = new ContentValues();
+            addr.put("address", from.isEmpty() ? "insert-address-token" : from);
+            addr.put("type", 137);
+            addr.put("charset", 106);
+            Uri addrUri = null; // NWP-20261129-02: still non-fatal; a throw counts as not inserted
+            try { addrUri = ctx.getContentResolver().insert(Uri.parse("content://mms/" + id + "/addr"), addr); } catch (Throwable ignore) {}
+            seen.addr(addrUri != null);
+
+            if (!early) {
+                for (int k = 0; k < total; k++) ok[k] = insertMmsPart(ctx, id, k, cts[k], names[k], datas[k]);
+            }
+            for (boolean b : ok) seen.part(b); // NWP-20261129-02: each part's final outcome, once
             insertedThisRun.add(when);
             // #150 (i): Bugle imports a sealed MMS delivered at login via its provider sync, but -- unlike a
             // live SMS -- treats the back-dated row as historical catch-up and does NOT raise a notification
@@ -918,6 +983,11 @@ final class TelIngest {
             android.util.Log.w("NowhereChooser", "mms part", t);
         }
         return inserted;
+    }
+
+    /** NWP-20261204-10: delete every part row under mid (deliverMms's placeholder, or a fallback's partial move). */
+    private static void deleteMmsParts(Context ctx, long mid) {
+        try { ctx.getContentResolver().delete(Uri.parse("content://mms/" + mid + "/part"), null, null); } catch (Throwable ignore) {}
     }
 
     /** #149: grant OUR OWN OP_WRITE_SMS in this roamed user so the ContentResolver.insert into content://sms

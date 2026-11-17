@@ -1,0 +1,18 @@
+# Endospore system_ext PUBLIC policy (NWP-20261116-37), wired by inject-product.sh as
+# SYSTEM_EXT_PUBLIC_SEPOLICY_DIRS += vendor/endospore/sepolicy_public on every device.
+#
+# ONE attribute and nothing else. The DRM store (/data/vendor/mediadrm) is labelled mediadrm_vendor_data_file, and
+# that type is NOT a platform type: each Pixel declares it in its own generated vendor policy
+# (vendor/google_devices/<device>/sepolicy/vendor/types.te). Our private policy (vendor/endospore/sepolicy, the
+# system_ext PRIVATE dir) compiles without the vendor policy in view, so naming the type there fails the build with
+# "unknown type mediadrm_vendor_data_file" -- the 0.5.58 break NWP-20261203-08 shipped to main.
+# The vendor policy, in turn, compiles against the PUBLIC policies only, so it can join a public attribute but can
+# never name endospore_priv, which stays private. This attribute is the meeting point:
+#   - vendor/endospore/sepolicy_vendor puts mediadrm_vendor_data_file into it, on a device whose vendor policy
+#     declares that type;
+#   - vendor/endospore/sepolicy/endospore.te grants endospore_priv delete-only access to it.
+# On a device that does not join it, the attribute holds no type and the grant reaches nothing.
+# Same pattern the Pixel trees use themselves: their system_ext public types.te declares hal_face_debug_* attributes
+# that their vendor policy fills.
+# NOTE: no backtick and no apostrophe in these comments -- the build runs .te through m4.
+attribute nowhere_drm_store_file;

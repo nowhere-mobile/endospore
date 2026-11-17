@@ -9,7 +9,8 @@
 #       i=0, i>n, n>9999, ms<0, ms>86400000, a null token and an unknown token.
 #   O2  SweepOutcome.TOKENS equals core/agent/auto_sweep.go autoSweepOutcomeTokens, literal for literal, in order.
 #   O3a the materialise loop sends one SweepOutcome.request(i + 1, work.size(), <end>, ...) per app, after
-#       materializeAndInstall(pkg, true), through DaemonSocket.roundTrip(<req>, 5000) behind a null check.
+#       materializeAndInstall(pkg, true), through DaemonSocket.roundTrip(<req>, 5000) behind a null check (the stop,
+#       hold and abandon blocks cut out first).
 #   O3b no SweepOutcome.request call in sweepAuto takes pkg (or work.get) in its arguments.
 #   O3c the catch after materializeAndInstall(pkg, true) sets the outcome the request reads to SweepOutcome.ERROR.
 #   O3d the sign-out stop sends ONE `stopped` request for app i + 1, and has no loop.
@@ -153,7 +154,8 @@ sources() {
   if [ -z "$sweep" ] || [ -z "$mai" ] || [ -z "$mloc" ]; then
     echo "FAIL O3 sweepAuto, materializeAndInstall or materializeLocked not found"; return 1
   fi
-  # The materialise loop: from its for to the sweep's outer finally. The stop block is cut out of it for O3a/O3c.
+  # The materialise loop: from its for to the sweep's outer finally. The sign-out stop, the SweepHold stop and the
+  # abandon (SweepStall, NWP-20261203-03) blocks are cut out of it for O3a/O3c: each sends its own one `stopped`.
   local loop
   loop=$(perl -0e '
       my $c = do { local $/; <STDIN> };
@@ -164,6 +166,7 @@ sources() {
       my $c = do { local $/; <STDIN> };
       $c =~ s/if \(SignOutGate\.begun\(\)\) \{.*?\bbreak;\s*\}//s;
       $c =~ s/if \(SweepHold\.held\(\)\) \{.*?\bbreak;\s*\}//s;
+      $c =~ s/if \(SweepStall\.abandoned\(\)\) \{.*?\bbreak;\s*\}//s;
       my $n = () = $c =~ /SweepOutcome\.request\(/g; exit 1 unless $n == 1;
       my $m = index($c, "materializeAndInstall(pkg, true)"); exit 1 if $m < 0;
       $c =~ /String (\w+) = SweepOutcome\.request\(i \+ 1, work\.size\(\), \w+, [^;]*\);\s*if \(\1 != null\) DaemonSocket\.roundTrip\(\1, 5000\);/s

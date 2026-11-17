@@ -3,6 +3,7 @@ package main
 import (
 	"net"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -84,23 +85,23 @@ func TestClaimCodeShape_CreateCodeRefusesBeforeAnything(t *testing.T) {
 	}
 }
 
-// Control: a well-formed code the gateway does not know still takes today's path -- it reaches /issue and the
-// gateway's refusal answers ERR-NOCODE.
-func TestClaimCodeShape_WellFormedUnknownCodeReachesTheGateway(t *testing.T) {
+// Control: a well-formed code the gateway does not know passes the shape check and creates a free profile (h55 #1,
+// NWP-20261207-01). The create sends no /issue: the code waits in the new profile's head as a pending claim, and a
+// later session's drain clears it.
+func TestClaimCodeShape_WellFormedUnknownCodeCreatesFree(t *testing.T) {
 	const name = "ccshape-b"
 	dest, _ := createCodeEnv(t, ccsFunded, 3)
 	seen := clSpy(t)
 	blobCache, contentCache = nil, nil
-	if got := verb(func(c net.Conn) { handleCreateCode(c, dest, name, ccsPass, ccsUnknown) }); got != "ERR-NOCODE" {
-		t.Fatalf("CREATE-CODE with an unknown well-formed code replied %q, want ERR-NOCODE", got)
+	if got := verb(func(c net.Conn) { handleCreateCode(c, dest, name, ccsPass, ccsUnknown) }); !strings.HasPrefix(got, "OK ") {
+		t.Fatalf("CREATE-CODE with an unknown well-formed code replied %q, want OK (h55 #1)", got)
 	}
-	issued := false
 	for _, p := range seen() {
 		if strings.HasPrefix(p, "/issue") {
-			issued = true
+			t.Errorf("the create sent %s: the code was redeemed at the create (h53 #6)", p)
 		}
 	}
-	if !issued {
-		t.Errorf("an unknown well-formed code never reached the gateway's /issue: %v", seen())
+	if sw := storedWallet(t, name, ccsPass); sw == nil || !slices.Equal(sw.PendingClaims, []string{ccsUnknown}) {
+		t.Error("the new profile's head does not carry the unknown code as its one pending claim")
 	}
 }

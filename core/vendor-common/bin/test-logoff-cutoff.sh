@@ -115,7 +115,8 @@ esac" 2>/dev/null && bash -n <<<"$C" 2>/dev/null || { no "THE BLOCKS DO NOT PARS
             grep -qxF -- "$4" "$d/slow" 2>/dev/null && sleep 0.4
             grep -qxF -- "$4" "$d/stubborn" 2>/dev/null || { [ -e "$d/pk/$4" ] && echo true > "$d/pk/$4"; }
             local a b; while read -r a b; do [ "$a" = "$4" ] && echo false > "$d/pk/$b"; done < "$d/peer" 2>/dev/null ;;
-          broadcast) shift; wu "$2" broadcast; echo "broadcast $*" >> "$d/calls" ;;
+          broadcast) shift; wu "$2" broadcast; echo "broadcast $*" >> "$d/calls"
+            [ -e "$d/amdone" ] && echo "Broadcast completed: result=0" ;;   # C37: what am prints on a device
         esac
       }
       settings(){ wu "$3" settings; echo "settings $5" >> "$d/calls"; cat "$d/set.$5" 2>/dev/null   # get --user <uid> secure <key>
@@ -164,7 +165,8 @@ am(){
       wu "$3" force-stop
       echo "stop $4" >> "$d/calls"
       grep -qxF -- "$4" "$d/stubborn" 2>/dev/null || { [ -e "$d/pk/$4" ] && echo true > "$d/pk/$4"; } ;;
-    broadcast) shift; wu "$2" broadcast; echo "broadcast $*" >> "$d/calls" ;;
+    broadcast) shift; wu "$2" broadcast; echo "broadcast $*" >> "$d/calls"
+      [ -e "$d/amdone" ] && echo "Broadcast completed: result=0" ;;
   esac
 }
 settings(){ wu "$3" settings; echo "settings $5" >> "$d/calls"; cat "$d/set.$5" 2>/dev/null; return 0; }
@@ -472,6 +474,23 @@ STUBS
     || no "C35 the wake answered [$(res "$d")], state [$(ls -A "$d/state" | tr '\n' ' ')]"
   command rm -rf "$d"
 
+  # C37 (NWP-20261202-35): the wake sends its boot pair as before. Only bootwake sets CUTOFF_BOOTOUT, so the wake
+  # writes no token file, its broadcasts are main's byte for byte (one at a time, so in order), and its line is main's.
+  d=$(dev com.msg=true com.google.android.gms=true); : > "$d/amdone"
+  printf 'com.google.android.gms\ncom.msg\n' > "$d/state/.cutoff.10"; run "$d" cutoffwake 45 "" 1
+  got=$(grep '^broadcast ' "$d/calls")
+  want=$(echo 'broadcast --user 10 --include-stopped-packages -a android.server.checkin.CHECKIN'
+    for k in com.google.android.gms com.msg; do
+    printf 'broadcast --user 10 -p %s --include-stopped-packages --allow-fgs-start-reason 202 -a android.intent.action.LOCKED_BOOT_COMPLETED\n' "$k"
+    printf 'broadcast --user 10 -p %s --include-stopped-packages --allow-fgs-start-reason 200 -a android.intent.action.BOOT_COMPLETED\n' "$k"
+  done)
+  outs=$(ls -A "$d/state" | grep '\.out$')
+  { [ "$got" = "$want" ] && [ -z "$outs" ] && grep -q "boot re-arm sent to 2," "$d/log" && ! grep -q 'sends finished' "$d/log" \
+    && [ "$(res "$d")" = "WAKE OK 2" ]; } \
+    && ok "C37 the wake sends main's boot pairs, leaves no .out file and logs no sends-finished clause (NWP-20261202-35)" \
+    || no "C37 broadcasts [$(printf '%s' "$got" | tr '\n' '|')], .out files [$outs], answer [$(res "$d")], log [$(cat "$d/log")]"
+  command rm -rf "$d"
+
   # cleanstorage, executed: everything but the record lines is stubbed out by running only those lines.
   d=$(dev); : > "$d/state/.cutoff.10"; : > "$d/state/.cutoff.10.new"; : > "$d/state/.cutoff.10.tmp"; : > "$d/state/.cutoff.11"
   ( uid=10 STATE="$d/state"; eval "$(printf '%s\n' "$C" | grep -F '.cutoff.')" ) >/dev/null 2>&1
@@ -590,4 +609,6 @@ mut_all "M54 the partial wake deletes the record" C33 's/        \*\)\n         
 mut_all "M55 the partial wake keeps the whole record" C33 's/        \*\)\n          # A loop of its own(?:.*\n)*?          fi ;;\n/        *) : ;;\n/' || fails=$((fails+1))
 mut_all "M57 a failed leftover write lost to a later entry" C36 's/\*" \$_p "\*\) echo "\$_p" \|\| exit 1 ;;/*" \$_p "*) echo "\$_p" ;;/' || fails=$((fails+1))
 mut_all "M56 UNVERIFIED deletes the record" C34 's/        unknown\) : ;;\n/        unknown) rm -f "\$_cf" ;;\n/' || fails=$((fails+1))
+# NWP-20261202-35: convicted by C37 (a .out file is left in the state dir).
+mut "M58 the wake opts into the token file"  's/(      cutoff_run boot "\$uid" "\$_cf\.ord")/      CUTOFF_BOOTOUT="\$_cf.out"\n$1/' || fails=$((fails+1))
 [ "$fails" -eq 0 ] && echo "== all mutations convicted" || { echo "== $fails mutation(s) not convicted"; exit 1; }

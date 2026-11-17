@@ -15,6 +15,10 @@ package main
 //
 // Lock order is mu, then the server's progMu. After Stop the lander publishes nothing and writes no list, so a late
 // progress line cannot outlive the teardown that removed it. It logs fixed words and counts: a rel names a user's file.
+//
+// NWP-20261207-11 (S6b half 1, §6, §10 O3): a pass that parked on transient fetch errors publishes RESTORE-WAITING (the
+// token alone, no number) after the RESTORING line, until the next file lands or the run ends. Stop clears the state
+// with no publish, as above.
 
 import (
 	"errors"
@@ -52,6 +56,8 @@ type bgLander struct {
 	totalB   int64    // guarded by mu
 	left     int      // guarded by mu
 	list     []string // landed paths not flushed yet, guarded by mu
+	wrote    int      // NWP-20261114-34: files this run landed, guarded by mu
+	parked   bool     // NWP-20261207-11: the last pass parked on transient fetch errors, guarded by mu
 }
 
 func newBgLander(stateDir, dest string, unders map[string]string, m chunkManifest, prog *mediaServer) *bgLander {
@@ -62,6 +68,7 @@ func newBgLander(stateDir, dest string, unders map[string]string, m chunkManifes
 func (l *bgLander) wire(in landerInput) landerInput {
 	in.stop = l.stopped.Load
 	in.sleep = l.sleep
+	in.onPark = l.onPark
 	in.commit = l.commit
 	in.onStart = l.onStart
 	in.onSettled = l.onSettled
@@ -104,6 +111,7 @@ func (l *bgLander) Stop() {
 		return
 	}
 	close(l.wake)
+	l.parked = false // no publish: after Stop the lander says nothing
 	l.flushListLocked()
 }
 
@@ -137,8 +145,23 @@ func (l *bgLander) onStart(pending []string) {
 	})
 }
 
-func (l *bgLander) onSettled(rel string, _ bool) {
+// onPark is the end of a pass that sleeps: RESTORE-WAITING while it parked on transient fetch errors.
+func (l *bgLander) onPark(parked bool) { l.unlessStopped(func() { l.setParkedLocked(parked) }) }
+
+// setParkedLocked publishes a change of the parked state only. Caller holds mu.
+func (l *bgLander) setParkedLocked(parked bool) {
+	if l.parked == parked {
+		return
+	}
+	l.parked = parked
+	l.prog.setRestoreWaiting(parked)
+}
+
+func (l *bgLander) onSettled(rel string, landedHere bool) {
 	l.unlessStopped(func() {
+		if landedHere { // a landing is the next success: the lander is no longer parked
+			l.setParkedLocked(false)
+		}
 		l.doneB += l.m.Ess[rel].Size
 		l.left--
 		l.publishLocked()
@@ -151,6 +174,7 @@ func (l *bgLander) onWritten(rel string) {
 		return
 	}
 	p := filepath.Join(l.dest, filepath.FromSlash(rel))
+	l.wrote++
 	l.list = append(l.list, p)
 	if len(l.list) >= landerBatch {
 		l.flushListLocked()
@@ -176,10 +200,14 @@ func (l *bgLander) flushListLocked() {
 // leaves no RESTORING line behind.
 func (l *bgLander) finish() {
 	l.unlessStopped(func() {
+		l.setParkedLocked(false)
 		l.flushListLocked()
 		if l.left > 0 {
 			l.left = 0
 			l.publishLocked()
+		}
+		if l.wrote > 0 { // NWP-20261114-34: the Gallery learns of the landed files by a rescan
+			bumpMediaLanded(l.stateDir, "background #media restore")
 		}
 	})
 }
@@ -269,6 +297,13 @@ func startBgLander(base, scope, pass, mediaDir, stateDir string, mounts []mediaM
 	goSafe("media lander", func() {
 		defer close(l.done)
 		defer l.finish()
+		bgT := mediaBgBegin() // NWP-20261205-08: a deferred end also runs after a recovered panic
+		defer func() {
+			l.mu.Lock()
+			b := l.doneB
+			l.mu.Unlock()
+			mediaBgEnd(bgT, 0, b)
+		}()
 		landBackground(in, m)
 	})
 	return l

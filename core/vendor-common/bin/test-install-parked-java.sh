@@ -42,9 +42,9 @@ mut() { # mut <label> <perl-expr> <case the mutant must fail>
   echo "  convicted $1 (fails '$3')"
 }
 fails=0
-mut "I1 the listener sends OTA-APPLY without the GET-COLDLOCK read" 's/(install\.setOnClickListener\(v -> )new Thread\(\(\) -> \{.*?\}\)\.start\(\)\);/$1new Thread(() -> { daemonCmd("OTA-APPLY"); runOnUiThread(startInstall); }).start());/s' \
+mut "I1 the listener sends OTA-APPLY without the GET-COLDLOCK read" 's/(install\.setOnClickListener\(v -> \{\n\s*install\.setEnabled\(false\);\n\s*)new Thread\(\(\) -> \{.*?\}\)\.start\(\);/$1new Thread(() -> { daemonCmd("OTA-APPLY"); runOnUiThread(startInstall); }).start();/s' \
   "listener reads GET-COLDLOCK" || fails=$((fails+1))
-mut "I2 the credit clause is never added" 's/\(creditLost \? " That includes storage credit it hasn.t saved\." : ""\)/""/' \
+mut "I2 the credit clause is never added" 's/\n[ \t]*if \(creditLost\) lines\.add\([^\n]*\n/\n/' \
   "text: named, credit" || fails=$((fails+1))
 mut "I3 an unanswered GET-COLDLOCK installs without asking" 's/ \|\| coldLockReply == null \|\| coldLockReply\.trim\(\)\.isEmpty\(\)//' \
   "ask: an empty reply warns" || fails=$((fails+1))

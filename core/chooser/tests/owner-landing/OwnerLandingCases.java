@@ -151,14 +151,14 @@ public final class OwnerLandingCases {
         pin("P1 Mark-mine", () -> landingGuarded(blockAt(c, BIND), "sendDaemon(\"SET-SIM-MINE\\n\""));
         pin("P1 Save", () -> landingGuarded(blockAt(c, STORE), "sendDaemon(\"SET-STORE\\n\""));
 
-        System.out.println("== P2: each dialog's positive button starts with the guard ==");
-        pin("P2 Repair", () -> first(blockAt(c, REPAIR), ".setPositiveButton(\"Repair\", (d, w) -> {").startsWith(GUARD));
+        System.out.println("== P2: each dialog's positive button (the Repair sheet's slot-0 action) starts with the guard ==");
+        pin("P2 Repair", () -> first(blockAt(c, REPAIR), "new Runnable[] { () -> {").startsWith(GUARD));
         pin("P2 Unbind", () -> first(blockAt(c, BIND), ".setPositiveButton(\"Unbind\", (d, w) -> {").startsWith(GUARD));
 
         System.out.println("== P3: owned is read once, on the UI thread, before the worker and the dialog ==");
         pin("P3 Clear all", () -> ownBefore(blockAt(blockAt(c, INBOX), "clear.setOnClickListener(v -> {"), THREAD));
         pin("P3 Delete", () -> ownBefore(blockAt(blockAt(c, ITEM), "del.setOnClickListener(v -> {"), THREAD));
-        pin("P3 Repair", () -> ownBefore(blockAt(c, REPAIR), BUILDER, THREAD));
+        pin("P3 Repair", () -> ownBefore(blockAt(c, REPAIR), "SheetDialog.confirm(", THREAD));
         pin("P3 Unbind", () -> ownBefore(blockAt(blockAt(c, BIND),
                 "settingsRow(\"Unbind all\", \"Remove every profile from this line\", v -> {"), BUILDER, THREAD));
         pin("P3 Mark-mine", () -> ownBefore(blockAt(blockAt(c, BIND), "BindingMarks.MARK_SUMMARY, v -> {"), THREAD));

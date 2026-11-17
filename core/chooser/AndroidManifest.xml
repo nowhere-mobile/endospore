@@ -1,8 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.nowhere.chooser"
-    android:versionCode="657"
-    android:versionName="8.92">
+    android:versionCode="704"
+    android:versionName="9.39">
   <uses-sdk android:minSdkVersion="24" android:targetSdkVersion="34"/>
   <!-- #747 (DIA-20260818-08): the storefront UI now lives in its OWN package (nApps) so it appears in
        Settings > Apps as its own app. It cannot talk to the login daemon: the daemon pins the first peer's
@@ -334,11 +334,12 @@
          zone, delete). Renamed from "Log off" (DIA-20260617-07) now that it's more than just logging off. This
          is the only LAUNCHER activity (the gate is not), so the drawer shows just this "Profile" entry.
          NWP-20261128-10: predictive back is on for this activity only, never on <application>, so the gate
-         (ChooserActivity) and the other activities keep onBackPressed exactly. -->
+         (ChooserActivity) and the other activities keep onBackPressed exactly.
+         NWP-20261203-20: it shows in Recents (h59 #6); the recovery-code screen sets FLAG_SECURE, so its thumbnail
+         is blank. The gate and the other activities stay out of Recents. -->
     <activity android:name=".ProfileActivity" android:exported="true"
               android:label="Profile"
               android:theme="@style/Theme.Nowhere"
-              android:excludeFromRecents="true"
               android:enableOnBackInvokedCallback="true"
               android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|uiMode|keyboard|keyboardHidden|navigation|mcc|mnc">
       <intent-filter>
@@ -398,6 +399,12 @@
          passphrase change on another phone. Started by SkipNoticeActivity.check from UnarchiveService's
          switch-landing start. Dismissible, not pinned; excluded from recents. -->
     <activity android:name=".SkipNoticeActivity" android:exported="false"
+              android:theme="@android:style/Theme.Material.Dialog.NoActionBar"
+              android:excludeFromRecents="true"/>
+    <!-- NWP-20261205-02 (h58 #1): the one line a sign-in shows when its last save did not finish. Started by
+         LastSaveNoticeActivity.check from UnarchiveService's switch-landing start, once per sign-in. At the top of the
+         screen, so it never covers the centred Auto sweep card. Dismissible, not pinned; excluded from recents. -->
+    <activity android:name=".LastSaveNoticeActivity" android:exported="false"
               android:theme="@android:style/Theme.Material.Dialog.NoActionBar"
               android:excludeFromRecents="true"/>
     <!-- NWP-20261202-22 (2026-11-10, item 1): the one-time "Finish setting up Google Play" card of a profile created

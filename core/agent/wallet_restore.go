@@ -361,6 +361,7 @@ func writeRestoredWallet(walletPath, gen string, pt []byte, mayWrite func() bool
 			discardWalletLanding(land)
 			return err
 		}
+		noteWalletRestored(walletPath, &stored) // NWP-20261202-40: the restored tokens are not a lost publish's loss
 		walletFileLandedHook(walletPath)
 		return proveWalletLanding(land)
 	}
@@ -375,6 +376,7 @@ func writeRestoredWallet(walletPath, gen string, pt []byte, mayWrite func() bool
 			discardWalletLanding(land)
 			return err
 		}
+		noteWalletRestored(walletPath, &restored) // NWP-20261202-40: the restored tokens are not a lost publish's loss
 	}
 	if err := putWalletBytes(walletPath, pt); err != nil {
 		discardWalletLanding(land)
@@ -775,6 +777,7 @@ func retryWalletRestoreWithin(base, name, pass string, dk []byte, walletPath, ge
 			discardWalletLanding(land)
 			return err
 		}
+		noteWalletRestored(walletPath, stored) // NWP-20261202-40: the restored tokens are not a lost publish's loss
 		walletFileLandedHook(walletPath)
 	}
 	if err := proveWalletLanding(land); err != nil {

@@ -24,6 +24,16 @@
 #                                  step, no .appcode left
 #   G  #apps 1 (damage)         -> lands as today: OK 11, `+de +media`, one stop, no .appcode left
 #
+# NWP-20261207-06 (docs/product-decisions.md, "eight answers to harvest 62 ...", 2026-11-09, #6): the #sys restore
+# (acct_restore) and the #keys restore follow the same rule. The #keys store request moved out of the landing into
+# keystore_fetch, which runs before the verdict and stages into keystore-in/<uid>.pre; keystore_restore promotes it at
+# the landing. Here acct_restore and keystore_fetch are stubs that return the case's status; ks_in_dir is the REAL one:
+#   H  #sys 5                   -> BLANK NET naming sys; no #media, no #apps, no keystore_fetch, no landing step
+#   I  #keys 5                  -> BLANK NET naming keys; keystore_fetch ran once and last; no keystore_restore, no .pre
+#   J  #keys 1 (damage)         -> lands: OK 11, `+de +media`; keystore_fetch before the media stop, keystore_restore
+#                                  after ks_signin_reset
+#   K  #sys 1 (damage)          -> lands: OK 11, `+de +media`
+#
 #   bash test-in-scope-net-blank.sh              # the cases
 #   bash test-in-scope-net-blank.sh --mutate     # ... plus mutants of roamd that must each CONVICT under every shell
 #
@@ -70,7 +80,7 @@ reroot() { printf '%s\n' "$1" | sed -E 's#([" ])/data/#\1$ROOT/data/#g'; }
 nleft() { printf '%s\n' "$1" | sed -E 's/(^|[[:space:]])#.*$//' | sed 's#\$ROOT/data/##g' | grep -cE '(^|[^[:alnum:]_])/data/'; }
 
 suite() {  # suite <roamd.sh> <shell> [quiet] -> 0 all ok, 1 a case failed, 2 the harness could not run
-  local f="$1" SH="$2" quiet="${3:-}" p=0 x=0 QN IST IN RI R S n PF NOID=0 WRONGSH=0 HARN="" HARNN=0 HARN1=""
+  local f="$1" SH="$2" quiet="${3:-}" p=0 x=0 QN IST KID IN RI R S n PF NOID=0 WRONGSH=0 HARN="" HARNN=0 HARN1=""
   say() { [ -n "$quiet" ] || printf '%s\n' "$1"; }
   chk() {
     local l="$1"; shift
@@ -89,9 +99,11 @@ suite() {  # suite <roamd.sh> <shell> [quiet] -> 0 all ok, 1 a case failed, 2 th
 
   QN=$(fn_of "$f" qn)
   IST=$(fn_of "$f" in_scope_tokens)
+  KID=$(fn_of "$f" ks_in_dir)   # NWP-20261207-06: the verdict's keystore-in/<uid>.pre removal reads it
   IN=$(arm_of "$f" in)
   [ -n "$QN" ] || { echo "EXTRACTION FAILED: function qn not found in $f" >&2; return 2; }
   [ -n "$IST" ] || { echo "EXTRACTION FAILED: function in_scope_tokens not found in $f" >&2; return 2; }
+  [ -n "$KID" ] || { echo "EXTRACTION FAILED: function ks_in_dir not found in $f" >&2; return 2; }
   case "$IN" in *'echo "NEEDKEY" > "$RES"'*'"${name}#de"'*'"${name}#media"'*'echo "OK $uid" > "$RES"'*'headblobs'*) ;;
     *) echo "EXTRACTION FAILED: the in arm in $f" >&2; return 2 ;; esac
   RI=$(reroot "$IN")
@@ -111,17 +123,18 @@ suite() {  # suite <roamd.sh> <shell> [quiet] -> 0 all ok, 1 a case failed, 2 th
     if [ ! -s "$1/sim/shell.id" ]; then NOID=1
     elif ! idok "$SH" "$1/sim/shell.id"; then WRONGSH=1; fi
   }
-  # mkrunner <file> <root> <#de rc> <#media rc> <#apps rc>: identity probe, print shim, the case's values, the stubs, qn,
-  # in_scope_tokens and the REAL arm. POSIX only: it runs under every shell found.
+  # mkrunner <file> <root> <#de rc> <#media rc> <#apps rc> <#sys rc> <#keys rc>: identity probe, print shim, the case's
+  # values, the stubs, qn, in_scope_tokens, ks_in_dir and the REAL arm. POSIX only: it runs under every shell found.
   mkrunner() {
     {
       printf '%s; printf "%%s|%%s\\n" "$_id" "$_pr" >> %s\n' "$IDPROBE" "$(sq "$2/sim/shell.id")"
       printf '%s\n' "$PRINT_SHIM"
       printf 'set -u\n'
-      printf 'ROOT=%s; uid=11; op=in; name=prof; pass=pw; keymode=""; srcunit=""; sesec=""; DE_RC=%s; MD_RC=%s; APPS_RC=%s\n' \
-        "$(sq "$2")" "$(sq "$3")" "$(sq "$4")" "$(sq "$5")"
+      printf 'ROOT=%s; uid=11; op=in; name=prof; pass=pw; keymode=""; srcunit=""; sesec=""; DE_RC=%s; MD_RC=%s; APPS_RC=%s; SYS_RC=%s; KEYS_RC=%s\n' \
+        "$(sq "$2")" "$(sq "$3")" "$(sq "$4")" "$(sq "$5")" "$(sq "$6")" "$(sq "$7")"
       cat <<'STUB'
 LOG="$ROOT/roam.log"; RES="$ROOT/res"; STATE="$ROOT/state"; USERDIR="$ROOT/data/user/$uid"; AGENT=agent_sim
+KS_IN="$ROOT/data/nowhere/keystore-in"
 rec() { printf '%s\n' "$*" >> "$ROOT/sim/calls"; }
 # the agent, by store ref ($3): the vault stages a claim seed, as NOWHERE_CLAIMS_SEED makes the real one do; #apps
 # writes a tree with its manifest whatever its status, so only the status can tell a failed restore
@@ -152,8 +165,21 @@ for t in relabel_launcher restore_media_tail ks_signin_reset keystore_restore tz
          od_parked_report reap_stale_ondemand reap_orphan_provisioned uiderrors_floor_commit; do
   eval "$t() { rec $t; }"
 done
-# acct_restore stages the profile's account rows in acct-hold-<uid>, as the real one does
-acct_restore() { rec acct_restore; mkdir -p "$ROOT/data/nowhere/acct-hold-$1"; echo rows > "$ROOT/data/nowhere/acct-hold-$1/accounts_ce.db"; }
+# acct_restore stages the profile's account rows in acct-hold-<uid>, as the real one does, and returns the case's #sys
+# status; on 5 it stages no hold, as the real one removes it (NWP-20261207-06)
+acct_restore() {
+  rec acct_restore
+  [ "$SYS_RC" = 5 ] && return 5
+  mkdir -p "$ROOT/data/nowhere/acct-hold-$1"; echo rows > "$ROOT/data/nowhere/acct-hold-$1/accounts_ce.db"
+  return "$SYS_RC"
+}
+# keystore_fetch stages a bundle in keystore-in/11.pre and returns the case's #keys status. It leaves the dir on 5 too,
+# so only the verdict's removal can clear it (NWP-20261207-06)
+keystore_fetch() {
+  rec keystore_fetch
+  mkdir -p "$ROOT/data/nowhere/keystore-in/11.pre"; : > "$ROOT/data/nowhere/keystore-in/11.pre/x.keys"
+  return "$KEYS_RC"
+}
 bt_reset() { rec bt_reset; BT_RESTORED=0; return 0; }
 # each stop records whether the CE restore ran (sim/first) and whether the reply was written ($RES)
 stop_mediad() {
@@ -164,6 +190,7 @@ stop_mediad() {
 STUB
       printf '%s\n' "$QN"
       printf '%s\n' "$IST"
+      printf '%s\n' "$KID"
       printf 'case "$op" in\n%s\nesac\n' "$RI"
     } > "$1"
   }
@@ -181,8 +208,8 @@ STUB
     [ "$1" = 1 ] && mkdir -p "$R/data/user_de/11" "$R/data/media/11"
     return 0
   }
-  run_in() {  # run_in <#de rc> <#media rc> [<#apps rc>, default 0]
-    mkrunner "$R/sim/run.sh" "$R" "$1" "$2" "${3:-0}"
+  run_in() {  # run_in <#de rc> <#media rc> [<#apps rc> [<#sys rc> [<#keys rc>]]], each default 0
+    mkrunner "$R/sim/run.sh" "$R" "$1" "$2" "${3:-0}" "${4:-0}" "${5:-0}"
     "$SH" "$R/sim/run.sh" >/dev/null 2>>"$R/sim/stderr"
     harness_check "$R"
     idcheck "$R"
@@ -208,6 +235,7 @@ STUB
     chk "$1 the put-back is logged" has_log "$R/roam.log" 'did not land -- per-login state put back (6 entries)'
     chk "$1 the SSAID seed is removed" absent "$R/data/system/users/11/nowhere-ssaid-seed"
     chk "$1 no account hold is left" absent "$R/data/nowhere/acct-hold-11"
+    chk "$1 no keystore-in/11.pre left" absent "$R/data/nowhere/keystore-in/11.pre"
   }
   # landed_common <case> <scope tokens>: what every landed case shares
   landed_common() {
@@ -225,7 +253,7 @@ STUB
 
   # the runner must parse under $SH before any case runs it
   PF=$(mktemp -p "$W") || return 2
-  mkrunner "$PF" "$W" 0 0 0
+  mkrunner "$PF" "$W" 0 0 0 0 0
   if ! "$SH" -n "$PF" 2>/dev/null; then
     command rm -f "$PF"
     chk "THE ARM DOES NOT PARSE under $SH" false
@@ -243,6 +271,7 @@ STUB
   chk "A no #media restore" ncalled "$R" "agent restore prof#media"
   chk "A no restore_media_tail" ncalled "$R" restore_media_tail
   chk "A no #apps restore" ncalled "$R" "agent restore prof#apps"
+  chk "A no keystore_fetch" ncalled "$R" keystore_fetch
   command rm -rf "$R"
 
   say ""
@@ -253,6 +282,7 @@ STUB
   chk "B acct_restore and the #media restore ran" eval 'called "$R" acct_restore && called "$R" "agent restore prof#media"'
   chk "B no restore_media_tail (the tail runs on 0 only)" ncalled "$R" restore_media_tail
   chk "B no #apps restore" ncalled "$R" "agent restore prof#apps"
+  chk "B no keystore_fetch" ncalled "$R" keystore_fetch
   command rm -rf "$R"
 
   say ""
@@ -284,13 +314,51 @@ STUB
   chk "F the #apps restore ran once, and nothing was recorded after it" \
     eval '[ "$(ncalls "$R" "agent restore prof#apps")" = 1 ] && [ "$(tail -n 1 "$R/sim/calls")" = "agent restore prof#apps" ]'
   chk "F the BLANK NET reply leaves no .appcode" eval 'holds "$R/res" "BLANK NET" && absent "$R/$APPCODE_REL"'
+  chk "F no keystore_fetch" ncalled "$R" keystore_fetch
   command rm -rf "$R"
 
   say ""
   say "== G: #apps 1 (damage, a missing chunk) still lands with no app code =="
   mkroot 1; run_in 0 0 1
   landed_common G '+de +media'
-  chk "G the #apps restore ran before the landing's media stop, and left no .appcode" eval '_ga=$(grep -nxF "agent restore prof#apps" "$R/sim/calls" | head -n 1 | cut -d: -f1); _gs=$(grep -n "^stop_mediad" "$R/sim/calls" | head -n 1 | cut -d: -f1); [ -n "$_ga" ] && [ -n "$_gs" ] && [ "$_ga" -lt "$_gs" ] && absent "$R/$APPCODE_REL"'
+  chk "G the #apps restore ran before the landing's media stop, and left no .appcode" eval '_ga=$(grep -nxF "agent restore prof#apps" "$R/sim/calls" | head -n 1 | cut -d: -f1); _gs=$(grep -n "^stop_mediad" "$R/sim/calls" | head -n 1 | cut -d: -f1); [ -n "$_ga" ] && [ -n "$_gs" ] && [ "$_ga" -lt "$_gs" ] &&  absent "$R/$APPCODE_REL"'
+  command rm -rf "$R"
+
+  say ""
+  say "== H: #sys 5 -> BLANK NET (sys); no #media, #apps or #keys restore runs (NWP-20261207-06) =="
+  mkroot 1; run_in 0 0 0 5 0
+  blank_common H
+  chk "H the BLANK NET line names sys" has_log "$R/roam.log" 'IN "prof" BLANK NET (the sys restore could not reach the store)'
+  chk "H acct_restore ran" called "$R" acct_restore
+  chk "H no #media restore" ncalled "$R" "agent restore prof#media"
+  chk "H no restore_media_tail" ncalled "$R" restore_media_tail
+  chk "H no #apps restore" ncalled "$R" "agent restore prof#apps"
+  chk "H no keystore_fetch" ncalled "$R" keystore_fetch
+  command rm -rf "$R"
+
+  say ""
+  say "== I: #keys 5 -> BLANK NET (keys) before every landing step (NWP-20261207-06) =="
+  mkroot 1; run_in 0 0 0 0 5
+  blank_common I
+  chk "I the BLANK NET line names keys" has_log "$R/roam.log" 'IN "prof" BLANK NET (the keys restore could not reach the store)'
+  chk "I keystore_fetch ran once, and nothing was recorded after it" \
+    eval '[ "$(ncalls "$R" keystore_fetch)" = 1 ] && [ "$(tail -n 1 "$R/sim/calls")" = keystore_fetch ]'
+  command rm -rf "$R"
+
+  say ""
+  say "== J: #keys 1 (damage) still lands; the fetch runs before the landing, the promotion after the reset =="
+  mkroot 1; run_in 0 0 0 0 1
+  landed_common J '+de +media'
+  chk "J keystore_fetch ran once, before the landing's media stop" eval '_jf=$(grep -nxF keystore_fetch "$R/sim/calls" | head -n 1 | cut -d: -f1); _js=$(grep -n "^stop_mediad" "$R/sim/calls" | head -n 1 | cut -d: -f1); [ "$(ncalls "$R" keystore_fetch)" = 1 ] && [ -n "$_jf" ] && [ -n "$_js" ] && [ "$_jf" -lt "$_js" ]'
+  chk "J keystore_restore ran after ks_signin_reset" eval '_jr=$(grep -nxF ks_signin_reset "$R/sim/calls" | head -n 1 | cut -d: -f1); _jk=$(grep -nxF keystore_restore "$R/sim/calls" | head -n 1 | cut -d: -f1); [ -n "$_jr" ] && [ -n "$_jk" ] && [ "$_jr" -lt "$_jk" ]'
+  command rm -rf "$R"
+
+  say ""
+  say "== K: #sys 1 (damage) still lands =="
+  mkroot 1; run_in 0 0 0 1 0
+  landed_common K '+de +media'
+  chk "K the #media and #apps restores and keystore_fetch ran" \
+    eval 'called "$R" "agent restore prof#media" && called "$R" "agent restore prof#apps" && called "$R" keystore_fetch'
   command rm -rf "$R"
 
   say ""
@@ -327,7 +395,14 @@ L_OR='      echo "OK $uid" > "$RES"; _inres=OK'
 L_AP='          if [ "$_aprc" = 5 ]; then _innet=apps; fi'
 L_AG='        if [ -z "$_innet" ]; then'
 L_AE='        fi'   # not unique in roamd: M10 takes the first one after L_AG, the guard's own
-for l in "$L_MD" "$L_GD" "$L_BN" "$L_VF" "$L_CE" "$L_SM" "$L_HO" "$L_OR" "$L_AP" "$L_AG"; do
+# NWP-20261207-06
+L_SY='        if [ "$_acrc" = 5 ]; then _innet=sys; fi'
+L_KF='      if [ -z "$_innet" ]; then keystore_fetch; _ksrc=$?; if [ "$_ksrc" = 5 ]; then _innet=keys; fi; fi'
+L_MG='      if [ -z "$_innet" ]; then   # NWP-20261207-06 (h62 #6): a #de or #sys exit 5 skips the MMS remap, #media and #apps'
+L_PR='      if _kpd=$(ks_in_dir); then rm -rf "$_kpd.pre" 2>> "$LOG"; fi'
+L_CALL='      ks_signin_reset "$uid"   # NWP-20261108-01: this landed sign-in drops every other session'"'"'s Keystore staging, before keystore_restore'
+for l in "$L_MD" "$L_GD" "$L_BN" "$L_VF" "$L_CE" "$L_SM" "$L_HO" "$L_OR" "$L_AP" "$L_AG" \
+         "$L_SY" "$L_KF" "$L_MG" "$L_PR" "$L_CALL"; do
   [ "$(grep -cxF -- "$l" "$SUT")" = 1 ] || { echo "EXTRACTION FAILED: anchor line not unique in $SUT: $l" >&2; exit 2; }
 done
 # mut <name> <awk-program>: convicted only by a failing line under EACH shell found; a harness error (rc 2) under any
@@ -336,7 +411,8 @@ mut() {
   local name="$1" prog="$2" t s r
   t=$(mktemp -p "$W")
   awk -v MD="$L_MD" -v GD="$L_GD" -v BN="$L_BN" -v VF="$L_VF" -v CE="$L_CE" -v SM="$L_SM" -v HO="$L_HO" -v OR="$L_OR" \
-    -v AP="$L_AP" -v AG="$L_AG" -v AE="$L_AE" "$prog" "$SUT" > "$t"
+    -v AP="$L_AP" -v AG="$L_AG" -v AE="$L_AE" -v SY="$L_SY" -v KF="$L_KF" -v MG="$L_MG" -v PR="$L_PR" -v CALL="$L_CALL" \
+    "$prog" "$SUT" > "$t"
   if cmp -s "$t" "$SUT"; then echo "  FAIL  mutant did not apply: $name"; MFAIL=1; command rm -f "$t"; return; fi
   for s in $SHELLS; do
     suite "$t" "$s" quiet >/dev/null 2>&1; r=$?
@@ -351,7 +427,7 @@ mut "M1 the #media rc-5 check removed (the sign-in lands)" \
   '$0==MD{next} {print}'
 mut "M2 any non-zero #media status treated as 5" \
   '$0==MD{print "        case \"$_mdrc\" in 0|skip) ;; *) _innet=media ;; esac"; next} {print}'
-mut "M3 the #media restore still runs after a #de 5" \
+mut "M3 the #sys chain still runs after a #de 5 (A convicts: acct_restore called)" \
   '$0==GD{print "      if true; then"; next} {print}'
 mut "M4 _inres=OK set on the blank path (the park put-back is skipped)" \
   '$0==BN{print $0 "; _inres=OK"; next} {print}'
@@ -369,5 +445,19 @@ mut "M10 the #apps block back after stop_mediad in the landing branch (F convict
   '$0==AG{inb=1; next} inb&&$0==AE{inb=0; next} inb{buf=buf $0 "\n"; next} {print} $0==SM{printf "%s", buf}'
 mut "M11 the #apps block's -z _innet guard removed (B convicts: the #apps restore ran after a #media 5)" \
   '$0==AG{print "        if true; then"; next} {print}'
+mut "M12 the #sys rc-5 check removed (H convicts: the sign-in lands)" \
+  '$0==SY{next} {print}'
+mut "M13 any non-zero #sys status treated as 5 (K convicts)" \
+  '$0==SY{print "        case \"$_acrc\" in 0) ;; *) _innet=sys ;; esac"; next} {print}'
+mut "M14 the #keys rc-5 check removed (I convicts: the sign-in lands)" \
+  '$0==KF{print "      if [ -z \"$_innet\" ]; then keystore_fetch; _ksrc=$?; fi"; next} {print}'
+mut "M15 any non-zero #keys status treated as 5 (J convicts)" \
+  '$0==KF{print "      if [ -z \"$_innet\" ]; then keystore_fetch; _ksrc=$?; case \"$_ksrc\" in 0) ;; *) _innet=keys ;; esac; fi"; next} {print}'
+mut "M16 the keystore_fetch block moved after ks_signin_reset in the landing (I convicts: the sign-in lands)" \
+  '$0==KF{next} {print} $0==CALL{print KF}'
+mut "M17 the verdict's keystore-in/<uid>.pre removal dropped (I convicts: .pre left)" \
+  '$0==PR{next} {print}'
+mut "M18 the MMS/#media guard removed (H convicts: the #media restore ran after a #sys 5)" \
+  '$0==MG{print "      if true; then"; next} {print}'
 [ "$MFAIL" = 0 ] || exit 1
 echo "all mutants convicted"

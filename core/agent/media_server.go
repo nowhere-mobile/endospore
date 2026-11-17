@@ -154,6 +154,69 @@ const mediaProgressFile = "media.progress"
 // single dominant-fetch media.progress (#90) -- that's one notification, this is N per-app rows.
 const mediaAppProgFile = "media.appprog"
 
+// mediaLandedFile (NWP-20261114-34) is a counter, a leaf under NOWHERE_STATE: one decimal number that mediad raises
+// each time a background run makes files local (a prefetch or pin materialize, or the after-gate #media lander) and
+// that mediad's start resets by removing the file. The login daemon relays it (GET-MEDIA-LANDED, "0" when absent);
+// the gate's watcher starts the session's media rescan when the number it last saw for that session changes. Why a
+// counter and not an event: MediaProvider scanned at user start and again right after the sign-in restore
+// (NWP-20261113-45), so the files a later run lands reach the Gallery only through another scan, and the watcher
+// polls (it may miss an edge, never a changed number). A changed number, not a larger one, is the signal, so a
+// mediad restart mid-session (the file starts again from 1) still reads as new work.
+const mediaLandedFile = "media.landed"
+
+// mediaLandedMu serializes the counter's read-modify-write within the process: both scopes' servers and the lander
+// can finish at once.
+var mediaLandedMu sync.Mutex
+
+// bumpMediaLanded raises $stateDir/media.landed by one, by temp file and rename (0600), so a reader sees the old
+// number or the new one. An unreadable or absent counter starts again from 1. Best-effort: a failed write logs and
+// costs one missed rescan (the files are local and the next sign-in's rescan indexes them), never data.
+func bumpMediaLanded(stateDir, why string) {
+	if stateDir == "" {
+		return
+	}
+	mediaLandedMu.Lock()
+	defer mediaLandedMu.Unlock()
+	p := filepath.Join(stateDir, mediaLandedFile)
+	n := 0
+	if b, err := os.ReadFile(p); err == nil {
+		if v, err := strconv.Atoi(strings.TrimSpace(string(b))); err == nil && v > 0 {
+			n = v
+		}
+	}
+	n++
+	tmp := p + ".tmp"
+	if err := os.WriteFile(tmp, []byte(strconv.Itoa(n)+"\n"), 0o600); err != nil {
+		dlog("mediad: landed counter not raised after %s: %v (NWP-20261114-34)", why, errCode(err))
+		return
+	}
+	if err := os.Rename(tmp, p); err != nil {
+		os.Remove(tmp)
+		dlog("mediad: landed counter not raised after %s: %v (NWP-20261114-34)", why, errCode(err))
+		return
+	}
+	dlog("mediad: landed counter %d after %s -- the gate asks the session to rescan (NWP-20261114-34)", n, why)
+}
+
+// announceMediaOverlays raises the landed counter once the #media scope's overlays are mounted (NWP-20261116-38), so
+// the gate starts the session's media rescan while the files waiting in the store are visible.
+//
+// THE ORDER WAS THE BUG. roamd's sign-in rescan (NWP-20261113-45) runs right after restore_media_tail, and mediad starts
+// later and mounts its overlays about a minute after that (lynx 2026111602, 2026-11-16: rescan 15:17:12, overlays
+// 15:18:02). A file waiting in the store exists in the user's storage only as a stub inside an overlay, so that scan
+// cannot see it, and nothing scanned again unless a background run landed a file -- which the Tier-2 prefetch does only
+// on Wi-Fi and idle or charging. A rescan started by hand once the overlays were up indexed all 12 waiting files.
+//
+// ⚠ THE SCAN READS WHAT IT INDEXES: MediaProvider opens each file for its metadata, and through the overlay that read
+// fetches chunks from the store (on lynx about 49 of the 61 MB waiting came down, 14.6 s). Only the #media scope counts:
+// the CE scope's overlays hold app data under /data/user, which MediaProvider never indexes.
+func announceMediaOverlays(stateDir string, mediaMounts int) {
+	if mediaMounts <= 0 {
+		return
+	}
+	bumpMediaLanded(stateDir, "mounting "+strconv.Itoa(mediaMounts)+" #media overlay(s)")
+}
+
 // mediaRestoreOKFile (NWP-20260822-05) is the leaf, under NOWHERE_STATE, where a #media RESTORE records that
 // it finished CLEANLY. It exists to disambiguate the one thing mediad provably cannot judge for itself.
 //
@@ -239,6 +302,135 @@ func finishRestore(profile, pass, restoredHead string, skipped int) {
 	}
 }
 
+// appsNotRestoredFile names a profile's list of kept #apps packages its sign-in did not restore (h47 #2,
+// NWP-20261207-08), in healListFile's shape: $NOWHERE_STATE is shared by every sign-in of the boot, so the name is a
+// hash of the scope's store ref and never the profile name. The reap removes it (isSessionFileList, h59 #11).
+func appsNotRestoredFile(profile, pass string) string {
+	sum := sha256.Sum256([]byte(profileRefV2(profile, pass)))
+	return "apps-not-restored-" + hex.EncodeToString(sum[:8])
+}
+
+// beginAppsNotRestored runs at the top of the restore case, before any return: it remembers the restore's profile
+// and pass for excuseAppsSkips (whose pinned call takes no pass), and removes this profile's list from an earlier
+// sign-in, so a list never outlives its sign-in.
+func beginAppsNotRestored(profile, pass string) {
+	untarSkip.mu.Lock()
+	untarSkip.prof, untarSkip.pass = profile, pass
+	untarSkip.mu.Unlock()
+	if st := os.Getenv("NOWHERE_STATE"); st != "" && strings.HasSuffix(profile, "#apps") {
+		os.Remove(filepath.Join(st, appsNotRestoredFile(profile, pass)))
+	}
+}
+
+// appsSkipsExcusable says an #apps restore's skips all lie inside kept packages' directories, and returns those
+// packages, distinct and sorted. Each name must be <pkg>/... or a <pkg>/ directory entry: a name with no slash
+// (manifest.tsv, any root file) and "" (an unsafe entry or a link) are never excusable. validPkgName alone cannot
+// tell a root file from a package, because validPkgName("manifest.tsv") is true.
+func appsSkipsExcusable(profile string, names []string, skipped int) ([]string, bool) {
+	if !strings.HasSuffix(profile, "#apps") || !carryEssential() || skipped <= 0 || len(names) != skipped {
+		return nil, false
+	}
+	seen := map[string]bool{}
+	for _, n := range names {
+		hasSlash := strings.Contains(n, "/")
+		pkg, _, _ := strings.Cut(strings.TrimSuffix(n, "/"), "/")
+		if !hasSlash || !validPkgName(pkg) {
+			return nil, false
+		}
+		seen[pkg] = true
+	}
+	pkgs := make([]string, 0, len(seen))
+	for p := range seen {
+		pkgs = append(pkgs, p)
+	}
+	sort.Strings(pkgs)
+	return pkgs, true
+}
+
+// excuseAppsSkips is h47 #2 (docs/product-decisions.md, 2026-10-28; built on NOWHERE_CARRY_ESSENTIAL, 2026-10-30
+// #2): an #apps restore whose only skips are local write failures inside kept packages still earns its receipt,
+// so the session's #apps seals are not refused. It returns the skipped count finishRestore should see: 0 when it
+// excuses the skips, else skipped unchanged.
+//
+// WHY THE RECEIPT IS SAFE HERE, AND ONLY HERE: with the carry on, the seal decides a package's absence from the
+// STAGE directory (carryablePackages, app_carry.go) and re-emits an unstaged package by hash from the stored head,
+// with its manifest.tsv line. A package that never installed is never staged, so the receipt cannot let a seal
+// overwrite that package's stored entry. Without carryEssential the seal would drop it, so the excuse requires it.
+func excuseAppsSkips(profile, dest string, skipped int) int {
+	pkgs, ok := appsSkipsExcusable(profile, untarSkipNamesSnapshot(), skipped)
+	if !ok {
+		return skipped
+	}
+	// NOWHERE-924's whole-or-nothing rule: a cut APK set must never be installable, so the package's partial
+	// directory goes. If one removal fails, nothing is excused and the receipt stays withheld.
+	for _, p := range pkgs {
+		if err := os.RemoveAll(filepath.Join(dest, p)); err != nil {
+			return skipped
+		}
+	}
+	untarSkip.mu.Lock()
+	prof, pass := untarSkip.prof, untarSkip.pass
+	untarSkip.mu.Unlock()
+	if st := os.Getenv("NOWHERE_STATE"); st != "" && prof == profile {
+		if err := writeAppsNotRestored(st, appsNotRestoredFile(profile, pass), pkgs); err != nil {
+			fmt.Fprintf(os.Stderr, "[restore] apps-not-restored list not written: %v\n", errCode(err))
+		}
+	}
+	// logProfile already ends in the #apps scope, so the line does not repeat it.
+	fmt.Printf("restore: profile %s: %d kept app(s) not restored; carried from the last save (h47 #2)\n", logProfile(profile), len(pkgs))
+	return 0
+}
+
+// writeAppsNotRestored publishes the list by temp + rename in the state dir. The temp's name starts with the
+// list's prefix, so the reap takes a temp a crash left behind.
+func writeAppsNotRestored(st, name string, pkgs []string) error {
+	f, err := os.CreateTemp(st, "apps-not-restored-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	err = f.Chmod(0o600)
+	if err == nil {
+		_, err = f.WriteString(strings.Join(pkgs, "\n") + "\n")
+	}
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err == nil {
+		err = os.Rename(tmp, filepath.Join(st, name))
+	}
+	if err != nil {
+		os.Remove(tmp)
+	}
+	return err
+}
+
+// notRestoredCarried returns how many of this seal's carried packages its sign-in listed as not restored
+// (excuseAppsSkips). 0 when there is no state dir, no list or nothing carried.
+func notRestoredCarried(profile, pass string, carryPkgs []string) int {
+	st := os.Getenv("NOWHERE_STATE")
+	if st == "" || len(carryPkgs) == 0 {
+		return 0
+	}
+	b, err := os.ReadFile(filepath.Join(st, appsNotRestoredFile(profile, pass)))
+	if err != nil {
+		return 0
+	}
+	listed := map[string]bool{}
+	for _, l := range strings.Split(string(b), "\n") {
+		if l != "" {
+			listed[l] = true
+		}
+	}
+	n := 0
+	for _, p := range carryPkgs {
+		if listed[p] {
+			n++
+		}
+	}
+	return n
+}
+
 type mediaServer struct {
 	base     string                  // the store the agent reads (cap/managed or S3), as any getChunk caller passes
 	dk       []byte                  // the profile data key (resolveDK) -- unseals the chunks
@@ -260,6 +452,7 @@ type mediaServer struct {
 	scarLogged  map[string]bool      // NWP-20260822-05: apps whose recreated dir was judged a benign #92 scar (log once)
 	progPath    string               // $NOWHERE_STATE/media.progress ("" disables publishing, e.g. unit tests)
 	appProgPath string               // #129 P5: $NOWHERE_STATE/media.appprog per-app progress ("" disables)
+	stateDir    string               // NWP-20261114-34: $NOWHERE_STATE, for the media.landed counter ("" disables)
 	active      map[string]fetchProg // #90: cache-key -> a big (whole-file / prefetch) fetch in flight
 	dmg         map[string]string    // #110: cache-key -> basename of a file with corrupt chunks (published DAMAGED)
 	incomplete  map[string]bool      // DIA-20260730: app whose deferred dir had to be RECREATED (short restore) -> published INCOMPLETE
@@ -267,6 +460,7 @@ type mediaServer struct {
 	restoring   struct {             // NWP-20261201-14: the #media lander's numbers, published RESTORING (guarded by progMu)
 		done, total int64
 		left        int
+		waiting     bool // NWP-20261207-11: the lander is parked on transient fetch errors, published RESTORE-WAITING
 	}
 }
 
@@ -333,6 +527,18 @@ func (s *mediaServer) setRestoring(done, total int64, left int) {
 		return
 	}
 	s.restoring.done, s.restoring.total, s.restoring.left = done, total, left
+	s.writeProg()
+}
+
+// setRestoreWaiting publishes whether the lander is parked on transient fetch errors (NWP-20261207-11): the
+// RESTORE-WAITING line, written only with the RESTORING line.
+func (s *mediaServer) setRestoreWaiting(w bool) {
+	s.progMu.Lock()
+	defer s.progMu.Unlock()
+	if s.progPath == "" {
+		return
+	}
+	s.restoring.waiting = w
 	s.writeProg()
 }
 
@@ -588,6 +794,10 @@ func (s *mediaServer) writeProg() {
 	if s.restoring.left > 0 {
 		// NWP-20261201-14: "RESTORING <done B> <total B> <files left>" -- the #media lander. Numbers only (§6).
 		lines += fmt.Sprintf("RESTORING %d %d %d\n", s.restoring.done, s.restoring.total, s.restoring.left)
+	}
+	if s.restoring.left > 0 && s.restoring.waiting {
+		// NWP-20261207-11: the lander is parked on transient fetch errors -- the token alone, no number (§6, O3).
+		lines += "RESTORE-WAITING\n"
 	}
 	tmp := s.progPath + ".tmp"
 	if os.WriteFile(tmp, []byte(lines), 0o600) == nil {
@@ -921,6 +1131,8 @@ func (s *mediaServer) materialize(label string, sel func(rel string, d deferredF
 	s.publishAppProg() // #129 P5: publish per-app totals up front (done=0) so the ring shows immediately
 	var did int
 	var matBytes int64
+	bgT := mediaBgBegin()                             // NWP-20261205-08: reads now count as during a background run
+	defer func() { mediaBgEnd(bgT, did, matBytes) }() // what landed, at return
 	for _, rel := range rels {
 		if stillOK != nil && !stillOK() {
 			// #129 P4: the Wi-Fi + idle/charging gate dropped mid-run -> PARK at this file boundary. The
@@ -977,6 +1189,7 @@ func (s *mediaServer) materialize(label string, sel func(rel string, d deferredF
 	}
 	if did > 0 {
 		dlog("mediad: %s materialize complete -- %d file(s) now local (sealed essential at next save)", label, did)
+		bumpMediaLanded(s.stateDir, label+" materialize") // NWP-20261114-34: the Gallery learns of them by a rescan
 	}
 }
 

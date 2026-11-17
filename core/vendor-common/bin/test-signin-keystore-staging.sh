@@ -28,6 +28,13 @@
 # file whose owner (<ns> less its last five digits) is another user with a record, and removes this uid's, a departed
 # user's, a malformed name and a symbolic link. S9 plants users/11.xml too, so keeping this uid's own import (P3) fails.
 #
+# NWP-20261207-06 (U6-U8, V1-V3; docs/product-decisions.md, "eight answers to harvest 62 ...", 2026-11-09, #6): a #keys
+# restore that cannot reach the store (exit 5) ends the sign-in as BLANK NET, so the store request left the landing.
+# The REAL keystore_fetch runs before the scope verdict and stages into keystore-in/<uid>.pre (exit 5: removed, return
+# 5; any other failure: the partial set kept, return 0); the REAL keystore_restore, still after ks_signin_reset, moves
+# the .pre dir onto keystore-in/<uid> and sends no store request. S1, S2, K1 and K2 therefore prove the bundle reaches
+# keystore-in/11 through the promotion. A roamd without keystore_fetch is not an extraction failure: the cases fail.
+#
 #   bash test-signin-keystore-staging.sh              # the cases
 #   bash test-signin-keystore-staging.sh --mutate     # ... plus mutants of roamd that must each CONVICT under every shell
 #
@@ -56,7 +63,7 @@ PLANTED_MAP='1110001 com.ex.a
 1010003 com.ex.c'
 
 suite() {  # suite <roamd.sh> [quiet] [shells] -> 0 all ok, 1 a check failed, 2 the harness could not run
-  local f="$1" quiet="${2:-}" shells="${3:-$SHELLS}" p=0 x=0 QN IN RI KR KSD KID UDR KRS n sh R HARN="" fa fn u I
+  local f="$1" quiet="${2:-}" shells="${3:-$SHELLS}" p=0 x=0 QN IN RI KR KSD KID UDR KRS KFS n sh R HARN="" fa fn u I kf
   say() { [ -n "$quiet" ] || printf '%s\n' "$1"; }
   chk() {
     local l="$1"; shift
@@ -79,8 +86,9 @@ suite() {  # suite <roamd.sh> [quiet] [shells] -> 0 all ok, 1 a check failed, 2 
   for fn in KID UDR KRS; do
     eval "[ -n \"\$$fn\" ]" || { echo "EXTRACTION FAILED: ks_in_dir, userdir_has_record or keystore_restore not found in $f" >&2; return 2; }
   done
-  KID=$(reroot "$KID"); UDR=$(reroot "$UDR"); KRS=$(reroot "$KRS")
-  n=$(nleft "$KID$UDR$KRS")
+  KFS=$(fn_of "$f" keystore_fetch)   # NWP-20261207-06: absent on a roamd without the fix; the cases then fail
+  KID=$(reroot "$KID"); UDR=$(reroot "$UDR"); KRS=$(reroot "$KRS"); KFS=$(reroot "$KFS")
+  n=$(nleft "$KID$UDR$KRS$KFS")
   [ "$n" = 0 ] || { echo "RE-ROOT INCOMPLETE: ks_in_dir, userdir_has_record or keystore_restore keeps $n absolute /data path(s)" >&2; return 2; }
   case "$IN" in *'echo "NEEDKEY" > "$RES"'*'echo "BLANK" > "$RES"'*'headblobs'*) ;; *) echo "EXTRACTION FAILED: the in arm in $f" >&2; return 2 ;; esac
   [ "$(printf '%s\n' "$KSD" | grep -c .)" = 4 ] || { echo "EXTRACTION FAILED: the four KS_ definitions in $f" >&2; return 2; }
@@ -93,6 +101,7 @@ suite() {  # suite <roamd.sh> [quiet] [shells] -> 0 all ok, 1 a check failed, 2 
   printf '%s\n' "$KID" > "$W/ksdir.sh"
   printf '%s\n' "$UDR" > "$W/udr.sh"
   printf '%s\n' "$KRS" > "$W/krs.sh"
+  printf '%s\n' "$KFS" > "$W/kfs.sh"
   printf 'case "$op" in\n%s\nesac\n' "$RI" > "$W/arm.sh"
 
   harness_check() {
@@ -123,6 +132,8 @@ agent_sim() {
       esac
       case "$3" in *'#apps') [ -n "$SIM_APPCODE" ] && : > "$5/manifest.tsv" ;; esac
       case "$3" in *'#keys') echo r > "$5/com.ex.r.keys" ;; esac
+      # NWP-20261207-06: keys5 / keys1 -- the #keys restore wrote its bundle and then exited 5 / 1
+      case "$3:$SIM_MODE" in *'#keys:keys5') return 5 ;; *'#keys:keys1') return 1 ;; esac
       return 0 ;;
     *) return 1 ;;
   esac
@@ -149,7 +160,7 @@ if [ -n "$GREPFAIL" ]; then
   grep() { case "$*" in *-vE*keystore-map*) printf partial; return 2 ;; esac; command grep "$@"; }
 fi
 EOF
-  libs() { printf '. "%s"\n' "$W/pre.sh" "$W/ksd.sh" "$W/qn.sh" "$W/ksdir.sh" "$W/udr.sh" "$W/kr.sh" "$W/krs.sh"; }
+  libs() { printf '. "%s"\n' "$W/pre.sh" "$W/ksd.sh" "$W/qn.sh" "$W/ksdir.sh" "$W/udr.sh" "$W/kr.sh" "$W/kfs.sh" "$W/krs.sh"; }
   # run_case <root> <shell> <ok|blank|blanknet|probe5|probe2|needkey> [appcode] [grepfail]: the REAL arm in <shell>
   run_case() {
     local ROOT="$1" s="$2" mode="$3" appcode="" gf="" a
@@ -162,11 +173,12 @@ EOF
     "$s" "$ROOT/case.sh" >/dev/null 2>>"$ROOT/sim/stderr"
     harness_check "$ROOT"
   }
-  # run_fn <root> <shell> <uid> <command>: one roamd function called directly, uid as given, the same stubs
+  # run_fn <root> <shell> <uid> <command> [<sim mode>, default ok]: one roamd function called directly, uid as given,
+  # the same stubs
   run_fn() {
     local ROOT="$1" s="$2"
     {
-      printf "ROOT='%s'; uid='%s'; SIM_MODE=ok; SIM_APPCODE=''; GREPFAIL=''\n" "$ROOT" "$3"
+      printf "ROOT='%s'; uid='%s'; SIM_MODE='%s'; SIM_APPCODE=''; GREPFAIL=''\n" "$ROOT" "$3" "${5:-ok}"
       libs
       printf '%s\n' "$4"
     } > "$ROOT/fn.sh"
@@ -212,14 +224,14 @@ EOF
     chk "S4 [$sh] exactly one reset line" eqv "$(grep -cF 'keystore staging reset for user 11:' "$R/roam.log" 2>/dev/null)" 1
     chk "S4 [$sh] the line is the eight counts" has_line "$R/roam.log" "[roamd] IN keystore staging reset for user 11: 1 bundle(s) left by an earlier session, 0 flat bundle(s) of an older build, 0 departed session dir(s), 0 parked session dir(s) kept, 1 import(s), 0 parked import(s) kept, 2 unsealed dump(s), 2 map row(s) of an earlier user 11 (NWP-20261108-01, NWP-20261112-01)"
     chk "S4 [$sh] it names no package, namespace or profile" eqv "$(grep 'keystore staging reset' "$R/roam.log" 2>/dev/null | grep -cE 'com\.ex|11100|zqprofile')" 0
-    chk "K1 [$sh] no chooser dir: keystore_restore called exactly once" eqv "$(nlines "$R/calls" 'restore zqprofile#keys')" 1
+    chk "K1 [$sh] no chooser dir: the #keys fetch ran exactly once" eqv "$(nlines "$R/calls" 'restore zqprofile#keys')" 1
     command rm -rf "$R1"
 
     say "== [$sh] K1: a landed sign-in whose #apps restore leaves no manifest still restores #keys =="
     mkroot; mkdir -p "$R/data/user/0/com.nowhere.chooser/files"
     run_case "$R" "$sh" ok
     chk "K1 [$sh] the #apps restore ran" has_line "$R/calls" 'restore zqprofile#apps'
-    chk "K1 [$sh] no manifest: keystore_restore called exactly once" eqv "$(nlines "$R/calls" 'restore zqprofile#keys')" 1
+    chk "K1 [$sh] no manifest: the #keys fetch ran exactly once" eqv "$(nlines "$R/calls" 'restore zqprofile#keys')" 1
     chk "K1 [$sh] its bundle survived the arm (it ran after ks_signin_reset)" held "$R/data/nowhere/keystore-in/11/com.ex.r.keys" r
     chk "K1 [$sh] the earlier session's bundle did not" absent "$R/data/nowhere/keystore-in/11/com.ex.a.keys"
     command rm -rf "$R"
@@ -231,7 +243,7 @@ EOF
     chk "S2 [$sh] keystore_push was never called" no_line "$R/calls" keystore_push
     chk "S2 [$sh] the bundle keystore_restore staged survived the arm" held "$R/data/nowhere/keystore-in/11/com.ex.r.keys" r
     chk "S2 [$sh] the earlier session's bundle did not" absent "$R/data/nowhere/keystore-in/11/com.ex.a.keys"
-    chk "K2 [$sh] with a manifest: keystore_restore called exactly once" eqv "$(nlines "$R/calls" 'restore zqprofile#keys')" 1
+    chk "K2 [$sh] with a manifest: the #keys fetch ran exactly once" eqv "$(nlines "$R/calls" 'restore zqprofile#keys')" 1
     a=$(calline "$R/calls" 'restore zqprofile#apps'); b=$(calline "$R/calls" 'restore zqprofile#keys')
     chk "K2 [$sh] it follows the #apps restore in the calls file" eval '[ -n "$a" ] && [ -n "$b" ] && [ "$a" -lt "$b" ]'
     command rm -rf "$R"
@@ -307,16 +319,39 @@ EOF
     chk "S10 [$sh] the log counts 2 removed, 0 parked import kept" eqv "$(grep -cF ', 2 import(s), 0 parked import(s) kept,' "$R/roam.log" 2>/dev/null)" 1
     command rm -rf "$R"
 
-    say "== [$sh] S8: with no numeric uid keystore_restore writes nothing under keystore-in (NWP-20261112-01) =="
+    say "== [$sh] S8: with no numeric uid keystore_fetch and keystore_restore write nothing under keystore-in (NWP-20261112-01) =="
     for u in '' 1x; do
       mkroot; command rm -rf "$R/data/nowhere/keystore-in/11"
       mkdir -p "$R/data/nowhere/keystore-in/10"; echo p > "$R/data/nowhere/keystore-in/10/com.ex.p.keys"
-      run_fn "$R" "$sh" "$u" keystore_restore
+      run_fn "$R" "$sh" "$u" 'keystore_fetch; keystore_restore'
       chk "S8 [$sh] uid '$u': keystore-in holds only user 10's bundle" eqv "$(cd "$R/data/nowhere/keystore-in" && find . -print | LC_ALL=C sort | tr '\n' ' ')" ". ./10 ./10/com.ex.p.keys "
       chk "S8 [$sh] uid '$u': no #keys restore was asked of the agent" no_line "$R/calls" 'restore zqprofile#keys'
       chk "S8 [$sh] uid '$u': one skipped line" eqv "$(grep -cF 'IN keystore restore skipped: no user id in scope, 0 bundle(s) staged' "$R/roam.log" 2>/dev/null)" 1
       command rm -rf "$R"
     done
+
+    say "== [$sh] U6: keystore_fetch on an agent exit 5 returns 5 and leaves nothing staged (NWP-20261207-06) =="
+    mkroot; run_fn "$R" "$sh" 11 'keystore_fetch; echo "rc=$?" > "$ROOT/rc"' keys5
+    chk "U6 [$sh] keystore_fetch returned 5" held "$R/rc" "rc=5"
+    chk "U6 [$sh] no keystore-in/11.pre is left" absent "$R/data/nowhere/keystore-in/11.pre"
+    chk "U6 [$sh] keystore-in/11 is as mkroot planted it" eval '[ "$(ls -A "$R/data/nowhere/keystore-in/11" 2>/dev/null)" = com.ex.a.keys ] && held "$R/data/nowhere/keystore-in/11/com.ex.a.keys" a'
+    command rm -rf "$R"
+
+    say "== [$sh] U7: keystore_fetch on an agent exit 1 returns 0 and keeps the partial set in .pre (NWP-20261207-06) =="
+    mkroot; run_fn "$R" "$sh" 11 'keystore_fetch; echo "rc=$?" > "$ROOT/rc"' keys1
+    chk "U7 [$sh] keystore_fetch returned 0" held "$R/rc" "rc=0"
+    chk "U7 [$sh] keystore-in/11.pre holds the partial set" eval '[ "$(ls -A "$R/data/nowhere/keystore-in/11.pre" 2>/dev/null)" = com.ex.r.keys ] && held "$R/data/nowhere/keystore-in/11.pre/com.ex.r.keys" r'
+    chk "U7 [$sh] keystore-in/11 is as mkroot planted it" eval '[ "$(ls -A "$R/data/nowhere/keystore-in/11" 2>/dev/null)" = com.ex.a.keys ] && held "$R/data/nowhere/keystore-in/11/com.ex.a.keys" a'
+    command rm -rf "$R"
+
+    say "== [$sh] U8: keystore_restore moves keystore-in/11.pre onto keystore-in/11, with no store request (NWP-20261207-06) =="
+    mkroot; mkdir -p "$R/data/nowhere/keystore-in/11.pre"; echo r > "$R/data/nowhere/keystore-in/11.pre/com.ex.r.keys"
+    run_fn "$R" "$sh" 11 keystore_restore
+    chk "U8 [$sh] keystore-in/11 holds exactly the fetched bundle" eval '[ "$(ls -A "$R/data/nowhere/keystore-in/11" 2>/dev/null)" = com.ex.r.keys ] && held "$R/data/nowhere/keystore-in/11/com.ex.r.keys" r'
+    chk "U8 [$sh] no keystore-in/11.pre is left" absent "$R/data/nowhere/keystore-in/11.pre"
+    chk "U8 [$sh] no #keys restore was asked of the agent" no_line "$R/calls" 'restore zqprofile#keys'
+    chk "U8 [$sh] one restored line counts the bundle" eqv "$(grep -cF '#keys restored (1 bundle(s))' "$R/roam.log" 2>/dev/null)" 1
+    command rm -rf "$R"
 
     say "== [$sh] S12: the map is only ever rewritten from a whole prune =="
     mkroot nomap; run_case "$R" "$sh" ok
@@ -334,8 +369,9 @@ EOF
     say "== [$sh] S6: source pins on the arm =="
     n=$(armcode | grep -cF 'ks_signin_reset "$uid"')
     chk "S6 [$sh] exactly one ks_signin_reset \"\$uid\" in the arm" eqv "$n" 1
-    a=$(lineno 'NOWHERE_PHASE=apps NOWHERE_CLAIMS_SEED'); v=$(lineno 'if [ -n "$_innet" ]; then'); b=$(lineno 'ks_signin_reset "$uid"'); c=$(lineno 'keystore_restore   # #210 p2')
-    chk "S6 [$sh] it follows the CE restore and the scope verdict, and precedes keystore_restore" eval '[ -n "$a" ] && [ -n "$v" ] && [ -n "$b" ] && [ -n "$c" ] && [ "$a" -lt "$v" ] && [ "$v" -lt "$b" ] && [ "$b" -lt "$c" ]'
+    a=$(lineno 'NOWHERE_PHASE=apps NOWHERE_CLAIMS_SEED'); kf=$(lineno 'keystore_fetch; _ksrc=$?'); v=$(lineno 'if [ -n "$_innet" ]; then'); b=$(lineno 'ks_signin_reset "$uid"'); c=$(lineno 'keystore_restore   # #210 p2')
+    chk "S6 [$sh] it follows the CE restore, keystore_fetch and the scope verdict, and precedes keystore_restore (NWP-20261207-06)" eval '[ -n "$a" ] && [ -n "$kf" ] && [ -n "$v" ] && [ -n "$b" ] && [ -n "$c" ] && [ "$a" -lt "$kf" ] && [ "$kf" -lt "$v" ] && [ "$v" -lt "$b" ] && [ "$b" -lt "$c" ]'
+    chk "S6 [$sh] exactly one keystore_fetch call in the arm (NWP-20261207-06)" eqv "$(armcode | sed -E 's/[[:space:]]#[[:space:]].*$//' | grep -c 'keystore_fetch')" 1
     chk "S6 [$sh] the arm calls no keystore_push" eqv "$(armcode | grep -c 'keystore_push')" 0
     chk "S6 [$sh] no top-level KS_IMPORT clear on every in" eqv "$(grep -cF '[ "$op" = "in" ] && rm -f "$KS_IMPORT"' "$f")" 0
 
@@ -365,7 +401,7 @@ L_CALL='      ks_signin_reset "$uid"   # NWP-20261108-01: this landed sign-in dr
 L_RF='      for _pn in media.restore-ok .btlogoff .had_account; do [ -e "$STATE/$_pn" ] && mv "$STATE/$_pn" "$PARK/" 2>> "$LOG"; done'
 L_PRUNE='    grep -vE "^${_ksu}[0-9]{5}( |$)" "$KS_MAP" > "$_kst" 2>/dev/null; _ksr=$?'
 L_EXP='  for _ksf in "$KS_EXPORT"/*.keys; do [ -e "$_ksf" ] || continue; rm -f "$_ksf" 2>>"$LOG" && _ksc=$((_ksc + 1)); done'
-L_KR='      keystore_restore   # #210 p2: pull name#keys; keystore_register promotes each bundle at the tap'
+L_KR='      keystore_restore   # #210 p2: promote the name#keys bundles keystore_fetch staged; keystore_register promotes each bundle at the tap'
 L_RMIN='    rm -rf "$KS_IN/$_ksu" 2>>"$LOG"'
 L_KRRM='  rm -rf "$_krd"; mkdir -p "$_krd" 2>>"$LOG" || return 0'
 L_KEEP='    if userdir_has_record "$_ksn"; then _ksk=$((_ksk + 1)); continue; fi'
@@ -377,15 +413,18 @@ L_WB='    if [ "$_ksr" = 0 ] || [ "$_ksr" = 1 ]; then mv -f "$_kst" "$KS_MAP" 2>
 L_RIN='            print -r -- "[roamd] IN $(qn "$name") #apps code restored → user0 chooser $(date)" >> "$LOG"'
 L_IOWN='      case "$_ksn" in '"''"'|*[!0-9]*) ;; ??????*) _kso=${_ksn%?????} ;; esac'
 L_IKEEP='    if [ -n "$_kso" ] && [ "$_kso" != "$_ksu" ] && userdir_has_record "$_kso"; then _ksj=$((_ksj + 1)); continue; fi'
+L_KFR='  if [ "$_kfr" = 5 ]; then rm -rf "$_krd" 2>>"$LOG"; return 5; fi'
+L_PROM='  if [ -e "$_krd" ] || ! mv "$_krd.pre" "$_krd" 2>>"$LOG"; then'
+L_PRE='  _krd="$_krd.pre"'
 M_P2='      case "$_ksn" in '"''"'|*[!0-9]*) ;; ??????*) _kso=${_ksn%"${_ksn#?????}"} ;; esac'
 M_P3='    if [ -n "$_kso" ] && userdir_has_record "$_kso"; then _ksj=$((_ksj + 1)); continue; fi'
 M_P4='    if [ -n "$_kso" ] && [ "$_kso" != "$_ksu" ] && userdir_has_record "$_kso"; then continue; fi'
 for l in "$L_CALL" "$L_RF" "$L_PRUNE" "$L_EXP" "$L_KR" "$L_RMIN" "$L_AC" "$L_WB" "$L_RIN" \
-         "$L_KRRM" "$L_KEEP" "$L_GONE" "$L_FLAT" "$L_KID" "$L_IOWN" "$L_IKEEP"; do
+         "$L_KRRM" "$L_KEEP" "$L_GONE" "$L_FLAT" "$L_KID" "$L_IOWN" "$L_IKEEP" "$L_KFR" "$L_PROM" "$L_PRE"; do
   [ "$(grep -cxF -- "$l" "$SUT")" = 1 ] || { echo "EXTRACTION FAILED: anchor line not unique in $SUT: $l" >&2; exit 2; }
 done
 export L_CALL L_RF L_PRUNE L_EXP L_KR L_RMIN L_AC L_WB L_RIN L_KRRM L_KEEP L_GONE L_FLAT L_KID L_IOWN L_IKEEP \
-       M_P2 M_P3 M_P4
+       L_KFR L_PROM L_PRE M_P2 M_P3 M_P4
 MFAIL=0
 # mut <name> <awk-program>: awk reads the anchors from the environment
 mut() {
@@ -413,7 +452,7 @@ mut "N1 the keystore_restore call moved back inside the #apps branch" '$0 == ENV
 mut "N2 a second keystore_restore call added inside the #apps branch" '{print} $0 == ENVIRON["L_RIN"] {print "        keystore_restore"}'
 mut "N3 the keystore_restore call moved above ks_signin_reset" '$0 == ENVIRON["L_KR"] {next} $0 == ENVIRON["L_CALL"] {print "      keystore_restore"} {print}'
 mut "N4 the keystore_restore call removed" '$0 == ENVIRON["L_KR"] {next} {print}'
-mut "U1 keystore_restore removes keystore-in whole" '$0 == ENVIRON["L_KRRM"] {print "  rm -rf \"$KS_IN\"; mkdir -p \"$_krd\" 2>>\"$LOG\" || return 0"; next} {print}'
+mut "U1 keystore_fetch removes keystore-in whole (S5 convicts)" '$0 == ENVIRON["L_KRRM"] {print "  rm -rf \"$KS_IN\"; mkdir -p \"$_krd\" 2>>\"$LOG\" || return 0"; next} {print}'
 mut "U2 ks_signin_reset removes every subdir" '$0 == ENVIRON["L_KEEP"] {next} {print}'
 mut "U3 ks_signin_reset keeps a subdir without a record" '$0 == ENVIRON["L_GONE"] {next} {print}'
 mut "U4 ks_signin_reset keeps flat bundles" '$0 == ENVIRON["L_FLAT"] {next} {print}'
@@ -422,5 +461,8 @@ mut "P1 the record check on imports dropped (every import removed)" '$0 == ENVIR
 mut "P2 the owner is the first five digits" '$0 == ENVIRON["L_IOWN"] {print ENVIRON["M_P2"]; next} {print}'
 mut "P3 this uid's own import kept" '$0 == ENVIRON["L_IKEEP"] {print ENVIRON["M_P3"]; next} {print}'
 mut "P4 the kept count never incremented" '$0 == ENVIRON["L_IKEEP"] {print ENVIRON["M_P4"]; next} {print}'
+mut "V1 keystore_fetch's rc-5 return dropped (U6 convicts: rc=0, .pre left)" '$0 == ENVIRON["L_KFR"] {next} {print}'
+mut "V2 keystore_restore's promotion dropped (U8, S1, K1 convict)" '$0 == ENVIRON["L_PROM"] {print "  if [ -e \"$_krd\" ]; then"; next} {print}'
+mut "V3 keystore_fetch writes keystore-in/<uid> directly (U6, U7 convict)" '$0 == ENVIRON["L_PRE"] {next} {print}'
 [ "$MFAIL" = 0 ] || exit 1
 echo "all mutants convicted"

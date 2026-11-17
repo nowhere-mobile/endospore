@@ -2,23 +2,30 @@
 # test-tel-seen-java.sh [--mutate] -- NWP-20261129-02: after a sign-in or resume delivery TelIngest reads back, as the
 # session's reader, each SMS and MMS it inserted, and login.log carries the counts, so an issue report tells a hidden
 # row from a delivered one. Evidence only: nothing TelIngest inserts, acknowledges, re-stages or notifies changes.
-# Compiles the chooser's pure TelSeen (java.lang and java.util only) with the cases ALONE and EXECUTES them (C1-C5), then
-# checks the REAL TelIngest methods, found by brace count. W1-W4 run on the source with comments dropped, so a comment
+# Compiles the chooser's pure TelSeen (java.lang and java.util only) with the cases ALONE and EXECUTES them (C1-C6), then
+# checks the REAL TelIngest methods, found by brace count. W1-W4 and W7 run on the source with comments dropped, so a comment
 # can neither satisfy nor trip them; W6 runs on the raw file, because a comment is what it checks:
 #   C1  a row inserted twice counts once, per kind, in arrival order.
 #   C2  readBack: TRUE counts nothing, FALSE counts hidden in its own kind, null counts unknown only.
 #   C3  addr/part: false counts, true does not; a false alone makes any() true.
-#   C4  line() is seven numbers, digits and single spaces only, each clamped to 0..99999.
+#   C4  line() is nine numbers, digits and single spaces only, each clamped to 0..99999.
 #   C5  sends(true, s) is false for any s; sends(false, empty) is false; sends(false, one hidden sms) is true.
+#   C6  (NWP-20261204-11) mmsDefault: defaultSms -1 counts nothing; a filed SIM other than the default counts
+#       off-default (a fallback -1 row included); a default not among the session's SIMs (null = none) counts away;
+#       line() carries the two last; any() is unchanged.
 #   W1  deliver records "sms" on the line after the insert, under ins != null, never for a call.
-#   W2  deliverMms records "mms" after the null check; the addr Uri and every insertMmsPart call feed TelSeen;
+#   W2  deliverMms records "mms" after the null check; the addr Uri and every part's final outcome feed TelSeen once
+#       (each insertMmsPart call keeps its outcome in ok[k], fed by one seen.part loop, NWP-20261204-10);
 #       insertMmsPart returns whether its part Uri is non-null, and its byte-write retry is unchanged.
 #   W3  run holds one TelSeen; the read-back follows the pass loop, the re-stage loops and the final ackLanded, under
-#       !live, through canReadMessages.
+#       !live, through canReadMessages. NWP-20261204-11: each pass sets seen.defaultSms = defaultSmsSub() on the line
+#       after activeSims(ctx), before the deliveries; defaultSmsSub returns the platform default, -1 on any throw.
 #   W4  one TELINGEST-SEEN send, behind TelSeen.sends(live, ...), on the line before ACK-TELINGEST.
 #   (W5, the control that v.put("sub_id", -1) and pdu.put("sub_id", -1) were unchanged, was retired by NWP-20261130-01,
 #   which files each SMS and MMS under its SIM's subscription; test-telingest-sub-java.sh pins that.)
 #   W6  the // comment lines directly above the read-back's if (!live) cite the decision: 2026-11-06, harvest 60, #4.
+#   W7  (NWP-20261204-11) deliverMms calls seen.mmsDefault(sub, sims.subIds) exactly once, on the line after
+#       tally.inserted(sub), before the addr insert.
 #
 # It needs a JDK and perl, and it FAILS when there is none: a Java suite that skips without one would read green on a
 # runner that never ran it. javac/java come from PATH, then the build VM's prebuilt JDK 21.
@@ -131,8 +138,10 @@ wiring() {
     $mms =~ /Uri addrUri = null;${nl}try \{ addrUri = ctx\.getContentResolver\(\)\.insert\(Uri\.parse\("content:\/\/mms\/" \+ id \+ "\/addr"\), addr\); \} catch \(Throwable ignore\) \{\}${nl}seen\.addr\(addrUri != null\);/
       or push @e, "the addr insert is not non-fatal with its Uri fed to seen.addr(addrUri != null)";
     my $calls = count($mms, qr/\binsertMmsPart\(/);
-    my $fed = count($mms, qr/\bseen\.part\(insertMmsPart\(/);
-    ($calls == 2 && $fed == 2) or push @e, "insertMmsPart calls: $calls, fed to seen.part: $fed (want 2 and 2)";
+    my $kept = count($mms, qr/\bok\[k\] = insertMmsPart\(/);
+    ($calls == 2 && $kept == 2) or push @e, "insertMmsPart calls: $calls, kept in ok[k]: $kept (want 2 and 2)";
+    count($mms, qr/\bseen\.part\(/) == 1 or push @e, "seen.part is called other than once";
+    $mms =~ /for \(boolean b : ok\) seen\.part\(b\);/ or push @e, "the final outcome of each part is not fed by for (boolean b : ok) seen.part(b);";
     if ($prt eq "") { push @e, "insertMmsPart does not return boolean" }
     else {
       $prt =~ /Uri partUri = ctx\.getContentResolver\(\)\.insert\(Uri\.parse\("content:\/\/mms\/" \+ mid \+ "\/part"\), v\);${nl}inserted = partUri != null;/
@@ -159,7 +168,17 @@ wiring() {
       rindex($run, "RESTAGE-TELINGEST") < $at or push @e, "the read-back is not after the re-stage loops";
     } else { push @e, "no read-back block: if (!live) { canReadMessages, then each sms and mms through canRead ? ... : null }" }
     count($run, qr/\bseen\.readBack\(/) == 2 or push @e, "run reads back other than in those two loops";
-    verdict("W3", "the read-back follows the passes and the final ackLanded, under !live, through canReadMessages", @e);
+    # NWP-20261204-11: the default SMS SIM, read each pass beside the active SIMs, before that pass delivers.
+    if ($run =~ /final TelSub\.Sims sims = activeSims\(ctx\);${nl}seen\.defaultSms = defaultSmsSub\(\);/) {
+      my $at = $-[0];
+      my $pass = index($run, "for (int pass = 0; pass < passes; pass++) {");
+      my $dlv = index($run, "deliver(ctx, reply.get(i)");
+      ($pass >= 0 && $at > $pass && $dlv > $at) or push @e, "seen.defaultSms is not set inside the pass loop before the deliveries";
+    } else { push @e, "the line after activeSims(ctx) is not: seen.defaultSms = defaultSmsSub();" }
+    count($code, qr/\bseen\.defaultSms = /) == 1 or push @e, "seen.defaultSms is set other than once";
+    method("private static int defaultSmsSub()") =~ /\{\s*try \{\s*return android\.telephony\.SubscriptionManager\.getDefaultSmsSubscriptionId\(\);\s*\} catch \(Throwable t\) \{\s*return -1;\s*\}\s*\}\z/
+      or push @e, "defaultSmsSub is not: return getDefaultSmsSubscriptionId(), -1 on any throw";
+    verdict("W3", "the read-back follows the passes and the final ackLanded, under !live, through canReadMessages; each pass reads the default SMS SIM", @e);
 
     @e = ();
     count($code, qr/"TELINGEST-SEEN\\n"/) == 1 or push @e, "the file does not send TELINGEST-SEEN exactly once";
@@ -191,6 +210,18 @@ wiring() {
       }
     }
     verdict("W6", "the comment above the read-back cites docs/product-decisions.md 2026-11-06 harvest 60 #4", @e);
+
+    # NWP-20261204-11: each inserted MMS is held against the default SMS SIM, once, before its addr insert.
+    @e = ();
+    $mms ne "" or push @e, "deliverMms not found";
+    count($mms, qr/\bseen\.mmsDefault\(sub, sims\.subIds\);/) == 1 or push @e, "deliverMms does not call seen.mmsDefault(sub, sims.subIds) exactly once";
+    count($code, qr/\bmmsDefault\(/) == 1 or push @e, "the file does not call mmsDefault exactly once";
+    if ($mms =~ /tally\.inserted\(sub\);${nl}seen\.mmsDefault\(sub, sims\.subIds\);/) {
+      my $at = $-[0];
+      my $addr = index($mms, "Uri addrUri = null;");
+      ($addr >= 0 && $at < $addr) or push @e, "seen.mmsDefault is not before the addr insert";
+    } else { push @e, "the line after tally.inserted(sub) is not: seen.mmsDefault(sub, sims.subIds);" }
+    verdict("W7", "deliverMms holds each inserted MMS against the default SMS SIM, once, before the addr insert", @e);
 
     exit $bad;' "$1/$CH/TelIngest.java"
 }
@@ -236,4 +267,12 @@ mut "M6 the read-back without canReadMessages" "$TI" 's/final boolean canRead = 
 mut "M7 line() unclamped" "$TS" 's/return v < 0 \? 0 : v > 99999 \? 99999 : v;/return v;/' C4 || fails=$((fails+1))
 mut "M8 deliver records an SMS whose insert returned null" "$TI" 's/if \(ins != null && !isCall\) seen\.inserted/if (!isCall) seen.inserted/' W1 || fails=$((fails+1))
 mut "M9 the read-back comment no longer cites h60 #4" "$TI" 's/harvest 60" #4/harvest 60"/' W6 || fails=$((fails+1))
+mut "M10 a part's outcome dropped from seen" "$TI" 's/for \(boolean b : ok\) seen\.part\(b\);//' W2 || fails=$((fails+1))
+# NWP-20261204-11 (M-a..M-f of the task).
+mut "M11 (M-a) the off-default test made ==" "$TS" 's/defaultSms != filedSub/defaultSms == filedSub/' C6 || fails=$((fails+1))
+mut "M12 (M-b) the away membership test inverted" "$TS" 's/if \(!in\) mmsDefaultAway\+\+;/if (in) mmsDefaultAway++;/' C6 || fails=$((fails+1))
+mut "M13 (M-c) no defaultSms < 0 guard" "$TS" 's/\n[ \t]*if \(defaultSms < 0\) return;//' C6 || fails=$((fails+1))
+mut "M14 (M-d) line() drops the last count" "$TS" 's/ \+ " " \+ clamp\(mmsDefaultAway\)//' C4 || fails=$((fails+1))
+mut "M15 (M-e) the deliverMms call removed" "$TI" 's/\n[ \t]*seen\.mmsDefault\(sub, sims\.subIds\);[^\n]*//' W7 || fails=$((fails+1))
+mut "M16 (M-f) the run assignment removed" "$TI" 's/\n[ \t]*seen\.defaultSms = defaultSmsSub\(\);[^\n]*//' W3 || fails=$((fails+1))
 [ "$fails" -eq 0 ] && echo "== all mutations convicted" || { echo "== $fails mutation(s) not convicted"; exit 1; }

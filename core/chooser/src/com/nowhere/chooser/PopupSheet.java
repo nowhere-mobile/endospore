@@ -11,12 +11,15 @@ import java.util.Locale;
  * and the confirmations move to one bottom-sheet design", design A, Chester 2026-11-08). A picker is a sheet of cards,
  * one per option; a confirmation is a round tone icon, a short title, one context sentence, "what happens" lines and
  * buttons, in one of three tones. This class holds the models, the fixed words and the rules check. SheetDialog draws a
- * model and calls violations() before it shows one.
+ * model and calls violations() before it shows one. A picker may carry Boxes under its cards: a heading and checkboxes
+ * that each save on their own toggle (NWP-20261206-04).
  *
  * The rules: a button names its action, never OK or Cancel; "&" is spelled "and"; a destructive or risky action is
  * never the green button. Routine: one green button does the action and the others are outlined. Warning: the green
  * button is the safe way out and the risky choice is red-outlined. Destructive: a red filled button, then an outlined
- * "Keep ...". Plain information is the routine tone with one "Got it".
+ * "Keep ...". Plain information is the routine tone with one "Got it". A failure the user can only acknowledge is the
+ * warning tone with one green "Got it" and nothing else (Chester, 2026-11-15, NWP-20261206-08: "3301 amber"); it has no
+ * risky choice to outline in red. A lone "Got it" is never destructive.
  *
  * Pure java.util so a javac suite can compile it off the build host (core/vendor-common/bin/test-popup-sheet-java.sh).
  */
@@ -41,7 +44,7 @@ final class PopupSheet {
     static final String R_WARNING_BUTTONS = "a warning needs one green way out, a red-outlined risk and no red filled button";
     static final String R_DESTRUCTIVE_GREEN = "a destructive sheet has a green button";
     static final String R_DESTRUCTIVE_ORDER = "a destructive sheet needs one red filled button first, then an outlined \"Keep ...\"";
-    static final String R_GOT_IT_TONE = "a lone \"Got it\" is only for the routine tone";
+    static final String R_GOT_IT_TONE = "a lone \"Got it\" is only for the routine or the warning tone";
     static final String R_TWO_CURRENT = "a picker has more than one current option";
 
     /** One card of a picker. */
@@ -67,6 +70,19 @@ final class PopupSheet {
         Picker(String title, List<Option> options) {
             this.title = title;
             this.options = copy(options);
+        }
+    }
+
+    /** A heading and one checkbox per label under a picker's cards; checked.get(i) is box i's state. */
+    static final class Boxes {
+        final String heading;
+        final List<String> labels;
+        final List<Boolean> checked;
+
+        Boxes(String heading, List<String> labels, List<Boolean> checked) {
+            this.heading = heading;
+            this.labels = copy(labels);
+            this.checked = copy(checked);
         }
     }
 
@@ -132,6 +148,19 @@ final class PopupSheet {
         return out;
     }
 
+    /** One fixed reason per breach of a box list's rules; empty when it has none. Never throws. */
+    static List<String> violations(Boxes b) {
+        List<String> out = new ArrayList<>();
+        if (b == null) {
+            out.add(R_EMPTY);
+            return out;
+        }
+        if (b.labels.size() != b.checked.size()) out.add(R_EMPTY);
+        ampersand(b.heading, out);
+        for (String l : b.labels) ampersand(l, out);
+        return out;
+    }
+
     /** One fixed reason per breach of a confirmation's rules; empty when it has none. Never throws. */
     static List<String> violations(Confirm c) {
         List<String> out = new ArrayList<>();
@@ -150,14 +179,17 @@ final class PopupSheet {
             if (b.style == Style.GREEN_FILLED && isDestructiveVerb(b.label)) out.add(R_GREEN_DESTRUCTIVE);
         }
         int green = count(buttons, Style.GREEN_FILLED);
+        // A warning notice: one green "Got it" and no other button. It answers the warning rule (NWP-20261206-08).
+        boolean warningNotice = c.tone == Tone.WARNING && buttons.size() == 1
+                && GOT_IT.equals(buttons.get(0).label) && buttons.get(0).style == Style.GREEN_FILLED;
         if (c.tone == Tone.ROUTINE && (green != 1 || count(buttons, Style.OUTLINED) != buttons.size() - 1))
             out.add(R_ROUTINE_BUTTONS);
-        if (c.tone == Tone.WARNING
+        if (c.tone == Tone.WARNING && !warningNotice
                 && (green != 1 || count(buttons, Style.RED_OUTLINED) < 1 || count(buttons, Style.RED_FILLED) != 0))
             out.add(R_WARNING_BUTTONS);
         if (c.tone == Tone.DESTRUCTIVE && green != 0) out.add(R_DESTRUCTIVE_GREEN);
         if (c.tone == Tone.DESTRUCTIVE && !destructiveOrder(buttons)) out.add(R_DESTRUCTIVE_ORDER);
-        if (c.tone != Tone.ROUTINE && buttons.size() == 1 && GOT_IT.equals(buttons.get(0).label)) out.add(R_GOT_IT_TONE);
+        if (c.tone == Tone.DESTRUCTIVE && buttons.size() == 1 && GOT_IT.equals(buttons.get(0).label)) out.add(R_GOT_IT_TONE);
         return out;
     }
 

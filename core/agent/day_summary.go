@@ -22,12 +22,20 @@ package main
 //	v=1 t=<unix s> ev=report kind=<scheduled|by_hand|none> rc=<ok|net|nogw|toobig|disabled|http>
 //	                                                                                   handleReportIssue, session scope
 //	v=1 t=<unix s> ev=vpnstate app=<1|0|-> lock=<1|0|-> pend=<1|0|-> net=<1|0|->       REPORT-ISSUE, a sent in-session report
+//	v=1 t=<unix s> ev=vpn at=<at> rc=<rc> s=<n|-> lock=<0|1|->                         daySummaryTakeVpn, from roamd's .vpndiag.<uid>
 //
 // The report line (NWP-20261202-11) is written by handleReportIssue AFTER its reply, on the send path and on ERR-NOGW,
 // at session scope only: a preview, a gate report and a device-scope report write none. kind is the caller's
 // report_kind (scheduled or by_hand, else none) and rc is the reply's class; no ticket, no tag. The line is written
 // after this report was built, so it shows in the NEXT report: that report tells whether a scheduled report reached
 // the agent and how the gateway answered.
+//
+// A vpn line (NWP-20261202-41) is one always-on VPN apply. at: signin = the sign-in's vpnup (retryVpnup); seal = the
+// deferred apply at a save; install = the deferred apply after one package's install (bootwake). rc is one of
+// applied|none|nohelper|deferred|notready|gaveup|dropped|other. s is whole seconds from this session's sign-in (the
+// instant retryVpnup started), "-" when the daemon has none (a restart, or after daySummaryForget). lock is the
+// lockdown of the choice applied or deferred, "-" for none or unknown. The line names no app, tunnel, profile or path:
+// roamd notes only closed codes in $STATE/.vpndiag.<uid>, and the take drops any record line of another shape.
 //
 // The signin line's times exclude the heal since NWP-20261130-08 (signin_summary.go); this line carries no heal figure.
 //
@@ -86,7 +94,8 @@ const daySummaryBetaHost = "api-beta.nowhere.mobile"
 // daySummaryNow is the clock; tests replace it.
 var daySummaryNow = time.Now
 
-// daySummaryMu serialises every write, opt-in, opt-out and forget of the two files.
+// daySummaryMu serialises every write, opt-in, opt-out and forget of the two files, every take of the VPN record, and
+// daySummaryVpnSignin.
 var daySummaryMu sync.Mutex
 
 // The file's only accepted line shapes, and DIAG-EVENT's only accepted argument.
@@ -95,11 +104,12 @@ var daySummarySaveRe = regexp.MustCompile(`^v=1 t=([0-9]{1,12}) ev=save ms=([0-9
 var daySummarySweepRe = regexp.MustCompile(`^v=1 t=([0-9]{1,12}) ev=sweep apps=([0-9]{1,12}) ok=([0-9]{1,12}) fail=([0-9]{1,12}) ms=([0-9]{1,12})$`)
 var daySummaryReportRe = regexp.MustCompile(`^v=1 t=([0-9]{1,12}) ev=report kind=(scheduled|by_hand|none) rc=(ok|net|nogw|toobig|disabled|http)$`)
 var daySummaryVpnStateRe = regexp.MustCompile(`^v=1 t=([0-9]{1,12}) ev=vpnstate app=(1|0|-) lock=(1|0|-) pend=(1|0|-) net=(1|0|-)$`)
+var daySummaryVpnRe = regexp.MustCompile(`^v=1 t=([0-9]{1,12}) ev=vpn at=(signin|seal|install) rc=(applied|none|nohelper|deferred|notready|gaveup|dropped|other) s=([0-9]{1,9}|-) lock=(0|1|-)$`)
 var daySummaryEventRe = regexp.MustCompile(`^sweep ([0-9]{1,12}) ([0-9]{1,12}) ([0-9]{1,12}) ([0-9]{1,12})$`)
 
-// daySummaryLineT returns a line's t when the line has one of the five shapes.
+// daySummaryLineT returns a line's t when the line has one of the six shapes.
 func daySummaryLineT(l string) (int64, bool) {
-	for _, re := range []*regexp.Regexp{daySummarySigninRe, daySummarySaveRe, daySummaryVpnStateRe, daySummarySweepRe, daySummaryReportRe} {
+	for _, re := range []*regexp.Regexp{daySummarySigninRe, daySummarySaveRe, daySummaryVpnStateRe, daySummaryVpnRe, daySummarySweepRe, daySummaryReportRe} {
 		if m := re.FindStringSubmatch(l); m != nil {
 			t, err := strconv.ParseInt(m[1], 10, 64)
 			return t, err == nil
@@ -320,6 +330,96 @@ func daySummaryForget(uid string) {
 	_ = os.Remove(daySummaryMarker(uid))
 	_ = os.Remove(path)
 	_ = os.Remove(path + ".tmp")
+	_ = os.Remove(daySummaryVpnRecord(uid))
+	delete(daySummaryVpnSignin, uid)
+}
+
+// daySummaryVpnPrefix names roamd's VPN apply record in the state tmpfs (vpn_diag_note, NWP-20261202-41): one line per
+// apply, `at=<at> rc=<rc> lock=<lock>`, at most 8. A take reads at most daySummaryVpnMaxBytes of it.
+const daySummaryVpnPrefix = ".vpndiag."
+const daySummaryVpnMaxBytes = 4 << 10
+
+// daySummaryVpnRecordRe is the record's only accepted line shape; the take drops every other line.
+var daySummaryVpnRecordRe = regexp.MustCompile(`^at=(signin|seal|install) rc=(applied|none|nohelper|deferred|notready|gaveup|dropped|other) lock=(0|1|-)$`)
+
+// daySummaryVpnSignin is each session's sign-in instant (daySummaryVpnStart), the zero of a vpn line's s.
+var daySummaryVpnSignin = map[string]time.Time{}
+
+func daySummaryVpnRecord(uid string) string {
+	return filepath.Join(loginStateDir(), daySummaryVpnPrefix+uid)
+}
+
+// daySummaryVpnStart records uid's sign-in instant: retryVpnup's start, the moment the sign-in's restore resolved.
+func daySummaryVpnStart(uid string) {
+	if !daySummaryUIDOK(uid) {
+		return
+	}
+	daySummaryMu.Lock()
+	defer daySummaryMu.Unlock()
+	daySummaryVpnSignin[uid] = daySummaryNow()
+}
+
+// daySummaryVpnRC is the CLOSED map from a vpnup reply to a signin vpn line's rc.
+func daySummaryVpnRC(reply string) string {
+	switch vpnupReplyToken(reply) {
+	case "OK APPLIED":
+		return "applied"
+	case "OK NONE":
+		return "none"
+	case "OK NOHELPER":
+		return "nohelper"
+	case "OK DEFERRED":
+		return "deferred"
+	}
+	return "other"
+}
+
+// daySummaryTakeVpn turns roamd's VPN apply record into vpn lines: it reads at most 4 KiB, removes the record (on
+// every path, a session that has not opted in included) and appends one line per valid record line. signinRC, when
+// not empty, is the sign-in's own outcome: a line `at=signin rc=<signinRC> lock=-` is appended when the record held
+// no signin line. The marker check is in the append.
+func daySummaryTakeVpn(uid, signinRC string) {
+	if !daySummaryUIDOK(uid) {
+		return
+	}
+	daySummaryMu.Lock()
+	defer daySummaryMu.Unlock()
+	path := daySummaryVpnRecord(uid)
+	var b []byte
+	if f, err := os.Open(path); err == nil {
+		b, _ = io.ReadAll(io.LimitReader(f, daySummaryVpnMaxBytes))
+		_ = f.Close()
+	}
+	_ = os.Remove(path)
+	now := daySummaryNow()
+	s := "-"
+	if t0, ok := daySummaryVpnSignin[uid]; ok {
+		if d := int64(now.Sub(t0) / time.Second); d >= 0 && d <= 999999999 {
+			s = strconv.FormatInt(d, 10)
+		}
+	}
+	line := func(at, rc, lock string) string {
+		return fmt.Sprintf("v=1 t=%d ev=vpn at=%s rc=%s s=%s lock=%s", now.Unix(), at, rc, s, lock)
+	}
+	signin := false
+	for _, l := range strings.Split(string(b), "\n") {
+		m := daySummaryVpnRecordRe.FindStringSubmatch(l)
+		if m == nil {
+			continue
+		}
+		signin = signin || m[1] == "signin"
+		daySummaryAppendLocked(uid, line(m[1], m[2], m[3]))
+	}
+	if signinRC != "" && !signin {
+		daySummaryAppendLocked(uid, line("signin", signinRC, "-"))
+	}
+}
+
+// daySummaryVpnAfterOp is triggerRoamWorkerKind's deferred take for the ops that run vpn_deferred_retry (out, bootwake).
+func daySummaryVpnAfterOp(op, uid string) {
+	if op == "out" || op == "bootwake" {
+		daySummaryTakeVpn(uid, "")
+	}
 }
 
 // daySummaryStatus renders a summary file as the day_summary key the file header describes.

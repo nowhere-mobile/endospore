@@ -16,6 +16,8 @@
 #   D  the whole arm and the script head: each bracket sits around its step (signin_in_ms, reap, acct and the three reown);
 #   E  the real timer lines in file order behind a stub clock: 35 s of work before the arm and 1 s after it give
 #      phase=reap ms=35000 and phase=in ms=36000.
+# NWP-20261203-09 (backlog: A sign-in fetches every CE vault chunk fresh: ...): each scope line also carries the restore
+# split (restore_split.go): fetched_bytes, wait_ms, write_ms and the parked skip's three counts; m29-m36 break it.
 # test-od-parked-report.sh pins od_parked_report's own append.
 # --mutate breaks each guard in turn on a COPY (the roamd script or the Go package); each mutant must be CONVICTED
 # (the shell one under every shell; the Go ones by a real `--- FAIL`). One that fails to apply or compile is a failure.
@@ -274,4 +276,21 @@ smut "m26 _sum0 starts after the two steps" -e '/^_sum0=\$(_ms)$/d' -e '/^\[ "\$
 smut "m27 the pre-arm reap line removed" -e '/^    _ssum reap "\$_sumt"/d'
 smut "m28 the pre-arm reap line before the file's rm" -e '/^    _ssum reap "\$_sumt"/d' \
   -e '/^    case "\$uid" in .*rm -f "\$STATE\/signin-summary\.\$uid"/i\    _ssum reap "$_sumt"'
-[ "$fails" -eq 0 ] && echo "== all 28 mutations convicted" || { echo "== $fails mutation(s) not convicted"; exit 1; }
+# NWP-20261203-09: the restore split. Each names the assertion that convicts it.
+# m29: TestSigninSummaryRestoreSplit run A, fetched bytes == the head's sizes. m30: run A, wait >= 40 ms. m31: run B, write >= 40 ms.
+mut "m29 getChunk adds no fetched bytes" main.go 'atomic\.AddInt64\(&restoreFetchedBytes, int64\(len\(b\)\)\)' '_ = b'
+mut "m30 the writer does not time the futures wait" main.go 'atomic\.AddInt64\(&restoreWaitNs, int64\(time\.Since\(w0\)\)\)' '_ = w0'
+mut "m31 the writer does not time pw.Write" main.go 'atomic\.AddInt64\(&restoreWriteNs, int64\(time\.Since\(p0\)\)\)' '_ = p0'
+# m32: TestSigninSummaryUnfetchedCounts, the counters against the unfetched: line.
+mut "m32 restoreSkippingParked stores no unfetched counts" unfetched_fetch.go \
+  'atomic\.StoreInt64\(&restoreUnfetchedPkgs,[^\n]*\n\t*atomic\.StoreInt64\(&restoreUnfetchedBytes,[^\n]*\n\t*atomic\.StoreInt64\(&restoreUnfetchedChunks,[^\n]*' \
+  '_, _, _ = skip, notFetched, nChunks'
+# m33, m35: TestSigninSummarySplitKeys's exact values (write_ms reads 7; wait_ms reads 3).
+mut "m33 the reader puts wait_ms under signin_<scope>_write_ms" signin_summary.go '= m\[10\], m\[11\]' '= m[11], m[10]'
+# m34: TestSigninSummaryStatusUnreadable, the old-shape line.
+mut "m34 the six split groups made optional" signin_summary.go \
+  '( fetched_bytes=\(\[0-9\]\{1,15\}\).*? unfetched_chunks=\(\[0-9\]\{1,12\}\))' '(?:\1)?'
+mut "m35 the writer prints the write time as wait_ms" signin_summary.go 'atomic\.LoadInt64\(&restoreWaitNs\)' 'atomic.LoadInt64(&restoreWriteNs)'
+# m36: TestSigninSummaryStatusFull's signin_media_user_files (it reads the vault's fetched_bytes group).
+mut "m36 the media groups not renumbered" signin_summary.go '= m\[15\], m\[16\]' '= m[9], m[10]'
+[ "$fails" -eq 0 ] && echo "== all 36 mutations convicted" || { echo "== $fails mutation(s) not convicted"; exit 1; }

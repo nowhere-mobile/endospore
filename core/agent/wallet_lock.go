@@ -90,9 +90,10 @@ import (
 // whose deadline leaseBudget(len(refs)) is capped at gwLeaseMax: 3 x 5 min = 15 min. And up to THREE
 // readStoredWallet calls (one per doFold), each FIVE store reads -- headKey's refProbe ladder (the unit head
 // under multi-device, v2, legacy), then getRef, then getBlob. A read is a /caps round trip (gwDefault, 30 s)
-// and an object GET (storeHTTP, 60 s), so one fully timed-out attempt costs 90 s: 15 x 90 s = 22.5 min.
+// and an object GET through storeXfer, priced at one full chunk in flight: storeXferDeadline(cdcMax) = 60 + 32 =
+// 92 s (NWP-20261203-10). So one fully timed-out attempt costs 122 s: 15 x 122 s = 30.5 min.
 //
-//	3 x gwLeaseMax + 15 x (gwDefault + storeHTTP) = 15 min + 22.5 min = 37.5 min
+//	3 x gwLeaseMax + 15 x (gwDefault + storeXferDeadline(cdcMax)) = 15 min + 30.5 min = 45.5 min
 //
 // leaseRefs holds for at most two leases (10 min). drainClaim takes the lock per /issue batch but re-takes it at
 // once, so a waiter polling every walletLockPoll sees the whole drain as one hold: about fifty round trips for
@@ -102,7 +103,7 @@ import (
 // /caps falls back to a second round trip, so a store that times out on every attempt can stretch a holder
 // past this. A waiter then proceeds unlocked and logs it -- today's behaviour, in a case that also needs the
 // store to be failing.
-var walletLockWait = 3*gwLeaseMax + 15*(gwDefault+storeHTTP.Timeout)
+var walletLockWait = 3*gwLeaseMax + 15*(gwDefault+storeXferDeadline(cdcMax))
 
 // walletSignInWait bounds every wallet-lock wait a person is waiting on: removeWallet and the restore (a
 // sign-in, a create, the legacy wipes), a claim before it mints, and sealWalletDurable's read. The chooser gives
@@ -308,6 +309,8 @@ func removeWallet(walletPath string) {
 	os.Remove(walletPath + ".seen")
 	os.Remove(walletPath + ".seen.tmp")
 	os.Remove(seenBadPath(walletPath))
+	os.Remove(walletRestoredPath(walletPath))
+	os.Remove(walletRestoredPath(walletPath) + ".tmp")
 	os.Remove(planMovingPath(walletPath)) // NWP-20261103-05: the plan-moving notice never outlives the session
 }
 
@@ -319,7 +322,8 @@ func removeWallet(walletPath string) {
 // The lock is taken with lockWalletWithin and anything but walletLocked KEEPS the file: the lock fails open, and a
 // drop that raced a writer is the loss this exists to prevent. Under it the generation is bumped before the
 // removal, so a writer of the departed session that loaded the file under gen finds it gone at its own check.
-// Removes the wallet, its temp file and the staged copy (walletPrevPath). NEVER the .lock, the .gen, a .landed-*
+// Removes the wallet, its temp file, the staged copy (walletPrevPath), the seen-set files (.seen, .seen.tmp,
+// .seen.bad), the plan-moving marker and the restored-token record (.restored, .restored.tmp). NEVER the .lock, the .gen, a .landed-*
 // proof (a departed session's late publisher still asks about its generation) or the .creditlost notice.
 func dropWalletIfUnchanged(walletPath, gen string, basis []byte) (bool, string) {
 	unlock, state := lockWalletWithin(walletPath, walletSignInWait)
@@ -345,6 +349,7 @@ func dropWalletIfUnchanged(walletPath, gen string, basis []byte) (bool, string) 
 	for _, p := range []string{
 		walletPath, walletPath + ".tmp", walletPrevPath(walletPath),
 		walletPath + ".seen", walletPath + ".seen.tmp", seenBadPath(walletPath),
+		walletRestoredPath(walletPath), walletRestoredPath(walletPath) + ".tmp",
 		planMovingPath(walletPath),
 	} {
 		if err := walletRemoveFile(p); err != nil && !errors.Is(err, fs.ErrNotExist) {

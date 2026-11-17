@@ -17,12 +17,12 @@
 # does not change them. A run fails on:
 #   NEW                a breach that is not in the baseline, or above its count: reword the dialog
 #   STALE: delete it   a baseline line that no longer occurs, or occurs fewer times: delete it or lower its count
-#   CONTROL            fewer than 50 builders found, so the scan did not run
+#   CONTROL            fewer than 5 builders found, so the scan did not run
 #   VERBS differ       core/chooser/src/.../PopupSheet.java holds another DESTRUCTIVE_VERBS list than this scanner
 # The rules judge the VALUE of a Java literal, after its unicode, octal and character escapes. A tab, a line break or
 # another unprintable character in a key is written as a backslash escape, so one key stays on one baseline line.
 # A label that is a variable, a call, a concatenation or a ternary cannot be judged. The run counts it under UNRESOLVED and
-# does not call it a breach. The number of builders is printed and never pinned: only the floor of 50 fails.
+# does not call it a breach. The number of builders is printed and never pinned: only the floor of 5 fails.
 #
 # ⚠ IT FAILS WHEN THERE IS NO PYTHON3, IT NEVER SKIPS.
 #
@@ -49,7 +49,7 @@ import collections, os, re, sys
 FILES = ("ChooserActivity.java", "ProfileActivity.java", "PrivateDnsPromptActivity.java", "PrivateDnsWatch.java")
 DESTRUCTIVE_VERBS = ("Delete", "Erase", "Wipe", "Remove", "Discard", "Unbind", "Clear", "Reset", "Drop", "Forget",
                      "Leave", "Uninstall")
-FLOOR = 50
+FLOOR = 5
 OK_OR_CANCEL = ("ok", "okay", "cancel")
 CONTROL_WORDS = ("if", "for", "while", "switch", "catch", "synchronized", "try", "do", "else", "return", "new")
 
@@ -571,7 +571,17 @@ T=$'\t'
 ACTIVITIES="ChooserActivity.java ProfileActivity.java PrivateDnsPromptActivity.java PrivateDnsWatch.java"
 CONSTANTS="PresetPicker.java PrivateDnsDowngrade.java WalletRepairCopy.java PlayChoice.java BuildWarningNotice.java GateHelpHome.java"
 PS="ProfileActivity.java"
-SIGNOUT="confirmSignOutAndInstall"
+# THE FIXTURE ANCHOR. Each popups slice moves a real builder to the sheet. A mutant that edits a product method then
+# breaks. So the mutants edit popupRulesAnchor, which no product method carries. fresh() plants it and its baseline line
+# in every copy. The scan of the real tree never sees it.
+SIGNOUT="popupRulesAnchor"
+ANCHOR='    private void popupRulesAnchor() {
+        new android.app.AlertDialog.Builder(this)
+                .setTitle("Anchor & more")
+                .setMessage("Anchor text")
+                .setPositiveButton("Go on", null)
+                .show();
+    }'
 VERBS='"Delete", "Erase", "Wipe", "Remove", "Discard", "Unbind", "Clear", "Reset", "Forget", "Leave", "Uninstall"'
 
 bad() { echo "FAIL: $*"; FAILS=$((FAILS + 1)); }
@@ -586,6 +596,8 @@ fresh() {
   done
   cp "$TREE_BASELINE" "$C/baseline.txt" || { bad "cannot copy the baseline"; APPLIED=no; }
   cp "$W/scan.py" "$C/scan.py" || { bad "cannot copy the scanner"; APPLIED=no; }
+  edit member "$C/$PS" "$ANCHOR"
+  printf '%s\n' "$PS$T$SIGNOUT${T}R2${T}Anchor & more${T}1" >> "$C/baseline.txt"
 }
 
 edit() {
@@ -644,14 +656,14 @@ fresh; edit member "$C/PresetPicker.java" 'static final String M2_LABEL = "Cance
 edit chain "$C/$PS" "$SIGNOUT" '.setNegativeButton(PresetPicker.M2_LABEL, null)'
 convict M2 1 "NEW: $PS$T$SIGNOUT${T}R1${T}Cancel (baseline 0, found 1)"
 
-fresh; edit in-method "$C/$PS" "$SIGNOUT" '.setMessage(OtaUpdate.installConfirm(local))' '.setMessage("Wi-Fi & data")'
+fresh; edit in-method "$C/$PS" "$SIGNOUT" '.setMessage("Anchor text")' '.setMessage("Wi-Fi & data")'
 convict M3 1 "NEW: $PS$T$SIGNOUT${T}R2${T}Wi-Fi & data (baseline 0, found 1)"
 
 fresh; edit chain "$C/$PS" "$SIGNOUT" '.setPositiveButton("Delete all", null)'
 convict M4 1 "NEW: $PS$T$SIGNOUT${T}R3${T}Delete all (baseline 0, found 1)"
 
-fresh; edit in-method "$C/$PS" confirmRollback '.setNegativeButton("Cancel"' '.setNegativeButton("Not now"'
-convict M5 1 "STALE: delete it: $PS${T}confirmRollback${T}R1${T}Cancel (baseline 1, found 0)"
+fresh; edit in-method "$C/$PS" "$SIGNOUT" '"Anchor & more"' '"Anchor and more"'
+convict M5 1 "STALE: delete it: $PS$T$SIGNOUT${T}R2${T}Anchor & more (baseline 1, found 0)"
 
 fresh; edit chain "$C/$PS" "$SIGNOUT" '// "OK & more"'
 edit once "$C/scan.py" 'text = strip_comments(raw)' 'text = raw'
@@ -659,18 +671,26 @@ convict M6 1 "NEW: $PS$T$SIGNOUT${T}R2${T}OK & more"
 
 fresh
 for f in $ACTIVITIES; do edit all "$C/$f" 'AlertDialog.Builder(' 'AlertDialog.Bilder('; done
-convict M7 1 "CONTROL: only 0 builders found, expected at least 50"
+convict M7 1 "CONTROL: only 0 builders found, expected at least 5"
 
-# The gate Help page is in scope: its Back label resolves through GateHelpHome.BACK, and no exemption hides it.
-fresh; edit once "$C/GateHelpHome.java" 'static final String BACK = "Back";' 'static final String BACK = "Cancel";'
-convict M8-the-gate-help-page-is-scanned 1 "NEW: ChooserActivity.java${T}showGateHelpPage${T}R1${T}Cancel (baseline 0, found 1)"
+# A label from a GateHelpHome constant is resolved, as the gate Help page's Back label is.
+fresh; edit member "$C/GateHelpHome.java" 'static final String M8_LABEL = "Cancel";'
+edit chain "$C/$PS" "$SIGNOUT" '.setNegativeButton(GateHelpHome.M8_LABEL, null)'
+convict M8-a-gate-help-constant-is-resolved 1 "NEW: $PS$T$SIGNOUT${T}R1${T}Cancel (baseline 0, found 1)"
 
-fresh; edit once "$C/scan.py" 'declarations = [m for m in VARIABLE.finditer(mask)]' 'declarations = []'
-convict M9 1 "STALE: delete it: ChooserActivity.java${T}showCreateOverColdLock${T}R1${T}OK" \
-             "STALE: delete it: ChooserActivity.java${T}showCreateOverColdLock${T}R1${T}Cancel"
+fresh; edit in-method "$C/$PS" "$SIGNOUT" '.show();' '.show();
+        android.app.AlertDialog.Builder b = new android.app.AlertDialog.Builder(this);
+        b.setPositiveButton("OK", null).setNegativeButton("Cancel", null);
+        b.show();'
+printf '%s\n' "$PS$T$SIGNOUT${T}R1${T}OK${T}1" "$PS$T$SIGNOUT${T}R1${T}Cancel${T}1" >> "$C/baseline.txt"
+edit once "$C/scan.py" 'declarations = [m for m in VARIABLE.finditer(mask)]' 'declarations = []'
+convict M9 1 "STALE: delete it: $PS$T$SIGNOUT${T}R1${T}OK (baseline 1, found 0)" \
+             "STALE: delete it: $PS$T$SIGNOUT${T}R1${T}Cancel (baseline 1, found 0)"
 
-fresh; edit once "$C/scan.py" 'return inside[:1]' 'return inside'
-convict M10 1 "NEW: $PS${T}confirmRemoveKey${T}R1${T}Cancel"
+fresh; edit in-method "$C/$PS" "$SIGNOUT" '.setPositiveButton("Go on", null)' '.setPositiveButton("Go on", (d, w) -> new android.app.AlertDialog.Builder(this).setNegativeButton("Cancel", null).show())'
+printf '%s\n' "$PS$T$SIGNOUT${T}R1${T}Cancel${T}1" >> "$C/baseline.txt"
+edit once "$C/scan.py" 'return inside[:1]' 'return inside'
+convict M10 1 "NEW: $PS$T$SIGNOUT${T}R1${T}Cancel (baseline 1, found 2)"
 
 fresh; printf 'final class PopupSheet { static final java.util.List<String> DESTRUCTIVE_VERBS = Collections.unmodifiableList(Arrays.asList(%s)); }\n' "$VERBS" > "$C/PopupSheet.java"
 convict M11 1 "VERBS differ: missing from PopupSheet.java ['Drop']"
@@ -686,13 +706,13 @@ fresh; edit chain "$C/$PS" "$SIGNOUT" '.setNeutralButton(" okay ", null)'
 convict M14 1 "NEW: $PS$T$SIGNOUT${T}R1$T okay  (baseline 0, found 1)"
 
 fresh; : > "$C/baseline.txt"
-convict M15-empty-baseline 1 "NEW: $PS$T$SIGNOUT${T}R2${T}Sign out & install (baseline 0, found 1)"
+convict M15-empty-baseline 1 "NEW: $PS$T$SIGNOUT${T}R2${T}Anchor & more (baseline 0, found 1)"
 
-fresh; edit chain "$C/$PS" confirmRollback '.setNegativeButton("Cancel", null)'
-convict M16-above-its-count 1 "NEW: $PS${T}confirmRollback${T}R1${T}Cancel (baseline 1, found 2)"
+fresh; edit chain "$C/$PS" "$SIGNOUT" '.setMessage("Anchor & more")'
+convict M16-above-its-count 1 "NEW: $PS$T$SIGNOUT${T}R2${T}Anchor & more (baseline 1, found 2)"
 
-fresh; edit once "$C/baseline.txt" "$PS${T}confirmRollback${T}R1${T}Cancel${T}1" "$PS${T}confirmRollback${T}R1${T}Cancel${T}2"
-convict M17-fewer-than-its-count 1 "STALE: delete it: $PS${T}confirmRollback${T}R1${T}Cancel (baseline 2, found 1)"
+fresh; edit once "$C/baseline.txt" "$PS$T$SIGNOUT${T}R2${T}Anchor & more${T}1" "$PS$T$SIGNOUT${T}R2${T}Anchor & more${T}2"
+convict M17-fewer-than-its-count 1 "STALE: delete it: $PS$T$SIGNOUT${T}R2${T}Anchor & more (baseline 2, found 1)"
 
 fresh; printf 'one field only\n' >> "$C/baseline.txt"
 convict M18-malformed-baseline 2 "a line is <file> TAB <method> TAB <rule> TAB <label> TAB <count>"
@@ -751,8 +771,8 @@ fi
 fresh; edit chain "$C/$PS" "$SIGNOUT" '// "OK & more"'
 accept P4-a-comment-does-not-count
 
-fresh; edit every-builder "$C/ChooserActivity.java" showGateHelpPage 1 '.setPositiveButton("Got it", null)'
-accept P5-the-gate-help-page-is-clean --lacks "showGateHelpPage"
+fresh; edit every-builder "$C/$PS" "$SIGNOUT" 1 '.setNeutralButton("Got it", null)'
+accept P5-a-clean-button-on-every-builder --lacks "$SIGNOUT"
 
 fresh; printf 'final class PopupSheet { static final java.util.List<String> DESTRUCTIVE_VERBS = Collections.unmodifiableList(Arrays.asList(%s, "Drop")); }\n' "$VERBS" > "$C/PopupSheet.java"
 accept P6-the-same-verbs-pass --lacks "VERBS differ" --lacks "PopupSheet.java absent"

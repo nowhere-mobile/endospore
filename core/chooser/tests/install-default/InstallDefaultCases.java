@@ -53,7 +53,8 @@ public class InstallDefaultCases {
   }
   static List<String> writes() {
     List<String> w = new ArrayList<>();
-    for (String j : StoreInstaller.journal) if (j.startsWith("removeKeepLines:") || j.startsWith("keepInMode:")) w.add(j);
+    for (String j : StoreInstaller.journal) if (j.startsWith("removeKeepLines:") || j.startsWith("keepInMode:")
+        || j.startsWith("recordTurnedOff:")) w.add(j);
     return w;
   }
   /** The outcome of decide's own line, for a call that logs a second line of its own (NWP-20261129-16). */
@@ -64,12 +65,12 @@ public class InstallDefaultCases {
     }
     return null;
   }
-  /** Every write decide made, in order: the flag, the keep lines, the playdep, the Off line. */
+  /** Every write decide made, in order: the flag, the keep lines, the playdep, the Off lines. */
   static List<String> order() {
     List<String> w = new ArrayList<>();
     for (String j : StoreInstaller.journal) {
       if (j.startsWith("cfgPut:") || j.startsWith("keepInMode:") || j.startsWith("removeKeepLines:")
-          || j.startsWith("setPlayDep:") || j.startsWith("clearTurnedOff:")) w.add(j);
+          || j.startsWith("setPlayDep:") || j.startsWith("clearTurnedOff:") || j.startsWith("recordTurnedOff:")) w.add(j);
     }
     return w;
   }
@@ -80,7 +81,15 @@ public class InstallDefaultCases {
   interface Case { void run() throws Exception; }
   static void run(String name, Case c) {
     reset();
-    try { c.run(); }
+    try {
+      c.run();
+      // NWP-20261203-11: only the off-default clear (the C4 cases) records an Off.
+      if (!name.startsWith("C4")) {
+        boolean none = true;
+        for (String j : StoreInstaller.journal) if (j.startsWith("recordTurnedOff:")) none = false;
+        check(name + ": no Off record written", none, "journal=" + StoreInstaller.journal);
+      }
+    }
     catch (Throwable t) { check(name + ": no exception", false, t.toString()); }
   }
 
@@ -122,7 +131,8 @@ public class InstallDefaultCases {
       boolean r = call(false, "broadcast");
       check("C4 off default, returning, kept -> false", !r, "r=" + r);
       check("C4 the previous install's keep line was cleared", CLEARED.equals(outcome("C4")), "lines=" + android.util.Log.lines);
-      check("C4 removeKeepLines({pkg}) and nothing else written", writes().equals(Arrays.asList("removeKeepLines:[" + P + "]")), "writes=" + writes());
+      check("C4 recordTurnedOff(pkg) THEN removeKeepLines({pkg}), nothing else written",
+          writes().equals(Arrays.asList("recordTurnedOff:" + P, "removeKeepLines:[" + P + "]")), "writes=" + writes());
       check("C4 keepInMode never called", !StoreInstaller.journal.contains("keepInMode:" + P + ",false,off"), "journal=" + StoreInstaller.journal);
       check("C4 explicitlyTurnedOff never consulted", ProfileActivity.offCalls == 0, "offCalls=" + ProfileActivity.offCalls);
       check("C4 the full log line",
@@ -135,11 +145,15 @@ public class InstallDefaultCases {
       call(false, "broadcast");
       check("C4b pkg also in the Off record -> still the clear", CLEARED.equals(outcome("C4b")), "lines=" + android.util.Log.lines);
       check("C4b the Off record never consulted", ProfileActivity.offCalls == 0, "offCalls=" + ProfileActivity.offCalls);
+      check("C4b recordTurnedOff(pkg) THEN removeKeepLines({pkg}), nothing else written",
+          writes().equals(Arrays.asList("recordTurnedOff:" + P, "removeKeepLines:[" + P + "]")), "writes=" + writes());
     });
     run("C4c aurora.services", () -> {
       installer("com.aurora.services"); ProfileActivity.mode = "off"; gone(); kept();
       call(false, "broadcast");
       check("C4c com.aurora.services -> bucket=aurora", logHas(" bucket=aurora "), "lines=" + android.util.Log.lines);
+      check("C4c recordTurnedOff(pkg) THEN removeKeepLines({pkg}), nothing else written",
+          writes().equals(Arrays.asList("recordTurnedOff:" + P, "removeKeepLines:[" + P + "]")), "writes=" + writes());
     });
 
     run("C5", () -> {

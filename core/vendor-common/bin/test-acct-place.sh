@@ -14,6 +14,11 @@
 # the placed CE db (CUT=db) or -wal (CUT=wal) after the real copy. P1 and P2: no accounts_ce.db* is left, the log has
 # `copied short`. P3: a whole CE+DE copy is placed as before. Each runs under every shell found.
 #
+# NWP-20261207-06 (docs/product-decisions.md, "eight answers to harvest 62 ...", 2026-11-09, #6): an agent exit 5 (the
+# store could not be reached) makes acct_restore return 5, so the `in` arm ends the sign-in as BLANK NET; the hold is
+# removed as on any agent failure. Any other agent failure still returns 0. Both cases run under every shell found,
+# and each status mutant must fail its named case under every shell.
+#
 #   bash test-acct-place.sh            # the cases
 #   bash test-acct-place.sh --mutate   # ... plus mutations that must each CONVICT the suite
 #
@@ -59,7 +64,7 @@ WANT=${ACCT_WANT:-13}   # a mutant that deletes path-bearing lines passes its ow
 [ ! -e /system/bin/nowhere_db_fix ] || { echo "refusing to run: /system/bin/nowhere_db_fix exists on this host" >&2; exit 2; }
 
 # --- harness ----------------------------------------------------------------------------------------------
-# run <mode> <lay> <preseed> <body>. mode: ok|fail -- what the stub agent exits with. lay: shell run by the stub
+# run <mode> <lay> <preseed> <body>. mode: ok|fail|net -- the stub agent exits 0, 1 or 5. lay: shell run by the stub
 # agent with $hold set (what the restore "downloads"). preseed: shell run before the call ($T is the temp root).
 # body: the call under test. Leaves $TT (root), $TT/out (stdout+stderr), $TT/trace (ordered cmd/cp/rm), $TT/log.
 TT=""
@@ -77,7 +82,7 @@ run(){
     echo "T='$T'; STATE=\"\$T/state\"; LANE=rw; LOG=\"\$T/log\"; : > \"\$LOG\"; name=probe; pass=x; uid=10"
     # uid=10 above: `local uid=$1 hold=...-$uid` reads the OUTER uid under bash (mksh assigns left to right).
     echo 'PATH="$T/wrap:$PATH"; AGENT=agent_stub; ACCT_MARK_ROOT="$T/user"'
-    echo 'agent_stub(){ local hold="$5"; '"${2:-:}"'; '"$([ "$1" = fail ] && echo return 1 || echo return 0)"'; }'
+    echo 'agent_stub(){ local hold="$5"; '"${2:-:}"'; '"$(case "$1" in fail) echo return 1 ;; net) echo return 5 ;; *) echo return 0 ;; esac)"'; }'
     echo 'cmd(){ echo "cmd $*" >> "$T/trace"; }; chown(){ :; }; restorecon(){ :; }'
     # NWP-20261118-09: cp runs the traced wrapper, then cuts the placed CE db (CUT=db) or -wal (CUT=wal) to 3 bytes.
     echo 'cp(){ local _cpl _cpr; command cp "$@"; _cpr=$?; for _cpl in "$@"; do :; done; case "${CUT:-}:$_cpl" in "db:$T/system_ce/10/") printf NEW > "$T/system_ce/10/accounts_ce.db" ;; "wal:$T/system_ce/10/") printf NEW > "$T/system_ce/10/accounts_ce.db-wal" ;; esac; return $_cpr; }'
@@ -106,9 +111,6 @@ HOLD='$T/nowhere/acct-hold-10'
 mkhold(){ echo 'hold='"$HOLD"'; '"$1"; }
 
 echo "== acct_restore =="
-run fail "$CE" "" 'acct_restore 10; echo "rc=$?"; [ -e '"$HOLD"' ] && echo hold=left || echo hold=gone'
-case "$(out)" in *rc=0*hold=gone*) ok "an agent failure removes the hold and returns 0" ;; *) no "an agent failure removes the hold and returns 0 -- $(out)" ;; esac; done_
-
 run ok 'mkdir -p "$hold/ce"; printf x > "$hold/ce/other"' "" 'acct_restore 10; echo "rc=$?"; [ -e '"$HOLD"' ] && echo hold=left || echo hold=gone'
 case "$(out)" in *rc=0*hold=gone*) ok "a hold with no db is removed" ;; *) no "a hold with no db is removed -- $(out)" ;; esac; done_
 
@@ -185,6 +187,17 @@ for RSH in "${SHELLS[@]}"; do
 done
 RSH=bash
 
+echo "== NWP-20261207-06: an agent exit 5 returns 5, any other agent failure returns 0, in every shell =="
+for RSH in "${SHELLS[@]}"; do
+  t="[$(basename "$RSH")]"
+  run fail "$CE" "" 'acct_restore 10; echo "rc=$?"; [ -e '"$HOLD"' ] && echo hold=left || echo hold=gone'
+  case "$(out)" in *rc=0*hold=gone*) ok "$t an agent failure removes the hold and returns 0" ;; *) no "$t an agent failure removes the hold and returns 0 -- $(out)" ;; esac; done_
+
+  run net "$CE" "" 'acct_restore 10; echo "rc=$?"; [ -e '"$HOLD"' ] && echo hold=left || echo hold=gone'
+  case "$(out)" in *rc=5*hold=gone*) ok "$t an agent exit 5 removes the hold and returns 5" ;; *) no "$t an agent exit 5 removes the hold and returns 5 -- $(out)" ;; esac; done_
+done
+RSH=bash
+
 echo "== NWP-20261104-05: acct_restore voids an earlier session's account marks, in every shell =="
 MARKS='$T/user/10/com.nowhere.chooser/files/nowhere-acct-marks'
 SEEDMARKS='mkdir -p "$T/user/10/com.nowhere.chooser/files"; printf "h1\nh2\n" > '"$MARKS"
@@ -232,8 +245,28 @@ if [ "$MUTATE" = yes ]; then
          's#^  cmd account detach-user "\$uid"#  cmd account reload-user "$uid"#'
   mutate "the final hold rm is dropped" \
          's#^  rm -rf "\$hold"$#  :#'
-  mutate "the agent-failure cleanup is dropped" \
-         's#|| { rm -rf "\$hold"; return 0; }#|| { return 0; }#'
+  # NWP-20261207-06: a mutant of acct_restore's status must fail the NAMED case under EVERY shell found.
+  # mutate_case <label> <sed> <assertion text, after the shell tag>
+  mutate_case(){
+    local o sh t
+    if ! sed "$2" "$SUT" > "$M/m.sh" 2>"$M/err"; then no "MUTATION BROKEN (sed): $1"; return; fi
+    if cmp -s "$SUT" "$M/m.sh"; then no "MUTATION INERT: $1"; return; fi
+    o=$(bash "$0" "$M/m.sh" 2>&1)
+    case "$o" in *"EXTRACTION FAILED"*) no "MUTATION BROKE EXTRACTION: $1"; return ;; esac
+    for sh in "${SHELLS[@]}"; do
+      t="[$(basename "$sh")]"
+      case "$o" in *"  FAIL  $t $3"*) ok "convicted under $t by '$3': $1" ;; *) no "NOT CONVICTED under $t by '$3': $1" ;; esac
+    done
+  }
+  mutate_case "the agent-failure cleanup is dropped" \
+         's#if \[ "\$_arc" != 0 \]; then rm -rf "\$hold"; #if [ "$_arc" != 0 ]; then #' \
+         "an agent failure removes the hold and returns 0"
+  mutate_case "the agent's exit 5 is not returned (NWP-20261207-06)" \
+         's#\[ "\$_arc" = 5 \] && return 5; ##' \
+         "an agent exit 5 removes the hold and returns 5"
+  mutate_case "any agent failure returns 5 (NWP-20261207-06)" \
+         's#\[ "\$_arc" = 5 \] && return 5; return 0; fi#return 5; fi#' \
+         "an agent failure removes the hold and returns 0"
   # NWP-20261118-09: a whole-copy mutant must fail the cases of EVERY shell found. Third argument: ACCT_WANT.
   mutate_all(){
     local o sh t

@@ -87,9 +87,9 @@ if [ "$MUTATE" = yes ] && [ "$rc" = 0 ]; then
   mutate "L8 Unbind's owned read moved into the dialog's button" "P3 Unbind" $A \
     's/(ICCID first"\); return; \}\n)[ ]*final boolean owned[^\n]*\n([ ]*new android\.app\.AlertDialog\.Builder\(this\)\n[ ]*\.setTitle\("Unbind this line\?"\))/$1$2/ or die; s/(\.setPositiveButton\("Unbind", \(d, w\) -> \{\n)/$1'"$O"'\n/ or die'
   mutate "L9 Repair's owned read moved into the worker" "P3 Repair" $A \
-    's/(private void confirmRepairBindings\(TextView status\) \{\n)[ ]*final boolean owned[^\n]*\n/$1/ or die; s/(\.setPositiveButton\("Repair".*?new Thread\(\(\) -> \{\n)/$1'"$O"'\n/s or die'
+    's/(private void confirmRepairBindings\(TextView status\) \{\n)[ ]*final boolean owned[^\n]*\n/$1/ or die; s/(GateNoticeSheets\.repairBindings\(\), new Runnable\[\] \{ \(\) -> \{.*?new Thread\(\(\) -> \{\n)/$1'"$O"'\n/s or die'
   mutate "L10 Repair's dialog guard removed" "P2 Repair" $A \
-    's/(\.setPositiveButton\("Repair", \(d, w\) -> \{)\n[ ]*'"$G"'/$1/ or die'
+    's/(GateNoticeSheets\.repairBindings\(\), new Runnable\[\] \{ \(\) -> \{)\n[ ]*'"$G"'/$1/ or die'
   mutate "L11 Unbind's dialog guard removed" "P2 Unbind" $A \
     's/(\.setPositiveButton\("Unbind", \(d, w\) -> \{)\n[ ]*'"$G"'/$1/ or die'
   mutate "L12 Save's landing guard moved after the toast" "P1 Save" $A \

@@ -172,6 +172,7 @@ suite() {  # suite <roamd.sh> <sh> [quiet] -> 0 all ok, 1 a case failed, 2 the h
       done
       printf '%s\n' 'vpn_preconsent_off() { :; }   # NWP-20261202-03'
       printf '%s\n' 'od_watched() { shift; "$@" 2>&1; }'
+      printf '%s\n' 'od_label_watched() { reown_restored "$2"; od_relabel "$1" "$2"; }   # NWP-20261202-32'
       printf '%s\n' 'od_fetch_data() { return 0; }; od_listed() { return 1; }; od_block_app() { return 0; }; od_unblock_app() { :; }; od_pending_clear() { :; }; od_block_installed() { :; }; od_shipped_prep() { return 0; }; od_park_var() { :; }; od_unf_path() { echo "$STATE/odfetch.$1/unfetched.$2"; }   # NWP-20261130-03'
       printf '%s\n' "$RG"
       printf 'for _stl in $ODLIST; do\nsrcunit=${_stl%%%%:*}; skind=${_stl#*:}\ncase "$op" in\n%s\nesac\ndone\n' "$RA"

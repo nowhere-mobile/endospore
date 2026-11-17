@@ -105,6 +105,21 @@ public class NowhereApp extends Application {
         // NWP-20261112-10 (Q061): the same for a permission answered in the live session -- relayed to its
         // PermsCaptureReceiver after 2 s of quiet. User-0 guard inside; armed per login after an OK GRANT-PERMS.
         PermsLiveRecord.register(this); // NWP-20261112-10
+        // NWP-20261203-04: a session chooser's last exit, read at its next birth, so login.log names a "permissions
+        // revoked" kill (REASON_PERMISSION_CHANGE = 8). Integers only; never the description. Session users only.
+        if (android.os.UserHandle.myUserId() != 0) {
+            new Thread(() -> {
+                try {
+                    android.app.ActivityManager am = getSystemService(android.app.ActivityManager.class);
+                    java.util.List<android.app.ApplicationExitInfo> x = am.getHistoricalProcessExitReasons(getPackageName(), 0, 1);
+                    if (x != null && !x.isEmpty()) {
+                        String l = SignInTrace.exitLine(x.get(0).getReason(), System.currentTimeMillis() - x.get(0).getTimestamp());
+                        if (l != null) ChooserActivity.idleTrace("exitinfo u=" + android.os.UserHandle.myUserId() + " " + l
+                                + " up=" + android.os.SystemClock.uptimeMillis());
+                    }
+                } catch (Throwable ignore) {}
+            }, "nowhere-exitinfo").start();
+        }
         // NWP-20261001-05 / NWP-20261002-01: keep the push apps on the Doze allow-list (ChooserActivity
         // .ensurePushDozeExemption) when any of them is installed, replaced or removed in ANY user. A session's
         // (re)install gives the app a new appId, which is exactly what leaves the allow-list stale, and the gate

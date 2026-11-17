@@ -19,6 +19,13 @@
 # determinate bar from MediaStatus.restoringPermille (a zero-byte set too: RESTORING 0 0 1); B4 pins the line in
 # writeProg.
 #
+# NWP-20261207-11 (S6b half 1, docs/media-after-gate.md §6 and §10 O3): a fifth line. mediad writes "RESTORE-WAITING",
+# the token alone, after the RESTORING line while the lander is parked on transient fetch errors. route() gives it
+# slot 4 by exact match, restoreWaiting() needs a valid RESTORING line beside it, and the restoring notice then reads
+# MediaStatus.WAITING_BODY under the same title and bar. D8 pins that the watcher passes restoreWaiting, D9 that the
+# body reads WAITING_BODY, B5 the line in writeProg, and F1 that WAITING_BODY is the O3 words of
+# docs/product-decisions.md.
+#
 # ⚠ IT FAILS WHEN THERE IS NO JAVAC, IT NEVER SKIPS.
 #
 #   bash test-media-status-java.sh            # the cases and the source checks
@@ -38,6 +45,7 @@ SUT="${MEDIA_STATUS_SRC:-$SRC/MediaStatus.java}"
 CHOOSER="$SRC/ChooserActivity.java"
 MEDIA_GO="$root/core/agent/media_server.go"
 MAIN_GO="$root/core/agent/main.go"
+DECISIONS="$root/docs/product-decisions.md"
 CASES="$root/core/chooser/tests/media-status/MediaStatusCases.java"
 HOST_JDK=/mnt/build/lineage/prebuilts/jdk/jdk21/linux-x86/bin
 
@@ -85,11 +93,13 @@ has() {
   return 1
 }
 
-# source_check <ChooserActivity.java> <media_server.go> <main.go> -> 0 when the wiring holds, 1 otherwise.
+# source_check <ChooserActivity.java> <media_server.go> <main.go> <product-decisions.md> -> 0 when the wiring holds,
+# 1 otherwise.
 source_check() {
-  local chooser="$1" mediago="$2" maingo="$3" code body raw bad=0
+  local chooser="$1" mediago="$2" maingo="$3" decisions="$4" code body raw bad=0
   command -v perl >/dev/null 2>&1 || { echo "  FAIL  no perl: the comment-stripped source checks cannot run" >&2; return 1; }
-  [ -f "$chooser" ] && [ -f "$mediago" ] && [ -f "$maingo" ] || { echo "  FAIL  a source file is missing" >&2; return 1; }
+  [ -f "$chooser" ] && [ -f "$mediago" ] && [ -f "$maingo" ] && [ -f "$decisions" ] \
+    || { echo "  FAIL  a source file is missing" >&2; return 1; }
 
   # (a) the watcher reads every line and routes them through MediaStatus.
   code=$(strip_java "$chooser") || { echo "  FAIL  could not strip comments from $chooser" >&2; return 1; }
@@ -119,12 +129,16 @@ source_check() {
       echo "  FAIL  D3 the notice choice is not loadLine, then restoring, then prefetchActive" >&2; bad=1
     fi
   fi
+  # NWP-20261207-11: the restoring branch passes the parked state.
+  has D8 'the watcher does not pass MediaStatus.restoreWaiting(mr) to the restoring notice' \
+    "$body" 'postMediaNotice(app, uid, restLine, MediaStatus.restoreWaiting(mr));' || bad=1
   local pmn
   pmn=$(printf '%s\n' "$code" \
-    | awk '/private static void postMediaNotice\(Context app, int uid, String status\) \{/ { on = 1 } on { print } on && /^    }$/ { exit }')
+    | awk '/private static void postMediaNotice\(Context app, int uid, String status, boolean waiting\) \{/ { on = 1 } on { print } on && /^    }$/ { exit }')
   pmn=$(tr -s ' \n' '  ' <<<"$pmn")
   if [ -z "$pmn" ]; then
-    echo "  FAIL  D4 postMediaNotice EXTRACTION FAILED (its signature is not found)" >&2; bad=1
+    echo "  FAIL  D4 postMediaNotice(Context, int, String, boolean waiting) EXTRACTION FAILED (its signature is not found)" >&2
+    bad=1
   else
     has D5 'postMediaNotice does not title the restoring form with MediaStatus.RESTORING_TITLE' \
       "$pmn" 'MediaStatus.RESTORING_TITLE' || bad=1
@@ -132,6 +146,8 @@ source_check() {
       "$pmn" 'MediaStatus.restoring(' || bad=1
     has D7 'postMediaNotice does not give the restoring form a determinate bar from MediaStatus.restoringPermille' \
       "$pmn" 'if (rest != null) { b.setProgress(1000, MediaStatus.restoringPermille(done, total), false);' || bad=1
+    has D9 'postMediaNotice does not give the waiting restoring form the body MediaStatus.WAITING_BODY' \
+      "$pmn" 'String body = rest != null ? (waiting ? MediaStatus.WAITING_BODY :' || bad=1
   fi
 
   # (b) the premise: writeProg writes the three kinds as separate "\n"-ended lines.
@@ -143,6 +159,20 @@ source_check() {
   has B2 'writeProg no longer appends a "DAMAGED ...\n" line' "$body" 'lines += fmt.Sprintf("DAMAGED %d %s\n",' || bad=1
   has B3 'writeProg no longer appends an "INCOMPLETE ...\n" line' "$body" 'lines += fmt.Sprintf("INCOMPLETE %d %s\n",' || bad=1
   has B4 'writeProg no longer appends a "RESTORING ...\n" line' "$body" 'lines += fmt.Sprintf("RESTORING %d %d %d\n",' || bad=1
+  has B5 'writeProg no longer gates RESTORE-WAITING on files left and the parked state' \
+    "$body" 'if s.restoring.left > 0 && s.restoring.waiting {' || bad=1
+  has B5 'writeProg no longer appends a "RESTORE-WAITING\n" line' "$body" 'lines += "RESTORE-WAITING\n"' || bad=1
+
+  # (f) NWP-20261207-11: WAITING_BODY is the decided O3 words, read from the real MediaStatus.java.
+  local wb o3
+  wb=$(sed -n 's/^ *static final String WAITING_BODY = "\([^"]*\)";$/\1/p' "$SUT")
+  o3=$(grep -F -- '- **O3.' "$decisions" || true)
+  if [ -z "$wb" ]; then
+    echo "  FAIL  F1 WAITING_BODY not found in $SUT" >&2; bad=1
+  else
+    has F1 "the O3 line of docs/product-decisions.md does not hold *\"$wb\"* while parked" \
+      "$o3" "*\"$wb\"* while parked" || bad=1
+  fi
 
   # (c) the daemon's GET-MEDIA-STATUS arm relays the file whole.
   raw=$(awk '/^\tif name == "GET-MEDIA-STATUS" \{/ { on = 1 } on { print } on && /^\t}$/ { exit }' "$maingo")
@@ -153,12 +183,35 @@ source_check() {
     "$body" 'line := strings.TrimRight(string(b), "\r\n")' || bad=1
   has C2 'the arm no longer relays the file whole' "$body" 'fmt.Fprint(conn, line+"\n")' || bad=1
 
+  # (e) NWP-20261114-34: a background landing starts the session's rescan. The watcher polls GET-MEDIA-LANDED, decides
+  # with MediaStatus.rescanAfterLanding and calls requestMediaRescan, which starts CredentialService rescanmedia as the
+  # session user; the daemon relays media.landed; materialize raises the counter after a run that landed files.
+  code=$(strip_java "$chooser")
+  body=$(printf '%s\n' "$code" | awk '/private void startSyncStatusWatcher\(\) \{/ { on = 1 } on { print } on && /^    }$/ { exit }')
+  has E1 'the watcher does not poll GET-MEDIA-LANDED' "$body" 'pollDaemon("GET-MEDIA-LANDED\n")' || bad=1
+  has E2 'the watcher does not start the rescan through MediaStatus.rescanAfterLanding' \
+    "$body" 'if (MediaStatus.rescanAfterLanding(landedSeen, landedReply)) requestMediaRescan(app, uid,' || bad=1
+  has E3 'the watcher does not reset its count for a new session' "$body" 'if (uid != landedUid) { landedUid = uid; landedSeen = "0"; }' || bad=1
+  local rmr
+  rmr=$(printf '%s\n' "$code" \
+    | awk '/private static void requestMediaRescan\(Context app, int uid, String count\) \{/ { on = 1 } on { print } on && /^    }$/ { exit }')
+  rmr=$(tr -s ' \n' '  ' <<<"$rmr")
+  has E4 'requestMediaRescan does not start CredentialService rescanmedia as the session user' \
+    "$rmr" 'app.startServiceAsUser( new android.content.Intent(app, CredentialService.class).putExtra("rescanmedia", true), android.os.UserHandle.of(uid));' || bad=1
+  raw=$(awk '/^\tif name == "GET-MEDIA-LANDED" \{/ { on = 1 } on { print } on && /^\t}$/ { exit }' "$maingo")
+  body=$(strip_go <<<"$raw")
+  has E5 'the daemon has no GET-MEDIA-LANDED arm reading mediaLandedFile' "$body" 'filepath.Join(dest, mediaLandedFile)' || bad=1
+  raw=$(awk '/^func \(s \*mediaServer\) materialize\(/ { on = 1 } on { print } on && /^}$/ { exit }' "$mediago")
+  body=$(strip_go <<<"$raw")
+  has E6 'materialize does not raise the landed counter after a run that landed files' \
+    "$body" 'bumpMediaLanded(s.stateDir, label+" materialize")' || bad=1
+
   [ "$bad" -eq 0 ]
 }
 
 echo "== $SUT"
 suite "$SUT" || { echo "FAILED"; exit 1; }
-source_check "$CHOOSER" "$MEDIA_GO" "$MAIN_GO" || { echo "FAILED (source)"; exit 1; }
+source_check "$CHOOSER" "$MEDIA_GO" "$MAIN_GO" "$DECISIONS" || { echo "FAILED (source)"; exit 1; }
 echo "source: ok"
 [ "$MUTATE" = yes ] || exit 0
 
@@ -177,18 +230,18 @@ mut() { # mut <label> <perl-expr>   (mutates MediaStatus.java; the cases must fa
     *) echo "  BROKEN    $1 -- the mutant did not compile (rc=$rc)"; return 1 ;;
   esac
 }
-mutsrc() { # mutsrc <label> <chooser|media|main> <perl-expr>   (mutates one source copy; the source check must fail)
-  local label="$1" kind="$2" expr="$3" d orig c rc ch="$CHOOSER" md="$MEDIA_GO" mn="$MAIN_GO"
+mutsrc() { # mutsrc <label> <chooser|media|main|decisions> <perl-expr>   (mutates one source copy; the source check must fail)
+  local label="$1" kind="$2" expr="$3" d orig c rc ch="$CHOOSER" md="$MEDIA_GO" mn="$MAIN_GO" dc="$DECISIONS"
   case "$kind" in
-    chooser) orig="$CHOOSER" ;; media) orig="$MEDIA_GO" ;; main) orig="$MAIN_GO" ;;
+    chooser) orig="$CHOOSER" ;; media) orig="$MEDIA_GO" ;; main) orig="$MAIN_GO" ;; decisions) orig="$DECISIONS" ;;
     *) echo "  ERROR     $label -- unknown source kind $kind"; return 1 ;;
   esac
   d=$(mktemp -d -p "$W") || return 1; c="$d/$(basename "$orig")"
   cp "$orig" "$c"
   if ! perl -0pi -e "$expr" "$c"; then echo "  ERROR     $label -- perl failed on the mutation"; rm -rf "$d"; return 1; fi
   if cmp -s "$orig" "$c"; then echo "  INERT     $label -- the mutation changed nothing"; rm -rf "$d"; return 1; fi
-  case "$kind" in chooser) ch="$c" ;; media) md="$c" ;; main) mn="$c" ;; esac
-  source_check "$ch" "$md" "$mn" >/dev/null 2>&1; rc=$?
+  case "$kind" in chooser) ch="$c" ;; media) md="$c" ;; main) mn="$c" ;; decisions) dc="$c" ;; esac
+  source_check "$ch" "$md" "$mn" "$dc" >/dev/null 2>&1; rc=$?
   rm -rf "$d"
   if [ "$rc" -eq 0 ]; then echo "  SURVIVED  $label"; return 1; fi
   echo "  convicted $label"
@@ -209,7 +262,7 @@ mutsrc "R6 the daemon arm relays only the first line" main \
   || fails=$((fails+1))
 # NWP-20261202-28: the RESTORING slot, its parser, the watcher's order and the notice's title.
 mut "R7 slot 3 is never filled (cases S10-S13)" \
-  's/\n\s*: line\.startsWith\("RESTORING"\) \? 3 : -1;/ : -1;/' || fails=$((fails+1))
+  's/\n\s*: line\.startsWith\("RESTORING"\) \? 3//' || fails=$((fails+1))
 mut "R8 RESTORING is routed into slot 0 (cases S10, S12, S13)" \
   's/startsWith\("RESTORING"\) \? 3/startsWith("RESTORING") ? 0/' || fails=$((fails+1))
 mut "R9 restoring accepts left 0 (case P3)" 's/if \(v\[2\] <= 0\) return null;/if (v[2] < 0) return null;/' \
@@ -234,4 +287,29 @@ mut "R16 restoringPermille multiplies in long and overflows (case Q5)" \
 mutsrc "R17 postMediaNotice gates the restoring bar on total > 0 (D7)" chooser \
   's/if \(rest != null\) \{\s*(?:\/\/[^\n]*\s*)?b\.setProgress\(1000, MediaStatus\.restoringPermille\(done, total\), false\);\s*\} else if \(!prefetch && total > 0/if (!prefetch \&\& total > 0/' \
   || fails=$((fails+1))
+# NWP-20261114-34: the landed count and the rescan it starts.
+mut "R18 rescanAfterLanding fires on a 0 count (case L10)" 's/now != null && !now\.equals\("0"\) && /now != null \&\& /' \
+  || fails=$((fails+1))
+mut "R19 rescanAfterLanding fires on an unchanged count (case L9)" 's/ && !now\.equals\(seen\);/;/' || fails=$((fails+1))
+mut "R20 landed accepts a negative (case L7)" "s/if \\(c < '0' \\|\\| c > '9'\\) return null;/if ((c < '0' || c > '9') \\&\\& c != '-') return null;/" \
+  || fails=$((fails+1))
+mutsrc "R21 the watcher never starts the rescan (E2)" chooser \
+  's/if \(MediaStatus\.rescanAfterLanding\(landedSeen, landedReply\)\) requestMediaRescan\(app, uid, MediaStatus\.landed\(landedReply\)\);//' \
+  || fails=$((fails+1))
+mutsrc "R22 requestMediaRescan starts the service as user 0 (E4)" chooser \
+  's/(putExtra\("rescanmedia", true\),\s*)android\.os\.UserHandle\.of\(uid\)/$1android.os.UserHandle.SYSTEM/' || fails=$((fails+1))
+mutsrc "R23 materialize no longer raises the counter (E6)" media \
+  's/\n\s*bumpMediaLanded\(s\.stateDir, label\+" materialize"\)[^\n]*//' || fails=$((fails+1))
+# NWP-20261207-11: the RESTORE-WAITING slot, restoreWaiting, the watcher's argument, the body and the O3 words.
+mut "R24 route fills slot 4 by prefix (case W3)" \
+  's/line\.equals\("RESTORE-WAITING"\) \? 4/line.startsWith("RESTORE-WAITING") ? 4/' || fails=$((fails+1))
+mut "R25 restoreWaiting ignores slot 3 (case W5a)" 's/ && restoring\(routed\[3\]\) != null//' || fails=$((fails+1))
+mutsrc "R26 the watcher always passes false (D8)" chooser \
+  's/restLine, MediaStatus\.restoreWaiting\(mr\)\)/restLine, false)/' || fails=$((fails+1))
+mut "R27 WAITING_BODY text changed (case T2)" 's/"Waiting for a network"/"Waiting for network"/' || fails=$((fails+1))
+mutsrc "R28 the body ignores waiting (D9)" chooser 's/waiting \? MediaStatus\.WAITING_BODY : //' || fails=$((fails+1))
+mutsrc "R29 the RESTORE-WAITING token is misspelt (B5)" media 's/"RESTORE-WAITING\\n"/"RESTORE_WAITING\\n"/' \
+  || fails=$((fails+1))
+mutsrc "R30 the O3 words change (F1)" decisions \
+  's/\*"Waiting for a network"\* while parked/*"Waiting for network"* while parked/' || fails=$((fails+1))
 [ "$fails" -eq 0 ] && echo "== all mutations convicted" || { echo "== $fails mutation(s) not convicted"; exit 1; }

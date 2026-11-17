@@ -6,8 +6,8 @@
 # BindingsRepair (a pure class, no android import) holds the confirmation copy and maps the daemon's reply to the line
 # the owner sees; it is compiled here with its cases (O1-O4). The SOURCE CHECKS (F1-F5) hold ChooserActivity, on its
 # code with the comments stripped: fillSimRows offers the row in both damage states (before the unreadable file's
-# early return, and not in the busy state), the tap asks with BindingsRepair.CONFIRM before the only REPAIR-BINDINGS
-# send, the send runs on a worker thread, the reply goes through BindingsRepair.outcome, and an OK re-runs a live
+# early return, and not in the busy state), the tap asks on the Repair sheet (GateNoticeSheets.repairBindings, whose
+# words are BindingsRepair.CONFIRM's two halves; NWP-20261206-17) before the only REPAIR-BINDINGS send, the send runs on a worker thread, the reply goes through BindingsRepair.outcome, and an OK re-runs a live
 # session's owner verdict on that thread before the UI reloads. Source checks run first and each failure is printed;
 # the helper's absence is reported after them.
 #
@@ -83,11 +83,11 @@ suite() {
   a=$(at "$fs" "$DAMAGE"); b=$(at "$fs" "$ROWLINE"); c=$(at "$fs" "$EARLY")
   if [ "$(cnt "$fs" "$ROWLINE")" != 1 ] || [ "$a" -eq 0 ] || [ "$b" -le "$a" ] || [ "$c" -le "$b" ]; then
     echo "  CHECK F1 fillSimRows does not add the Repair row (guarded by sums != null) exactly once between the damage test and the early return" >&2; bad=1; fi
-  # F2: the dialog, with CONFIRM and its Repair button, comes before the send -- and the send is the file's only one.
-  a=$(at "$m" 'new android.app.AlertDialog.Builder(this)'); b=$(at "$m" '.setMessage(BindingsRepair.CONFIRM)')
-  c=$(at "$m" '.setPositiveButton("Repair",'); e=$(at "$m" "$SEND")
-  if [ "$a" -eq 0 ] || [ "$b" -le "$a" ] || [ "$c" -le "$b" ] || [ "$e" -le "$c" ] || [ "$(cnt "$m" '.setNegativeButton("Cancel", null)')" != 1 ]; then
-    echo "  CHECK F2 confirmRepairBindings does not ask with BindingsRepair.CONFIRM (Repair / Cancel) before the REPAIR-BINDINGS send" >&2; bad=1; fi
+  # F2: the Repair sheet, its action in the Repair button's slot, comes before the send -- and the send is the file's
+  # only one. No plain dialog is left in the method (NWP-20261206-17).
+  a=$(at "$m" 'SheetDialog.confirm(this, GateNoticeSheets.repairBindings(), new Runnable[] { () -> {'); e=$(at "$m" "$SEND")
+  if [ "$a" -eq 0 ] || [ "$e" -le "$a" ] || [ "$(cnt "$m" 'AlertDialog')" != 0 ] || [ "$(cnt "$m" 'setNegativeButton(')" != 0 ]; then
+    echo "  CHECK F2 confirmRepairBindings does not ask on the Repair sheet (GateNoticeSheets.repairBindings) before the REPAIR-BINDINGS send" >&2; bad=1; fi
   if [ "$(cnt "$all" 'REPAIR-BINDINGS')" != 1 ]; then
     echo "  CHECK F2 REPAIR-BINDINGS is not sent from exactly one place in ChooserActivity's code" >&2; bad=1; fi
   # F3: the send is the first thing a started worker thread does.
@@ -143,7 +143,7 @@ mut() { # mut <label> <copy|act> <perl-expr>
 fails=0
 mut "M1 the row added after the early return"   act  's/(\n[ ]*if \(sums != null\) rows\.addView\(settingsRow\(BindingsRepair\.ROW,[^\n]*)(\n[ ]*if \(sums == null \|\| sums == TelArrival\.DAMAGED_BINDINGS\) return;[^\n]*)/$2$1/' || fails=$((fails+1))
 mut "M2 the send without the dialog"            act  's/v -> confirmRepairBindings\(err\)/v -> new Thread(() -> sendDaemon("REPAIR-BINDINGS\\n")).start()/' || fails=$((fails+1))
-mut "M2b the dialog without CONFIRM"            act  's/\.setMessage\(BindingsRepair\.CONFIRM\)/.setMessage(BindingsRepair.ROW_SUMMARY)/' || fails=$((fails+1))
+mut "M2b the dialog without CONFIRM"            act  's/GateNoticeSheets\.repairBindings\(\)/GateNoticeSheets.otaNotes(BindingsRepair.TITLE, BindingsRepair.ROW_SUMMARY)/' || fails=$((fails+1))
 mut "M3 the send on the UI thread"              act  's/new Thread\(\(\) -> \{(\s*final String r = sendDaemon\("REPAIR-BINDINGS)/((Runnable) () -> {$1/; s/\}, "nowhere-bindings-repair"\)\.start\(\);/}).run();/' || fails=$((fails+1))
 mut "M4 outcome maps ERR io to success"         copy 's/(t\.startsWith\("ERR io "\)\) return )IO;/${1}CLEAN;/' || fails=$((fails+1))
 mut "M5 outcome maps BUSY to success"           copy 's/if \(t\.equals\("BUSY"\)\) return BUSY;/if (t.equals("BUSY")) return CLEAN;/' || fails=$((fails+1))

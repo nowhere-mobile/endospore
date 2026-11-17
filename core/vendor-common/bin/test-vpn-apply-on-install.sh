@@ -55,6 +55,7 @@ A=$(awk -v l="  bootwake)" '$0==l{on=1} on{print} on&&/^    ;;$/{exit}' "$SUT")
 C=$(func vpn_apply_choice)
 K=$(func vpn_pick_consume)
 R=$(func vpn_deferred_retry)
+VD=$(func vpn_diag_note)   # NWP-20261202-41: the real note, so a case runs the deferred retry whole
 T=$(grep -m1 -E '^VPN_APPLY_TRIES=' "$SUT")
 ODH=$(grep -m1 -E '^ODHOLD=' "$SUT")
 case "$F" in *'cutoff_run()'*) ;; *) echo "EXTRACTION FAILED: the cutoff functions in $SUT" >&2; exit 2 ;; esac
@@ -63,6 +64,7 @@ case "$A" in *'cutoff_run boot'*) ;; *) echo "EXTRACTION FAILED: the bootwake ar
 case "$C" in *'np.VpnAlwaysOn'*) ;; *) echo "EXTRACTION FAILED: vpn_apply_choice in $SUT" >&2; exit 2 ;; esac
 case "$K" in *'nowhere-vpn-pick'*) ;; *) echo "EXTRACTION FAILED: vpn_pick_consume in $SUT" >&2; exit 2 ;; esac
 case "$R" in *'.vpndeferred'*) ;; *) echo "EXTRACTION FAILED: vpn_deferred_retry in $SUT" >&2; exit 2 ;; esac
+case "$VD" in *'.vpndiag.'*) ;; *) echo "EXTRACTION FAILED: vpn_diag_note in $SUT" >&2; exit 2 ;; esac
 [ -n "$T" ] || { echo "EXTRACTION FAILED: VPN_APPLY_TRIES= not found in $SUT" >&2; exit 2; }
 [ -n "$ODH" ] || { echo "EXTRACTION FAILED: ODHOLD= not found in $SUT" >&2; exit 2; }
 RA=$(printf '%s\n' "$A" | sed -E 's#([" |])/data/#\1$ROOT/data/#g')
@@ -118,7 +120,7 @@ app_process(){
 }
 EOF
 )
-BODY=$(printf '%s\n' "$ODH" "$F" "$L" "$K" "$C" "$T" "$R" 'umask 022' 'case "$op" in' "$RA" '  seal)' '    vpn_deferred_retry "$uid"' '    ;;' 'esac')
+BODY=$(printf '%s\n' "$ODH" "$F" "$L" "$K" "$C" "$T" "$VD" "$R" 'umask 022' 'case "$op" in' "$RA" '  seal)' '    vpn_deferred_retry "$uid"' '    ;;' 'esac')
 
 # The session of the cases, for user 10. com.vpn.tail (the VPN app, declares a boot receiver), com.vpn.quiet (a VPN app
 # with no boot receiver) and com.other (any other restored app, declares one) are installed with their data dirs.

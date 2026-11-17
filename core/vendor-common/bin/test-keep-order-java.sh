@@ -367,7 +367,7 @@ IFS= read -r -d '' P_PAINT <<'EOF'
 EOF
 IFS= read -r -d '' P_DIALOG <<'EOF'
         // NWP-20261012-06: no "Download first" button -- the install order is the order of the rows, dragged.
-        new android.app.AlertDialog.Builder(this)
+        SheetDialog.picker(this, KeepModeSheets.picker(String.valueOf(keptLabel(pkg)), items, checked),
 EOF
 IFS= read -r -d '' P_CHIP <<'EOF'
         chip.setText(label);
@@ -522,7 +522,7 @@ mut "C10 the marks deleted though the reorder failed"  S 's/            if \(!re
 mut "C11 a wake choice written inverted"               S 's/KeepOrder\.setWake\(f\.exists\(\) \? KeepOrder\.readText\(f\) : "", pkg, on\)/KeepOrder.setWake(f.exists() ? KeepOrder.readText(f) : "", pkg, !on)/' || fails=$((fails+1))
 mut "C12 Your apps lists rows unsorted"                P 's/java\.util\.List<String> sorted = KeepOrder\.keptFirst\(pkgs, keptNow\);/java.util.List<String> sorted = new java.util.ArrayList<>(pkgs);/' || fails=$((fails+1))
 mut "C13 a drag is never written"                      P 's/                    dragged\.setAlpha\(1f\);\n                    writeKeepOrder\(list\);\n/                    dragged.setAlpha(1f);\n/' || fails=$((fails+1))
-mut "C14 Download first is offered again"              P 's/(rows, dragged\.\n        new android\.app\.AlertDialog\.Builder\(this\))\n/$1.setNeutralButton("Download first", null)\n/' || fails=$((fails+1))
+mut "C14 Download first is offered again"              P 's/(rows, dragged\.\n)(        SheetDialog\.picker\(this, KeepModeSheets\.picker\()/$1        new android.app.AlertDialog.Builder(this).setNeutralButton("Download first", null).show();\n$2/' || fails=$((fails+1))
 mut "C15 checking the box does not wake the app"       P 's/ != 0\) UnarchiveService\.unstop\(app, pkg\);/ != 0) Log.i("NowhereChooser", "not woken");/' || fails=$((fails+1))
 mut "C16 the check is offered on On-demand rows too"   P 's/boolean wakeable = MODE_AUTO\.equals\(m\) \|\| MODE_INSTALLED\.equals\(m\);/boolean wakeable = m != null;/' || fails=$((fails+1))
 mut "C17 the first chip label is back"                 P 's/        chip\.setText\(label\);/        chip.setText(MODE_AUTO.equals(mode) ? label + " · first" : label);/' || fails=$((fails+1))

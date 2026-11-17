@@ -296,3 +296,68 @@ func handleAutoSweepApp(conn net.Conn, r *bufio.Reader) {
 	fmt.Fprintf(os.Stderr, "[logind] auto sweep app %d/%d: %s in %dms\n", i, n, autoSweepOutcomeTokens[k], ms)
 	fmt.Fprint(conn, "OK\n")
 }
+
+// NWP-20261203-03 (the backlog row "P1: An Auto sweep stalls after its first fetch and no app installs for the rest
+// of the session ..."; frankel 0.5.55, NW-349dcb68882a / NW-8d4e018a16d7): after one RESTORE-ODDATA answered OK,
+// login.log held 40 minutes with no `auto sweep app` and no `auto sweep ended` line, and nothing named the step the
+// sweep waited in. The chooser's SweepStall watches each step of the sweep and sends AUTO-SWEEP-STEP when a step has
+// made no progress for 5 minutes (stall, repeated every 10), when a stalled step ends (ended), when the pass is
+// abandoned after 25 minutes (abandoned), and when a start joins a running sweep (joined). The daemon writes ONE line
+// from validated numbers and two tokens of these closed sets: no package, no label, no path. Lock-free, like
+// AUTO-SWEEP-APP: a stalled sweep may be waiting on a lock this verb must never wait on.
+
+// autoSweepStepKinds is the closed set of AUTO-SWEEP-STEP kinds, in SweepStall.KINDS order.
+var autoSweepStepKinds = [...]string{"stall", "ended", "abandoned", "joined"}
+
+// autoSweepStepTokens is the closed set of sweep steps, in SweepStall.STEPS order (test-sweep-stall-java.sh T1).
+var autoSweepStepTokens = [...]string{"list", "card", "seal-hold", "tap", "restore-only", "lock", "dep-fetch", "dep-install", "dep-restore", "fetch", "version", "install", "restore", "report", "busy-wait"}
+
+// autoSweepStepIndex is tok's index in set, -1 for anything else.
+func autoSweepStepIndex(set []string, tok string) int {
+	for k, t := range set {
+		if t == tok {
+			return k
+		}
+	}
+	return -1
+}
+
+// parseSweepStep validates AUTO-SWEEP-STEP's five lines: a kind and a step of the closed sets (their indexes k and
+// s), 0 <= i <= n <= 9999, 0 <= secs <= 86400. PURE.
+func parseSweepStep(kindRaw, stepRaw, iRaw, nRaw, secsRaw string) (k, s, i, n, secs int, ok bool) {
+	var okI, okN, okSecs bool
+	k = autoSweepStepIndex(autoSweepStepKinds[:], kindRaw)
+	s = autoSweepStepIndex(autoSweepStepTokens[:], stepRaw)
+	i, okI = sweepAppNum(iRaw, 4, 0, 9999)
+	n, okN = sweepAppNum(nRaw, 4, 0, 9999)
+	secs, okSecs = sweepAppNum(secsRaw, 5, 0, 86400)
+	if k < 0 || s < 0 || !okI || !okN || !okSecs || i > n {
+		return 0, 0, 0, 0, 0, false
+	}
+	return k, s, i, n, secs, true
+}
+
+// handleAutoSweepStep is "AUTO-SWEEP-STEP\n<kind>\n<step>\n<i>\n<n>\n<secs>\n" -> "OK" | "ERR-ARG". NWP-20261203-03.
+// On OK it logs ONE line to login.log, built from the validated numbers and the tokens taken from
+// autoSweepStepKinds / autoSweepStepTokens (never the wire string). Anything else -- a token outside the sets, a bad
+// number, a line cut short -- answers ERR-ARG and logs nothing. No lock, no store, no session file, no lease renewal:
+// it is on the lock-free allowlist.
+func handleAutoSweepStep(conn net.Conn, r *bufio.Reader) {
+	var f [5]string
+	for x := range f {
+		l, err := r.ReadString('\n')
+		if err != nil {
+			fmt.Fprint(conn, "ERR-ARG\n")
+			return
+		}
+		f[x] = strings.TrimRight(l, "\r\n") // not TrimSpace: a token with a space is refused
+	}
+	k, s, i, n, secs, ok := parseSweepStep(f[0], f[1], f[2], f[3], f[4])
+	if !ok {
+		fmt.Fprint(conn, "ERR-ARG\n")
+		return
+	}
+	fmt.Fprintf(os.Stderr, "[logind] auto sweep step %s: %s app %d/%d after %ds\n",
+		autoSweepStepKinds[k], autoSweepStepTokens[s], i, n, secs)
+	fmt.Fprint(conn, "OK\n")
+}

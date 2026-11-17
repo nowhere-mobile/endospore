@@ -14,8 +14,8 @@ public final class SupersedeCreditCases {
         }
     }
 
-    // The dialog's wait and the Cancel path are Android code no case can run, so they are pinned byte for byte. The
-    // ways they break silently -- a dialog the back key dismisses with no answer, Continue that never counts down, a
+    // The sheet's wait and the keep path are Android code no case can run, so they are pinned byte for byte. The
+    // ways they break silently -- a sheet the back key dismisses with no answer, Continue that never counts down, a
     // gate that goes away read as Continue, a wait with no limit or one that stops while the phone sleeps, Cancel
     // landing anywhere but the parked session -- each change the text. A deliberate edit updates the pin with it; a
     // failure names the first line that differs.
@@ -23,17 +23,14 @@ public final class SupersedeCreditCases {
             "    private boolean confirmSupersedeLoss(final boolean creditLost) {\n"
             + "        final java.util.concurrent.CountDownLatch answered = new java.util.concurrent.CountDownLatch(1);\n"
             + "        final boolean[] go = {false};\n"
-            + "        final android.app.AlertDialog[] shown = {null};\n"
+            + "        final android.app.Dialog[] shown = {null};\n"
             + "        final long since = android.os.SystemClock.elapsedRealtime();\n"
             + "        runOnUiThread(() -> {\n"
             + "            if (isFinishing() || isDestroyed()) { answered.countDown(); return; }\n"
-            + "            shown[0] = new android.app.AlertDialog.Builder(this)\n"
-            + "                    .setTitle(supersedeLossTitle())\n"
-            + "                    .setMessage(supersedeLossText(creditLost))\n"
-            + "                    .setCancelable(false)\n"
-            + "                    .setPositiveButton(\"Continue\", (d, w) -> { go[0] = true; answered.countDown(); })\n"
-            + "                    .setNegativeButton(\"Cancel\", (d, w) -> answered.countDown())\n"
-            + "                    .show();\n"
+            + "            shown[0] = SheetDialog.confirm(this,\n"
+            + "                    SigninLossSheets.supersede(supersedeLossTitle(), supersedeLossContext(), supersedeLossLines(creditLost)),\n"
+            + "                    new Runnable[] { () -> answered.countDown(), () -> { go[0] = true; answered.countDown(); } }, null);\n"
+            + "            if (shown[0] != null) shown[0].setCancelable(false);\n"
             + "        });\n"
             + "        try {\n"
             + "            while (!answered.await(500, java.util.concurrent.TimeUnit.MILLISECONDS)) {\n"
@@ -75,7 +72,7 @@ public final class SupersedeCreditCases {
             + "                }\n"
             + "                supersedeLossAcceptedUid = supersedeColdUid; // its NEEDKEY key-wait retry does not ask again\n"
             + "            }\n";
-    static final String CREDIT = " That includes storage credit it hasn't saved. Credit saved before that session is safe.";
+    static final String CREDIT = "That includes storage credit it hasn't saved. Credit saved before that session is safe.";
 
     public static void main(String[] a) throws Exception {
         // ---- the decision: when a sign-in asks ----
@@ -102,21 +99,24 @@ public final class SupersedeCreditCases {
         // ---- the copy ----
         // The gate cannot learn whether the parked session has unsaved changes, so the words must be true either way,
         // of a stored session and a throwaway alike: they say what ends and what is lost IF unsaved, never whether.
-        String title = Lifted.supersedeLossTitle(), t0 = Lifted.supersedeLossText(false), t1 = Lifted.supersedeLossText(true);
+        // The sheet shows the title, the context sentence and the lines; what the green button keeps is its own label
+        // (core/vendor-common/bin/test-signin-loss-sheets-java.sh checks the labels).
+        String title = Lifted.supersedeLossTitle(), ctx = Lifted.supersedeLossContext();
+        String[] l0 = Lifted.supersedeLossLines(false), l1 = Lifted.supersedeLossLines(true);
+        String t0 = ctx + "\n" + String.join("\n", l0), t1 = ctx + "\n" + String.join("\n", l1);
         check("copy: the title names no credit", !title.isEmpty() && !title.toLowerCase().contains("credit"), title);
         check("copy: says signing in ends a locked session on this phone",
-                t0.contains("Signing in now ends a locked session on this phone.")
-                        && t1.contains("Signing in now ends a locked session on this phone."), t0 + "\n--\n" + t1);
+                ctx.equals("Signing in now ends a locked session on this phone."), ctx);
         check("copy: says anything the session hasn't saved is lost",
-                t0.contains("Anything that session hasn't saved is lost.")
-                        && t1.contains("Anything that session hasn't saved is lost."), t0 + "\n--\n" + t1);
-        check("copy: says what Cancel keeps", t0.endsWith("\n\nCancel keeps that session.")
-                && t1.endsWith("\n\nCancel keeps that session."), t0 + "\n--\n" + t1);
+                l0.length > 0 && l1.length > 0 && l0[0].equals("Anything that session hasn't saved is lost.")
+                        && l1[0].equals("Anything that session hasn't saved is lost."), t0 + "\n--\n" + t1);
         check("copy: without LOST it names no credit", !t0.toLowerCase().contains("credit"), t0);
         check("copy: with LOST it carries the credit sentence",
-                t1.contains(" That includes storage credit it hasn't saved.")
+                t1.contains("That includes storage credit it hasn't saved.")
                         && t1.contains("Credit saved before that session is safe."), t1);
-        check("copy: the credit sentence is the only difference", t1.replace(CREDIT, "").equals(t0), t0 + "\n--\n" + t1);
+        boolean onlyCredit = l1.length == l0.length + 1 && l1[l0.length].equals(CREDIT);
+        for (int i = 0; onlyCredit && i < l0.length; i++) onlyCredit = l1[i].equals(l0[i]);
+        check("copy: the credit sentence is the only difference", onlyCredit, t0 + "\n--\n" + t1);
         String all = title + "\n" + t0 + "\n" + t1, lower = all.toLowerCase();
         check("copy: names no amount (no digit anywhere)", !all.matches("(?s).*[0-9].*"), all);
         check("copy: names no profile (no placeholder)", !all.contains("%") && !all.contains("{") && !all.contains("<")

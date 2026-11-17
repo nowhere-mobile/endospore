@@ -240,6 +240,9 @@ suite() {
     for c in 0 1 2; do
       T=$(mktemp -d -p "$W"); : > "$T/argv"
       stub="bt_reset() { printf '%s|%s|%s\n' \"\$1\" \"\$2\" \"\$3\" > \"\$T/btargs\"; return $c; }"
+      stub="$stub
+drm_wipe() { DRM_LINE=\"\"; }"   # NWP-20261203-08: the block now ends with the DRM store wipe, test-drm-wipe.sh's
+
       { printf "T='%s'\nLOG=\"\$T/log\"; uid=11\n" "$T"; printf '%s\n%s\n' "$stub" "$OPBLOCK"; } > "$T/run.sh"
       "$sh" "$T/run.sh" >"$T/stdout" 2>&1
       [ "$(cat "$T/btargs" 2>/dev/null)" = '|reap|11' ] || no "L8: status $c: the block called bt_reset with '$(cat "$T/btargs" 2>/dev/null)'"

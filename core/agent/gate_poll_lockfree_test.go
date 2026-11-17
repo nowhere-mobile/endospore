@@ -60,6 +60,9 @@ func TestGatePollVerbsAnswerWhileSessionMuIsHeld(t *testing.T) {
 			func(t *testing.T, dest string) { gatePollPlant(t, dest, mediaAppProgFile, appprog) }},
 		{"media status, no file", "GET-MEDIA-STATUS\n", "IDLE", func(t *testing.T, dest string) {}},
 		{"media app progress, no file", "GET-MEDIA-APP-PROGRESS\n", "IDLE", func(t *testing.T, dest string) {}},
+		{"media landed, a count", "GET-MEDIA-LANDED\n", "3", func(t *testing.T, dest string) { gatePollPlant(t, dest, mediaLandedFile, "3\n") }},
+		{"media landed, no file", "GET-MEDIA-LANDED\n", "0", func(t *testing.T, dest string) {}},
+		{"media landed, not a number", "GET-MEDIA-LANDED\n", "0", func(t *testing.T, dest string) { gatePollPlant(t, dest, mediaLandedFile, "x\n") }},
 		{"metered on for the session", "GET-PREFETCH-METERED\n", "1", func(t *testing.T, dest string) {
 			gatePollMark(t, dest)
 			gatePollPlant(t, dest, prefetchMeteredOut, "12 1\n")

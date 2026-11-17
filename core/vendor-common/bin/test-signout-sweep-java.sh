@@ -96,7 +96,7 @@ sources() {
   fi
   if perl -0e '
       my $c = do { local $/; <STDIN> };
-      exit 1 unless $c =~ /for \(int c = 0; c < retry\.size\(\); c \+= OdRestoreList\.CHUNK\) \{\s*if \(SignOutGate\.begun\(\)\) break;\s*if \(SweepHold\.held\(\)\) break;\s*java\.util\.List<String> chunk = [^;]*;\s*MAT_LOCK\.lock\(\);.*?restoreOnlyListLocked\(keep\)/s;
+      exit 1 unless $c =~ /for \(int c = 0; c < retry\.size\(\); c \+= OdRestoreList\.CHUNK\) \{\s*if \(SignOutGate\.begun\(\)\) break;\s*if \(SweepHold\.held\(\)\) break;\s*(?:if \(SweepStall\.abandoned\(\)\) break;\s*step\(SweepStall\.LOCK, c, retry\.size\(\)\);\s*)?java\.util\.List<String> chunk = [^;]*;\s*MAT_LOCK\.lock\(\);.*?restoreOnlyListLocked\(keep\)/s;
       exit 1 if $c =~ /for \(String pkg : work\)/;
       exit 1 unless $c =~ /for \(int i = 0; i < work\.size\(\); i\+\+\) \{\s*if \(SignOutGate\.begun\(\)\) \{(?:(?!materializeAndInstall).)*?\bbreak;\s*\}\s*String pkg = work\.get\(i\);.*?materializeAndInstall\(pkg, true\)/s;
       exit 0;' <<<"$sweep"; then

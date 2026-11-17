@@ -393,6 +393,13 @@ func healthStatusValue(r *healthRuleResult, now time.Time) string {
 // mergeHealth adds the session's last results (uid) to an in-session report's status, after buildIssueReportWith, as
 // mergeDaySummary does. It deletes every caller-sent health_ key first, at every scope, so only this file can set one.
 // A gate report carries none, and neither does a report for a uid the stored results are not for.
+//
+// NWP-20261205-03: the value of a rule with a Fix (a healthFixes key) ends with ` fix_age=<s>`, the seconds since this
+// session's last successful Fix of that rule, or ` fix=none` when there was none; a rule with no Fix gets neither. How
+// to read one value: age is the seconds since the rule's last check, bad_for the length of the bad run up to that
+// check, fix_age the seconds since the Fix. CLEAR with fix_age > age means a check after the Fix found Play push
+// healthy. FIRING with age < fix_age < age + bad_for means the bad run began before the Fix and a check after the Fix
+// still found it bad. The fix ages are read before healthMu is taken: the two mutexes never nest.
 func mergeHealth(status map[string]string, uid string, deviceScope bool) {
 	for k := range status { // a nil map ranges zero times
 		if strings.HasPrefix(k, "health_") {
@@ -403,13 +410,24 @@ func mergeHealth(status map[string]string, uid string, deviceScope bool) {
 		return
 	}
 	now := healthNow()
+	fixes := map[string]string{} // rule id -> its Fix field, read before healthMu is taken
+	for _, rule := range healthRules {
+		if _, hasFix := healthFixes[rule.id]; !hasFix {
+			continue
+		}
+		if age, ok := healthFixAge(uid, rule.id, now); ok {
+			fixes[rule.id] = fmt.Sprintf(" fix_age=%d", age)
+		} else {
+			fixes[rule.id] = " fix=none"
+		}
+	}
 	healthMu.Lock()
 	defer healthMu.Unlock()
 	if healthState == nil || !healthSessionLive(uid) || healthState.uid != uid {
 		return
 	}
 	for i, rule := range healthRules {
-		status[rule.statusKey] = healthStatusValue(&healthState.results[i], now)
+		status[rule.statusKey] = healthStatusValue(&healthState.results[i], now) + fixes[rule.id]
 	}
 	status["health_checks"] = strconv.Itoa(healthState.checks)
 }

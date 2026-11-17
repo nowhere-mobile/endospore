@@ -115,7 +115,7 @@ sources() {
     else {
       my $b = substr($s, $i + length($loop));
       push @f, "the chunk loop does not check SignOutGate.begun() before anything else"
-        unless $b =~ /\A\s*if \(SignOutGate\.begun\(\)\) break;\s*if \(SweepHold\.held\(\)\) break;\s*java\.util\.List<String> chunk = retry\.subList\(c, Math\.min\(c \+ OdRestoreList\.CHUNK, retry\.size\(\)\)\);\s*MAT_LOCK\.lock\(\);/;
+        unless $b =~ /\A\s*if \(SignOutGate\.begun\(\)\) break;\s*if \(SweepHold\.held\(\)\) break;\s*(?:if \(SweepStall\.abandoned\(\)\) break;\s*step\(SweepStall\.LOCK, c, retry\.size\(\)\);\s*)?java\.util\.List<String> chunk = retry\.subList\(c, Math\.min\(c \+ OdRestoreList\.CHUNK, retry\.size\(\)\)\);\s*MAT_LOCK\.lock\(\);/;
       push @f, "the chunk loop does not re-read autoAction(hasInstalledCode(pkg), odRestored(pkg), false) under MAT_LOCK"
         unless $b =~ /\A[^}]*?MAT_LOCK\.lock\(\);\s*try \{\s*java\.util\.List<String> keep = new ArrayList<>\(\);\s*for \(String pkg : chunk\) \{\s*if \(autoAction\(hasInstalledCode\(pkg\), odRestored\(pkg\), false\)\s*== AUTO_RESTORE_ONLY\) keep\.add\(pkg\);\s*\}/;
       push @f, "the chunk loop does not send one app through restoreOnlyLocked and two or more through restoreOnlyListLocked"
@@ -131,14 +131,14 @@ FAIL P1 the perl check did not run"
   # P2: the list path.
   if ! has "$rlist" 'OdRestoreList.parse(DaemonSocket.roundTripLines(OdRestoreList.request(keep), 130000), keep);'; then
     echo "FAIL P2 restoreOnlyListLocked does not send OdRestoreList.request(keep) through roundTripLines and parse it"; bad=1
-  elif ! perl -0777 -ne 'exit(/for \(String pkg : keep\) \{\s*try \{\s*restoreOnlyReplied\(pkg, replies\.get\(pkg\)\);/ ? 0 : 1)' <<<"$rlist"; then
+  elif ! perl -0777 -ne 'exit(/for \(String pkg : keep\) \{\s*try \{\s*(?:OdRestoreOnce\.record\(pkg, installStamp\(this, pkg\), replies\.get\(pkg\)\);[^\n]*\n\s*)?restoreOnlyReplied\(pkg, replies\.get\(pkg\)\);/ ? 0 : 1)' <<<"$rlist"; then
     echo "FAIL P2 restoreOnlyListLocked does not hand each app its own reply through restoreOnlyReplied"; bad=1
   elif has "$rlist" 'markOdRestored(' || has "$rlist" 'wakeOnRestore('; then
     echo "FAIL P2 restoreOnlyListLocked marks or wakes on its own, not through the shared tail"; bad=1
   else echo "ok P2 restoreOnlyListLocked sends one list and hands each app its own reply"; fi
   # P3: the one-name path and the shared tail.
   mk=$(lineno "$rtail" 'if (ok) markOdRestored(pkg);'); wk=$(lineno "$rtail" 'if (ok && wakeOnRestore(this, pkg)) unstop(this, pkg);')
-  if ! has "$ronly" 'String rr = daemon("RESTORE-ODDATA\n" + pkg + "\n");' || ! has "$ronly" 'return restoreOnlyReplied(pkg, rr);'; then
+  if ! has "$ronly" 'String rr = OdRestoreOnce.send(pkg, installStamp(this, pkg), () -> daemon("RESTORE-ODDATA\n" + pkg + "\n"), ' || ! has "$ronly" 'return restoreOnlyReplied(pkg, rr);'; then
     echo "FAIL P3 restoreOnlyLocked does not send the one-name request and return restoreOnlyReplied(pkg, rr)"; bad=1
   elif has "$ronly" 'markOdRestored('; then
     echo "FAIL P3 restoreOnlyLocked marks on its own, not through the shared tail"; bad=1

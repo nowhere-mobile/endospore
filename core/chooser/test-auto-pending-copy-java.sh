@@ -15,7 +15,7 @@
 # install" literal of its own; (P3) it shows AutoPendingCopy.link(allowMetered, onWifi) with a click listener that
 # opens showOfflineMedia(); (P4) applyPendingRow reads readPrefetchMetered() and ChooserActivity.onWifiCtx(this) before
 # its NONE return, gives them and the row's tag to AutoPendingCopy.rowAction there, and passes them to the one
-# installPendingRow(n, allowMetered, onWifi) call; (P5) installPendingRow tags its row with waitingForWifi.
+# installPendingRow(n, allowMetered, onWifi, mode) call (NWP-20261203-23 adds HoldRow's mode); (P5) installPendingRow tags its row with waitingForWifi.
 # The merger's full javac / `m NowhereChooser` covers ProfileActivity itself.
 #
 # What this does NOT prove: the handset look (switch off, mobile data only: Your apps shows the waiting line and its
@@ -206,7 +206,7 @@ def body(sig):
             if d == 0: return src[j:k + 1]
     print("EXTRACTION FAILED: unbalanced braces after %r" % sig); sys.exit(2)
 
-row = body('private LinearLayout installPendingRow(int n, boolean allowMetered, boolean onWifi) {')
+row = body('private LinearLayout installPendingRow(int n, boolean allowMetered, boolean onWifi, int mode) {')
 app = body('private void applyPendingRow(LinearLayout ll, View summary, View[] rowRef, int[] shown, int n, boolean sweepEnded) {')   # NWP-20261119-30: the body; the five-argument one delegates with false
 bad = []
 
@@ -229,11 +229,11 @@ am = app.find('boolean allowMetered = readPrefetchMetered();')
 ow = app.find('boolean onWifi = ChooserActivity.onWifiCtx(this);')
 ra = app.find('act = AutoPendingCopy.rowAction(act, rowRef[0] == null ? null : rowRef[0].getTag(), allowMetered, onWifi);')
 no = app.find('if (act == PendingRow.NONE) return;')
-call = app.find('installPendingRow(n, allowMetered, onWifi)')
+call = app.find('installPendingRow(n, allowMetered, onWifi, mode)')
 if min(ca, am, ow, ra, no, call) < 0 or not (ca < ra and am < ra and ow < ra and ra < no < call):
     bad.append('(P4) applyPendingRow does not read readPrefetchMetered() and ChooserActivity.onWifiCtx(this), ask '
                'AutoPendingCopy.rowAction with the row\'s tag before its NONE return, and pass them to '
-               'installPendingRow(n, allowMetered, onWifi)')
+               'installPendingRow(n, allowMetered, onWifi, mode)')
 if len(re.findall(r'\ballowMetered\s*=', app)) != 1 or len(re.findall(r'\bonWifi\s*=', app)) != 1:
     bad.append('(P4) applyPendingRow sets allowMetered or onWifi more than once')
 # P5 the row records which words it says, for rowAction

@@ -7,8 +7,9 @@
 # save line ends kib=<upload KiB> from that run's seal split, "-" when the run left none (NWP-20261128-29). Every
 # REPORT-ISSUE sent at session scope adds a report line (the caller's report_kind, the reply's class, no ticket) after
 # its reply, so the next report shows it (NWP-20261202-11).
+# Each always-on VPN apply adds a codes-only ev=vpn line (NWP-20261202-41, vpn_day_summary_test.go; mutants A1-A6).
 #
-# Runs day_summary_test.go. --mutate breaks each guard in turn on a COPY of the package; each mutant must be
+# Runs day_summary_test.go and vpn_day_summary_test.go. --mutate breaks each guard in turn on a COPY of the package; each mutant must be
 # CONVICTED by a real `--- FAIL`. One that fails to apply or compile is a failure.
 set -uo pipefail
 cd "$(dirname "$0")"
@@ -103,4 +104,17 @@ mut "m18 the report writer ignores device scope" day_summary.go \
   '\tif deviceScope \{\n\t\treturn\n\t\}\n(\tdaySummaryAppend\(uid, fmt\.Sprintf\("v=1 t=%d ev=report)' '\1'
 mut "m19 the report rc keeps the ticket" day_summary.go \
   '(case reply == "OK" \|\| strings\.HasPrefix\(reply, "OK "\):\n\t\treturn "ok")' '\1 + strings.TrimPrefix(reply, "OK")'
-[ "$fails" -eq 0 ] && echo "== all 26 mutations convicted" || { echo "== $fails mutation(s) not convicted"; exit 1; }
+# NWP-20261202-41: the always-on VPN apply's ev=vpn lines (vpn_day_summary_test.go, TestDaySummaryVpn*).
+mut "A1 the vpn shape missing from daySummaryLineT" day_summary.go \
+  'daySummaryVpnStateRe, daySummaryVpnRe, ' 'daySummaryVpnStateRe, '
+mut "A2 the vpn rc group loosened to any lower-case token" day_summary.go \
+  'ev=vpn at=\(signin\|seal\|install\) rc=\([a-z|]+\) s=' 'ev=vpn at=(signin|seal|install) rc=([a-z.]+) s='
+mut "A3 the vpnup give-up writes no line" main.go \
+  '\n\tdaySummaryTakeVpn\(uid, "gaveup"\)' ''
+mut "A4 the take does not remove the record" day_summary.go \
+  '\t_ = os\.Remove\(path\)\n\tnow := daySummaryNow\(\)' '\tnow := daySummaryNow()'
+mut "A5 the vpn line's s is always -" day_summary.go \
+  's = strconv\.FormatInt\(d, 10\)' '_ = d'
+mut "A6 the vpn take removed from triggerRoamWorkerKind" main.go \
+  '\n\tdefer daySummaryVpnAfterOp\(op, uid\)[^\n]*' ''
+[ "$fails" -eq 0 ] && echo "== all 32 mutations convicted" || { echo "== $fails mutation(s) not convicted"; exit 1; }

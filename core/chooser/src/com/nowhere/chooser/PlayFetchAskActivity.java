@@ -20,12 +20,21 @@ import android.widget.TextView;
  * {@link #ask} runs on the UnarchiveService worker: it opens a token on {@link PlayFetchAsk#ASKER}, starts this
  * activity and waits. The service and this activity share one process per user, so the static holder is shared.
  * The unarchive broadcast grants the FGS a temporary activity-start allowlist (120 s), so the start is permitted.
+ *
+ * NWP-20261205-12: the Your apps tap (ProfileActivity.yourAppsTap) asks through this same activity, with
+ * {@link #EXTRA_PLAY} false for an app with no Play-stack dep. Two askers can now run at once, so each acts only on
+ * its own token: {@link #dismiss(long)} finishes only its own question, and a question whose ask is no longer live
+ * never shows.
  */
 public class PlayFetchAskActivity extends Activity {
     static final String EXTRA_TOKEN = "nowhere.playask.token";
     static final String EXTRA_PKG = "nowhere.playask.pkg";
     static final String EXTRA_BYTES = "nowhere.playask.bytes";
+    /** NWP-20261205-12: true (the default) for the Play setup's words; false for an app with no Play-stack dep. */
+    static final String EXTRA_PLAY = "nowhere.playask.play";
     private static volatile PlayFetchAskActivity current;
+    /** NWP-20261205-12: the token whose ask waits now, 0 for none. Set with ASKER.open() under one lock. */
+    private static final java.util.concurrent.atomic.AtomicLong LIVE = new java.util.concurrent.atomic.AtomicLong();
     private long token;
 
     @Override protected void onCreate(Bundle b) {
@@ -41,6 +50,8 @@ public class PlayFetchAskActivity extends Activity {
         super.onCreate(b);
         Intent in = getIntent();
         token = in != null ? in.getLongExtra(EXTRA_TOKEN, -1) : -1;
+        // NWP-20261205-12: an ask that was retired, or timed out before this was created, never shows its question.
+        if (token != LIVE.get()) { finish(); return; }
         String pkg = in != null ? in.getStringExtra(EXTRA_PKG) : null;
         long bytes = in != null ? in.getLongExtra(EXTRA_BYTES, -1) : -1;
 
@@ -58,7 +69,7 @@ public class PlayFetchAskActivity extends Activity {
             col.addView(title);
         }
         TextView body = new TextView(this);
-        body.setText(PlayFetchAsk.message(bytes));
+        body.setText(in == null || in.getBooleanExtra(EXTRA_PLAY, true) ? PlayFetchAsk.message(bytes) : YourAppsFetch.message(bytes, false));
         body.setTextSize(16);
         col.addView(body);
 
@@ -80,6 +91,8 @@ public class PlayFetchAskActivity extends Activity {
 
         setContentView(col);
         setFinishOnTouchOutside(false); // an outside tap must not decide a ~130 MB download either way
+        final PlayFetchAskActivity prev = current;
+        if (prev != null && prev != this && prev.token != token) prev.finish(); // its ask was retired by ours; its buttons are dead
         current = this;
     }
 
@@ -109,27 +122,47 @@ public class PlayFetchAskActivity extends Activity {
         if (current == this) current = null;
     }
 
-    /** Dismiss the live question, if any. Safe to call from the UnarchiveService worker thread. */
-    static void dismiss() {
+    /** Dismiss the question of ask t, if it is the one showing. Safe from any thread. Another ask's question stays. */
+    static void dismiss(long t) {
         final PlayFetchAskActivity a = current;
-        if (a != null) new Handler(Looper.getMainLooper()).post(a::finish);
+        if (a != null && a.token == t) new Handler(Looper.getMainLooper()).post(a::finish);
     }
 
-    /** Ask, and wait at most waitMs. A failed start gives TIMEOUT at once; a TIMEOUT takes the dialog down. */
+    /** NWP-20261205-12: a question is up, or an ask is live whose activity is not created yet. */
+    static boolean showing() {
+        return current != null || LIVE.get() != 0;
+    }
+
+    /** Ask with the Play setup's words (UnarchiveService's call). */
     static PlayFetchAsk.Reply ask(Context ctx, String pkg, long bytes, long waitMs) {
-        long t = PlayFetchAsk.ASKER.open();
-        try {
-            ctx.startActivity(new Intent(ctx, PlayFetchAskActivity.class)
-                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_NO_ANIMATION)
-                    .putExtra(EXTRA_TOKEN, t)
-                    .putExtra(EXTRA_PKG, pkg)
-                    .putExtra(EXTRA_BYTES, bytes));
-        } catch (Throwable e) {
-            android.util.Log.w("NowhereChooser", "play-fetch ask: start failed", e);
-            return PlayFetchAsk.Reply.TIMEOUT;
+        return ask(ctx, pkg, bytes, true, waitMs);
+    }
+
+    /** Ask, and wait at most waitMs. A failed start gives TIMEOUT at once; a TIMEOUT takes this ask's dialog down.
+     *  play false: the size-unknown body is YourAppsFetch.UNKNOWN_APP, not the Play stack's. */
+    static PlayFetchAsk.Reply ask(Context ctx, String pkg, long bytes, boolean play, long waitMs) {
+        long t;
+        synchronized (PlayFetchAskActivity.class) {
+            t = PlayFetchAsk.ASKER.open();
+            LIVE.set(t);
         }
-        PlayFetchAsk.Reply r = PlayFetchAsk.ASKER.await(t, waitMs);
-        if (r == PlayFetchAsk.Reply.TIMEOUT) dismiss();
-        return r;
+        try {
+            try {
+                ctx.startActivity(new Intent(ctx, PlayFetchAskActivity.class)
+                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_NO_ANIMATION)
+                        .putExtra(EXTRA_TOKEN, t)
+                        .putExtra(EXTRA_PKG, pkg)
+                        .putExtra(EXTRA_BYTES, bytes)
+                        .putExtra(EXTRA_PLAY, play));
+            } catch (Throwable e) {
+                android.util.Log.w("NowhereChooser", "play-fetch ask: start failed", e);
+                return PlayFetchAsk.Reply.TIMEOUT;
+            }
+            PlayFetchAsk.Reply r = PlayFetchAsk.ASKER.await(t, waitMs);
+            if (r == PlayFetchAsk.Reply.TIMEOUT) dismiss(t);
+            return r;
+        } finally {
+            LIVE.compareAndSet(t, 0);
+        }
     }
 }

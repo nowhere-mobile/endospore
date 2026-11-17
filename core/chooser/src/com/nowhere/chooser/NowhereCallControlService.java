@@ -29,7 +29,7 @@ import android.telecom.InCallService;
  * profile does not own the SIM. On an UNBOUND SIM, TEL-OWNER answers NO for EVERY profile -- so every roamed
  * session is a stranger, so EVERY inbound call was declined, a PSAP calling back included. It rang first and
  * TelScrub then wiped user 0's log, so the outcome was ring, vanish, no record: exactly what #196 was decided
- * to prevent, reached by a different route. See emergencyExemption for the four signals and why the
+ * to prevent, reached by a different route. See emergencyExemption for the five signals and why the
  * foreground "stranger" is, on a callback, the person who dialled.
  */
 public final class NowhereCallControlService extends InCallService {
@@ -43,6 +43,9 @@ public final class NowhereCallControlService extends InCallService {
      *  would be invisible until someone needed it. So we also remember, locally, that an emergency call went out.
      *  ⚠ NWP-20260930-05: a PER-PROCESS static, and Telecom binds this service as the FOREGROUND user, so it does
      *  NOT survive a user switch -- docs/backlog.md, "The emergency-callback window does not survive a user switch, so a PSAP callback after a login can be rejected".
+     *  So since NWP-20261115-18 (Q047) the login daemon keeps a second copy, which does survive one: onCallAdded tells
+     *  it (EmergencyWindow.tell, EMERGENCY-MARK) where it sets this field, and signal 4 of emergencyExemption asks it
+     *  (EmergencyWindow.exemptReason, EMERGENCY-RECENT) when this field misses.
      *  Static and RAM-only, deliberately: it must not survive a power-off (nothing does here), and a fresh
      *  boot starting at 0 is correct -- the phone has placed no emergency call this boot. */
     private static volatile long sLastEmergencyOutboundAt = 0L;
@@ -71,7 +74,7 @@ public final class NowhereCallControlService extends InCallService {
      *  whoever is holding the phone, so on a callback they are not a stranger to that call at all -- they are
      *  the caller. Ringing it for them is not a leak being tolerated for safety; it is the correct routing.
      *
-     *  Four independent signals, any one of which exempts. Each is guarded separately so that a throw in one
+     *  Five independent signals, any one of which exempts. Each is guarded separately so that a throw in one
      *  only removes THAT signal rather than the whole check.
      *
      *  Returning null (reject) is only reached when every signal was evaluated and none fired. */
@@ -96,16 +99,15 @@ public final class NowhereCallControlService extends InCallService {
                     app.getSystemService(android.telephony.TelephonyManager.class);
             if (tm != null && tm.getEmergencyCallbackMode()) return "device is in emergency callback mode";
         } catch (Throwable ignore) {}
-        // 4. We saw an emergency call leave this handset recently (see sLastEmergencyOutboundAt).
-        long since = sLastEmergencyOutboundAt;
-        if (since > 0) {
-            long age = System.currentTimeMillis() - since;
-            // A backwards clock jump would make age negative; treat that as inside the window rather than
-            // outside it, because the safe direction here is "do not reject".
-            if (age < EMERGENCY_CALLBACK_WINDOW_MS) {
-                return "an emergency call left this phone " + (age < 0 ? 0 : age / 1000) + "s ago";
-            }
-        }
+        // 4. We saw an emergency call leave this handset recently (see sLastEmergencyOutboundAt). NWP-20261115-18
+        //    (Q047): a hit in the local static OR in the login daemon's record counts -- the static is 0 in a process
+        //    started after a user switch, the daemon's record is not. The static is checked first and a hit there
+        //    asks nothing. No daemon answer within EmergencyWindow.ASK_CAP_MS fails OPEN: the call rings rather than
+        //    being rejected. The window's semantics, a backwards clock counting as inside it, are EmergencyWindowRule.
+        try {
+            String recent = EmergencyWindow.exemptReason(sLastEmergencyOutboundAt);
+            if (recent != null) return recent;
+        } catch (Throwable ignore) {}
         // 5. The caller's number is itself an emergency number. Public API. Last because a PSAP callback
         //    usually arrives from an ordinary administrative number, so this rarely fires -- but when it does
         //    it is decisive.
@@ -141,6 +143,9 @@ public final class NowhereCallControlService extends InCallService {
                                 getApplicationContext().getSystemService(android.telephony.TelephonyManager.class);
                         if (to != null && !to.isEmpty() && tm != null && tm.isEmergencyNumber(to)) {
                             sLastEmergencyOutboundAt = System.currentTimeMillis();
+                            // NWP-20261115-18 (Q047): and the login daemon, whose mark survives a user switch.
+                            // Fire-and-forget on its own thread; no number goes on the wire.
+                            EmergencyWindow.tell();
                             // No number in the log line: this is user-0's logcat and the number is the
                             // emergency service, but the FACT of the call is still the user's business.
                             android.util.Log.i("NowhereChooser",

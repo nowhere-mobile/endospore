@@ -119,9 +119,14 @@ func TestGatewayBudgetsAreTheReviewedValues(t *testing.T) {
 // and a lease at gwDefault); see capFlushWalletWait for what it leaves out.
 //
 // capFlush has a SECOND silent stretch: after the last blob's progress write, through the fold blob, the
-// pointer PUTs and putWalletHead's try for the lock. Each PUT there is one store request (storeHTTP) like any
+// pointer PUTs and putWalletHead's try for the lock. Each PUT there is one store request (storeXfer) like any
 // blob's; what this slice adds to it is the try, so the try is counted beside one PUT and must leave the same
 // 2x margin.
+//
+// NWP-20261203-10: that PUT is bounded by storeXferDeadline, not storeHTTP's 60 s Timeout, and it is priced at
+// 64 KiB in flight. That is honest for two reasons. The head's value is putHead's sealed pointer to the wallet
+// blob (billing.go, putHead(base, name+"#wallet", pass, h)): a hash, far under 64 KiB. And the head PUT runs
+// after the blob pass, so no wave of chunk PUTs is in flight beside it.
 func TestSealGatewayLegFitsTheStallBudget(t *testing.T) {
 	const callsInTheSilentWindow = 2 // quote, then lease
 	silent := callsInTheSilentWindow*gwDefault + capFlushWalletWait
@@ -131,10 +136,10 @@ func TestSealGatewayLegFitsTheStallBudget(t *testing.T) {
 			"seal, not a more patient one. If a longer lease deadline is genuinely needed, the fix is to feed "+
 			"progress across the gateway leg FIRST", silent, capFlushWalletWait, roamStallBudget)
 	}
-	if head := storeHTTP.Timeout + capFlushHeadWait; head*2 > roamStallBudget {
-		t.Errorf("the wallet head's PUT can be silent for %v (storeHTTP %v + capFlushHeadWait %v) against a %v "+
-			"stall budget -- putWalletHead must try the lock, not wait for it", head, storeHTTP.Timeout,
-			capFlushHeadWait, roamStallBudget)
+	if head := storeXferDeadline(64<<10) + capFlushHeadWait; head*2 > roamStallBudget {
+		t.Errorf("the wallet head's PUT can be silent for %v (storeXferDeadline(64 KiB) %v + capFlushHeadWait %v) "+
+			"against a %v stall budget -- putWalletHead must try the lock, not wait for it", head,
+			storeXferDeadline(64<<10), capFlushHeadWait, roamStallBudget)
 	}
 	// NWP-20261117-10: the lease leg's longest silence is now one leaseBeat, not leaseBudget: a /lease in flight
 	// re-writes its line every leaseBeat (lease_progress.go).
@@ -181,8 +186,10 @@ func TestStoreScreenProbesUseTheUIBudget(t *testing.T) {
 // restore writes progress in chunk order, so a chunk stuck there is a stretch with no progress at all. Its
 // worst case has to fit inside the worker's stall budget, or the retries meant for a hung fetch can never run:
 // the watchdog's ERR-TIMEOUT arrives first. One attempt is readCap's gateway requests at gwDefault each plus
-// storeHTTP.Timeout; retryStoreWithin starts the last attempt at most capGetRetryWindow after the first, and
-// the largest backoff is added on top to stay pessimistic.
+// storeXferStall, where a hung presigned GET ends (NWP-20261203-10: the GET goes through storeXfer, not
+// storeHTTP's 60 s Timeout); retryStoreWithin starts the last attempt at most capGetRetryWindow after the first,
+// and the largest backoff is added on top to stay pessimistic. A GET whose bytes flow is bounded by
+// storeXferCeil, which must end before the sign-in restore's watchdog (roamInStallTicks).
 func TestCapGetFitsTheStallBudget(t *testing.T) {
 	// readCap's gateway requests: the /caps POST, then the GET /cap fallback for a gateway that predates /caps.
 	// Counted from the source so a third request cannot slip in without this sum noticing.
@@ -191,14 +198,18 @@ func TestCapGetFitsTheStallBudget(t *testing.T) {
 	if gwCalls != 2 {
 		t.Errorf("readCap makes %d gateway requests, this test was written for 2 -- recheck the sum below", gwCalls)
 	}
-	attempt := gwCalls*gwDefault + storeHTTP.Timeout
+	attempt := gwCalls*gwDefault + storeXferStall
 	maxBackoff := s3RetryBase << (storeRetryAttempts - 2)
 	if worst := capGetRetryWindow + attempt + maxBackoff; worst >= roamStallBudget {
-		t.Errorf("one capGet can take %v (capGetRetryWindow %v + one attempt %v [%d x gwDefault %v + storeHTTP %v] "+
+		t.Errorf("one capGet can take %v (capGetRetryWindow %v + one attempt %v [%d x gwDefault %v + storeXferStall %v] "+
 			"+ backoff %v) against a %v stall budget -- the watchdog would give up before the retries do. Shrink "+
 			"capGetRetryWindow first; if an attempt alone no longer fits, the fix is to feed progress across "+
 			"the retry, not to raise roamStallTicks", worst, capGetRetryWindow, attempt, gwCalls, gwDefault,
-			storeHTTP.Timeout, maxBackoff, roamStallBudget)
+			storeXferStall, maxBackoff, roamStallBudget)
+	}
+	if in := roamInStallTicks * 500 * time.Millisecond; storeXferCeil >= in {
+		t.Errorf("storeXferCeil %v is not under the sign-in watchdog's %v (roamInStallTicks) -- a chunk GET whose "+
+			"bytes flow must end at its own deadline before the watchdog gives the whole restore up", storeXferCeil, in)
 	}
 	// The window must still let a FAST failure (a reset, #70; a stale-cap 403, #139) use every attempt: the
 	// backoffs between the five attempts sum to s3RetryBase x (1+2+4+8).

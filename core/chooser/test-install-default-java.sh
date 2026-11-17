@@ -19,6 +19,8 @@
 # without the GrapheneOS App Store (Diaspore) the flag changes nothing.
 # NWP-20261129-16 (docs/product-decisions.md, 2026-11-05, "seventeen answers to harvest 59 ...", #7): a hand install of
 # Play Store with play.wanted=0 turns Play back On (C13's "0" arm and C15; M1-M9 did not move).
+# NWP-20261203-11 (docs/product-decisions.md, 2026-09-26): the off-default clear records the Off (recordTurnedOff) before
+# removeKeepLines, and no other branch records one (C4, C4b, C4c and the harness check; M10-M12).
 # What it does NOT prove: the device run on that row (install from Aurora, set On-demand, uninstall in Settings, reinstall
 # in the same session; Your apps shows it Off, the bucket default).
 #
@@ -82,7 +84,7 @@ mut() { # mut <label> <perl-expr> [<lines-that-must-change>]
 }
 fails=0
 mut "M1 the off-default and Off-record branches swapped" 's/(        \} else if \(ProfileActivity\.APPDEF_OFF\.equals\(mode\)\) \{\n.*?\n)(        \} else if \(ProfileActivity\.explicitlyTurnedOff\(ctx\)\.contains\(pkg\)\) \{\n            outcome = "not kept \(the user switched this app off\)";\n)/$2$1/s' 2 || fails=$((fails+1))
-mut "M2 returning && dropped from the off-default clear" 's/(\n {12})if \(returning && (StoreInstaller\.keepSetHas\(ctx, pkg\)\) \{\n {16}StoreInstaller\.removeKeepLines)/$1if ($2/' || fails=$((fails+1))
+mut "M2 returning && dropped from the off-default clear" 's/(\n {12})if \(returning && (StoreInstaller\.keepSetHas\(ctx, pkg\)\) \{\n {16}StoreInstaller\.recordTurnedOff)/$1if ($2/' || fails=$((fails+1))
 mut "M3 the nApps branch removed" 's/\} else if \(ProfileActivity\.CFG_APPS_NAPPS\.equals\(key\)\) \{/} else if (false) {/' || fails=$((fails+1))
 mut "M4 removeKeepLines dropped from the returning reset" 's/ {12}StoreInstaller\.removeKeepLines\(ctx, java\.util\.Collections\.singleton\(pkg\)\);(\n {12}wrote = StoreInstaller\.keepInMode)/            ;$1/' || fails=$((fails+1))
 mut "M5 the catch-up log condition inverted" 's/if \(!"catch-up"\.equals\(via\) \|\| wrote\) \{/if ("catch-up".equals(via) || wrote) {/' || fails=$((fails+1))
@@ -98,4 +100,10 @@ mut "N7 the keepSetHas guard of the back-On playdep removed" 's/if \(!wrote && S
 mut "N8 clearTurnedOff dropped" 's/StoreInstaller\.clearTurnedOff\(ctx, java\.util\.Collections\.singleton\(PlayChoice\.VENDING\)\);/;/' || fails=$((fails+1))
 mut "N10 the marks dropped" 's/StoreInstaller\.keepInMode\(ctx, member, false, PlayChoice\.ONDEMAND\);/;/' || fails=$((fails+1))
 mut "N11 the on-this-phone test misses an archived package" 's/android\.content\.pm\.PackageManager\.MATCH_ARCHIVED_PACKAGES/0L/' || fails=$((fails+1))
+# NWP-20261203-11: the off-default clear records the Off first.
+# M10 and M11: convicted by C4's "recordTurnedOff(pkg) THEN removeKeepLines({pkg})" (and C4b's, C4c's).
+mut "M10 the Off record dropped from the off-default clear" 's/( {16})StoreInstaller\.recordTurnedOff\(ctx, pkg\);/$1;/' || fails=$((fails+1))
+mut "M11 the Off record written after removeKeepLines" 's/( {16}StoreInstaller\.recordTurnedOff\(ctx, pkg\);\n)( {16}StoreInstaller\.removeKeepLines\(ctx, java\.util\.Collections\.singleton\(pkg\)\);\n)/$2$1/' || fails=$((fails+1))
+# M12: convicted by C5's and C5b's "no Off record written" (the harness check).
+mut "M12 the Off record hoisted above the returning guard" 's/(\n {12})(if \(returning && StoreInstaller\.keepSetHas\(ctx, pkg\)\) \{)\n {16}(StoreInstaller\.recordTurnedOff\(ctx, pkg\);)/$1$3$1$2/' || fails=$((fails+1))
 [ "$fails" -eq 0 ] && echo "== all mutations convicted" || { echo "== $fails mutation(s) not convicted"; exit 1; }

@@ -15,6 +15,7 @@ import android.view.View;
 import android.view.ViewGroup;
 import android.view.Window;
 import android.widget.Button;
+import android.widget.CheckBox;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
@@ -26,8 +27,11 @@ import java.util.function.IntConsumer;
 /**
  * NWP-20261201-28: draws a PopupSheet model as a bottom sheet in GatePalette.active()'s colours (design A,
  * docs/backlog.md "Popups are plain dialogs: ..."). No layout XML and no bitmaps. Back or a touch outside the sheet
- * only closes it. A tap closes the sheet first and then acts; the isShowing check keeps a second queued tap from acting
- * twice. A model that breaks a rule of PopupSheet is logged by count and shown anyway.
+ * only closes it, except a held sheet (confirmHeld), which only a button closes. A tap closes the sheet first and then
+ * acts; the isShowing check keeps a second queued tap from acting twice. A model that breaks a rule of PopupSheet is
+ * logged by count and shown anyway. A slot sheet (NWP-20261206-05) holds the caller's view between the text and the
+ * buttons and is not scrolled. A box under a picker's cards saves through its callback and never closes the sheet
+ * (NWP-20261206-04).
  */
 final class SheetDialog {
     private SheetDialog() {}
@@ -35,10 +39,11 @@ final class SheetDialog {
     private static final int WRAP = LinearLayout.LayoutParams.WRAP_CONTENT;
     private static final int MATCH = LinearLayout.LayoutParams.MATCH_PARENT;
 
-    /** A card per option. A tap on one closes the sheet and calls onPick with its index. */
-    static void picker(Context ctx, PopupSheet.Picker m, IntConsumer onPick) {
+    /** A card per option. A tap on one closes the sheet and calls onPick with its index. Returns the dialog it shows,
+     *  or null for a null model. */
+    static Dialog picker(Context ctx, PopupSheet.Picker m, IntConsumer onPick) {
         warn(PopupSheet.violations(m));
-        if (m == null) return;
+        if (m == null) return null;
         GatePalette p = GatePalette.active();
         Dialog dlg = new Dialog(ctx);
         LinearLayout panel = panel(ctx, p);
@@ -52,14 +57,78 @@ final class SheetDialog {
                 onPick.accept(index);
             }), topMargin(ctx, 10));
         }
-        show(dlg, panel);
+        show(dlg, panel, false);
+        return dlg;
+    }
+
+    /** A box's toggle: index is the box, on its new state. The callee calls settle.accept(state) once the save is done
+     *  or undone; that sets the box to state and enables it again, and does not call toggled. */
+    interface BoxToggle {
+        void toggled(int index, boolean on, Consumer<Boolean> settle);
+    }
+
+    /** picker's title and cards, then the heading and one box per label of b. A card tap closes the sheet and calls
+     *  onPick with its index. A box tap disables the box and calls onToggle; the sheet stays open. */
+    static Dialog pickerWithBoxes(Context ctx, PopupSheet.Picker m, PopupSheet.Boxes b, IntConsumer onPick,
+            BoxToggle onToggle) {
+        warn(PopupSheet.violations(m));
+        warn(PopupSheet.violations(b));
+        if (m == null) return null;
+        GatePalette p = GatePalette.active();
+        Dialog dlg = new Dialog(ctx);
+        LinearLayout panel = panel(ctx, p);
+        panel.addView(title(ctx, p, m.title), new LinearLayout.LayoutParams(MATCH, WRAP));
+        for (int i = 0; i < m.options.size(); i++) {
+            if (m.options.get(i) == null) continue;
+            final int index = i;
+            panel.addView(card(ctx, p, m.options.get(i), () -> {
+                if (!dlg.isShowing()) return;
+                dlg.dismiss();
+                onPick.accept(index);
+            }), topMargin(ctx, 10));
+        }
+        if (b != null) {
+            panel.addView(text(ctx, b.heading, 13, p.muted), topMargin(ctx, 16));
+            for (int i = 0; i < b.labels.size(); i++) {
+                final int index = i;
+                final CheckBox box = new CheckBox(ctx);
+                box.setText(b.labels.get(i));
+                box.setTextColor(p.ink);
+                box.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+                box.setChecked(i < b.checked.size() && Boolean.TRUE.equals(b.checked.get(i)));
+                final Consumer<Boolean> settle = state -> {
+                    box.setChecked(state);
+                    box.setEnabled(true);
+                };
+                // A click has already flipped the box; a setChecked from settle fires no click, so it never re-saves.
+                box.setOnClickListener(v -> {
+                    box.setEnabled(false);
+                    onToggle.toggled(index, box.isChecked(), settle);
+                });
+                panel.addView(box, topMargin(ctx, 4));
+            }
+        }
+        show(dlg, panel, false);
+        return dlg;
     }
 
     /** The tone icon, title, context and lines, then the buttons in model order. actions[i] runs after button i closes
-     *  the sheet; a null action only closes it. A line with a linkKey closes the sheet and calls onLink with the key. */
-    static void confirm(Context ctx, PopupSheet.Confirm m, Runnable[] actions, Consumer<String> onLink) {
+     *  the sheet; a null action only closes it. A line with a linkKey closes the sheet and calls onLink with the key.
+     *  Returns the shown sheet, or null for a null model. */
+    static Dialog confirm(Context ctx, PopupSheet.Confirm m, Runnable[] actions, Consumer<String> onLink) {
+        return confirmSheet(ctx, m, actions, onLink, false);
+    }
+
+    /** The same sheet, which Back and a touch outside do not close: only a button closes it (NWP-20261206-17, a notice
+     *  that must not be cleared unseen). Returns the shown sheet, or null for a null model. */
+    static Dialog confirmHeld(Context ctx, PopupSheet.Confirm m, Runnable[] actions) {
+        return confirmSheet(ctx, m, actions, null, true);
+    }
+
+    private static Dialog confirmSheet(Context ctx, PopupSheet.Confirm m, Runnable[] actions, Consumer<String> onLink,
+            boolean held) {
         warn(PopupSheet.violations(m));
-        if (m == null) return;
+        if (m == null) return null;
         GatePalette p = GatePalette.active();
         Dialog dlg = new Dialog(ctx);
         LinearLayout panel = panel(ctx, p);
@@ -69,23 +138,60 @@ final class SheetDialog {
         panel.addView(context, topMargin(ctx, 4));
         for (PopupSheet.Line l : m.lines) if (l != null) panel.addView(line(ctx, p, l, dlg, onLink), topMargin(ctx, 4));
         panel.addView(buttons(ctx, p, m, dlg, actions), topMargin(ctx, 16));
-        show(dlg, panel);
+        show(dlg, panel, held);
+        return dlg;
+    }
+
+    /** NWP-20261206-05: the title, the context and the lines, then the caller's view, then the buttons in model order;
+     *  actions as confirm's. No tone icon: it is a picker. Not in a ScrollView, which takes the vertical drag from a
+     *  TimePicker's dial. Returns the shown Dialog; null for a null model. */
+    static Dialog slot(Context ctx, PopupSheet.Confirm m, View slot, Runnable[] actions) {
+        warn(PopupSheet.violations(m));
+        if (m == null) return null;
+        GatePalette p = GatePalette.active();
+        Dialog dlg = new Dialog(ctx);
+        dlg.setCanceledOnTouchOutside(true); // closed by a touch outside; window() no longer sets it (NWP-20261206-17)
+        LinearLayout panel = panel(ctx, p);
+        panel.addView(title(ctx, p, m.title), new LinearLayout.LayoutParams(MATCH, WRAP));
+        if (m.context != null && !m.context.isEmpty()) panel.addView(text(ctx, m.context, 14, p.muted), topMargin(ctx, 4));
+        for (PopupSheet.Line l : m.lines) if (l != null) panel.addView(line(ctx, p, l, dlg, null), topMargin(ctx, 4));
+        if (slot.getParent() instanceof ViewGroup) ((ViewGroup) slot.getParent()).removeView(slot);
+        LinearLayout.LayoutParams slp = topMargin(ctx, 12);
+        slp.gravity = Gravity.CENTER_HORIZONTAL;
+        panel.addView(slot, slp);
+        panel.addView(buttons(ctx, p, m, dlg, actions), topMargin(ctx, 16));
+        window(dlg, panel);
+        return dlg;
     }
 
     private static void warn(List<String> breaches) {
         if (!breaches.isEmpty()) Log.w("NowhereChooser", "popup rules: " + breaches.size() + " breach(es)");
     }
 
-    private static void show(Dialog dlg, LinearLayout panel) {
-        dlg.requestWindowFeature(Window.FEATURE_NO_TITLE);
+    /** held: Back and a touch outside do not close the sheet. Not held: either closes it. setCanceledOnTouchOutside(true)
+     *  also makes the dialog cancelable, so the held branch must never reach it.
+     *  Set here, before window() shows the sheet; window() sets neither. */
+    private static void show(Dialog dlg, LinearLayout panel, boolean held) {
         ScrollView scroll = new ScrollView(dlg.getContext());
         scroll.addView(panel, new ViewGroup.LayoutParams(MATCH, WRAP));
-        dlg.setContentView(scroll);
+        if (held) {
+            dlg.setCancelable(false);
+            dlg.setCanceledOnTouchOutside(false);
+        } else {
+            dlg.setCanceledOnTouchOutside(true);
+        }
+        window(dlg, scroll);
+    }
+
+    /** The sheet's window: no title, a transparent background, at the bottom, full width. Whether Back or a touch
+     *  outside closes it is set by the caller (show, slot) before this shows it. */
+    private static void window(Dialog dlg, View content) {
+        dlg.requestWindowFeature(Window.FEATURE_NO_TITLE);
+        dlg.setContentView(content);
         Window w = dlg.getWindow();
         w.setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
         w.setGravity(Gravity.BOTTOM);
         w.setLayout(MATCH, WRAP);
-        dlg.setCanceledOnTouchOutside(true);
         dlg.show();
     }
 

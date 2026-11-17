@@ -33,4 +33,7 @@ final class StoreInstaller {
   static void clearTurnedOff(Context ctx, java.util.Collection<String> pkgs) {
     journal.add("clearTurnedOff:" + new TreeSet<>(pkgs));
   }
+  static void recordTurnedOff(Context ctx, String pkg) {
+    journal.add("recordTurnedOff:" + pkg);
+  }
 }

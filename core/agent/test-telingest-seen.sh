@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # test-telingest-seen.sh [--mutate] -- runs telingest_seen_test.go (NWP-20261129-02): TELINGEST-SEEN writes one
-# validated line of a delivery run's read-back counts to login.log, refuses anything but seven numbers each 0..99999,
+# validated line of a delivery run's read-back counts to login.log, refuses anything but seven or nine numbers each 0..99999 (nine since NWP-20261204-11),
 # and never waits on sessionMu. --mutate breaks telingest_seen.go / main.go on a copy of the package. Each mutant must be
 # CONVICTED by the named test's `--- FAIL`; one that fails to apply, or to compile, is a failure.
 set -uo pipefail
@@ -43,7 +43,12 @@ PY
   else echo "  SURVIVED  $label -- no --- FAIL: $want"; tail -n 15 <<<"$res"; fails=$((fails+1)); fi
   cp -f "$W/$SEEN.orig" "$SEEN"; cp -f "$W/$MAIN.orig" "$MAIN"
 }
-mut "G1 six fields accepted" "$SEEN" 'len\(f\) != len\(n\) \{(.*?)for i := range n \{' 'len(f) != 6 && len(f) != 7 {\1for i := range f {' TestTelIngestSeenRefusesBadLines
-mut "G2 a count dropped from the line" "$SEEN" ', mms parts not inserted=%d( \(NWP-20261129-02\)\\n",\s*n\[0\], n\[1\], n\[2\], n\[3\], n\[4\], n\[5\]), n\[6\]\)' '\1)' TestTelIngestSeenLogsCounts
+# G1 accepts eight fields, not six: the handler reads n[0]..n[6], so a six-field line would panic the test binary
+# instead of failing a named test.
+mut "G1 eight fields accepted" "$SEEN" 'len\(f\) != 7 && len\(f\) != 9 \{' 'len(f) != 7 && len(f) != 8 && len(f) != 9 {' TestTelIngestSeenRefusesBadLines
+mut "G2 a count dropped from the line" "$SEEN" ', mms parts not inserted=%d(%s \(NWP-20261129-02\)\\n",\s*n\[0\], n\[1\], n\[2\], n\[3\], n\[4\], n\[5\]), n\[6\],' '\1,' TestTelIngestSeenLogsCounts
 mut "G3 the verb out of concurrentSafeCmd" "$MAIN" '\t\t"TELINGEST-SEEN",\n' '' TestTelIngestSeenIsConcurrentSafe
+# NWP-20261204-11.
+mut "G4 nine fields refused" "$SEEN" 'len\(f\) != 7 && len\(f\) != 9 \{' 'len(f) != 7 {' TestTelIngestSeenLogsNineCounts
+mut "G5 the two new counts dropped from the line" "$SEEN" 'if len\(n\) == 9 \{' 'if false {' TestTelIngestSeenLogsNineCounts
 [ "$fails" -eq 0 ] && echo "== all mutations convicted" || { echo "== $fails mutation(s) not convicted"; exit 1; }

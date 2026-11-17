@@ -209,8 +209,10 @@ public class AppInstallReceiver extends BroadcastReceiver {
      *  login reunites" outcome~~ is superseded for the session: an empty reply, ERR-WORKER-BUSY, ERR-TIMEOUT and
      *  ERR-NOTREADY are sent again six times over about an hour (HealRetry). Before each retry the heal stops at a
      *  sign-out (SignOutGate.begun()), when the package has no code any more, or when another path wrote the marker.
-     *  A retry while the first request still waits for the slot can queue a second odrestore; both are idempotent
-     *  (the second answers OK NOSRC). A process death ends the retries; the next sign-in reunites the hold, as before.
+     *  ~~A retry while the first request still waits for the slot can queue a second odrestore; both are idempotent
+     *  (the second answers OK NOSRC).~~ superseded by NWP-20261202-38: a retry while a send of the same install is in
+     *  flight shares that send's reply, and one after its OK sends nothing (OdRestoreOnce). A process death ends the
+     *  retries; the next sign-in reunites the hold, as before.
      *  The heal also SKIPS a package with no code (an archived placeholder: its restore can only keep the hold and
      *  answer ERR-NOTREADY, 5-10 s of RW lane). Its real install fires the heal again, as ADDED with EXTRA_REPLACING.
      *
@@ -239,7 +241,8 @@ public class AppInstallReceiver extends BroadcastReceiver {
                         for (int attempt = 1; ; attempt++) {
                             String r = "";
                             try {
-                                r = DaemonSocket.roundTrip("RESTORE-ODDATA\n" + pkg + "\n", 130000).trim();
+                                // NWP-20261202-38: one restore per install (OdRestoreOnce) -- a later sender takes this one's reply
+                                r = OdRestoreOnce.send(pkg, UnarchiveService.installStamp(context, pkg), () -> DaemonSocket.roundTrip("RESTORE-ODDATA\n" + pkg + "\n", 130000), m -> android.util.Log.i("NowhereChooser", m));
                                 if (r.startsWith("OK")) UnarchiveService.markOdRestored(context, pkg);
                                 else OdDataBarrierHost.afterReply(context, pkg, r); // NWP-20261130-03: a failed fetch keeps the hold
                             } catch (Throwable t) {
@@ -395,7 +398,15 @@ public class AppInstallReceiver extends BroadcastReceiver {
         } else if (ProfileActivity.APPDEF_OFF.equals(mode)) {
             // The bucket default is "do not keep", which means NO keep line -- so a stale one from the
             // previous incarnation has to go, or the app reads as kept at a tier the user never chose for it.
+            // NWP-20261203-11 (DECIDED 2026-09-26, "an app switched Off leaves the store at the next roam, exactly
+            // like an app that was never kept"): record the Off BEFORE the keep line goes, as the sign-out prune and
+            // the phantom reconcile do. roamd's code-side drop is appoff INTERSECT appdrop, so without the Off record
+            // the `#apps` carry re-emits the head's copy at every sign-in. No uninstall record: an Off never mints the
+            // account tombstone. A later install from a keeping bucket then reads "not kept (the user switched this
+            // app off)" until the user switches it On -- "the Off stands in the profile until the user turns it back
+            // on".
             if (returning && StoreInstaller.keepSetHas(ctx, pkg)) {
+                StoreInstaller.recordTurnedOff(ctx, pkg);
                 StoreInstaller.removeKeepLines(ctx, java.util.Collections.singleton(pkg));
                 outcome = "not kept (this bucket's default is off) -- and the previous install's keep line was cleared";
             } else {

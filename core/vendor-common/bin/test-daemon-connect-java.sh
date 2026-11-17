@@ -5,19 +5,23 @@
 #
 # WHY THIS IS COMMITTED. Every chooser daemon call goes through DaemonSocket.connect (ProfileActivity's connect sites,
 # ChooserActivity, UnarchiveService, StoreService, WifiMirror, NfcFido2; sendDaemon -> roundTrip). LocalSocket has no
-# connect timeout, so a wedged daemon blocks a bare connect forever, and that cost the 60 s background-broadcast ANR that
-# killed the persistent gate process (#77). connect() bounds it with a watchdog that closes the socket at
-# CONNECT_CAP_MS if it wins a compare-and-set on `settled`; the caller's post-connect compare-and-set refuses a socket the
-# watchdog already closed. Nothing executed that code. Three breakages passed CI green: dropping the post-connect
-# check hands a caller a closed socket (every call on a slow-accepting daemon then fails as "no reply"); a watchdog that
-# closes without the compare-and-set kills healthy connections (on the interrupt, at once); a new bare
-# `new LocalSocket()` brings #77 back. The cases cover the first two; the FENCE covers the third.
+# connect timeout, so a wedged daemon blocks a bare connect for as long as it does not accept, and that cost the 60 s
+# background-broadcast ANR that killed the persistent gate process (#77). The #77 bound closed the socket from a watchdog
+# at CONNECT_CAP_MS; on lynx (S8, build 2026111001, 2026-11-11) a connect pending on a SIGSTOPped daemon's full listen
+# backlog ignored that close, and chooser calls hung for minutes (173 s measured). Since NWP-20261203-06 connect() runs
+# the connect on a "nowhere-daemon-connect" helper thread and the CALLER waits at most CONNECT_CAP_MS on a latch; one
+# compareAndSet state decides who owns the socket (the caller returns it open, or the helper closes it when its connect
+# returns); the caller never closes a pending socket. Each connect holds one of MAX_STRANDED slots (a Semaphore) from
+# before its socket exists until its connect returns, so at most MAX_STRANDED connects are ever pending, even when
+# callers arrive together; a caller that gets no slot within the cap returns null. Once MAX_STRANDED abandoned connects
+# are still pending, connect() returns null at once with no socket and no thread. Either refusal logs one count-only
+# line per episode. The cases run that against stubs (a connect that ignores close, as on lynx; MAX_STRANDED+3 callers
+# started together) and against a REAL wedged AF_UNIX server (backlog 1, never accepts; Linux and Java 16+, else the
+# harness exits 2). The FENCE keeps every other chooser connect behind it:
+# a new bare `new LocalSocket()` brings #77 back.
 #
-# THIS SUITE PINS SHIPPED BEHAVIOUR: its cases pass on main. What must fail is every mutant (--mutate).
-#
-# WHAT IT DOES NOT PROVE: that a real LocalSocket.connect() against a WEDGED daemon (accepting, never answering) is
-# unblocked by close() -- that is the backlog row's remaining device step ("doLogoff's LOGOUT and SEAL-STATUS socket
-# connects have no timeout"). The stub closes a blocked connect the way the FP3 did in #77; the bound is what is tested.
+# WHAT IT DOES NOT PROVE: the lynx SIGSTOP run (the backlog row's device half): that a real LocalSocket's connect on a
+# device behaves as the real AF_UNIX wedge does here, and that each chooser screen reaches its failure copy in time.
 #
 # ⚠ IT FAILS WHEN THERE IS NO JAVAC, IT NEVER SKIPS. javac comes from PATH, else from the build host's JDK below; the
 # version is printed first so the log proves which compiler ran.
@@ -125,10 +129,23 @@ fence() {
   return "$rc"
 }
 
-# suite <DaemonSocket.java> -> 0 pass, 1 a pin or a case failed, 2 connect() did not extract, 3 it did not compile.
+# pin_max <DaemonSocket.java>: the fail-fast limit is declared exactly once, as 4. -> 0 or 1
+pin_max() {
+  local decls
+  decls=$(codeonly < "$1" | grep -E 'MAX_STRANDED[[:space:]]*=' || true)
+  if [ "$(printf '%s' "$decls" | grep -c .)" != 1 ] \
+     || ! grep -qE '^[[:space:]]*static final int MAX_STRANDED = 4;[[:space:]]*$' <<<"$decls"; then
+    echo "  PIN   DaemonSocket.java must declare 'static final int MAX_STRANDED = 4;' exactly once (got: ${decls:-nothing})" >&2
+    return 1
+  fi
+}
+
+# suite <DaemonSocket.java> -> 0 pass, 1 a pin or a case failed, 2 connect() or a member did not extract (or the host
+# cannot run the real-socket case), 3 it did not compile.
 # Only 1 may convict a mutant; 2 and 3 prove nothing about the logic.
 suite() {
   pin_cap "$1" || return 1
+  pin_max "$1" || return 1
   bash "$RUN" "$1"
 }
 
@@ -142,6 +159,7 @@ echo "  the fence finds exactly the 4 allowed sites, and ignores comments and st
 
 echo "== $DS"
 pin_cap "$DS" || { echo "FAILED"; exit 1; }
+pin_max "$DS" || { echo "FAILED"; exit 1; }
 suite "$DS" || { echo "FAILED"; exit 1; }
 echo "== fence"
 fence "$CH" "$NAPPS" || { echo "FAILED"; exit 1; }
@@ -176,10 +194,14 @@ fmut() {
   echo "  convicted $1"
 }
 fails=0
-mut "M1 the post-connect compareAndSet check removed"       's/if \(!settled\.compareAndSet\(false, true\)\) \{/if (false) {/' || fails=$((fails+1))
-mut "M2 the watchdog closes without the compareAndSet"      's/if \(settled\.compareAndSet\(false, true\)\) \{ \/\/ watchdog won/if (true) { \/\/ watchdog won/' || fails=$((fails+1))
-mut "M3 the watchdog is never started"                      's/\n\s*wd\.start\(\);//' || fails=$((fails+1))
-mut "M4 the catch no longer closes the socket"              's/(settled\.set\(true\);)\s*try \{ s\.close\(\); \} catch \(Throwable ignore\) \{\}/$1/' || fails=$((fails+1))
+mut "M1 the caller's await has no timeout (case1/c6 hang)"           's/in = done\.await\(Math\.max\(0L, deadline - System\.nanoTime\(\)\), TimeUnit\.NANOSECONDS\);/done.await(); in = true;/' || fails=$((fails+1))
+mut "M2 the slot limit removed: callers together pass MAX_STRANDED (c8)" 's/new Semaphore\(MAX_STRANDED\)/new Semaphore(Integer.MAX_VALUE)/' || fails=$((fails+1))
+mut "M3 the connector does not close an abandoned socket (case4/c6)" 's/try \{ s\.close\(\); \} catch \(Throwable ignore\) \{\} \/\/ abandoned/\/\/ abandoned/' || fails=$((fails+1))
+mut "M4 the caller returns s when the connect threw (case3)"        's/return state\.get\(\) == CONNECTED \? s : null;/return s;/' || fails=$((fails+1))
+mut "M5 STRANDED is never decremented (case1/c9)"                   's/if \(STRANDED\.decrementAndGet\(\) < MAX_STRANDED\)/if (STRANDED.get() < MAX_STRANDED)/' || fails=$((fails+1))
+mut "M6 the caller closes s on the abandon path (case1)"            's/if \(state\.compareAndSet\(PENDING, ABANDONED\)\) return null;/if (state.compareAndSet(PENDING, ABANDONED)) { try { s.close(); } catch (Throwable ignore) {} return null; }/' || fails=$((fails+1))
+mut "M7 the STRANDED fail-fast check removed: it waits for a slot (c9)" 's/if \(n >= MAX_STRANDED\) return refuse\(n\);/if (false) return refuse(n);/' || fails=$((fails+1))
+mut "M8 a connected helper keeps its slot (case5)"                 's/SLOTS\.release\(\); \/\/ the connect is no longer pending/\/\/ the connect is no longer pending/' || fails=$((fails+1))
 fmut "F1 a bare new LocalSocket() in ProfileActivity"        ProfileActivity.java 's/(\npublic (?:final )?class ProfileActivity[^\n]*\{\n)/$1    static android.net.LocalSocket bareProbe = new LocalSocket();\n/' || fails=$((fails+1))
 fmut "F2 a receiver watchdog that no longer sleeps its cap"  IdleLogoffReceiver.java 's/Thread\.sleep\(CONNECT_CAP_MS\)/Thread.sleep(1)/' || fails=$((fails+1))
 fmut "F3 a receiver watchdog that no longer closes"          ReloginReceiver.java 's/(RELOGIN: daemon unresponsive, abandoning"\);\s*)try \{ s\.close\(\); \} catch \(Throwable ignore\) \{\}/$1/' || fails=$((fails+1))

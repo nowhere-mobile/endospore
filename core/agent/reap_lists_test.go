@@ -16,10 +16,12 @@ import (
 var reapListsGone = []string{
 	"scancache.ab12", "scancache.ab12.tmp", "heal-handled-0123456789abcdef", "heal-handled-0123456789abcdef.tmp",
 	"sealdelta.idx", "sealdelta.idx.tmp", "sealdelta.listed", "sealdelta.listed.tmp", "media-bg.list.handoff",
+	"apps-not-restored-0123456789abcdef", "apps-not-restored-123456789.tmp",
 }
 
 var reapListsStay = []string{
 	"blobcache.x", "signin-summary.11", "xscancache.1", "xheal-handled-1", "xcontentcache.1", "xsealcount.1",
+	"xapps-not-restored-1",
 }
 
 var reapCachesGone = []string{
@@ -28,7 +30,7 @@ var reapCachesGone = []string{
 
 const (
 	reapListsKeptLine  = "[logind] reap: kept the session file lists and caches -- a session is live or parked (h59 #11, h60 #8)"
-	reapListsDoneLine  = "[logind] reap: removed 9 session file list(s) from the state tmpfs (h59 #11)"
+	reapListsDoneLine  = "[logind] reap: removed 11 session file list(s) from the state tmpfs (h59 #11)"
 	reapCachesDoneLine = "[logind] reap: removed 6 session cache file(s) from the state tmpfs (h60 #8)"
 )
 
@@ -240,7 +242,7 @@ func TestReapLists_L6_LinesNameNoFile(t *testing.T) {
 		t.Errorf("the kept reap logged %q, want only %q", kept, reapListsKeptLine)
 	}
 	for _, l := range append(removed, kept...) {
-		for _, n := range []string{"scancache", "heal-handled", "sealdelta", "contentcache", "groupcache", "sealcount", "mnochange", "ab12"} {
+		for _, n := range []string{"scancache", "heal-handled", "apps-not-restored", "sealdelta", "contentcache", "groupcache", "sealcount", "mnochange", "ab12"} {
 			if strings.Contains(l, n) {
 				t.Errorf("the line %q names %s", l, n)
 			}

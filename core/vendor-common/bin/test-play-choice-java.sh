@@ -21,7 +21,7 @@
 #   P2  turnPlayOff signs each Google account out through signOutGoogle (after GoogleSignOut.claim) and never calls
 #       removeAccount itself; signOutGoogle writes the mark, returns when it was not recorded, and only then removes.
 #   P3  turnPlayOff writes "0" and checks it landed before it drops anything or signs anything out; it drops exactly
-#       PlayChoice.offDrops(); confirmPlayOff's "Turn off" runs it.
+#       PlayChoice.offDrops(); confirmPlayOff opens GoogleSheets.playOff() and only its "Turn off" (slot 1) runs it.
 #   P4  reconcilePlayStack derives playOff from PlayChoice.blocksVendingReadd(playState()) and guards exactly the two
 #       Play Store re-adds with it (the user-kept m.put and the auto-pulled applyStackMember); gms/gsf are not guarded.
 #   P5  AppInstallReceiver.decide reads the flag through PlayChoice.effective(..., ProfileActivity.gosStorePresent(ctx))
@@ -241,9 +241,9 @@ pin('P3 turnPlayOff writes "0", returns unless it landed, then drops, then signs
 pin('P3 turnPlayOff drops exactly PlayChoice.offDrops() (one applyKeepModeOffThread, one setAppMode path)',
     poff.count('applyKeepModeOffThread(') == 1 and 'setAppMode(' not in poff and 'GMS_PKG' not in poff and 'GSF_PKG' not in poff,
     'applyKeepModeOffThread x%d' % poff.count('applyKeepModeOffThread('))
-pin('P3 confirmPlayOff warns with the drafted words and "Turn off" runs turnPlayOff',
-    '.setTitle(PlayChoice.OFF_TITLE).setMessage(PlayChoice.OFF_MESSAGE).setNegativeButton(PlayChoice.OFF_CANCEL,null)'
-    '.setPositiveButton(PlayChoice.OFF_CONFIRM,(d,w)->turnPlayOff())' in pconf, pconf[:300])
+pin('P3 confirmPlayOff opens the Play Off sheet and only its "Turn off" (slot 1) runs turnPlayOff',
+    'SheetDialog.confirm(this,GoogleSheets.playOff(),newRunnable[]{null,()->turnPlayOff()},null);' in pconf
+    and 'AlertDialog' not in pconf, pconf[:300])
 
 # P4
 pin('P4 reconcilePlayStack derives playOff from PlayChoice.blocksVendingReadd(playState()) once',

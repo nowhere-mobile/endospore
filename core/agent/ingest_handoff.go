@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 
 	"golang.org/x/sys/unix"
 )
@@ -42,22 +43,89 @@ import (
 //
 // Files >= 1 MiB are DEFERRED by the web writer and not on disk at login, and a deferred file makes mediad
 // overlay its dir: the overlay set is every dir holding a deferred entry, whatever its path (deferredDirs,
-// media_server.go). A read THROUGH that FUSE overlay lists the deferred stub beside the real files and makes
-// mediad fetch it from the store inside this socket handler. So the staging dir is resolved first
-// (ingestResolveDir): when the published mountpoint -> hidden map (publishedMediaUnders) names the dir, or an
-// ancestor of it, every ReadDir, Stat and ReadFile goes to the hidden .under path, which holds only real
-// on-disk files -- exactly the non-deferred ones -- and never fetches. A deferred file is simply not served
-// (the chooser has nothing to ingest from it at login). If the map names the dir but the hidden path is
-// unreadable (a torn-down bind), the answer is NONE: falling back to the overlay path would be the very fetch
-// this avoids. With no map entry the plain path is read, as before (NWP-20260827-26).
+// media_server.go). A read THROUGH that FUSE overlay lists the deferred stub beside the real files, and an open
+// of the stub makes mediad fetch it from the store inside this socket handler. Until NWP-20261203-15 a mapped
+// dir was read at its hidden .under path instead (NWP-20261013-30), and on an enforcing device that read can
+// never work: mediad makes .under inside the chooser's files dir in /data/user/<N> (serveMediaScope), vold makes
+// /data/user/<N> at user N's MLS level, and dir search there needs a subject that dominates it. This daemon runs
+// at s0, so every Lstat under .under was denied and the answer was NONE, silently (S7, lynx 2026111001). That is
+// MLS, not type enforcement: a sepolicy allow changes nothing, and mlstrustedsubject would lift the barrier for
+// the whole network-facing login daemon. The precedent is the backlog row "The daemon is denied `search` on one
+// of the session user's system directories every 30 seconds, on a user build" (NWP-20261005-08): stop reading
+// /data/user from the daemon. So GET-INGEST never reads the .under path. For a mapped dir it reads the PLAIN
+// mountpoint (the daemon holds fuse dir/file read, nowhere.te), but only the names in the snapshot kickMediad
+// takes before it asks mediad to start (ingestSnapshotStaged), each with the size it had then. A real name falls
+// through mediad's loopback without a fetch (mediaRoot.Lookup, mediafs.go). A deferred name was not on disk when
+// the snapshot was taken, so it is never named, opened or fetched. No snapshot for the peer's user means NONE.
+// Each NONE other than "nothing staged" and each serve writes one count-only line to login.log: never a file
+// name, a size or a path. With no map entry the plain path is read, as before (NWP-20260827-26).
 
 var ingestMediaBase = "/data/media" // var so tests can redirect
 
 // ingestUndersFn supplies the mountpoint -> hidden map; var so tests can inject one.
 var ingestUndersFn = publishedMediaUnders
 
+// ingestReadFn reads one staged file; var so tests can record every path GET-INGEST opens.
+var ingestReadFn = ingestReadStaged
+
+// ingestLogf writes GET-INGEST's evidence line; var so tests can capture it. os.Stderr is what login.log carries.
+var ingestLogf = func(format string, a ...any) { fmt.Fprintf(os.Stderr, format, a...) }
+
+// ingestSnap is what the plain staging dir held when the daemon last asked mediad to start: the staged names
+// that were real files then, with their Lstat sizes. In memory only: never written to disk, never logged.
+type ingestSnap struct {
+	uid   string
+	names map[string]int64
+}
+
+var (
+	ingestSnapMu  sync.Mutex
+	ingestSnapRec *ingestSnap
+)
+
+// ingestSnapshotStaged records the regular files staged for user uid, for kickMediad to call before it requests
+// a mediad start (so before mediad can mount an overlay there). When the dir is mapped already (overlaid, or its
+// mounts are dead after a SIGKILL'd mediad) a read now would go through FUSE, so the record is kept as it is.
+func ingestSnapshotStaged(uid string) {
+	dir := filepath.Join(ingestMediaBase, uid, ingestDir)
+	if _, mapped := ingestResolveDir(dir); mapped {
+		return
+	}
+	rec := &ingestSnap{uid: uid, names: map[string]int64{}}
+	if ingestStagingDirOK(dir, false) {
+		if names, err := ingestList(dir, false); err == nil {
+			for _, n := range names {
+				if st, err := os.Lstat(filepath.Join(dir, n)); err == nil && st.Mode().IsRegular() {
+					rec.names[n] = st.Size()
+				}
+			}
+		}
+	}
+	ingestSnapMu.Lock()
+	ingestSnapRec = rec
+	ingestSnapMu.Unlock()
+}
+
+// ingestSnapshotFor returns the snapshot recorded for user uid, and false when the record is for another user or
+// there is none. The map is never written after it is published, so the caller may read it unlocked.
+func ingestSnapshotFor(uid string) (map[string]int64, bool) {
+	ingestSnapMu.Lock()
+	defer ingestSnapMu.Unlock()
+	if ingestSnapRec == nil || ingestSnapRec.uid != uid {
+		return nil, false
+	}
+	return ingestSnapRec.names, true
+}
+
+// ingestNone answers NONE and logs its reason class (counts and fixed words only).
+func ingestNone(conn net.Conn, userID, reason string) {
+	fmt.Fprint(conn, "NONE\n")
+	ingestLogf("[logind] ingest: user %s: NONE (%s) (NWP-20261203-15)\n", userID, reason)
+}
+
 // ingestResolveDir maps dir to the hidden .under path when the map names dir or its nearest mapped ancestor,
-// and reports whether it did. A mapped dir is never read in place.
+// and reports whether it did. GET-INGEST uses only the report: the hidden path is not a read path there (see
+// the header).
 func ingestResolveDir(dir string) (string, bool) {
 	m := ingestUndersFn()
 	for d := dir; len(m) > 0 && d != "/" && d != "."; d = filepath.Dir(d) {
@@ -88,8 +156,8 @@ var ingestNameRe = regexp.MustCompile(`^(?i)[^/\x00.][^/\x00]{0,250}\.(vcf|ics)$
 // ingestList lists the regular vcf/ics files (a link, FIFO, socket or device is not listed) in the user's staging dir, sorted for a deterministic wire order.
 // Every match is served on every login; the chooser skips the ones it holds receipts for. A missing dir
 // is simply "nothing staged". The web writer stages files under 1 MiB essential, so re-serving them each
-// login is cheap next to the round trip; dir is the resolved real dir, so a deferred one is not listed (see
-// the header). A mapped dir that does not exist is an error, not "nothing staged".
+// login is cheap next to the round trip. On an overlaid dir a deferred stub IS listed, so the caller keeps only
+// the snapshot's names (see the header). A mapped dir that does not exist is an error, not "nothing staged".
 func ingestList(dir string, mapped bool) ([]string, error) {
 	ents, rerr := os.ReadDir(dir)
 	if rerr != nil {
@@ -113,7 +181,9 @@ func ingestList(dir string, mapped bool) ([]string, error) {
 // ingestMediaBase (<u>, Documents, Imported) is Lstat'd; mapped, the resolved hidden dir itself. A link, a
 // non-directory or any Lstat error is false (the answer is NONE; an absent unmapped dir was "nothing staged"
 // and an absent mapped one an error, both NONE). ReadDir follows a linked dir, so without this a link
-// planted at any component would redirect the read, as root, to a tree the user does not own.
+// planted at any component would redirect the read, as root, to a tree the user does not own. GET-INGEST and
+// ingestSnapshotStaged both pass mapped=false since NWP-20261203-15, because both read the plain path; on an
+// overlaid dir the last component is the FUSE mountpoint, which is a dir, not a link.
 func ingestStagingDirOK(dir string, mapped bool) bool {
 	paths := []string{dir}
 	if !mapped {
@@ -163,32 +233,66 @@ func ingestReadStaged(p string, max int64) ([]byte, bool) {
 }
 
 // handleGetIngest serves GET-INGEST for the peer's own user: one "F <name_b64> <bytes_b64>" line per
-// staged file.
+// staged file. A mapped dir is read through the overlay, for the snapshot's names only (see the header).
 func handleGetIngest(conn net.Conn, peerUID int) {
 	if peerUID <= 0 {
-		fmt.Fprint(conn, "NONE\n")
+		ingestNone(conn, "?", "no-peer")
 		return
 	}
 	userID := strconv.Itoa(peerUID / 100000)
-	dir, mapped := ingestResolveDir(filepath.Join(ingestMediaBase, userID, ingestDir))
-	if !ingestStagingDirOK(dir, mapped) {
-		fmt.Fprint(conn, "NONE\n")
+	plain := filepath.Join(ingestMediaBase, userID, ingestDir)
+	_, mapped := ingestResolveDir(plain)
+	dir := plain
+	var snap map[string]int64
+	if mapped {
+		var ok bool
+		if snap, ok = ingestSnapshotFor(userID); !ok {
+			ingestNone(conn, userID, "mapped-no-snapshot")
+			return
+		}
+	}
+	if !ingestStagingDirOK(dir, false) {
+		if _, err := os.Lstat(dir); !mapped && os.IsNotExist(err) {
+			fmt.Fprint(conn, "NONE\n") // nothing staged: an ordinary sign-in stays silent
+			return
+		}
+		ingestNone(conn, userID, "dir-refused")
 		return
 	}
 	names, err := ingestList(dir, mapped)
-	if err != nil || len(names) == 0 {
+	if err != nil {
+		ingestNone(conn, userID, "list-failed")
+		return
+	}
+	if mapped {
+		var known []string
+		for _, n := range names {
+			if _, inSnap := snap[n]; inSnap {
+				known = append(known, n)
+			}
+		}
+		names = known
+	}
+	if len(names) == 0 && !mapped {
 		fmt.Fprint(conn, "NONE\n")
 		return
 	}
 	var out strings.Builder
 	out.WriteString("OK\n")
-	total := 0
+	total, served := 0, 0
 	emit := func(name string) {
-		b, ok := ingestReadStaged(filepath.Join(dir, name), ingestMaxFileBytes)
+		p := filepath.Join(dir, name)
+		if mapped {
+			if st, err := os.Lstat(p); err != nil || !st.Mode().IsRegular() || st.Size() != snap[name] {
+				return
+			}
+		}
+		b, ok := ingestReadFn(p, ingestMaxFileBytes)
 		if !ok || total+len(b) > ingestMaxTotal {
 			return
 		}
 		total += len(b)
+		served++
 		out.WriteString("F ")
 		out.WriteString(base64.StdEncoding.EncodeToString([]byte(name)))
 		out.WriteByte(' ')
@@ -198,9 +302,14 @@ func handleGetIngest(conn net.Conn, peerUID int) {
 	for _, n := range names {
 		emit(n)
 	}
-	if out.Len() <= len("OK\n") {
-		fmt.Fprint(conn, "NONE\n")
+	if served == 0 {
+		ingestNone(conn, userID, "none-readable")
 		return
 	}
+	via := "plain"
+	if mapped {
+		via = "overlay"
+	}
+	ingestLogf("[logind] ingest: user %s: served %d of %d staged file(s) via %s (NWP-20261203-15)\n", userID, served, len(names), via)
 	fmt.Fprint(conn, out.String())
 }

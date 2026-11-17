@@ -33,6 +33,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -317,4 +318,95 @@ func haveRestoreReceipt(ref string) bool {
 	}
 	_, err := os.Stat(f)
 	return err == nil
+}
+
+// receiptSnapshot names, in fixed words and counts only, the receipts state this session holds for profile under
+// pass: whether the receipts directory is there, how many receipts it holds, which of the profile's scopes hold one,
+// and whether a park (in_park.go) holds a receipts directory with this profile's receipt. NWP-20261203-16 (docs/backlog.md,
+// "When the sign-out reap restarts the system server, the `#keys` seal that follows is refused for want of a
+// restore-completion receipt and the session's new Keystore bundles are destroyed"): every no-receipt seal refusal
+// prints it, so the next device proof names why the receipt was missing. It never holds a name, a ref or a path.
+// "" when receipts are off.
+func receiptSnapshot(profile, pass string) string {
+	st := os.Getenv("NOWHERE_STATE")
+	d := restoreReceiptDir()
+	if st == "" || d == "" {
+		return ""
+	}
+	dir, files := "present", 0
+	if ents, err := os.ReadDir(d); err == nil {
+		for _, e := range ents {
+			if isReceiptName(e.Name()) {
+				files++
+			}
+		}
+	} else if errors.Is(err, fs.ErrNotExist) {
+		dir = "absent"
+	} else {
+		dir = "unreadable"
+	}
+	base := receiptBaseName(profile)
+	var have []string
+	for _, suf := range append([]string{""}, scopeIndexSuffixes...) {
+		if !haveRestoreReceipt(profileRefV2(base+suf, pass)) {
+			continue
+		}
+		if suf == "" {
+			have = append(have, "vault")
+		} else {
+			have = append(have, suf[1:])
+		}
+	}
+	if len(have) == 0 {
+		have = []string{"none"}
+	}
+	park := "absent"
+	p := filepath.Join(st, inParkDir)
+	if _, err := os.Lstat(p); err == nil {
+		park = "present"
+		pr := filepath.Join(p, "restore-receipts")
+		if fi, err := os.Stat(pr); err == nil && fi.IsDir() {
+			park = "present+rcpt"
+			if _, err := os.Stat(filepath.Join(pr, profileRefV2(profile, pass))); err == nil {
+				park = "present+rcpt+this"
+			}
+		}
+	}
+	return fmt.Sprintf("dir=%s files=%d have=%s park=%s", dir, files, strings.Join(have, ","), park)
+}
+
+// isReceiptName reports whether n names a receipt: a profileRefV2 ref, 64 lower-case hex. roster.*, walked.* and
+// *.tmp entries share the directory and are not receipts.
+func isReceiptName(n string) bool {
+	if len(n) != 64 {
+		return false
+	}
+	for i := 0; i < len(n); i++ {
+		if c := n[i]; (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// receiptBaseName strips a known scope suffix from profile; a name with an unknown '#' suffix is kept whole.
+func receiptBaseName(profile string) string {
+	if i := strings.LastIndexByte(profile, '#'); i >= 0 {
+		for _, suf := range scopeIndexSuffixes {
+			if profile[i:] == suf {
+				return profile[:i]
+			}
+		}
+	}
+	return profile
+}
+
+// logNoReceiptSnapshot prints the receiptSnapshot line after a no-receipt SEAL REFUSED line. The scope token is a fixed
+// word; the profile is not printed.
+func logNoReceiptSnapshot(profile, pass string) {
+	label := progScopeOf(profile)
+	if label == "" {
+		label = "vault"
+	}
+	fmt.Printf("push: #%s no-receipt snapshot: %s (NWP-20261203-16)\n", label, receiptSnapshot(profile, pass))
 }

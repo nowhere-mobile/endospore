@@ -96,7 +96,7 @@ run() {
 }
 
 suite() {
-  local f="$1" quiet="${2:-}" p=0 x=0 fns out ctx d blk sh tab n2 rel p1="" p2="" p3 d4 d4w i=0
+  local f="$1" quiet="${2:-}" p=0 x=0 fns out ctx d blk sh tab n2 rel p1="" p2="" p3 d4 d4w olw i=0
   ok(){ p=$((p+1)); [ -n "$quiet" ] || printf '  ok    [%s] %s\n' "$sh" "$1"; }
   no(){ x=$((x+1)); if [ -n "$quiet" ]; then printf 'FAILED [%s] %s\n' "$sh" "$1"; else printf '  FAIL  [%s] %s\n' "$sh" "$1"; fi; }
 
@@ -257,14 +257,17 @@ suite() {
   esac
   done
 
-  # W: the wiring. Both arms of the copy (clean and failed) relabel through od_relabel, and the old no-op is gone.
-  # Shell-independent (a grep), so it runs once, tagged [-].
+  # W: the wiring. Both arms of the copy (clean and failed) relabel through od_label_watched, which runs od_relabel in
+  # both its forms (NWP-20261202-32), and the old no-op is gone. Shell-independent (a grep), so it runs once, tagged [-].
   sh=-
   blk=$(extract_odrestore "$f")
   if [ -z "$blk" ]; then no "W0 EXTRACTION FAILED -- the odrestore op moved"
   else
-    [ "$(printf '%s\n' "$blk" | grep -c '^          od_relabel "\$vol" "\$dst"$')" = 2 ] \
-      && ok "W1 both copy arms relabel through od_relabel" || no "W1 od_relabel is not on both copy arms"
+    olw=$(sed -n '/^od_label_watched() {$/,/^}$/p' "$f")
+    [ "$(printf '%s\n' "$blk" | grep -c '^          od_label_watched "\$vol" "\$dst"$')" = 2 ] \
+      && [ "$(printf '%s\n' "$olw" | grep -o 'od_relabel "\$vol" "\$dst"' | grep -c .)" = 2 ] \
+      && ok "W1 both copy arms relabel through od_label_watched -> od_relabel" \
+      || no "W1 od_label_watched -> od_relabel is not on both copy arms"
     grep -q 'restorecon -R "\$dst"' <<<"$blk" \
       && no "W2 odrestore still runs restorecon -R on the app dir (it relabels nothing there)" || ok "W2 the no-op restorecon is gone"
   fi
@@ -361,12 +364,12 @@ EOF
 )"
   mutate 'a decoded trailing newline is dropped'       's@mi_path "\$\{mp\}x"\); mp=\$\{mp%x\}@mi_path "$mp")@'
   mutate 'the glob copy drops a trailing newline'      's@g=\$\(print -r -- "\$\{mp\}x" (\| sed .*)\); g=\$\{g%x\};; esac$@g=$(print -r -- "$mp" \1);; esac@'
-  mutate 'the chcon walk crosses filesystems'          's@^  \[ "\$n" -gt 0 \] && find "\$d" -xdev @  [ "$n" -gt 0 ] \&\& find "$d" @'
-  mutate 'the chcon walk runs when nothing differs'    's@^  \[ "\$n" -gt 0 \] && find @  find @'
+  mutate 'the chcon walk crosses filesystems'          's@^    \[ "\$n" -gt 0 \] && find "\$d" -xdev @    [ "$n" -gt 0 ] \&\& find "$d" @'
+  mutate 'the chcon walk runs when nothing differs'    's@^    \[ "\$n" -gt 0 \] && (find "\$d" -xdev .* -exec chcon -h )@    \1@'
   mutate 'chcon follows symlinks'                      's@-exec chcon -h "\$ctx"@-exec chcon "$ctx"@'
   mutate 'any dir context is accepted'                 's@^    u:object_r:app_data_file:s0\*\|u:object_r:privapp_data_file:s0\*\) ;;$@    *) ;;@'
-  mutate 'the external volumes take the CE walk'       's@^    /data/media/\*\) restorecon -R "\$2" 2>>"\$LOG" ;;$@    /data/media/*) relabel_restored "$2" ;;@'
-  mutate 'the clean copy goes back to restorecon'      '0,/^          od_relabel "\$vol" "\$dst"$/ s@^          od_relabel "\$vol" "\$dst"$@          restorecon -R "$dst" 2>>"$LOG"@' any
+  mutate 'the external volumes take the CE walk'       's@^        restorecon -R "\$2" 2>>"\$LOG"$@        relabel_restored "$2"@'
+  mutate 'the clean copy goes back to restorecon'      '0,/^          od_label_watched "\$vol" "\$dst"$/ s@^          od_label_watched "\$vol" "\$dst"$@          restorecon -R "$dst" 2>>"$LOG"@' any
   echo
   [ "${MFAIL:-0}" = 0 ] && echo "ALL MUTATIONS BEHAVED" || { echo "PROBLEM: a mutation did not behave"; FAILED=1; }
 fi

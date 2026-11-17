@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -19,7 +20,7 @@ import (
 var signinSummaryDigits = regexp.MustCompile(`^[0-9]+$`)
 
 // signinSummaryCounters sets the restore's cache counters for one test, and the store counters to values no other
-// field of a fixture holds (signinSummaryTrace), and puts them back after it.
+// field of a fixture holds (signinSummaryTrace), and the restore split's counters to 0, and puts them back after it.
 func signinSummaryCounters(t *testing.T, hits, miss int64) {
 	t.Helper()
 	h0, m0 := atomic.LoadInt64(&chunkHits), atomic.LoadInt64(&chunkMiss)
@@ -28,6 +29,7 @@ func signinSummaryCounters(t *testing.T, hits, miss int64) {
 	atomic.StoreInt64(&chunkMiss, miss)
 	atomic.StoreInt64(&traceGetN, 21)
 	atomic.StoreInt64(&traceCapN, 2)
+	signinSplitCounters(t)
 	t.Cleanup(func() {
 		atomic.StoreInt64(&chunkHits, h0)
 		atomic.StoreInt64(&chunkMiss, m0)
@@ -36,8 +38,51 @@ func signinSummaryCounters(t *testing.T, hits, miss int64) {
 	})
 }
 
-// signinSummaryTrace is the store fields of a line signinSummaryAppend writes under signinSummaryCounters.
-const signinSummaryTrace = " store_reads=21 cap_calls=2"
+// signinSplitAll is the restore split's six counters (restore_split.go), in the scope line's order.
+var signinSplitAll = []*int64{&restoreFetchedBytes, &restoreWaitNs, &restoreWriteNs,
+	&restoreUnfetchedPkgs, &restoreUnfetchedBytes, &restoreUnfetchedChunks}
+
+// signinSplitCounters sets the six restore split counters to 0 for one test and puts them back after it.
+func signinSplitCounters(t *testing.T) {
+	t.Helper()
+	saved := make([]int64, len(signinSplitAll))
+	for i, c := range signinSplitAll {
+		saved[i] = atomic.LoadInt64(c)
+		atomic.StoreInt64(c, 0)
+	}
+	t.Cleanup(func() {
+		for i, c := range signinSplitAll {
+			atomic.StoreInt64(c, saved[i])
+		}
+	})
+}
+
+// signinSplitReset is signinSplitCounters plus cdcRestoreProg's two seams and no chunk cache, all put back after it.
+func signinSplitReset(t *testing.T) {
+	t.Helper()
+	signinSplitCounters(t)
+	fetchFn, untarFn, cache := cdcFetchChunk, cdcUntar, chunkCacheDir
+	chunkCacheDir = ""
+	t.Cleanup(func() {
+		cdcFetchChunk, cdcUntar, chunkCacheDir = fetchFn, untarFn, cache
+	})
+}
+
+// signinSplitZero adds the six restore split keys of each scope, at 0, to want.
+func signinSplitZero(want map[string]string, scopes ...string) map[string]string {
+	for _, s := range scopes {
+		for _, k := range []string{"fetched_bytes", "wait_ms", "write_ms", "unfetched_pkgs", "unfetched_bytes", "unfetched_chunks"} {
+			want["signin_"+s+"_"+k] = "0"
+		}
+	}
+	return want
+}
+
+// signinSummarySplit0 is the restore split's fields of a line written with its six counters at 0.
+const signinSummarySplit0 = " fetched_bytes=0 wait_ms=0 write_ms=0 unfetched_pkgs=0 unfetched_bytes=0 unfetched_chunks=0"
+
+// signinSummaryTrace is the store and split fields of a line signinSummaryAppend writes under signinSummaryCounters.
+const signinSummaryTrace = " store_reads=21 cap_calls=2" + signinSummarySplit0
 
 func signinSummaryRead(t *testing.T, p string) string {
 	t.Helper()
@@ -157,11 +202,11 @@ func TestSigninSummaryAppendTwoLines(t *testing.T) {
 	}
 }
 
-const signinSummaryFull = "v=1 scope=vault ms=61000 chunks=900 cached=12 fetched=888 heal_ms=7000 store_reads=901 cap_calls=4\n" +
-	"v=1 scope=de ms=4000 chunks=40 cached=1 fetched=39 heal_ms=500 store_reads=41 cap_calls=3\n" +
-	"v=1 scope=media ms=88000 chunks=1700 cached=0 fetched=1700 heal_ms=0 store_reads=1702 cap_calls=6 user_files=310 user_bytes=1700000000 other_files=55 other_bytes=90000000\n" +
-	"v=1 scope=apps ms=9000 chunks=120 cached=100 fetched=20 heal_ms=0 store_reads=22 cap_calls=5\n" +
-	"v=1 scope=sys ms=700 chunks=3 cached=0 fetched=3 heal_ms=0 store_reads=8 cap_calls=1\n" +
+const signinSummaryFull = "v=1 scope=vault ms=61000 chunks=900 cached=12 fetched=888 heal_ms=7000 store_reads=901 cap_calls=4 fetched_bytes=3100000000 wait_ms=250000 write_ms=61001 unfetched_pkgs=2 unfetched_bytes=7000 unfetched_chunks=90\n" +
+	"v=1 scope=de ms=4000 chunks=40 cached=1 fetched=39 heal_ms=500 store_reads=41 cap_calls=3 fetched_bytes=41000000 wait_ms=1200 write_ms=2100 unfetched_pkgs=1 unfetched_bytes=300 unfetched_chunks=4\n" +
+	"v=1 scope=media ms=88000 chunks=1700 cached=0 fetched=1700 heal_ms=0 store_reads=1702 cap_calls=6 fetched_bytes=1800000000 wait_ms=70000 write_ms=9000 unfetched_pkgs=3 unfetched_bytes=800 unfetched_chunks=5 user_files=310 user_bytes=1700000000 other_files=55 other_bytes=90000000\n" +
+	"v=1 scope=apps ms=9000 chunks=120 cached=100 fetched=20 heal_ms=0 store_reads=22 cap_calls=5 fetched_bytes=150000000 wait_ms=5000 write_ms=3000 unfetched_pkgs=6 unfetched_bytes=410000000 unfetched_chunks=55\n" +
+	"v=1 scope=sys ms=700 chunks=3 cached=0 fetched=3 heal_ms=0 store_reads=8 cap_calls=1 fetched_bytes=90000 wait_ms=30 write_ms=20 unfetched_pkgs=7 unfetched_bytes=900 unfetched_chunks=8\n" +
 	"v=1 parked apps=14 ce_kib=812000 de_kib=4100\n" +
 	"v=1 phase=reap ms=25000\n" +
 	"v=1 phase=reown ms=30000\n" +
@@ -185,6 +230,16 @@ var signinSummaryFullKeys = map[string]string{
 	"signin_apps_store_reads": "22", "signin_apps_cap_calls": "5",
 	"signin_sys_ms": "700", "signin_sys_chunks": "3", "signin_sys_cached": "0", "signin_sys_fetched": "3",
 	"signin_sys_store_reads": "8", "signin_sys_cap_calls": "1",
+	"signin_vault_fetched_bytes": "3100000000", "signin_vault_wait_ms": "250000", "signin_vault_write_ms": "61001",
+	"signin_vault_unfetched_pkgs": "2", "signin_vault_unfetched_bytes": "7000", "signin_vault_unfetched_chunks": "90",
+	"signin_de_fetched_bytes": "41000000", "signin_de_wait_ms": "1200", "signin_de_write_ms": "2100",
+	"signin_de_unfetched_pkgs": "1", "signin_de_unfetched_bytes": "300", "signin_de_unfetched_chunks": "4",
+	"signin_media_fetched_bytes": "1800000000", "signin_media_wait_ms": "70000", "signin_media_write_ms": "9000",
+	"signin_media_unfetched_pkgs": "3", "signin_media_unfetched_bytes": "800", "signin_media_unfetched_chunks": "5",
+	"signin_apps_fetched_bytes": "150000000", "signin_apps_wait_ms": "5000", "signin_apps_write_ms": "3000",
+	"signin_apps_unfetched_pkgs": "6", "signin_apps_unfetched_bytes": "410000000", "signin_apps_unfetched_chunks": "55",
+	"signin_sys_fetched_bytes": "90000", "signin_sys_wait_ms": "30", "signin_sys_write_ms": "20",
+	"signin_sys_unfetched_pkgs": "7", "signin_sys_unfetched_bytes": "900", "signin_sys_unfetched_chunks": "8",
 	"signin_parked_apps": "14", "signin_parked_ce_kib": "812000", "signin_parked_de_kib": "4100",
 	"signin_heal_ms": "7500", // vault plus #de
 	"signin_in_ms":   "320000",
@@ -258,9 +313,9 @@ func TestSigninSummaryHealCountsOnce(t *testing.T) {
 func TestSigninSummaryStatusHeal(t *testing.T) {
 	// A later line of a scope replaces the earlier line's heal, as it does every other key of that scope.
 	got := signinSummaryStatus(signinSummaryPlant(t, t.TempDir(), "s",
-		"v=1 scope=vault ms=1 chunks=1 cached=1 fetched=0 heal_ms=5 store_reads=1 cap_calls=1\n"+
-			"v=1 scope=de ms=1 chunks=1 cached=1 fetched=0 heal_ms=7 store_reads=1 cap_calls=1\n"+
-			"v=1 scope=vault ms=1 chunks=1 cached=1 fetched=0 heal_ms=9 store_reads=3 cap_calls=2\n"))
+		"v=1 scope=vault ms=1 chunks=1 cached=1 fetched=0 heal_ms=5 store_reads=1 cap_calls=1 fetched_bytes=0 wait_ms=0 write_ms=0 unfetched_pkgs=0 unfetched_bytes=0 unfetched_chunks=0\n"+
+			"v=1 scope=de ms=1 chunks=1 cached=1 fetched=0 heal_ms=7 store_reads=1 cap_calls=1 fetched_bytes=0 wait_ms=0 write_ms=0 unfetched_pkgs=0 unfetched_bytes=0 unfetched_chunks=0\n"+
+			"v=1 scope=vault ms=1 chunks=1 cached=1 fetched=0 heal_ms=9 store_reads=3 cap_calls=2 fetched_bytes=0 wait_ms=0 write_ms=0 unfetched_pkgs=0 unfetched_bytes=0 unfetched_chunks=0\n"))
 	if got["signin_heal_ms"] != "16" {
 		t.Errorf("signin_heal_ms = %q, want 16 (the vault's last 9 plus #de's 7)", got["signin_heal_ms"])
 	}
@@ -268,7 +323,7 @@ func TestSigninSummaryStatusHeal(t *testing.T) {
 		t.Errorf("vault reads %q caps %q, want the later line's 3 and 2", got["signin_vault_store_reads"], got["signin_vault_cap_calls"])
 	}
 	// A scope line with no heal still says 0.
-	got = signinSummaryStatus(signinSummaryPlant(t, t.TempDir(), "s", "v=1 scope=sys ms=1 chunks=1 cached=1 fetched=0 heal_ms=0 store_reads=1 cap_calls=0\n"))
+	got = signinSummaryStatus(signinSummaryPlant(t, t.TempDir(), "s", "v=1 scope=sys ms=1 chunks=1 cached=1 fetched=0 heal_ms=0 store_reads=1 cap_calls=0 fetched_bytes=0 wait_ms=0 write_ms=0 unfetched_pkgs=0 unfetched_bytes=0 unfetched_chunks=0\n"))
 	if v, ok := got["signin_heal_ms"]; !ok || v != "0" {
 		t.Errorf("a scope line with no heal: signin_heal_ms = %q (%v), want 0", v, ok)
 	}
@@ -347,7 +402,9 @@ func TestSigninSummaryPrefetchCountsCapCalls(t *testing.T) {
 // The thirteen lines a sign-in writes, every field at its widest, fit the reader's bound and read back.
 func TestSigninSummaryWidestFits(t *testing.T) {
 	n := "999999999999"
-	wide := "ms=" + n + " chunks=" + n + " cached=" + n + " fetched=" + n + " heal_ms=" + n + " store_reads=" + n + " cap_calls=" + n
+	b15 := "999999999999999"
+	wide := "ms=" + n + " chunks=" + n + " cached=" + n + " fetched=" + n + " heal_ms=" + n + " store_reads=" + n + " cap_calls=" + n +
+		" fetched_bytes=" + b15 + " wait_ms=" + n + " write_ms=" + n + " unfetched_pkgs=" + n + " unfetched_bytes=" + b15 + " unfetched_chunks=" + n
 	var b strings.Builder
 	for _, s := range []string{"vault", "de", "apps", "sys"} {
 		b.WriteString("v=1 scope=" + s + " " + wide + "\n")
@@ -364,17 +421,21 @@ func TestSigninSummaryWidestFits(t *testing.T) {
 	if got["signin_summary"] != "" || got["signin_reown_ms"] != "2999999999997" || got["signin_heal_ms"] != "4999999999995" {
 		t.Errorf("the widest file: unreadable %q reown %q heal %q", got["signin_summary"], got["signin_reown_ms"], got["signin_heal_ms"])
 	}
+	if got["signin_media_unfetched_bytes"] != b15 || got["signin_vault_fetched_bytes"] != b15 || got["signin_sys_write_ms"] != n {
+		t.Errorf("the widest file: media unfetched_bytes %q vault fetched_bytes %q sys write_ms %q", got["signin_media_unfetched_bytes"],
+			got["signin_vault_fetched_bytes"], got["signin_sys_write_ms"])
+	}
 }
 
 func TestSigninSummaryStatusSizeUnknownAndIndexed0(t *testing.T) {
 	got := signinSummaryStatus(signinSummaryPlant(t, t.TempDir(), "s",
-		"v=1 parked apps=3 size=unknown\nv=1 scope=media ms=5 chunks=1 cached=0 fetched=1 heal_ms=0 store_reads=0 cap_calls=0 indexed=0\n"))
-	want := map[string]string{
+		"v=1 parked apps=3 size=unknown\nv=1 scope=media ms=5 chunks=1 cached=0 fetched=1 heal_ms=0 store_reads=0 cap_calls=0 fetched_bytes=0 wait_ms=0 write_ms=0 unfetched_pkgs=0 unfetched_bytes=0 unfetched_chunks=0 indexed=0\n"))
+	want := signinSplitZero(map[string]string{
 		"signin_parked_apps": "3",
 		"signin_media_ms":    "5", "signin_media_chunks": "1", "signin_media_cached": "0", "signin_media_fetched": "1",
 		"signin_media_store_reads": "0", "signin_media_cap_calls": "0", "signin_heal_ms": "0",
 		"signin_media_indexed": "0",
-	}
+	}, "media")
 	if len(got) != len(want) {
 		t.Errorf("%d keys %v, want %v", len(got), got, want)
 	}
@@ -395,23 +456,23 @@ func TestSigninSummaryStatusMissingAndEmpty(t *testing.T) {
 }
 
 func TestSigninSummaryStatusUnreadable(t *testing.T) {
-	good := "v=1 scope=vault ms=1 chunks=2 cached=0 fetched=2 heal_ms=0 store_reads=0 cap_calls=0\n"
+	good := "v=1 scope=vault ms=1 chunks=2 cached=0 fetched=2 heal_ms=0 store_reads=0 cap_calls=0 fetched_bytes=0 wait_ms=0 write_ms=0 unfetched_pkgs=0 unfetched_bytes=0 unfetched_chunks=0\n"
 	big := strings.Repeat(good, signinSummaryMaxBytes/len(good)+1)
 	for _, c := range []struct{ label, body string }{
 		{"oversized", big},
-		{"a letter in a number", good + "v=1 scope=de ms=12a chunks=1 cached=0 fetched=1 heal_ms=0 store_reads=0 cap_calls=0\n"},
-		{"an extra field", "v=1 scope=de ms=1 chunks=1 cached=0 fetched=1 heal_ms=0 store_reads=0 cap_calls=0 x=1\n"},
-		{"extras on a non-media scope", "v=1 scope=vault ms=1 chunks=1 cached=0 fetched=1 heal_ms=0 store_reads=0 cap_calls=0 user_files=1 user_bytes=1 other_files=1 other_bytes=1\n"},
-		{"a media line with neither the share nor indexed=0", "v=1 scope=media ms=1 chunks=2 cached=0 fetched=2 heal_ms=0 store_reads=0 cap_calls=0\n"},
-		{"a truncated media line after a whole one", "v=1 scope=media ms=1 chunks=2 cached=0 fetched=2 heal_ms=0 store_reads=0 cap_calls=0 user_files=1 user_bytes=9 other_files=1 other_bytes=9\n" +
-			"v=1 scope=media ms=1 chunks=2 cached=0 fetched=2 heal_ms=0 store_reads=0 cap_calls=0\n"},
-		{"indexed=0 on a non-media scope", "v=1 scope=de ms=1 chunks=1 cached=0 fetched=1 heal_ms=0 store_reads=0 cap_calls=0 indexed=0\n"},
-		{"a profile-name-shaped scope", "v=1 scope=alice ms=1 chunks=1 cached=0 fetched=1 heal_ms=0 store_reads=0 cap_calls=0\n"},
+		{"a letter in a number", good + "v=1 scope=de ms=12a chunks=1 cached=0 fetched=1 heal_ms=0 store_reads=0 cap_calls=0 fetched_bytes=0 wait_ms=0 write_ms=0 unfetched_pkgs=0 unfetched_bytes=0 unfetched_chunks=0\n"},
+		{"an extra field", "v=1 scope=de ms=1 chunks=1 cached=0 fetched=1 heal_ms=0 store_reads=0 cap_calls=0 fetched_bytes=0 wait_ms=0 write_ms=0 unfetched_pkgs=0 unfetched_bytes=0 unfetched_chunks=0 x=1\n"},
+		{"extras on a non-media scope", "v=1 scope=vault ms=1 chunks=1 cached=0 fetched=1 heal_ms=0 store_reads=0 cap_calls=0 fetched_bytes=0 wait_ms=0 write_ms=0 unfetched_pkgs=0 unfetched_bytes=0 unfetched_chunks=0 user_files=1 user_bytes=1 other_files=1 other_bytes=1\n"},
+		{"a media line with neither the share nor indexed=0", "v=1 scope=media ms=1 chunks=2 cached=0 fetched=2 heal_ms=0 store_reads=0 cap_calls=0 fetched_bytes=0 wait_ms=0 write_ms=0 unfetched_pkgs=0 unfetched_bytes=0 unfetched_chunks=0\n"},
+		{"a truncated media line after a whole one", "v=1 scope=media ms=1 chunks=2 cached=0 fetched=2 heal_ms=0 store_reads=0 cap_calls=0 fetched_bytes=0 wait_ms=0 write_ms=0 unfetched_pkgs=0 unfetched_bytes=0 unfetched_chunks=0 user_files=1 user_bytes=9 other_files=1 other_bytes=9\n" +
+			"v=1 scope=media ms=1 chunks=2 cached=0 fetched=2 heal_ms=0 store_reads=0 cap_calls=0 fetched_bytes=0 wait_ms=0 write_ms=0 unfetched_pkgs=0 unfetched_bytes=0 unfetched_chunks=0\n"},
+		{"indexed=0 on a non-media scope", "v=1 scope=de ms=1 chunks=1 cached=0 fetched=1 heal_ms=0 store_reads=0 cap_calls=0 fetched_bytes=0 wait_ms=0 write_ms=0 unfetched_pkgs=0 unfetched_bytes=0 unfetched_chunks=0 indexed=0\n"},
+		{"a profile-name-shaped scope", "v=1 scope=alice ms=1 chunks=1 cached=0 fetched=1 heal_ms=0 store_reads=0 cap_calls=0 fetched_bytes=0 wait_ms=0 write_ms=0 unfetched_pkgs=0 unfetched_bytes=0 unfetched_chunks=0\n"},
 		{"a profile-name-shaped token", good + "v=1 parked apps=2 size=unknown gt1424-alice\n"},
 		{"a path", good + "/data/user/10/com.ex.app\n"},
 		{"a path in a value", "v=1 parked apps=/data/user/10 size=unknown\n"},
 		{"v=2", "v=2 scope=vault ms=1 chunks=2 cached=0 fetched=2\n"},
-		{"fields out of order", "v=1 scope=vault chunks=2 ms=1 cached=0 fetched=2 heal_ms=0 store_reads=0 cap_calls=0\n"},
+		{"fields out of order", "v=1 scope=vault chunks=2 ms=1 cached=0 fetched=2 heal_ms=0 store_reads=0 cap_calls=0 fetched_bytes=0 wait_ms=0 write_ms=0 unfetched_pkgs=0 unfetched_bytes=0 unfetched_chunks=0\n"},
 		{"a blank line inside", good + "\n" + good},
 		{"a negative value", "v=1 parked apps=-1 size=unknown\n"},
 		{"half the sizes", "v=1 parked apps=1 ce_kib=5\n"},
@@ -419,7 +480,13 @@ func TestSigninSummaryStatusUnreadable(t *testing.T) {
 		{"a scope line without the store fields", "v=1 scope=vault ms=1 chunks=2 cached=0 fetched=2\n"},
 		{"a scope line without cap_calls", "v=1 scope=vault ms=1 chunks=2 cached=0 fetched=2 heal_ms=0 store_reads=0\n"},
 		{"the store fields out of order", "v=1 scope=vault ms=1 chunks=2 cached=0 fetched=2 heal_ms=0 cap_calls=0 store_reads=0\n"},
-		{"a letter in heal_ms", "v=1 scope=vault ms=1 chunks=2 cached=0 fetched=2 heal_ms=1x store_reads=0 cap_calls=0\n"},
+		{"an old-shape line, without the restore split", "v=1 scope=vault ms=1 chunks=2 cached=0 fetched=2 heal_ms=0 store_reads=0 cap_calls=0\n"},
+		{"a media line without the restore split", "v=1 scope=media ms=1 chunks=2 cached=0 fetched=2 heal_ms=0 store_reads=0 cap_calls=0 indexed=0\n"},
+		{"a scope line without unfetched_chunks", "v=1 scope=vault ms=1 chunks=2 cached=0 fetched=2 heal_ms=0 store_reads=0 cap_calls=0 fetched_bytes=0 wait_ms=0 write_ms=0 unfetched_pkgs=0 unfetched_bytes=0\n"},
+		{"a letter in wait_ms", "v=1 scope=vault ms=1 chunks=2 cached=0 fetched=2 heal_ms=0 store_reads=0 cap_calls=0 fetched_bytes=0 wait_ms=1x write_ms=0 unfetched_pkgs=0 unfetched_bytes=0 unfetched_chunks=0\n"},
+		{"split fields out of order", "v=1 scope=vault ms=1 chunks=2 cached=0 fetched=2 heal_ms=0 store_reads=0 cap_calls=0 fetched_bytes=0 write_ms=0 wait_ms=0 unfetched_pkgs=0 unfetched_bytes=0 unfetched_chunks=0\n"},
+		{"a 16-digit fetched_bytes", "v=1 scope=vault ms=1 chunks=2 cached=0 fetched=2 heal_ms=0 store_reads=0 cap_calls=0 fetched_bytes=1234567890123456 wait_ms=0 write_ms=0 unfetched_pkgs=0 unfetched_bytes=0 unfetched_chunks=0\n"},
+		{"a letter in heal_ms", "v=1 scope=vault ms=1 chunks=2 cached=0 fetched=2 heal_ms=1x store_reads=0 cap_calls=0 fetched_bytes=0 wait_ms=0 write_ms=0 unfetched_pkgs=0 unfetched_bytes=0 unfetched_chunks=0\n"},
 		{"a phase word outside the list", good + "v=1 phase=keystore ms=1\n"},
 		{"a profile-name-shaped phase word", "v=1 phase=alice ms=1\n"},
 		{"a letter in a phase value", "v=1 phase=in ms=1a\n"},
@@ -442,11 +509,11 @@ func TestSigninSummaryStatusUnreadable(t *testing.T) {
 
 func TestSigninSummaryStatusLastWins(t *testing.T) {
 	got := signinSummaryStatus(signinSummaryPlant(t, t.TempDir(), "s",
-		"v=1 scope=vault ms=1 chunks=1 cached=1 fetched=0 heal_ms=0 store_reads=0 cap_calls=0\n"+
-			"v=1 scope=media ms=2 chunks=2 cached=0 fetched=2 heal_ms=0 store_reads=0 cap_calls=0 user_files=1 user_bytes=9 other_files=1 other_bytes=9\n"+
+		"v=1 scope=vault ms=1 chunks=1 cached=1 fetched=0 heal_ms=0 store_reads=0 cap_calls=0 fetched_bytes=0 wait_ms=0 write_ms=0 unfetched_pkgs=0 unfetched_bytes=0 unfetched_chunks=0\n"+
+			"v=1 scope=media ms=2 chunks=2 cached=0 fetched=2 heal_ms=0 store_reads=0 cap_calls=0 fetched_bytes=0 wait_ms=0 write_ms=0 unfetched_pkgs=0 unfetched_bytes=0 unfetched_chunks=0 user_files=1 user_bytes=9 other_files=1 other_bytes=9\n"+
 			"v=1 parked apps=4 ce_kib=10 de_kib=20\n"+
-			"v=1 scope=vault ms=7 chunks=8 cached=0 fetched=8 heal_ms=0 store_reads=0 cap_calls=0\n"+
-			"v=1 scope=media ms=3 chunks=3 cached=3 fetched=0 heal_ms=0 store_reads=0 cap_calls=0 indexed=0\n"+
+			"v=1 scope=vault ms=7 chunks=8 cached=0 fetched=8 heal_ms=0 store_reads=0 cap_calls=0 fetched_bytes=0 wait_ms=0 write_ms=0 unfetched_pkgs=0 unfetched_bytes=0 unfetched_chunks=0\n"+
+			"v=1 scope=media ms=3 chunks=3 cached=3 fetched=0 heal_ms=0 store_reads=0 cap_calls=0 fetched_bytes=0 wait_ms=0 write_ms=0 unfetched_pkgs=0 unfetched_bytes=0 unfetched_chunks=0 indexed=0\n"+
 			"v=1 parked apps=5 size=unknown\n"))
 	want := map[string]string{
 		"signin_vault_ms": "7", "signin_vault_chunks": "8", "signin_vault_cached": "0", "signin_vault_fetched": "8",
@@ -456,6 +523,7 @@ func TestSigninSummaryStatusLastWins(t *testing.T) {
 		"signin_media_indexed": "0",
 		"signin_parked_apps":   "5",
 	}
+	signinSplitZero(want, "vault", "media")
 	if len(got) != len(want) {
 		t.Errorf("%d keys %v, want %v (an earlier line's extras or sizes must not survive)", len(got), got, want)
 	}
@@ -474,10 +542,10 @@ func TestSigninSummaryStatusLastWins(t *testing.T) {
 func TestSigninSummaryMerge(t *testing.T) {
 	st := t.TempDir()
 	t.Setenv("NOWHERE_STATE", st)
-	signinSummaryPlant(t, st, "signin-summary.10", "v=1 scope=media ms=42 chunks=1 cached=0 fetched=1 heal_ms=0 store_reads=0 cap_calls=0 indexed=0\n")
-	signinSummaryPlant(t, st, "signin-summary.11", "v=1 scope=vault ms=99 chunks=9 cached=9 fetched=0 heal_ms=0 store_reads=0 cap_calls=0\n")
-	signinSummaryPlant(t, st, "signin-summary", "v=1 scope=apps ms=77 chunks=7 cached=7 fetched=0 heal_ms=0 store_reads=0 cap_calls=0\n")
-	signinSummaryPlant(t, st, "signin-summary.", "v=1 scope=apps ms=78 chunks=7 cached=7 fetched=0 heal_ms=0 store_reads=0 cap_calls=0\n")
+	signinSummaryPlant(t, st, "signin-summary.10", "v=1 scope=media ms=42 chunks=1 cached=0 fetched=1 heal_ms=0 store_reads=0 cap_calls=0 fetched_bytes=0 wait_ms=0 write_ms=0 unfetched_pkgs=0 unfetched_bytes=0 unfetched_chunks=0 indexed=0\n")
+	signinSummaryPlant(t, st, "signin-summary.11", "v=1 scope=vault ms=99 chunks=9 cached=9 fetched=0 heal_ms=0 store_reads=0 cap_calls=0 fetched_bytes=0 wait_ms=0 write_ms=0 unfetched_pkgs=0 unfetched_bytes=0 unfetched_chunks=0\n")
+	signinSummaryPlant(t, st, "signin-summary", "v=1 scope=apps ms=77 chunks=7 cached=7 fetched=0 heal_ms=0 store_reads=0 cap_calls=0 fetched_bytes=0 wait_ms=0 write_ms=0 unfetched_pkgs=0 unfetched_bytes=0 unfetched_chunks=0\n")
+	signinSummaryPlant(t, st, "signin-summary.", "v=1 scope=apps ms=78 chunks=7 cached=7 fetched=0 heal_ms=0 store_reads=0 cap_calls=0 fetched_bytes=0 wait_ms=0 write_ms=0 unfetched_pkgs=0 unfetched_bytes=0 unfetched_chunks=0\n")
 
 	// Device scope: nothing is added and nothing is removed.
 	s := map[string]string{"x": "1", "signin_media_ms": "abc"}
@@ -504,6 +572,7 @@ func TestSigninSummaryMerge(t *testing.T) {
 		"signin_media_store_reads": "0", "signin_media_cap_calls": "0", "signin_heal_ms": "0",
 		"signin_media_indexed": "0",
 	}
+	signinSplitZero(want, "media")
 	if len(s) != len(want) {
 		t.Errorf("session scope: %v, want %v", s, want)
 	}
@@ -606,5 +675,132 @@ func TestSigninSummarySourcePins(t *testing.T) {
 	next := strings.TrimSpace(strings.SplitN(src[f+nl+1:], "\n", 2)[0])
 	if !strings.HasPrefix(next, call) {
 		t.Errorf("report_issue.go: the line after mergeSigninFail is %q, want %s", next, call)
+	}
+}
+
+// NWP-20261203-09: the six restore split counters reach their keys exactly, ns floored to ms.
+func TestSigninSummarySplitKeys(t *testing.T) {
+	signinSplitReset(t)
+	atomic.StoreInt64(&restoreFetchedBytes, 123456789012345)
+	atomic.StoreInt64(&restoreWaitNs, 7_999_999)
+	atomic.StoreInt64(&restoreWriteNs, 3_000_001)
+	atomic.StoreInt64(&restoreUnfetchedPkgs, 4)
+	atomic.StoreInt64(&restoreUnfetchedBytes, 5)
+	atomic.StoreInt64(&restoreUnfetchedChunks, 6)
+	p := filepath.Join(t.TempDir(), "signin-summary.10")
+	t.Setenv("NOWHERE_SIGNIN_SUMMARY", p)
+	t.Setenv("NOWHERE_PHASE", "apps")
+	signinSummaryAppend(chunkManifest{Chunks: []string{"a"}}, 10, 0)
+	got := signinSummaryStatus(p)
+	for k, v := range map[string]string{
+		"signin_vault_fetched_bytes": "123456789012345", "signin_vault_wait_ms": "7", "signin_vault_write_ms": "3",
+		"signin_vault_unfetched_pkgs": "4", "signin_vault_unfetched_bytes": "5", "signin_vault_unfetched_chunks": "6",
+	} {
+		if got[k] != v {
+			t.Errorf("%s = %q, want %q (file %q)", k, got[k], v, signinSummaryRead(t, p))
+		}
+	}
+}
+
+// signinSplitSlowReader sleeps before every Read: the untar consuming slowly.
+type signinSplitSlowReader struct {
+	r     io.Reader
+	delay time.Duration
+}
+
+func (s signinSplitSlowReader) Read(p []byte) (int, error) {
+	time.Sleep(s.delay)
+	return s.r.Read(p)
+}
+
+// NWP-20261203-09: a fixture CDC restore puts a slow store into wait_ms and a slow untar into write_ms, and counts the
+// sealed bytes it fetched. Lower bounds only: the other counter may hold anything.
+func TestSigninSummaryRestoreSplit(t *testing.T) {
+	signinSplitReset(t)
+	t.Setenv("NOWHERE_DOWNLOAD_WORKERS", "1")
+	const scope = "signin-split-restore"
+	base, m, _ := psSeal(t, scope, ufFiles())
+	if len(m.Chunks) < 3 || len(m.Sizes) != len(m.Chunks) {
+		t.Fatalf("fixture: %d chunks and %d sizes, want at least 3 chunks, each with a size", len(m.Chunks), len(m.Sizes))
+	}
+	key, _, ok := resolveKey(base, scope, unfPass)
+	if !ok {
+		t.Fatalf("no %s head", scope)
+	}
+	const delay = 40 * time.Millisecond
+
+	// Run A: a slow store.
+	for _, c := range signinSplitAll {
+		atomic.StoreInt64(c, 0)
+	}
+	fetch := cdcFetchChunk
+	cdcFetchChunk = func(b, h string) []byte {
+		time.Sleep(delay)
+		return fetch(b, h)
+	}
+	captureStdout(t, func() { cdcRestore(base, key, m, t.TempDir()) })
+	if w := time.Duration(atomic.LoadInt64(&restoreWaitNs)); w < delay {
+		t.Errorf("a store %v late per chunk: the writer waited %v, want at least %v", delay, w, delay)
+	}
+	if got, want := atomic.LoadInt64(&restoreFetchedBytes), sumSizes(m); got != want {
+		t.Errorf("fetched %d sealed bytes, want the head's %d (no cache, no retry)", got, want)
+	}
+
+	// Run B: a slow untar.
+	for _, c := range signinSplitAll {
+		atomic.StoreInt64(c, 0)
+	}
+	cdcFetchChunk = fetch
+	untar := cdcUntar
+	cdcUntar = func(dir string, r io.Reader) int { return untar(dir, signinSplitSlowReader{r, delay}) }
+	captureStdout(t, func() { cdcRestore(base, key, m, t.TempDir()) })
+	if w := time.Duration(atomic.LoadInt64(&restoreWriteNs)); w < delay {
+		t.Errorf("an untar %v slow per read: the writer spent %v in the pipe, want at least %v", delay, w, delay)
+	}
+}
+
+var signinSplitUnfetchedRe = regexp.MustCompile(`unfetched: ([0-9]+) package\(s\) skipped, ([0-9]+) B not fetched, ([0-9]+) chunk\(s\)`)
+
+// NWP-20261203-09: the parked skip's counts are the numbers of its own `unfetched:` line, and 0 when the skip is off.
+func TestSigninSummaryUnfetchedCounts(t *testing.T) {
+	signinSplitReset(t)
+	_, _, out := ufSkipRestore(t, "signin-split-uf", ufFiles())
+	g := signinSplitUnfetchedRe.FindStringSubmatch(out)
+	if g == nil {
+		t.Fatalf("no unfetched: line in\n%s", out)
+	}
+	if g[1] == "0" {
+		t.Fatalf("fixture: the skip skipped no package\n%s", out)
+	}
+	for i, c := range []*int64{&restoreUnfetchedPkgs, &restoreUnfetchedBytes, &restoreUnfetchedChunks} {
+		if got := strconv.FormatInt(atomic.LoadInt64(c), 10); got != g[i+1] {
+			t.Errorf("counter %d = %s, want the line's %s (%q)", i, got, g[i+1], g[0])
+		}
+	}
+
+	// The skip off: nothing is stored.
+	for _, c := range signinSplitAll {
+		atomic.StoreInt64(c, 0)
+	}
+	const scope = "signin-split-ufoff"
+	base, m, _ := psSeal(t, scope, ufFiles())
+	dir := t.TempDir()
+	for _, f := range []string{odUnfetchedCE, odUnfetchedDE, "shipped"} {
+		if err := os.WriteFile(filepath.Join(dir, f), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("NOWHERE_PARK_KEEP", "")
+	t.Setenv("NOWHERE_PARK_SHIPPED", filepath.Join(dir, "shipped"))
+	t.Setenv("NOWHERE_UNFETCHED_LIST", filepath.Join(dir, odUnfetchedCE))
+	key, _, ok := resolveKey(base, scope, unfPass)
+	if !ok {
+		t.Fatalf("no %s head", scope)
+	}
+	captureStdout(t, func() { restoreSkippingParked(base, key, scope, m, t.TempDir()) })
+	for i, c := range []*int64{&restoreUnfetchedPkgs, &restoreUnfetchedBytes, &restoreUnfetchedChunks} {
+		if n := atomic.LoadInt64(c); n != 0 {
+			t.Errorf("the skip off: counter %d = %d, want 0", i, n)
+		}
 	}
 }

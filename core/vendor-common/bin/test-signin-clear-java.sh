@@ -13,7 +13,7 @@
 # NWP-20261118-07 (docs/product-decisions.md 2026-10-30, "ten answers to harvest 48 ...", item 7) applies the same
 # rule to the three screens the clear left out. The source check pins closeScreenOffSurfaces, called once by the
 # receiver after clearSignInFields: it dismisses the kept "Couldn't load your data" offer (snapshotOffer) and runs its
-# Cancel's statements; it empties every box of Reset passphrase or Add this phone (gateSubScreen), moves
+# Not now's statements; it empties every box of Reset passphrase or Add this phone (gateSubScreen), moves
 # gateSubScreenGen and shows the sign-in screen. A reset or add already sent finishes, but its reply refills no name
 # and touches no closed screen (the gen check). No log line of it prints a field or a name.
 #
@@ -249,18 +249,17 @@ else:
        "the receiver calls closeScreenOffSurfaces() once, after clearSignInFields(), before new Thread(")
 ok(pb is not None and "closeScreenOffSurfaces" not in s[pb[0]:pb[1]], "onPause never calls closeScreenOffSurfaces")
 
-# 13. the offer is kept, its buttons unchanged
+# 13. the offer is kept, its three actions unchanged and in order (NWP-20261206-09: a sheet)
 ob2 = block(s, "private void offerSnapshotRecovery(")
 if ob2 is None:
     ok(False, "offerSnapshotRecovery's body is found")
 else:
     o = norm(s[ob2[0]:ob2[1] + 1])
-    k = o.find("snapshotOffer = new android.app.AlertDialog.Builder(this)")
-    ok(k >= 0 and o.find(".show();", k) > k, "offerSnapshotRecovery keeps the dialog .show() returns in snapshotOffer")
-    ok(all(t in o for t in ('.setPositiveButton("Try again", (d, w) -> roamLogin(name, pw, false))',
-                            '.setNeutralButton("Restore last good version", (d, w) -> doGateRollback(name, pw))',
-                            '.setNegativeButton("Cancel", (d, w) -> { hideRestore(); if (result != null) result.setText(""); })')),
-       "the offer's three buttons are unchanged")
+    ok("snapshotOffer = SheetDialog.confirm(this, SigninLossSheets.snapshotOffer(), new Runnable[] {" in o,
+       "offerSnapshotRecovery keeps the dialog SheetDialog.confirm returns in snapshotOffer")
+    ok("SheetDialog.confirm(this, SigninLossSheets.snapshotOffer(), new Runnable[] { () -> roamLogin(name, pw, false),"
+       ' () -> doGateRollback(name, pw), () -> { hideRestore(); if (result != null) result.setText(""); } }, null);' in o,
+       "the offer's three actions are unchanged, in order: Try again, Restore last good version, Not now")
 
 # 14. the snapshot branch
 sb = block(xs, "if (snapshotOffer != null && snapshotOffer.isShowing())")
@@ -421,7 +420,7 @@ smut "N6 gateSubScreenGen++ removed" 's/\n[ \t]*gateSubScreenGen\+\+;//' || fail
 smut "N7 setContentView(gateView) removed from the sub-screen branch" 's/(gateSubScreenGen\+\+;\n)[ \t]*setContentView\(gateView\);\n/$1/' || fails=$((fails+1))
 smut "N8 the gen check removed from buildRecoverScreen's success branch" 's/(private View buildRecoverScreen\(\).*?)if \(gen == gateSubScreenGen\) \{/$1if (true) {/s' || fails=$((fails+1))
 smut "N9 the gen check removed from buildAddPhoneScreen's success branch" 's/(private View buildAddPhoneScreen\(\).*?)if \(gen == gateSubScreenGen\) \{/$1if (true) {/s' || fails=$((fails+1))
-smut "N10 offerSnapshotRecovery no longer keeps the dialog" 's/snapshotOffer = (new android\.app\.AlertDialog\.Builder\(this\))/$1/' || fails=$((fails+1))
+smut "N10 offerSnapshotRecovery no longer keeps the dialog" 's/snapshotOffer = (SheetDialog\.confirm\(this, SigninLossSheets\.snapshotOffer\(\))/$1/' || fails=$((fails+1))
 smut "N11 Reset's failure touches the views again" 's/(private View buildRecoverScreen\(\).*?)\n[ \t]*if \(gen != gateSubScreenGen\) return;[^\n]*/$1/s' || fails=$((fails+1))
 smut "N12 Reset's Cancel keeps gateSubScreen" 's/(private View buildRecoverScreen\(\).*?)gateSubScreen = null; (setContentView\(gateView\);)/$1$2/s' || fails=$((fails+1))
 smut "N13 forgotLink's click no longer records the screen" 's/gateSubScreen = buildRecoverScreen\(\);[^\n]*\n[ \t]*setContentView\(gateSubScreen\);/setContentView(buildRecoverScreen());/' || fails=$((fails+1))

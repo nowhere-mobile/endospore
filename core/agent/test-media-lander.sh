@@ -106,7 +106,7 @@ mut "M29 a restart does not report a corrupt rel again (L12a: the restart's onDa
 mut "M30 a corrupt digest goes to the landed roster (L12a: a corrupt rel's digest is in the landed roster)" $L \
   'recordCorruptRoster\(in\.ref, in\.dk, \[\]string\{rel\}\)' 'recordCorruptRoster(in.ref, in.dk, []string{rel}); recordLandedRoster(in.ref, in.dk, []string{rel})'
 mut "M31 a transient error is recorded as corrupt (L12b: the corrupt roster after a transient error)" $L \
-  '\} else \{\n(\t+)next = append\(next, rel\)' '} else {\n\1recordCorruptRoster(in.ref, in.dk, []string{rel})\n\1next = append(next, rel)'
+  '\} else \{\n(\t+)transient\+\+\n\t+next = append\(next, rel\)' '} else {\n\1transient++\n\1recordCorruptRoster(in.ref, in.dk, []string{rel})\n\1next = append(next, rel)'
 mut "M32 a restart drops a corrupt rel from the pending set (L12a: the restart's pending set)" $L \
   'if !held\(rel\) \{' 'if !held(rel) && !wasCorrupt(rel) {'
 # NWP-20261130-17: the landed roster is written per landing (TestMediaLander_L13, media_lander_persist_test.go).

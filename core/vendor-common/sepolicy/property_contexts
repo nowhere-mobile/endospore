@@ -18,3 +18,6 @@ ctl.stop$nowhere_mediad        u:object_r:ctl_nowhere_mediad_prop:s0
 # Per-edition brand (set in <edition>.mk): an app-readable type so the confined gate domain can read it
 # (default_prop is app-neverallow). See nowhere.te (nowhere_brand_prop + allow nowhere_chooser).
 ro.nowhere.brand               u:object_r:nowhere_brand_prop:s0
+# NWP-20261203-13: the push gateway nowhere_login.sh publishes from the merged conf for NowherePush (platform_app): its
+# own app-readable type, as the brand line (default_prop is app-neverallow). See nowhere.te (nowhere_gateway_prop).
+nowhere.gateway_url            u:object_r:nowhere_gateway_prop:s0

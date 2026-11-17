@@ -55,9 +55,9 @@ mut "G4 the gate's answer is always NONE" wallet_restore.go \
 mut "G5 the restart tells nothing" end_unsaved.go \
   'if tell != "" \{\n\t\tnoteRestartCreditLost\(tell\)' 'if false {\n\t\tnoteRestartCreditLost(tell)'
 mut "G6 the restart tells whatever the session held" end_unsaved.go \
-  'ok == endUnsavedCreditLost && walletHoldsCredit\(walletPathFor\(dest\)\)' 'ok == endUnsavedCreditLost'
+  'ok == endUnsavedCreditLost && walletHoldsUnrestoredCredit\(walletPathFor\(dest\)\)' 'ok == endUnsavedCreditLost'
 mut "G7 a restart that saved the wallet tells too" end_unsaved.go \
-  'if ok == endUnsavedCreditLost && walletHoldsCredit' 'if walletHoldsCredit'
+  'if ok == endUnsavedCreditLost && walletHoldsUnrestoredCredit' 'if walletHoldsUnrestoredCredit'
 mut "G8 the notice is written before the restart can refuse" end_unsaved.go \
   '(tell = strconv\.FormatInt\(time\.Now\(\)\.Unix\(\), 10\)\n)(.*?)\t// NWP-20261016-47: after the last refusal[^\n]*\n\tif tell != "" \{\n\t\tnoteRestartCreditLost\(tell\)\n\t\}\n' \
   '\1\t\tnoteRestartCreditLost(tell)\n\2'

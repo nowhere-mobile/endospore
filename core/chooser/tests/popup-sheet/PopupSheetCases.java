@@ -130,8 +130,15 @@ final class PopupSheetCases {
         fires("R_DESTRUCTIVE_ORDER alone", PopupSheet.violations(conf(Tone.DESTRUCTIVE, b("Delete it", Style.RED_FILLED))),
                 PopupSheet.R_DESTRUCTIVE_ORDER);
 
-        fires("R_GOT_IT_TONE warning", PopupSheet.violations(conf(Tone.WARNING, b(PopupSheet.GOT_IT, Style.GREEN_FILLED))),
-                PopupSheet.R_GOT_IT_TONE, PopupSheet.R_WARNING_BUTTONS);
+        check("a warning notice: one green Got it", PopupSheet.violations(conf(Tone.WARNING,
+                b(PopupSheet.GOT_IT, Style.GREEN_FILLED))).isEmpty());
+        fires("R_WARNING_BUTTONS a lone green that is not Got it", PopupSheet.violations(conf(Tone.WARNING,
+                b("Try again", Style.GREEN_FILLED))), PopupSheet.R_WARNING_BUTTONS);
+        fires("R_WARNING_BUTTONS a lone outlined Got it", PopupSheet.violations(conf(Tone.WARNING,
+                b(PopupSheet.GOT_IT, Style.OUTLINED))), PopupSheet.R_WARNING_BUTTONS);
+        fires("R_WARNING_BUTTONS Got it beside another button", PopupSheet.violations(conf(Tone.WARNING,
+                b(PopupSheet.GOT_IT, Style.GREEN_FILLED), b(PopupSheet.NOT_NOW, Style.OUTLINED))),
+                PopupSheet.R_WARNING_BUTTONS);
         fires("R_GOT_IT_TONE destructive", PopupSheet.violations(conf(Tone.DESTRUCTIVE, b(PopupSheet.GOT_IT, Style.OUTLINED))),
                 PopupSheet.R_GOT_IT_TONE, PopupSheet.R_DESTRUCTIVE_ORDER);
 

@@ -32,7 +32,7 @@ tail = ('\t\tfmt.Fprint(os.Stderr, "[logind] create refused: the name holds \'#\
         '\t\tfmt.Fprint(conn, "ERR-NAME\\n")\n')
 head = "\tif strings.IndexByte(name, '#') >= 0 { // NWP-20261117-11 (#54): "
 b1 = head + "'#' is the scope separator; the typed name alone decides\n" + tail + "\t\treturn false\n\t}\n"
-b2 = head + "before the floor, the gateway, the code and the drain\n" + tail + "\t\treturn\n\t}\n"
+b2 = head + "before the floor, the gateway, the code and the staging\n" + tail + "\t\treturn\n\t}\n"
 b3 = (head + "a throwaway's name is fixed, so a retry cannot help\n"
       '\t\tfmt.Fprint(os.Stderr, "[logind] promote refused: the name holds \'#\' (ERR-NAME)\\n")\n'
       '\t\tfmt.Fprint(conn, "ERR-NAME\\n")\n\t\treturn "", "", "", false\n\t}\n')
@@ -54,7 +54,7 @@ PY
   cp -f "$W/$F.orig" "$F"
 }
 mut N1 "N1 the createPrecheck check removed" TestNameHash_CreateRefusesBeforeTheStore
-mut N2 "N2 the handleCreateCode check removed" TestNameHash_CreateCodeRefusesBeforeTheDrain
+mut N2 "N2 the handleCreateCode check removed" TestNameHash_CreateCodeRefusesBeforeTheStaging
 mut N3 "N3 the promoteGuards check removed" TestNameHash_PromoteRefusesBeforeTheStoreAndTheRekey
 mut N4 "N4 the create check moved after the existence probe" TestNameHash_CreateRefusesBeforeTheStore
 [ "$fails" -eq 0 ] && echo "== all mutations convicted" || { echo "== $fails mutation(s) not convicted"; exit 1; }

@@ -14,7 +14,8 @@
 #
 # What counts as already wired (NWP-20261027-18): only a LIVE directive -- a line that is not a comment
 # (no leading `#` after optional whitespace). Block 1 and 2 need a live line naming the path; block 3 needs
-# a live `BUILD_BROKEN_ELF_PREBUILT_PRODUCT_COPY_FILES := true`. A commented-out inherit would otherwise skip
+# a live `BUILD_BROKEN_ELF_PREBUILT_PRODUCT_COPY_FILES := true`. A path matches only as a whole word, so the
+# live `vendor/endospore/sepolicy_public` line of block 4 never counts as block 2's `vendor/endospore/sepolicy`. A commented-out inherit would otherwise skip
 # block 1 and, through inherit-product-if-exists, build an image WITHOUT the Endospore fragment, silently; a
 # `:= false` would skip block 3 and fail the bundled-app JNI libs. A block this script appended itself is
 # live, so a wired tree re-runs as a no-op.
@@ -36,6 +37,18 @@ SEPOL_MARK='# --- endospore: confined SELinux domain (system-side private policy
 [ -f "$MK" ] || { echo "ERROR: $MK not found -- run adevtool generate-all -d $DEV first" >&2; exit 1; }
 [ -f "$BC" ] || { echo "ERROR: $BC not found -- run adevtool generate-all -d $DEV first" >&2; exit 1; }
 
+# Does this device's generated vendor policy declare the DRM store type (block 5)? Decided BEFORE any edit, so the
+# refusal below leaves both files untouched.
+VPOL="$TREE/vendor/google_devices/$DEV/sepolicy/vendor"
+VEN_RE='^[[:space:]]*[^#[:space:]].*vendor/endospore/sepolicy_vendor([[:space:]]|$)'
+HAS_DRM=no
+if [ -d "$VPOL" ] && grep -rqsE '^[[:space:]]*(type[[:space:]]+mediadrm_vendor_data_file[[:space:]]*[,;]|\(type[[:space:]]+mediadrm_vendor_data_file\))' "$VPOL"; then
+  HAS_DRM=yes
+elif grep -qE "$VEN_RE" "$BC"; then
+  echo "ERROR: $BC wires vendor/endospore/sepolicy_vendor, but $DEV's vendor policy declares no mediadrm_vendor_data_file -- the policy compile would fail" >&2
+  exit 1
+fi
+
 # 1. Product fragment inherit (keeps the product name $DEV so the E.1 release tooling is unchanged).
 if grep -qE '^[[:space:]]*[^#[:space:]].*vendor/endospore/endospore\.mk' "$MK"; then
   echo "[inject-product] product inherit already present in $MK"
@@ -45,7 +58,7 @@ else
 fi
 
 # 2. Board sepolicy dir (so the nowhere / nowhere_chooser domains + login socket types are compiled in).
-if grep -qE '^[[:space:]]*[^#[:space:]].*vendor/endospore/sepolicy' "$BC"; then
+if grep -qE '^[[:space:]]*[^#[:space:]].*vendor/endospore/sepolicy([[:space:]]|$)' "$BC"; then
   echo "[inject-product] sepolicy dir already wired in $BC"
 else
   printf '\n%s\n%s\n' "$SEPOL_MARK" "$SEPOL_LINE" >> "$BC"
@@ -65,4 +78,36 @@ else
   # make's last assignment wins, so this overrides an earlier generated `:= false` (left as it is).
   printf '\n%s\n%s\n' "$BROKEN_MARK" "$BROKEN_LINE" >> "$BC"
   echo "[inject-product] wired BUILD_BROKEN_ELF_PREBUILT_PRODUCT_COPY_FILES into $BC"
+fi
+
+# 4. The system_ext PUBLIC policy dir (NWP-20261116-37): one attribute, nowhere_drm_store_file, that a vendor type
+# can join. The vendor policy compiles against the public policies only, so it can name this attribute but never
+# endospore_priv; the grant on the attribute stays in block 2's private dir. Wired on EVERY device: an attribute no
+# type joins grants nothing.
+PUB_LINE='SYSTEM_EXT_PUBLIC_SEPOLICY_DIRS += vendor/endospore/sepolicy_public'
+PUB_MARK='# --- endospore: public attribute a vendor type can join (system-side public policy) ---'
+if grep -qE '^[[:space:]]*[^#[:space:]].*vendor/endospore/sepolicy_public([[:space:]]|$)' "$BC"; then
+  echo "[inject-product] public sepolicy dir already wired in $BC"
+else
+  printf '\n%s\n%s\n' "$PUB_MARK" "$PUB_LINE" >> "$BC"
+  echo "[inject-product] wired SYSTEM_EXT_PUBLIC_SEPOLICY_DIRS into $BC"
+fi
+
+# 5. The VENDOR policy dir (NWP-20261116-37): it puts the device's own mediadrm_vendor_data_file into that attribute,
+# so roamd's drm_wipe may delete from /data/vendor/mediadrm. The type is the DEVICE's (declared in its generated
+# vendor policy), never a platform one, and a vendor policy naming a type the device does not declare fails the
+# build -- the 0.5.58 break of NWP-20261203-08. So the dir is wired only when that policy declares the type; on a
+# device that does not, drm_wipe reads UNREACHABLE and the build says so here. A live line on such a device would
+# fail later in the policy compile, so the script refuses it up front (HAS_DRM, before any edit).
+VEN_LINE='BOARD_VENDOR_SEPOLICY_DIRS += vendor/endospore/sepolicy_vendor'
+VEN_MARK='# --- endospore: the device DRM store type joins the public attribute (vendor policy) ---'
+if [ "$HAS_DRM" = yes ]; then
+  if grep -qE "$VEN_RE" "$BC"; then
+    echo "[inject-product] vendor sepolicy dir already wired in $BC"
+  else
+    printf '\n%s\n%s\n' "$VEN_MARK" "$VEN_LINE" >> "$BC"
+    echo "[inject-product] wired BOARD_VENDOR_SEPOLICY_DIRS into $BC"
+  fi
+else
+  echo "[inject-product] $DEV's vendor policy declares no mediadrm_vendor_data_file: vendor sepolicy dir NOT wired, drm_wipe reads UNREACHABLE on this device"
 fi

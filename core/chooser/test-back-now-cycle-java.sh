@@ -9,6 +9,11 @@
 # pure Java, so this suite compiles it alone with the cases below; the PINS read the watcher in ChooserActivity as
 # data, with comments stripped.
 #
+# NWP-20261204-03: the cycle log. The watcher writes each transition to login.log through IDLE-TRACE (`backnow drop`,
+# `backnow post at=<reconnect>`, each new `backnow landed s=<stamp>` it reads, `backnow cancel`, `cancel drop`,
+# `cancel gate`), so an in-session issue report shows the cycle. BackNowCycle.landedChanged keeps the landed lines to
+# one per new stamp; the cases below run it, and pins P9-P12 read the traces in the watcher (mutants N1-N9).
+#
 # ⚠ IT FAILS WHEN THERE IS NO JAVAC, IT NEVER SKIPS. javac comes from PATH, else from the build host's JDK; the version
 # is printed first so the log proves which compiler ran.
 #
@@ -168,6 +173,31 @@ public class BackNowCycleCases {
         eq("reply \"OK 1999\" does not cancel", b.onReply("OK 1999"), N);
         eq("reply \"OK 2100\" cancels", b.onReply("OK 2100"), C);
 
+        // NWP-20261204-03: landedChanged -- the watcher logs each new GET-SEAL-LANDED stamp once per cycle. Each
+        // forget case reads the stamp 0 right before and right after the forget, because onDrop and reset also set
+        // the last stamp to 0: only forgetting that a stamp was seen can make the second read true (mutant N2).
+        b = new BackNowCycle();
+        b.onDrop();
+        b.onOnline(2000);
+        eq("landedChanged: the first stamp of a cycle, even 0", b.landedChanged(0) ? 1 : 0, 1);
+        eq("landedChanged: the same stamp again", b.landedChanged(0) ? 1 : 0, 0);
+        eq("landedChanged: a new stamp", b.landedChanged(1500) ? 1 : 0, 1);
+        eq("landedChanged: the same new stamp again", b.landedChanged(1500) ? 1 : 0, 0);
+        eq("landedChanged: an unreadable reply (-1) is a value", b.landedChanged(-1) ? 1 : 0, 1);
+        eq("landedChanged: -1 then -1", b.landedChanged(-1) ? 1 : 0, 0);
+        b.landedChanged(0);
+        b.onDrop();
+        eq("landedChanged: onDrop forgets the last stamp", b.landedChanged(0) ? 1 : 0, 1);
+        b.landedChanged(0);
+        b.reset();
+        eq("landedChanged: reset forgets the last stamp", b.landedChanged(0) ? 1 : 0, 1);
+        b = new BackNowCycle();
+        b.onDrop();
+        b.onOnline(2000);
+        eq("landedChanged: a first read of a new cycle", b.landedChanged(0) ? 1 : 0, 1);
+        eq("landedChanged: the cycle still cancels on a landed stamp", b.onLanded(2100), C);
+        eq("landedChanged: a CANCEL forgets too", b.landedChanged(0) ? 1 : 0, 1);
+
         if (failed > 0) { System.out.println(failed + " case(s) failed"); System.exit(1); }
         System.out.println("all cases passed");
     }
@@ -236,12 +266,32 @@ pins() {
     || { echo "  PIN   P2 the no-session arm does not reset the cycle" >&2; bad=1; }
   perl -0ne 'exit(/if \(offTicks >= 3\) \{(?:(?!\n\s*\}\n).)*?postDropNotice\(app, uid\);\s*dropShownForUid = uid; backNow\.onDrop\(\);\s*\}/s ? 0 : 1)' "$w" \
     || { echo "  PIN   P3 the debounced drop arm does not arm the cycle" >&2; bad=1; }
-  perl -0ne 'exit(/if \(backNow\.onOnline\(System\.currentTimeMillis\(\) \/ 1000L\) == BackNowCycle\.POST\) \{\s*postBackNowNotice\(app, uid, backNow\.reconnectAt\(\), SaveMode\.backNowBody\(pollDaemon\("GET-SAVE-MODE\\n"\), unmeteredCtx\(app\)\)\);\s*backNowShownForUid = uid;\s*\}/ ? 0 : 1)' "$w" \
-    || { echo "  PIN   P4 the online arm does not post the prompt on POST" >&2; bad=1; }
-  perl -0ne 'exit(/if \(backNow\.awaitingLanded\(\)\s*&& backNow\.onReply\(pollDaemon\("GET-SEAL-LANDED\\n"\)\.trim\(\)\) == BackNowCycle\.CANCEL\) \{\s*cancelBackNowNotice\(app, uid\);\s*backNowShownForUid = -1;\s*\}/ ? 0 : 1)' "$w" \
-    || { echo "  PIN   P7 the slow tick does not cancel the prompt on GET-SEAL-LANDED's CANCEL" >&2; bad=1; }
+  perl -0ne 'exit(/if \(backNow\.onOnline\(System\.currentTimeMillis\(\) \/ 1000L\) == BackNowCycle\.POST\) \{\s*postBackNowNotice\(app, uid, backNow\.reconnectAt\(\), SaveMode\.backNowBody\(pollDaemon\("GET-SAVE-MODE\\n"\), unmeteredCtx\(app\)\)\);\s*backNowShownForUid = uid;\s*idleTrace\("backnow post user=" \+ uid \+ " at=" \+ backNow\.reconnectAt\(\)\);\s*\}/ ? 0 : 1)' "$w" \
+    || { echo "  PIN   P4 the online arm does not post the prompt on POST, then trace it" >&2; bad=1; }
+  perl -0ne 'exit(/if \(backNow\.awaitingLanded\(\)\) \{\s*String reply = pollDaemon\("GET-SEAL-LANDED\\n"\)\.trim\(\);\s*long st = BackNowCycle\.landedStamp\(reply\);\s*if \(backNow\.landedChanged\(st\)\) idleTrace\("backnow landed user=" \+ uid \+ " s=" \+ st \+ " at=" \+ backNow\.reconnectAt\(\)\);\s*if \(backNow\.onReply\(reply\) == BackNowCycle\.CANCEL\) \{\s*cancelBackNowNotice\(app, uid\);\s*idleTrace\("backnow cancel user=" \+ uid \+ " s=" \+ st\);\s*backNowShownForUid = -1;\s*\}\s*\}/ ? 0 : 1)' "$w" \
+    || { echo "  PIN   P7 the slow tick does not read GET-SEAL-LANDED once, trace it, and cancel on the same reply's CANCEL" >&2; bad=1; }
   # P8: postBackNowNotice is called only from the POST arm.
   [ "$(grep -c 'postBackNowNotice(' "$w")" = 1 ] || { echo "  PIN   P8 the watcher posts the prompt somewhere else" >&2; bad=1; }
+  # NWP-20261204-03, the cycle log. P9: the drop is traced once per drop (offTicks == 3), and the drop arm's cancel too.
+  local n l1 l2
+  perl -0ne 'exit(/if \(offTicks >= 3\) \{\s*if \(offTicks == 3\) idleTrace\("backnow drop user=" \+ uid\);\s*if \(backNowShownForUid >= 0\) \{ idleTrace\("backnow cancel drop user=" \+ backNowShownForUid\); cancelBackNowNotice\(app, backNowShownForUid\); backNowShownForUid = -1; \}/ ? 0 : 1)' "$w" \
+    || { echo "  PIN   P9 the drop trace is not guarded by offTicks == 3, or the drop arm's cancel is not traced" >&2; bad=1; }
+  n=$(grep -c 'idleTrace("backnow drop' "$w")
+  [ "$n" = 1 ] || { echo "  PIN   P9 the watcher has $n backnow drop traces, want 1" >&2; bad=1; }
+  # P10: the post line carries the reconnect stamp.
+  n=$(grep -cF 'idleTrace("backnow post user=" + uid + " at=" + backNow.reconnectAt());' "$w")
+  [ "$n" = 1 ] || { echo "  PIN   P10 the post trace does not carry at=<reconnectAt> (found $n)" >&2; bad=1; }
+  # P11: GET-SEAL-LANDED is read once per tick, and the landed trace comes before the CANCEL decision.
+  n=$(grep -cF 'pollDaemon("GET-SEAL-LANDED\n")' "$w")
+  [ "$n" = 1 ] || { echo "  PIN   P11 the watcher polls GET-SEAL-LANDED $n times, want 1" >&2; bad=1; }
+  l1=$(awk 'index($0, "idleTrace(\"backnow landed") {print NR; exit}' "$w")
+  l2=$(awk 'index($0, "backNow.onReply(reply) == BackNowCycle.CANCEL") {print NR; exit}' "$w")
+  if [ -z "$l1" ] || [ -z "$l2" ] || [ "$l1" -ge "$l2" ]; then
+    echo "  PIN   P11 the landed trace (line ${l1:-none}) does not precede the CANCEL decision (line ${l2:-none})" >&2; bad=1
+  fi
+  # P12: the no-session arm traces its cancel of the prompt.
+  perl -0ne 'exit(/if \(uid < 0\) \{(?:(?!\n                \}).)*?if \(backNowShownForUid >= 0\) \{ idleTrace\("backnow cancel gate user=" \+ backNowShownForUid\); cancelBackNowNotice\(app, backNowShownForUid\);/s ? 0 : 1)' "$w" \
+    || { echo "  PIN   P12 the no-session arm does not trace its cancel of the prompt" >&2; bad=1; }
   return "$bad"
 }
 
@@ -291,4 +341,13 @@ mut "C8 a malformed reply reads as a stamp"       bc 's/return v < 0 \? NOTHING 
 mut "C9 the online arm posts on every tick"       ch 's/if \(backNow\.onOnline\(System\.currentTimeMillis\(\) \/ 1000L\) == BackNowCycle\.POST\) \{/if (backNow.onOnline(System.currentTimeMillis() \/ 1000L) >= 0) {/' || fails=$((fails+1))
 mut "C10 reconnectAt returns 0 (case reconnectAt: the POST's stamp after it)" bc 's/(long reconnectAt\(\) \{\n\s*)return reconnectAt;/$1return 0;/' || fails=$((fails+1))
 mut "C11 the watcher passes no stamp (pin P4)"     ch 's/postBackNowNotice\(app, uid, backNow\.reconnectAt\(\), /postBackNowNotice(app, uid, 0L, /' || fails=$((fails+1))
+mut "N1 landedChanged always true (case landedChanged: the same stamp again)" bc 's/\n\s*if \(landedSeen && stamp == lastLanded\) return false;//' || fails=$((fails+1))
+mut "N2 onDrop does not forget (case landedChanged: onDrop forgets the last stamp)" bc 's/(void onDrop\(\) \{.*?)\n\s*landedSeen = false;/$1/s' || fails=$((fails+1))
+mut "N3 the drop trace on every offline tick (pin P9)" ch 's/if \(offTicks == 3\) idleTrace/if (offTicks >= 3) idleTrace/' || fails=$((fails+1))
+mut "N4 the post trace drops at= (pins P4, P10)" ch 's/idleTrace\("backnow post user=" \+ uid \+ " at=" \+ backNow\.reconnectAt\(\)\);/idleTrace("backnow post user=" + uid);/' || fails=$((fails+1))
+mut "N5 the landed trace removed (pins P7, P11)" ch 's/\n\s*if \(backNow\.landedChanged\(st\)\) idleTrace\([^\n]*\);//' || fails=$((fails+1))
+mut "N6 the cancel trace removed (pin P7)" ch 's/\n\s*idleTrace\("backnow cancel user=" \+ uid \+ " s=" \+ st\);//' || fails=$((fails+1))
+mut "N7 GET-SEAL-LANDED polled twice (pins P11, P7)" ch 's/backNow\.onReply\(reply\) == BackNowCycle\.CANCEL/backNow.onReply(pollDaemon("GET-SEAL-LANDED\\n").trim()) == BackNowCycle.CANCEL/' || fails=$((fails+1))
+mut "N8 the gate cancel not traced (pin P12)" ch 's/idleTrace\("backnow cancel gate user=" \+ backNowShownForUid\); //' || fails=$((fails+1))
+mut "N9 the drop arm cancel not traced (pin P9)" ch 's/idleTrace\("backnow cancel drop user=" \+ backNowShownForUid\); //' || fails=$((fails+1))
 [ "$fails" -eq 0 ] && echo "== all mutations convicted" || { echo "== $fails mutation(s) not convicted"; exit 1; }

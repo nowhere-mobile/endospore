@@ -380,15 +380,21 @@ func unfetchedRestorePlan(profile string, m chunkManifest) (cands map[string][][
 }
 
 // parkedFromKeep is the set hold_ondemand parks: the keep file's ondemand and auto packages, minus the ones the image
-// ships (the file NOWHERE_PARK_SHIPPED names, NWP-20261129-27). ok is false when either file cannot be read.
-func parkedFromKeep(keepPath, shippedPath string) (map[string]bool, bool) {
+// ships (the file NOWHERE_PARK_SHIPPED names, NWP-20261129-27). absent is true, with ok and an empty set, when the keep
+// file does not exist: a profile with no nowhere-appkeep keeps nothing, so nothing is parked whatever the image ships,
+// and the shipped list is not read (NWP-20261202-42). ok is false when the keep file exists but cannot be read, or the
+// shipped list cannot be read.
+func parkedFromKeep(keepPath, shippedPath string) (parked map[string]bool, absent, ok bool) {
 	kb, err := os.ReadFile(keepPath)
+	if errors.Is(err, fs.ErrNotExist) {
+		return map[string]bool{}, true, true
+	}
 	if err != nil {
-		return nil, false
+		return nil, false, false
 	}
 	sb, err := os.ReadFile(shippedPath)
 	if err != nil {
-		return nil, false
+		return nil, false, false
 	}
 	shipped := parseUnfetched(sb)
 	out := map[string]bool{}
@@ -397,7 +403,7 @@ func parkedFromKeep(keepPath, shippedPath string) (map[string]bool, bool) {
 			out[p] = true
 		}
 	}
-	return out, true
+	return out, false, true
 }
 
 // chunkSel is the sub-manifest of m whose chunk indices keep says yes to, in index order: a fresh slice, never an
@@ -450,7 +456,10 @@ func restoreSkippingParked(base string, key []byte, profile string, m chunkManif
 	skipped := cdcRestoreProg(base, key, p1, dest, 0, ladder, nil)
 
 	skip := map[string]bool{}
-	if parked, ok := parkedFromKeep(os.Getenv("NOWHERE_PARK_KEEP"), os.Getenv("NOWHERE_PARK_SHIPPED")); ok {
+	if parked, absent, ok := parkedFromKeep(os.Getenv("NOWHERE_PARK_KEEP"), os.Getenv("NOWHERE_PARK_SHIPPED")); ok {
+		if absent {
+			fmt.Printf("restore: profile %s unfetched: no keep file -> nothing to skip (NWP-20261202-42)\n", logProfile(profile))
+		}
 		for p := range cands {
 			if parked[p] {
 				skip[p] = true
@@ -502,6 +511,9 @@ func restoreSkippingParked(base string, key []byte, profile string, m chunkManif
 		done := sumSizes(p1)
 		skipped += cdcRestoreProg(base, key, p2, dest, done, done+sumSizes(p2), nil)
 	}
+	atomic.StoreInt64(&restoreUnfetchedPkgs, int64(len(skip))) // NWP-20261203-09: the skip's counts as summary fields
+	atomic.StoreInt64(&restoreUnfetchedBytes, notFetched)
+	atomic.StoreInt64(&restoreUnfetchedChunks, int64(nChunks))
 	fmt.Printf("restore: profile %s unfetched: %d package(s) skipped, %d B not fetched, %d chunk(s) (NWP-20261130-03)\n",
 		logProfile(profile), len(skip), notFetched, nChunks)
 	return skipped

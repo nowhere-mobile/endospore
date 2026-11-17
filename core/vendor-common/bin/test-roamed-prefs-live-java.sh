@@ -12,7 +12,8 @@
 # change applies now while the gate keeps the old values, with green CI.
 #
 # RoamedPrefs is pure java.lang and is compiled here with WipeOnSave, WipeChoice and its cases. Source pins (comment
-# lines stripped) hold applyRoamedPrefs, applyLivePrefs, PrefsLiveReceiver, the manifest line and both Save lambdas.
+# lines stripped) hold applyRoamedPrefs, applyLivePrefs, PrefsLiveReceiver, the manifest line, the wipe Save lambda and
+# Auto standby's saveStandby (NWP-20261206-04: a card tap or a box toggle) with StandbySheets.toast.
 #
 # ⚠ IT FAILS WHEN THERE IS NO JAVAC, IT NEVER SKIPS. javac comes from PATH, else from the build host's JDK below;
 # the version is printed first so the log proves which compiler ran.
@@ -33,6 +34,7 @@ SRC="$root/core/chooser/src/com/nowhere/chooser"
 SUT="$SRC/RoamedPrefs.java"
 CHOOSER="$SRC/ChooserActivity.java"
 RECV="$SRC/PrefsLiveReceiver.java"
+SS="$SRC/StandbySheets.java"
 PA="$SRC/ProfileActivity.java"
 MAN="$root/core/chooser/AndroidManifest.xml"
 CASES="$root/core/chooser/tests/roamed-prefs/RoamedPrefsCases.java"
@@ -78,19 +80,20 @@ first_line() { printf '%s\n' "$1" | RE="$2" awk '$0 ~ ENVIRON["RE"] { print NR; 
 # code <file>: the file without its comment lines.
 code() { awk '$0 !~ /^[ \t]*(\/\/|\*|\/\*)/' "$1"; }
 
-# pins <ChooserActivity.java> <PrefsLiveReceiver.java> <ProfileActivity.java> <AndroidManifest.xml> -> 0 when the
-# wiring holds, 1 otherwise.
+# pins <ChooserActivity.java> <PrefsLiveReceiver.java> <ProfileActivity.java> <AndroidManifest.xml> <StandbySheets.java>
+# -> 0 when the wiring holds, 1 otherwise.
 pins() {
-  local ch="$1" rv="$2" pa="$3" man="$4" bad=0 arp alp rcv sip swp slp g a l f n s first_set arm
+  local ch="$1" rv="$2" pa="$3" man="$4" ss="$5" bad=0 arp alp rcv sip sst swp slp g a l f n s first_set arm
   [ -f "$rv" ] || { echo "  FAIL  pins: $rv does not exist" >&2; bad=1; rv=/dev/null; }
   arp=$(mbody "$ch" 'private void applyRoamedPrefs\(')
   alp=$(mbody "$ch" 'static void applyLivePrefs\(')
   rcv=$(code "$rv")
-  sip=$(mbody "$pa" 'private void showIdlePicker\(')
+  sip=$(mbody "$pa" 'private void saveStandby\(')
+  sst=$(code "$ss")
   swp=$(mbody "$pa" 'private void showWipePicker\(')
   slp=$(mbody "$pa" 'private boolean sendLivePrefs\(')
   # A missing body is reported and the checks still run, so each one shows what it holds.
-  for n in arp alp sip swp slp; do [ -n "${!n}" ] || { echo "  FAIL  pins: $n body not found" >&2; bad=1; }; done
+  for n in arp alp sip sst swp slp; do [ -n "${!n}" ] || { echo "  FAIL  pins: $n body not found" >&2; bad=1; }; done
 
   # R1-R3: applyRoamedPrefs parses through RoamedPrefs once and assigns the five statics from its result.
   [ "$(count "$arp" 'RoamedPrefs\.parse\(idle, wipe, wipesaved, holdlock, holdaudio, IDLE_LOGOFF_MS, HARD_WIPE_MS\)')" -eq 1 ] \
@@ -154,22 +157,24 @@ pins() {
     || { echo "  FAIL  M1 the manifest declares PrefsLiveReceiver exported=\"true\"" >&2; bad=1; }
 
   # P1/P2: each Save sends only inside the branch where its write landed, and says "applies next sign-in" only when
-  # it did not send.
-  [ "$(count "$sip" '^ *final boolean idleOk = writeIdlePref\(mins\[idx\]\);$')" -eq 1 ] \
-    && [ "$(count "$sip" '^ *final boolean holdOk = setPref\("holdlock", holdBox\.isChecked\(\) \? "" : "0"\);$')" -eq 1 ] \
-    && [ "$(count "$sip" '^ *final boolean audioOk = setPref\("holdaudio", audioBox\.isChecked\(\) \? "" : "0"\);$')" -eq 1 ] \
-    || { echo "  FAIL  P1 showIdlePicker does not keep all three write results" >&2; bad=1; }
+  # it did not send. Auto standby's saveStandby keeps its one write's result; its toast is StandbySheets.toast.
+  [ "$(count "$sip" '^ *final boolean ok = "idle"\.equals\(key\) \? writeIdlePref\(Integer\.parseInt\(value\)\) : setPref\(key, value\);$')" -eq 1 ] \
+    || { echo "  FAIL  P1 saveStandby does not keep its write's result" >&2; bad=1; }
   for f in sip swp; do
     case "$f" in
-      sip) s='^ *if \(idleOk && holdOk && audioOk\) live = sendLivePrefs\(\);$' ;;
+      sip) s='^ *if \(ok\) live = sendLivePrefs\(\);$' ;;
       swp) s='^ *if \(writeWipePref\(idx\)\) live = sendLivePrefs\(\);$' ;;
     esac
     [ "$(count "${!f}" "$s")" -eq 1 ] && [ "$(count "${!f}" 'sendLivePrefs\(')" -eq 1 ] \
       || { echo "  FAIL  P $f does not send only when its write landed" >&2; bad=1; }
+  done
+  for f in sst swp; do
     [ "$(count "${!f}" '\(live \? "" : " — applies next sign-in"\)')" -eq 1 ] \
       && [ "$(count "${!f}" 'applies next sign-in')" -eq 1 ] \
       || { echo "  FAIL  P $f does not say \"applies next sign-in\" on the failure path only" >&2; bad=1; }
   done
+  [ "$(count "$sip" 'StandbySheets\.toast\(toastIdx, live\)')" -eq 1 ] && [ "$(count "$sip" 'applies next sign-in')" -eq 0 ] \
+    || { echo "  FAIL  P sip does not toast StandbySheets.toast(toastIdx, live) once" >&2; bad=1; }
   # P3: sendLivePrefs sends one explicit broadcast to user 0, with the six extras.
   [ "$(count "$slp" 'sendBroadcastAsUser\(new android\.content\.Intent\(this, PrefsLiveReceiver\.class\)')" -eq 1 ] \
     && [ "$(count "$slp" 'sendBroadcastAsUser\(')" -eq 1 ] \
@@ -212,7 +217,7 @@ pins() {
 
 echo "== $SUT"
 suite "$SUT" || { echo "FAILED"; exit 1; }
-pins "$CHOOSER" "$RECV" "$PA" "$MAN" || { echo "FAILED (pins)"; exit 1; }
+pins "$CHOOSER" "$RECV" "$PA" "$MAN" "$SS" || { echo "FAILED (pins)"; exit 1; }
 echo "pins: ok"
 [ "$MUTATE" = yes ] || exit 0
 
@@ -231,19 +236,20 @@ mut() { # mut <label> <perl-expr>   (mutates RoamedPrefs.java; the cases must fa
     *) echo "  BROKEN    $1 -- the mutant did not compile (rc=$rc)"; return 1 ;;
   esac
 }
-mutpin() { # mutpin <label> <CH|RV|PA|MAN> <perl-expr>   (mutates one source; the pins must fail)
-  local d c rc why ch="$CHOOSER" rv="$RECV" pa="$PA" man="$MAN" orig
+mutpin() { # mutpin <label> <CH|RV|PA|MAN|SS> <perl-expr>   (mutates one source; the pins must fail)
+  local d c rc why ch="$CHOOSER" rv="$RECV" pa="$PA" man="$MAN" ss="$SS" orig
   d=$(mktemp -d -p "$W") || return 1
   case "$2" in
     CH) orig="$CHOOSER"; c="$d/ChooserActivity.java"; ch="$c" ;;
     RV) orig="$RECV"; c="$d/PrefsLiveReceiver.java"; rv="$c" ;;
     PA) orig="$PA"; c="$d/ProfileActivity.java"; pa="$c" ;;
     MAN) orig="$MAN"; c="$d/AndroidManifest.xml"; man="$c" ;;
+    SS) orig="$SS"; c="$d/StandbySheets.java"; ss="$c" ;;
   esac
   cp "$orig" "$c"
   if ! perl -0pi -e "$3" "$c"; then echo "  ERROR     $1 -- perl failed on the mutation"; rm -rf "$d"; return 1; fi
   if cmp -s "$orig" "$c"; then echo "  INERT     $1 -- the mutation changed nothing"; rm -rf "$d"; return 1; fi
-  why=$(pins "$ch" "$rv" "$pa" "$man" 2>&1); rc=$?
+  why=$(pins "$ch" "$rv" "$pa" "$man" "$ss" 2>&1); rc=$?
   rm -rf "$d"
   if [ "$rc" -eq 0 ]; then echo "  SURVIVED  $1"; return 1; fi
   echo "  CONVICTED $1 --$(printf '%s\n' "$why" | grep -m1 'FAIL' | sed 's/^ *FAIL//')"
@@ -253,9 +259,9 @@ mutpin "X1 the getCurrentUser() guard removed" CH 's/\n *if \(uid <= 0 \|\| [^\n
 mutpin "X2 the armIdleWatcher call removed" CH 's/(static void applyLivePrefs\(.*?)\n *armIdleWatcher\(appCtx, uid\);/$1/s' || fails=$((fails+1))
 mutpin "X3 sWipeOnSave not set by applyLivePrefs" CH 's/\n *sWipeOnSave = v\.wipeOnSave;//' || fails=$((fails+1))
 mutpin "X4 the wipe Save sends before its write" PA 's/if \(writeWipePref\(idx\)\) live = sendLivePrefs\(\);/live = sendLivePrefs(); writeWipePref(idx);/' || fails=$((fails+1))
-mutpin "X4b the idle Save sends before its writes" PA 's/(\n *)(final boolean idleOk = writeIdlePref)/$1live = sendLivePrefs();$1$2/; s/if \(idleOk && holdOk && audioOk\) live = sendLivePrefs\(\);/if (idleOk \&\& holdOk \&\& audioOk) live = true;/' || fails=$((fails+1))
+mutpin "X4b Auto standby sends before its write" PA 's/(\n *)(final boolean ok = "idle"\.equals\(key\))/$1live = sendLivePrefs();$1$2/; s/if \(ok\) live = sendLivePrefs\(\);/if (ok) live = true;/' || fails=$((fails+1))
 mutpin "X5 the receiver exported" MAN 's/(android:name="\.PrefsLiveReceiver" android:exported=)"false"/$1"true"/' || fails=$((fails+1))
-mutpin "X6 the idle toast always says applies next sign-in" PA 's/("Auto standby when idle: " \+ labels\[idx\]\.toLowerCase\(\)\n *\+ )\(live \? "" : " — applies next sign-in"\)/$1" — applies next sign-in"/' || fails=$((fails+1))
+mutpin "X6 the idle toast always says applies next sign-in" SS 's/\+ \(live \? "" : " — applies next sign-in"\)/+ " — applies next sign-in"/' || fails=$((fails+1))
 mut "X7 parse reads \"0\" (Never) as the default" 's/if \(idle != null && !idle\.isEmpty\(\)\)/if (idle != null \&\& !idle.isEmpty() \&\& !"0".equals(idle))/' || fails=$((fails+1))
 mutpin "X8 the receiver calls another ChooserActivity method" RV 's/(\n *ChooserActivity\.applyLivePrefs\()/\n        ChooserActivity.armIdleWatcher(app, 0);$1/' || fails=$((fails+1))
 mutpin "X9 applyLivePrefs arms the wipe alarm now" CH 's/(\n *)(armIdleWatcher\(appCtx, uid\);)/$1$2$1armWipeWatcher(appCtx, uid);/' || fails=$((fails+1))

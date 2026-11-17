@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # test-idle-trace.sh [--mutate] -- runs idle_trace_test.go (NWP-20261106-19); --mutate re-runs it against idle_trace.go and
 # main.go with the IDLE-TRACE vocabulary broken in turn (I1 any word kept, I2 a key's value not digits, I3 `screen` not a
-# verb, I4 the arm printing the raw filtered text, I5 `installs` not a verb), restoring both files on exit. Each mutant
-# must be CONVICTED by a `--- FAIL`; one that fails to apply, or fails to compile, counts as a failure.
+# verb, I4 the arm printing the raw filtered text, I5 `installs` not a verb, I6 `backnow` not a verb, I7 `cancel` not a
+# word -- NWP-20261204-03), restoring both files on exit. Each mutant must be CONVICTED by a `--- FAIL`; one that fails
+# to apply, or fails to compile, counts as a failure.
 set -uo pipefail
 cd "$(dirname "$0")"
 . ./suite-report.sh
@@ -49,4 +50,6 @@ mut "I2 a key value not required to be digits" "$IT" 'idleTraceKeys\[k\] && idle
 mut "I3 screen removed from the verbs" "$IT" '"screen": true, ("arm": true, "cancel")' '\1'
 mut "I4 the arm prints the raw filtered text" "$MAIN" 'idleTraceLine\(ev\); line != ""' 'idleTraceFilter(ev); line != ""'
 mut "I5 installs removed from the verbs" "$IT" '"fire": true, "installs": true, ' '"fire": true, '
+mut "I6 backnow removed from the verbs (TestIdleTraceKeepsTheChooserEvents)" "$IT" ', "backnow": true' ''
+mut "I7 cancel removed from the words (TestIdleTraceKeepsTheChooserEvents)" "$IT" '"cancel": true, "gate": true' '"gate": true'
 [ "$fails" -eq 0 ] && echo "== all mutations convicted" || { echo "== $fails mutation(s) not convicted"; exit 1; }

@@ -11,14 +11,16 @@ import (
 
 // isSessionFileList says a top-level name in the state tmpfs is one of the plaintext file-name lists a session leaves
 // there. contentcache.* and groupcache.* hold hashes, not rels, and are not lists: isSessionCache takes them at the reap
-// (h60 #8). Only blobcache.* stays.
+// (h60 #8). Only blobcache.* stays. apps-not-restored-<hash> is the kept #apps packages a sign-in did not restore (h47
+// #2, NWP-20261207-08), its .tmp form included.
 func isSessionFileList(name string) bool {
 	switch name {
 	case "sealdelta.idx", "sealdelta.idx.tmp", "sealdelta.listed", "sealdelta.listed.tmp",
 		"media-bg.list", "media-bg.list.tmp", "media-bg.list.handoff":
 		return true
 	}
-	return strings.HasPrefix(name, "scancache.") || strings.HasPrefix(name, "heal-handled-")
+	return strings.HasPrefix(name, "scancache.") || strings.HasPrefix(name, "heal-handled-") ||
+		strings.HasPrefix(name, "apps-not-restored-")
 }
 
 // isSessionCache says a top-level name in the state tmpfs is one of a session's content and group caches, its seal
@@ -36,7 +38,8 @@ func isSessionCache(name string) bool {
 // docs/product-decisions.md, 2026-11-05, under #39's roster rule; NWP-20261129-19): scancache.<tag> (every large file
 // of the vault, #de and #media), heal-handled-<hash> (the rels the sign-in heal handled) and the walk's sealdelta
 // lists. sealdelta.listed is not one of the decision's three: it is the same class of roster, written beside
-// sealdelta.idx by the same op after the question was asked, so taking it too is an inference. In session the lists
+// sealdelta.idx by the same op after the question was asked, so taking it too is an inference. apps-not-restored-<hash>
+// (the kept #apps packages a sign-in did not restore, h47 #2, NWP-20261207-08) is a list of the same class. In session the lists
 // keep their form, which h56 #6 reads. The same pass removes the session's caches (isSessionCache; h60 #8,
 // docs/product-decisions.md, 2026-11-06; NWP-20261201-35): the content cache is a plaintext fingerprint testable with no
 // key. A later sign-in of the same profile in the same boot pays for that by re-reading its small files on its first
