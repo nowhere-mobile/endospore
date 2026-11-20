@@ -15,12 +15,12 @@
 # runs before the verdict too. This suite runs the REAL extracted arm, with the REAL qn and in_scope_tokens, under every shell found
 # among bash, sh, dash and mksh (the device's /system/bin/sh). The agent is stubbed per store ref and every helper
 # the arm calls is a recording stub:
-#   A  vault 0, #de 5           -> BLANK NET naming de; no #sys, no #media, no stop, no landing step; park put back
-#   B  vault 0, #de 0, #media 5 -> BLANK NET naming media; no #apps, no stop, no landing step, no claims seed, no account hold
+#   A  vault 0, #de 5           -> BLANK NET naming de; no #sys, no stop, no landing step; park put back
+#   B  vault 0, #de 0, #media 5 -> BLANK NET naming media; no stop, no landing step, no claims seed, no account hold
 #   C  #media 1 (damage)        -> lands as today: OK 11, `+de !media(rc=1)`, one stop, before the reply
 #   D  all three 0              -> OK 11, `+de +media`, one stop; the #apps set stays for the gate
 #   E  no per-user dirs (skip)  -> OK 11, `-de -media`, one stop
-#   F  vault, #de, #media 0, #apps 5 -> BLANK NET naming apps; the #apps restore ran once and last; no stop, no landing
+#   F  vault, #de, #media 0, #apps 5 -> BLANK NET naming apps; the #apps restore ran once; no stop, no landing
 #                                  step, no .appcode left
 #   G  #apps 1 (damage)         -> lands as today: OK 11, `+de +media`, one stop, no .appcode left
 #
@@ -28,11 +28,17 @@
 # (acct_restore) and the #keys restore follow the same rule. The #keys store request moved out of the landing into
 # keystore_fetch, which runs before the verdict and stages into keystore-in/<uid>.pre; keystore_restore promotes it at
 # the landing. Here acct_restore and keystore_fetch are stubs that return the case's status; ks_in_dir is the REAL one:
-#   H  #sys 5                   -> BLANK NET naming sys; no #media, no #apps, no keystore_fetch, no landing step
-#   I  #keys 5                  -> BLANK NET naming keys; keystore_fetch ran once and last; no keystore_restore, no .pre
+#   H  #sys 5                   -> BLANK NET naming sys; no landing step
+#   I  #keys 5                  -> BLANK NET naming keys; keystore_fetch ran once; no keystore_restore, no .pre
 #   J  #keys 1 (damage)         -> lands: OK 11, `+de +media`; keystore_fetch before the media stop, keystore_restore
 #                                  after ks_signin_reset
 #   K  #sys 1 (damage)          -> lands: OK 11, `+de +media`
+#
+# NWP-20261210-03: once the vault restore lands, the #media, #apps code and #keys restores run as background lanes beside
+# the #de and #sys restores, and the arm joins them before the verdict. So a #de, #sys or #media exit 5 no longer stops
+# the later scopes: A, B, F, H and I now check that every lane ran, and the verdict still names the FIRST scope with exit 5
+# in the decided order de, sys, media, apps, keys. Every BLANK NET case also leaves no .appcode and no lane dir.
+# test-in-scope-lanes.sh runs the lanes' order, download share and progress relay.
 #
 #   bash test-in-scope-net-blank.sh              # the cases
 #   bash test-in-scope-net-blank.sh --mutate     # ... plus mutants of roamd that must each CONVICT under every shell
@@ -104,7 +110,7 @@ suite() {  # suite <roamd.sh> <shell> [quiet] -> 0 all ok, 1 a case failed, 2 th
   [ -n "$QN" ] || { echo "EXTRACTION FAILED: function qn not found in $f" >&2; return 2; }
   [ -n "$IST" ] || { echo "EXTRACTION FAILED: function in_scope_tokens not found in $f" >&2; return 2; }
   [ -n "$KID" ] || { echo "EXTRACTION FAILED: function ks_in_dir not found in $f" >&2; return 2; }
-  case "$IN" in *'echo "NEEDKEY" > "$RES"'*'"${name}#de"'*'"${name}#media"'*'echo "OK $uid" > "$RES"'*'headblobs'*) ;;
+  case "$IN" in *'echo "NEEDKEY" > "$RES"'*'"${name}#media"'*'"${name}#de"'*'echo "OK $uid" > "$RES"'*'headblobs'*) ;;
     *) echo "EXTRACTION FAILED: the in arm in $f" >&2; return 2 ;; esac
   RI=$(reroot "$IN")
   n=$(printf '%s\n' "$RI" | grep -o '\$ROOT/data/' | grep -c .)
@@ -154,11 +160,13 @@ agent_sim() {
   esac
 }
 pw() { printf '%s\n' "$ROOT/sim/pw"; }
+pwv() { [ -z "$1" ] || pw "$1"; }
 _ms() { echo 0; }
 od_fetch_data() { return 0; }; od_listed() { return 1; }; od_block_app() { return 0; }; od_unblock_app() { :; }; od_pending_clear() { :; }; od_block_installed() { :; }; od_shipped_prep() { return 0; }; od_park_var() { :; }; od_unf_path() { echo "$STATE/odfetch.$1/unfetched.$2"; }   # NWP-20261130-03
 _sum0=0; _sumt=0   # set above the `in` arm in the script (NWP-20261130-08); this harness runs the arm alone under set -u
+_se_v=""; _fh_v=""   # set at the top level in the script (NWP-20261205-18); the same reason
 sleep() { return 0; }
-for t in usb_host remap_media_db insert_deferred_media rescan_media remap_per_pkg _tlog _ssum remap_tree reown_ext_appdata keystore_push restorecon uiderrors_floor_take; do
+for t in usb_host rescan_media remap_per_pkg _tlog _ssum remap_tree reown_ext_appdata keystore_push restorecon uiderrors_floor_take; do
   eval "$t() { :; }"
 done
 for t in relabel_launcher restore_media_tail ks_signin_reset keystore_restore tz_surface sroam_surface hold_ondemand \
@@ -236,6 +244,12 @@ STUB
     chk "$1 the SSAID seed is removed" absent "$R/data/system/users/11/nowhere-ssaid-seed"
     chk "$1 no account hold is left" absent "$R/data/nowhere/acct-hold-11"
     chk "$1 no keystore-in/11.pre left" absent "$R/data/nowhere/keystore-in/11.pre"
+    chk "$1 no .appcode left" absent "$R/$APPCODE_REL"
+    chk "$1 no lane dir left (NWP-20261210-03)" eval '[ -z "$(ls -A "$S" | grep "^in-lanes")" ]'
+  }
+  # lanes_ran <case>: the #media, #apps and #keys lanes each ran once, whatever the foreground did (NWP-20261210-03)
+  lanes_ran() {
+    chk "$1 the #media, #apps and #keys lanes each ran once" eval '[ "$(ncalls "$R" "agent restore prof#media")" = 1 ] && [ "$(ncalls "$R" "agent restore prof#apps")" = 1 ] && [ "$(ncalls "$R" keystore_fetch)" = 1 ]'
   }
   # landed_common <case> <scope tokens>: what every landed case shares
   landed_common() {
@@ -262,16 +276,13 @@ STUB
   fi
   command rm -f "$PF"
 
-  say "== A: vault 0, #de 5 -> BLANK NET (de); nothing after the #de restore runs =="
+  say "== A: vault 0, #de 5 -> BLANK NET (de); the foreground skips #sys, the lanes are joined =="
   mkroot 1; run_in 5 0
   blank_common A
   chk "A the BLANK NET line names de" has_log "$R/roam.log" 'IN "prof" BLANK NET (the de restore could not reach the store)'
   chk "A the #de restore ran" called "$R" "agent restore prof#de"
   chk "A no acct_restore (no #sys fetch)" ncalled "$R" acct_restore
-  chk "A no #media restore" ncalled "$R" "agent restore prof#media"
-  chk "A no restore_media_tail" ncalled "$R" restore_media_tail
-  chk "A no #apps restore" ncalled "$R" "agent restore prof#apps"
-  chk "A no keystore_fetch" ncalled "$R" keystore_fetch
+  lanes_ran A
   command rm -rf "$R"
 
   say ""
@@ -281,8 +292,7 @@ STUB
   chk "B the BLANK NET line names media" has_log "$R/roam.log" 'IN "prof" BLANK NET (the media restore could not reach the store)'
   chk "B acct_restore and the #media restore ran" eval 'called "$R" acct_restore && called "$R" "agent restore prof#media"'
   chk "B no restore_media_tail (the tail runs on 0 only)" ncalled "$R" restore_media_tail
-  chk "B no #apps restore" ncalled "$R" "agent restore prof#apps"
-  chk "B no keystore_fetch" ncalled "$R" keystore_fetch
+  lanes_ran B
   command rm -rf "$R"
 
   say ""
@@ -311,10 +321,8 @@ STUB
   mkroot 1; run_in 0 0 5
   blank_common F
   chk "F the BLANK NET line names apps" has_log "$R/roam.log" 'IN "prof" BLANK NET (the apps restore could not reach the store)'
-  chk "F the #apps restore ran once, and nothing was recorded after it" \
-    eval '[ "$(ncalls "$R" "agent restore prof#apps")" = 1 ] && [ "$(tail -n 1 "$R/sim/calls")" = "agent restore prof#apps" ]'
+  lanes_ran F
   chk "F the BLANK NET reply leaves no .appcode" eval 'holds "$R/res" "BLANK NET" && absent "$R/$APPCODE_REL"'
-  chk "F no keystore_fetch" ncalled "$R" keystore_fetch
   command rm -rf "$R"
 
   say ""
@@ -325,15 +333,12 @@ STUB
   command rm -rf "$R"
 
   say ""
-  say "== H: #sys 5 -> BLANK NET (sys); no #media, #apps or #keys restore runs (NWP-20261207-06) =="
+  say "== H: #sys 5 -> BLANK NET (sys); the lanes are joined (NWP-20261207-06, NWP-20261210-03) =="
   mkroot 1; run_in 0 0 0 5 0
   blank_common H
   chk "H the BLANK NET line names sys" has_log "$R/roam.log" 'IN "prof" BLANK NET (the sys restore could not reach the store)'
   chk "H acct_restore ran" called "$R" acct_restore
-  chk "H no #media restore" ncalled "$R" "agent restore prof#media"
-  chk "H no restore_media_tail" ncalled "$R" restore_media_tail
-  chk "H no #apps restore" ncalled "$R" "agent restore prof#apps"
-  chk "H no keystore_fetch" ncalled "$R" keystore_fetch
+  lanes_ran H
   command rm -rf "$R"
 
   say ""
@@ -341,8 +346,7 @@ STUB
   mkroot 1; run_in 0 0 0 0 5
   blank_common I
   chk "I the BLANK NET line names keys" has_log "$R/roam.log" 'IN "prof" BLANK NET (the keys restore could not reach the store)'
-  chk "I keystore_fetch ran once, and nothing was recorded after it" \
-    eval '[ "$(ncalls "$R" keystore_fetch)" = 1 ] && [ "$(tail -n 1 "$R/sim/calls")" = keystore_fetch ]'
+  lanes_ran I
   command rm -rf "$R"
 
   say ""
@@ -384,25 +388,26 @@ if [ "$MUTATE" = no ]; then exit "$rc"; fi
 
 # --- mutants ------------------------------------------------------------------------------------------------
 # Each is a transform of roamd's text, by exact line; a mutant that changes nothing is a failure of the suite.
-L_MD='        if [ "$_mdrc" = 5 ]; then _innet=media; fi'
+L_MD='      elif [ "$_mdrc" = 5 ]; then _innet=media'
 L_GD='      if [ -z "$_innet" ]; then'
 L_BN='      echo "BLANK NET" > "$RES"'
 L_VF='    if [ -n "$_innet" ]; then'
-L_CE='    elif od_shipped_prep && NOWHERE_PARK_KEEP="$(od_park_var keep)" NOWHERE_PARK_SHIPPED="$(od_park_var shipped)" NOWHERE_UNFETCHED_LIST="$(od_park_var ce)" NOWHERE_PHASE=apps NOWHERE_CLAIMS_SEED="$STATE/claims.seed" "$AGENT" restore s3 "$name" "$(pw "$pass")" "$USERDIR" >> "$LOG" 2>&1; then'
+L_CE='    elif od_shipped_prep && NOWHERE_PARK_KEEP="$(od_park_var keep)" NOWHERE_PARK_SHIPPED="$(od_park_var shipped)" NOWHERE_UNFETCHED_LIST="$(od_park_var ce)" NOWHERE_PHASE=apps NOWHERE_CLAIMS_SEED="$STATE/claims.seed" NOWHERE_SE_SECRET="$(pwv "$_se_v")" NOWHERE_FIDO2_HMAC="$(pwv "$_fh_v")" "$AGENT" restore s3 "$name" "$(pw "$pass")" "$USERDIR" >> "$LOG" 2>&1; then'
 L_SM='      stop_mediad   # NWP-20261117-16: a predecessor'"'"'s media daemon goes only once this sign-in has landed'
 L_HO='      hold_ondemand "$uid"'
 L_OR='      echo "OK $uid" > "$RES"; _inres=OK'
-L_AP='          if [ "$_aprc" = 5 ]; then _innet=apps; fi'
-L_AG='        if [ -z "$_innet" ]; then'
-L_AE='        fi'   # not unique in roamd: M10 takes the first one after L_AG, the guard's own
-# NWP-20261207-06
-L_SY='        if [ "$_acrc" = 5 ]; then _innet=sys; fi'
-L_KF='      if [ -z "$_innet" ]; then keystore_fetch; _ksrc=$?; if [ "$_ksrc" = 5 ]; then _innet=keys; fi; fi'
-L_MG='      if [ -z "$_innet" ]; then   # NWP-20261207-06 (h62 #6): a #de or #sys exit 5 skips the MMS remap, #media and #apps'
+L_AP='      elif [ "$_aprc" = 5 ]; then _innet=apps'
+# NWP-20261210-03: lane A's status read back at the join, and the BLANK NET arm's .appcode removal
+L_AR='      if [ -f "$_inlanes/A" ]; then read -r _aprc < "$_inlanes/A" || _aprc=1; fi'
+L_AB='      rm -rf "$APPCODE" "$_inlanes" 2>> "$LOG"'
+# NWP-20261207-06; NWP-20261210-03: the verdict reads #sys and #keys at the join, and lane K runs keystore_fetch
+L_SY='      elif [ "${_acrc:-}" = 5 ]; then _innet=sys'
+L_KF='      elif [ "$_ksrc" = 5 ]; then _innet=keys'
+L_KL='          keystore_fetch; _ksrc=$?'
 L_PR='      if _kpd=$(ks_in_dir); then rm -rf "$_kpd.pre" 2>> "$LOG"; fi'
 L_CALL='      ks_signin_reset "$uid"   # NWP-20261108-01: this landed sign-in drops every other session'"'"'s Keystore staging, before keystore_restore'
-for l in "$L_MD" "$L_GD" "$L_BN" "$L_VF" "$L_CE" "$L_SM" "$L_HO" "$L_OR" "$L_AP" "$L_AG" \
-         "$L_SY" "$L_KF" "$L_MG" "$L_PR" "$L_CALL"; do
+for l in "$L_MD" "$L_GD" "$L_BN" "$L_VF" "$L_CE" "$L_SM" "$L_HO" "$L_OR" "$L_AP" "$L_AR" "$L_AB" \
+         "$L_SY" "$L_KF" "$L_KL" "$L_PR" "$L_CALL"; do
   [ "$(grep -cxF -- "$l" "$SUT")" = 1 ] || { echo "EXTRACTION FAILED: anchor line not unique in $SUT: $l" >&2; exit 2; }
 done
 # mut <name> <awk-program>: convicted only by a failing line under EACH shell found; a harness error (rc 2) under any
@@ -411,7 +416,7 @@ mut() {
   local name="$1" prog="$2" t s r
   t=$(mktemp -p "$W")
   awk -v MD="$L_MD" -v GD="$L_GD" -v BN="$L_BN" -v VF="$L_VF" -v CE="$L_CE" -v SM="$L_SM" -v HO="$L_HO" -v OR="$L_OR" \
-    -v AP="$L_AP" -v AG="$L_AG" -v AE="$L_AE" -v SY="$L_SY" -v KF="$L_KF" -v MG="$L_MG" -v PR="$L_PR" -v CALL="$L_CALL" \
+    -v AP="$L_AP" -v AR="$L_AR" -v AB="$L_AB" -v SY="$L_SY" -v KF="$L_KF" -v KL="$L_KL" -v PR="$L_PR" -v CALL="$L_CALL" \
     "$prog" "$SUT" > "$t"
   if cmp -s "$t" "$SUT"; then echo "  FAIL  mutant did not apply: $name"; MFAIL=1; command rm -f "$t"; return; fi
   for s in $SHELLS; do
@@ -426,7 +431,7 @@ echo "== mutants (each must CONVICT under every shell found) =="
 mut "M1 the #media rc-5 check removed (the sign-in lands)" \
   '$0==MD{next} {print}'
 mut "M2 any non-zero #media status treated as 5" \
-  '$0==MD{print "        case \"$_mdrc\" in 0|skip) ;; *) _innet=media ;; esac"; next} {print}'
+  '$0==MD{print "      elif [ \"$_mdrc\" != 0 ] && [ \"$_mdrc\" != skip ]; then _innet=media"; next} {print}'
 mut "M3 the #sys chain still runs after a #de 5 (A convicts: acct_restore called)" \
   '$0==GD{print "      if true; then"; next} {print}'
 mut "M4 _inres=OK set on the blank path (the park put-back is skipped)" \
@@ -440,24 +445,24 @@ mut "M7 the verdict placed after bt_reset" \
 mut "M8 the #apps rc-5 check removed (the sign-in lands; F convicts)" \
   '$0==AP{next} {print}'
 mut "M9 any non-zero #apps status treated as 5 (G convicts)" \
-  '$0==AP{print "          case \"$_aprc\" in 0|skip) ;; *) _innet=apps ;; esac"; next} {print}'
-mut "M10 the #apps block back after stop_mediad in the landing branch (F convicts: stop_mediad and keystore_restore called)" \
-  '$0==AG{inb=1; next} inb&&$0==AE{inb=0; next} inb{buf=buf $0 "\n"; next} {print} $0==SM{printf "%s", buf}'
-mut "M11 the #apps block's -z _innet guard removed (B convicts: the #apps restore ran after a #media 5)" \
-  '$0==AG{print "        if true; then"; next} {print}'
+  '$0==AP{print "      elif [ \"$_aprc\" != 0 ] && [ \"$_aprc\" != skip ]; then _innet=apps"; next} {print}'
+mut "M10 lane A's status never read back at the join (F convicts: the sign-in lands)" \
+  '$0==AR{next} {print}'
+mut "M11 the BLANK NET arm's .appcode removal dropped (A convicts: lane A's set is left)" \
+  '$0==AB{print "      rm -rf \"$_inlanes\" 2>> \"$LOG\""; next} {print}'
 mut "M12 the #sys rc-5 check removed (H convicts: the sign-in lands)" \
   '$0==SY{next} {print}'
 mut "M13 any non-zero #sys status treated as 5 (K convicts)" \
-  '$0==SY{print "        case \"$_acrc\" in 0) ;; *) _innet=sys ;; esac"; next} {print}'
+  '$0==SY{print "      elif [ -n \"${_acrc:-}\" ] && [ \"$_acrc\" != 0 ]; then _innet=sys"; next} {print}'
 mut "M14 the #keys rc-5 check removed (I convicts: the sign-in lands)" \
-  '$0==KF{print "      if [ -z \"$_innet\" ]; then keystore_fetch; _ksrc=$?; fi"; next} {print}'
+  '$0==KF{next} {print}'
 mut "M15 any non-zero #keys status treated as 5 (J convicts)" \
-  '$0==KF{print "      if [ -z \"$_innet\" ]; then keystore_fetch; _ksrc=$?; case \"$_ksrc\" in 0) ;; *) _innet=keys ;; esac; fi"; next} {print}'
-mut "M16 the keystore_fetch block moved after ks_signin_reset in the landing (I convicts: the sign-in lands)" \
-  '$0==KF{next} {print} $0==CALL{print KF}'
+  '$0==KF{print "      elif [ \"$_ksrc\" != 0 ]; then _innet=keys"; next} {print}'
+mut "M16 keystore_fetch moved out of lane K to after ks_signin_reset in the landing (I convicts: the sign-in lands)" \
+  '$0==KL{print "          _ksrc=0"; next} {print} $0==CALL{print "      keystore_fetch"}'
 mut "M17 the verdict's keystore-in/<uid>.pre removal dropped (I convicts: .pre left)" \
   '$0==PR{next} {print}'
-mut "M18 the MMS/#media guard removed (H convicts: the #media restore ran after a #sys 5)" \
-  '$0==MG{print "      if true; then"; next} {print}'
+# M18 (the MMS/#media guard removed) is retired: since NWP-20261210-03 #media runs as a lane whatever #sys returns, and
+# the MMS remap's own skip after a #de or #sys exit 5 is test-mms-remap-verdict.sh's.
 [ "$MFAIL" = 0 ] || exit 1
 echo "all mutants convicted"

@@ -123,7 +123,7 @@ reroot() { printf '%s\n' "$1" | sed -E 's#([" |])/data/#\1$ROOT/data/#g'; }
 nleft() { printf '%s\n' "$1" | sed -E 's/(^|[[:space:]])#.*$//' | sed 's#\$ROOT/data/##g' | grep -cE '(^|[^[:alnum:]_])/data/'; }
 
 suite() {  # suite <roamd.sh> <sh> [quiet] -> 0 all ok, 1 a case failed, 2 the harness could not run
-  local f="$1" sh="$2" quiet="${3:-}" p=0 x=0 ARM GPF RA RG ODH PKGOK n R k L1 L2 sum ng na e
+  local f="$1" sh="$2" quiet="${3:-}" p=0 x=0 ARM GPF GWA RA RG ODH PKGOK n R k L1 L2 sum ng na e
   say() { [ -n "$quiet" ] || printf '%s\n' "$1"; }
   chk() {
     local l="$1"; shift
@@ -144,6 +144,7 @@ suite() {  # suite <roamd.sh> <sh> [quiet] -> 0 all ok, 1 a case failed, 2 the h
 
   ARM=$(arm_of "$f" odrestore)
   GPF=$(fn_of "$f" grant_perms_for)
+  GWA=$(fn_of "$f" gwin_add)   # NWP-20261210-09: the window helper grant_perms_for calls (absent before it)
   PKGOK=$(fn_of "$f" pkgname_ok)
   ODH=$(grep -m1 -E '^ODHOLD=' "$f")
   case "$ARM" in *'echo "OK NOSRC" > "$RES"'*'echo "ERR-NOTREADY" > "$RES"'*) ;; *) echo "EXTRACTION FAILED: the odrestore arm in $f" >&2; return 2 ;; esac
@@ -173,8 +174,9 @@ suite() {  # suite <roamd.sh> <sh> [quiet] -> 0 all ok, 1 a case failed, 2 the h
       printf '%s\n' 'vpn_preconsent_off() { :; }   # NWP-20261202-03'
       printf '%s\n' 'od_watched() { shift; "$@" 2>&1; }'
       printf '%s\n' 'od_label_watched() { reown_restored "$2"; od_relabel "$1" "$2"; }   # NWP-20261202-32'
+      printf '%s\n' 'od_extdata_watched() { reown_ext_appdata "$1"; restorecon -R -D "$ROOT/data/media/$uid/Android/data/$1" 2>>"$LOG"; }   # NWP-20261208-13'
       printf '%s\n' 'od_fetch_data() { return 0; }; od_listed() { return 1; }; od_block_app() { return 0; }; od_unblock_app() { :; }; od_pending_clear() { :; }; od_block_installed() { :; }; od_shipped_prep() { return 0; }; od_park_var() { :; }; od_unf_path() { echo "$STATE/odfetch.$1/unfetched.$2"; }   # NWP-20261130-03'
-      printf '%s\n' "$RG"
+      printf '%s\n%s\n' "$GWA" "$RG"
       printf 'for _stl in $ODLIST; do\nsrcunit=${_stl%%%%:*}; skind=${_stl#*:}\ncase "$op" in\n%s\nesac\ndone\n' "$RA"
     } > "$1/run.sh"
   }
@@ -281,7 +283,7 @@ export M_GPF='      grant_perms_for "$uid" "$pkg" "$_first" ${odbatch:+"$odbatch
 export M_TOP='    GPF3_MS=0; GPF3_SRC=none; _odt0=$(_ms 2>/dev/null)'
 export M_CACHE='    [ "$_g3hit" = 1 ] && GPF3_SRC=cache'
 export M_GT1='    [ "$_g3hit" = 1 ] || { _gt1=$(_ms 2>/dev/null); GPF3_MS=$(( ${_gt1:-0} - ${_gt0:-0} )); GPF3_SRC=pm; }'
-export M_INET='    pm grant --user "$uid" "$dpkg" android.permission.INTERNET </dev/null >/dev/null 2>&1 && { dflt=$((dflt+1)); echo "$dpkg" >> "$_gok"; }'
+export M_INET='    { pm grant --user "$uid" "$dpkg" android.permission.INTERNET </dev/null >/dev/null 2>&1 && { echo x >> "$_gdf"; echo "$dpkg" >> "$_gok"; }; } &'
 export M_POS='    _odpos=one; [ -n "$odbatch" ] && _odpos="$_odbi/$_odbn"'
 for l in "$M_T5" "$M_GPF" "$M_CACHE" "$M_GT1" "$M_INET" "$M_POS"; do
   [ "$(grep -cxF -- "$l" "$SUT")" = 1 ] || { echo "EXTRACTION FAILED: anchor line not unique in $SUT: $l" >&2; exit 2; }

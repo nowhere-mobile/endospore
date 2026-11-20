@@ -25,6 +25,15 @@ public class NowhereApp extends Application {
         } catch (Throwable t) {
             android.util.Log.w("NowhereChooser", "NowhereApp: reap watcher start", t);
         }
+        // NWP-20261204-25: the media ring poller, for the same reason as the reap watcher. It is the only sender of
+        // the launcher's MEDIA_PROGRESS. Started only from the gate Activity, a restart of this persistent process
+        // during a session left none, so the launcher kept its last ring while the reap watcher (started here)
+        // cleared the notice. User-0 guard and a started flag inside, so session users' processes start nothing.
+        try {
+            ChooserActivity.startMediaRingPoller(this);
+        } catch (Throwable t) {
+            android.util.Log.w("NowhereChooser", "NowhereApp: media ring poller start", t);
+        }
         // NWP-20261122-07: the blocked-encrypted-DNS watcher, for the same reason as the reap watcher: this process is
         // android:persistent and can restart during a session with no gate Activity, and h49 #2 rule (ii) restores
         // strict mode at EVERY start. Idempotent (user-0 guard + a started flag).
@@ -32,6 +41,14 @@ public class NowhereApp extends Application {
             PrivateDnsWatch.start(this);
         } catch (Throwable t) {
             android.util.Log.w("NowhereChooser", "NowhereApp: private dns watch start", t);
+        }
+        // NWP-20261208-08: the gate input-stall probe, for the row "After a sign-out the gate can stop taking touches".
+        // On an input or frame stall over 5 s it writes fixed codes to gate.log, which every issue report carries.
+        // User-0 guard and a started flag inside.
+        try {
+            GateInputProbe.start(this);
+        } catch (Throwable t) {
+            android.util.Log.w("NowhereChooser", "NowhereApp: input probe start", t);
         }
         // NWP-20260824-03: arm the OTA wake-up here for the SAME reason the reap watcher lives here -- this
         // process is android:persistent and can be restarted with no foreground gate task, so
@@ -75,6 +92,8 @@ public class NowhereApp extends Application {
             // NWP-20261119-10: also an UPDATE (Play, or a materialise over an archived placeholder), so the code list
             // names the new /data/app dir before the next periodic seal. Same runtime-registration reason as above.
             f.addAction(android.content.Intent.ACTION_PACKAGE_REPLACED);
+            // NWP-20261210-01: also a CLEAR-DATA, which arms EXPECT-SHRINK-ANDROID. Same runtime-registration reason as above.
+            f.addAction(android.content.Intent.ACTION_PACKAGE_DATA_CLEARED);
             f.addDataScheme("package");
             if (android.os.Build.VERSION.SDK_INT >= 33) {
                 registerReceiver(new AppInstallReceiver(), f, android.content.Context.RECEIVER_NOT_EXPORTED);

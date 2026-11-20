@@ -159,7 +159,7 @@ sources() {
   local loop
   loop=$(perl -0e '
       my $c = do { local $/; <STDIN> };
-      $c =~ /(for \(int i = 0; i < work\.size\(\); i\+\+\) \{.*?)\}\s*finally\s*\{\s*DaemonSocket\.roundTrip\("AUTO-SWEEP\\n0\\n"/s
+      $c =~ /(for \(int i = 0; i < work\.size\(\); i\+\+\) \{.*?)\}\s*finally\s*\{\s*qDrop\(queued\);\s*DaemonSocket\.roundTrip\("AUTO-SWEEP\\n0\\n"/s
         or exit 1;
       print $1;' <<<"$sweep")
   if perl -0e '
@@ -223,7 +223,7 @@ sources() {
   if perl -0e '
       my $c = do { local $/; <STDIN> };
       my $n = () = $c =~ /DaemonSocket\.roundTrip\("AUTO-SWEEP\\n0\\n", 30000\);/g; exit 1 unless $n == 1;
-      exit 1 unless $c =~ /\}\s*finally\s*\{\s*DaemonSocket\.roundTrip\("AUTO-SWEEP\\n0\\n", 30000\);\s*\}/;
+      exit 1 unless $c =~ /\}\s*finally\s*\{\s*qDrop\(queued\);\s*DaemonSocket\.roundTrip\("AUTO-SWEEP\\n0\\n", 30000\);\s*\}/;
       exit 0;' <<<"$sweep"; then
     echo "ok O3e AUTO-SWEEP 0 is still sent from sweepAuto's finally"
   else
@@ -249,7 +249,7 @@ sources() {
       $t == 1 or push @e, "materializeLocked does not record ok ? INSTALLED : INSTALL_FAILED once";
       my ($q, $o) = (index($mloc, "matEnd = ok ?"), index($mloc, "if (ok) {"));
       ($q >= 0 && $o > $q) or push @e, "the ok record is not before if (ok) {";
-      $loop =~ /MAT_LOCK\.lock\(\);\s*try \{[^}]*materializeAndInstall\(pkg, true\);\s*\w+ = matEnd;\s*\}.*?finally \{\s*MAT_LOCK\.unlock\(\);\s*\}/s
+      $loop =~ /MAT_LOCK\.lock\(\);\s*(?:cardStarted\(card, pkg\);\s*)?try \{[^}]*materializeAndInstall\(pkg, true\);\s*\w+ = matEnd;\s*\}.*?finally \{\s*MAT_LOCK\.unlock\(\);\s*\}/s
         or push @e, "the loop does not read matEnd between MAT_LOCK.lock() and MAT_LOCK.unlock()";
       print join("; ", @e);' <<<"$mai
 <<<SPLIT>>>

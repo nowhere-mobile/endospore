@@ -14,6 +14,12 @@
 #   4. with $TMUX set: each client of `tmux list-clients` and its ancestors (the operator's attached terminal);
 #   5. this uid's user manager: a `systemd` with ppid 1 and its `(sd-pam)` child. That is an INFERENCE from systemd's
 #      user@<uid>.service layout, not a fact read from the build host.
+#   6. two session helpers (Chester, 2026-11-17, NWP-20261116-61; docs/product-decisions.md): a `dbus-daemon` whose
+#      parent is that user manager, and a `gpg-agent` whose parent is pid 1 or that user manager (it daemonises; the
+#      build host's is the GrapheneOS `repo` tool's, ~/.repoconfig/gnupg). Both start again by themselves, so a sitting
+#      that ended them could not count on them staying gone. They are matched by NAME, which any process of this uid
+#      can set: the guard catches a forgotten session (an agent ssh, a stray shell), not a hostile process of the
+#      signing user, which could hide from ps as easily.
 # The pid->ppid edges come from BOTH tables. The first ps lists itself (and often the subshell that ran it); both are
 # children of this guard and both have exited before the second ps runs, so the -e table alone would name them foreign.
 #
@@ -72,6 +78,9 @@ OUT=$(printf '%s\n' "$IN" | awk -v me="$ME" -v wp="$WP" '
     for (p in uppid) if (ucomm[p] == "systemd" && uppid[p] == 1) um[p] = 1
     for (p in uppid) if (ucomm[p] == "(sd-pam)" && (uppid[p] in um)) ok[p] = 1
     for (p in um) ok[p] = 1
+    # 6: the session helpers (by name; see the header).
+    for (p in uppid) if (ucomm[p] == "dbus-daemon" && (uppid[p] in um)) ok[p] = 1
+    for (p in uppid) if (ucomm[p] == "gpg-agent" && (uppid[p] == 1 || (uppid[p] in um))) ok[p] = 1
     for (i = 1; i <= n; i++) if (!(up[i] in ok)) print "pid " up[i] " " uc[i]
   }
   function walk(p,   guard) {

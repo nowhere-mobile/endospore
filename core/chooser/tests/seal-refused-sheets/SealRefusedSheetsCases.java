@@ -38,7 +38,7 @@ final class SealRefusedSheetsCases {
         Confirm c = SealRefusedSheets.refused(who, one, many, restSaved);
         check("refused tone", kase, c.tone == Tone.WARNING);
         check("refused title", kase, c.title.equals(who + (many ? " are blocking sign-out" : " is blocking sign-out")));
-        check("refused context", kase, c.context.equals("Nowhere couldn't read some of " + who
+        check("refused context", kase, c.context.equals("nowhere couldn't read some of " + who
                 + "'s files, so it can't save this session safely and has not signed you out."));
         check("refused lines", kase, texts(c).equals(Arrays.asList(
                 restSaved ? "Everything else in your session IS saved, and your stored copy is intact."

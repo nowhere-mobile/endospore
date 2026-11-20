@@ -102,7 +102,7 @@ public class CreateProgressCases {
         check("S2 createStreaming paints the bar and never the status text",
                 cs != null
                         && cs.contains("DaemonSocket.connect()")
-                        && cs.contains("setSoTimeout(90000)")
+                        && cs.contains("setSoTimeout(DaemonReadCap.forRequest(msg))")
                         && cs.contains("CreateReplyStream.verdict(")
                         && cs.contains("progressBar.setProgress(")
                         && cs.contains("finally")

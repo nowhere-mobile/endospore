@@ -43,6 +43,7 @@ helper_case() {
   d=$(mktemp -d -p "$W")
   { printf 'AGENT=%s; LOG=%s/log\n' "$W/agent-stub" "$d"
     printf 'pw() { echo "@file:x"; }\n'
+    printf 'pwv() { :; }\n'   # NWP-20261205-18: the call stages the chip secret and the key hmac through pwv
     printf '%s\n' "$HELPER"
     printf 'round_record n p de=failed; echo "$?" > %s/hrc\n' "$d"
   } > "$d/run.sh"

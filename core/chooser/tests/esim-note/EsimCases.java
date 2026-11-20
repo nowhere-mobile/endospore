@@ -24,7 +24,7 @@ public class EsimCases {
         check(mix != null && mix.contains("3 eSIM profiles") && mix.contains("1 switched off"), "(2,1) names 3 profiles, 1 off: " + mix);
         for (String n : new String[] { one, off, mix }) {
             if (n == null) { check(false, "a note is missing"); continue; }
-            check(n.contains("Nowhere never deletes one."), "never-deletes sentence: " + n);
+            check(n.contains("nowhere never deletes one."), "never-deletes sentence: " + n);
             check(n.contains("stays through sign-out and power-off"), "kept-on-the-phone sentence: " + n);
             String l = n.toLowerCase();
             check(!l.contains("remove") && !l.contains("delete it") && !l.contains("factory"), "no removal instruction, no factory claim: " + n);

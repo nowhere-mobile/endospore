@@ -153,11 +153,13 @@ agent_sim() {
   esac
 }
 pw() { printf '%s\n' "$ROOT/sim/pw"; }
+pwv() { [ -z "$1" ] || pw "$1"; }
 _ms() { echo 0; }
 od_fetch_data() { return 0; }; od_listed() { return 1; }; od_block_app() { return 0; }; od_unblock_app() { :; }; od_pending_clear() { :; }; od_block_installed() { :; }; od_shipped_prep() { return 0; }; od_park_var() { :; }; od_unf_path() { echo "$STATE/odfetch.$1/unfetched.$2"; }   # NWP-20261130-03
 _sum0=0; _sumt=0   # set above the `in` arm in the script (NWP-20261130-08); this harness runs the arm alone under set -u
+_se_v=""; _fh_v=""   # set at the top level in the script (NWP-20261205-18); the same reason
 sleep() { return 0; }
-for t in usb_host relabel_launcher remap_media_db insert_deferred_media remap_per_pkg _tlog _ssum acct_restore remap_tree reown_ext_appdata \
+for t in usb_host relabel_launcher remap_per_pkg _tlog _ssum acct_restore remap_tree reown_ext_appdata \
          keystore_push keystore_fetch keystore_restore ks_signin_reset hold_ondemand od_parked_report reap_stale_ondemand reap_orphan_provisioned restorecon \
          uiderrors_floor_take uiderrors_floor_commit tz_surface sroam_surface; do
   eval "$t() { :; }"
@@ -470,7 +472,7 @@ L_RR='      [ -e "$STATE/restore-receipts" ] && mv "$STATE/restore-receipts" "$P
 L_RF='      for _pn in media.restore-ok .btlogoff .had_account; do [ -e "$STATE/$_pn" ] && mv "$STATE/$_pn" "$PARK/" 2>> "$LOG"; done'
 L_SL='    [ -e "$STATE/.fido2slots" ] && mv "$STATE/.fido2slots" "$PARK/" 2>> "$LOG"'
 L_IF='    if [ -z "$_probe" ] && { [ "$fido2_needed" = 0 ] || [ -n "$fresh_hmac" ]; }; then'
-L_CE='    elif od_shipped_prep && NOWHERE_PARK_KEEP="$(od_park_var keep)" NOWHERE_PARK_SHIPPED="$(od_park_var shipped)" NOWHERE_UNFETCHED_LIST="$(od_park_var ce)" NOWHERE_PHASE=apps NOWHERE_CLAIMS_SEED="$STATE/claims.seed" "$AGENT" restore s3 "$name" "$(pw "$pass")" "$USERDIR" >> "$LOG" 2>&1; then'
+L_CE='    elif od_shipped_prep && NOWHERE_PARK_KEEP="$(od_park_var keep)" NOWHERE_PARK_SHIPPED="$(od_park_var shipped)" NOWHERE_UNFETCHED_LIST="$(od_park_var ce)" NOWHERE_PHASE=apps NOWHERE_CLAIMS_SEED="$STATE/claims.seed" NOWHERE_SE_SECRET="$(pwv "$_se_v")" NOWHERE_FIDO2_HMAC="$(pwv "$_fh_v")" "$AGENT" restore s3 "$name" "$(pw "$pass")" "$USERDIR" >> "$LOG" 2>&1; then'
 L_PC='    case $? in'
 L_HM='      [ -e "$STATE/.fido2hmac" ] && mv "$STATE/.fido2hmac" "$PARK/" 2>> "$LOG"'
 # The line the OK arm no longer holds (NWP-20261129-17). Its anchor is L_OR; the mutant below puts it back there.

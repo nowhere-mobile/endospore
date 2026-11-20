@@ -283,12 +283,12 @@ func TestShrinkForget_CallSites(t *testing.T) {
 	}
 	const call = "forgetShrinkIntents(dest)"
 	in := fn("func handleRoamIn(", "func handleRoamInOffline(")
-	after, forget, claim := at(in, "handleRoamIn", "recordAnrSeen(dest)"), at(in, "handleRoamIn", call), at(in, "handleRoamIn", `claimLocGlobalsAsync(dest, uid, "signin")`)
+	after, forget, claim := at(in, "handleRoamIn", "recordAnrSeen(dest)"), at(in, "handleRoamIn", call), at(in, "handleRoamIn", `claimSessionGlobalsAsync(dest, uid, "signin")`)
 	if !(after < forget && forget < claim) {
 		t.Errorf("sign-in order: recordAnrSeen %d, forget %d, claim %d", after, forget, claim)
 	}
 	off := fn("func handleRoamInOffline(", "func handleRelogin(")
-	after, forget, claim = at(off, "handleRoamInOffline", "resetSealSignals()"), at(off, "handleRoamInOffline", call), at(off, "handleRoamInOffline", `claimLocGlobalsAsync(dest, uid, "offline")`)
+	after, forget, claim = at(off, "handleRoamInOffline", "resetSealSignals()"), at(off, "handleRoamInOffline", call), at(off, "handleRoamInOffline", `claimSessionGlobalsAsync(dest, uid, "offline")`)
 	if !(after < forget && forget < claim) {
 		t.Errorf("offline order: resetSealSignals %d, forget %d, claim %d", after, forget, claim)
 	}

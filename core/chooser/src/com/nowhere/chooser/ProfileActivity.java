@@ -52,6 +52,13 @@ public class ProfileActivity extends Activity {
     // gate -- you must not be able to Home/Back your way back into a session you've already logged off.
     private boolean loggingOff = false;
 
+    // NWP-20261208-02: the live Profile screens, so AdminReceiver's L4 backstop can tell whether one is already
+    // ending the session. Every screen that sets loggingOff -- a sign-out, the session ending, a delete, a stop --
+    // must survive a further wrong unlock: the backstop's start clears the task, which would destroy it.
+    private static final AutoLogoffGate.Live<ProfileActivity> LIVE = new AutoLogoffGate.Live<>();
+
+    static boolean anySignOutUnderWay() { return LIVE.any(a -> a.loggingOff); }
+
     private static final int MATCH = LinearLayout.LayoutParams.MATCH_PARENT;
     private static final int WRAP  = LinearLayout.LayoutParams.WRAP_CONTENT;
 
@@ -119,6 +126,9 @@ public class ProfileActivity extends Activity {
     // lands after the user opened a sub-screen does not pull them back; the next showConfirm() reads the fields.
     private android.view.View shownView;
     private android.view.View confirmView;
+    // NWP-20261208-04: showConfirm asks GET-CLAIM-NOTICE once per activity instance, not at every redraw of the menu,
+    // so one open shows the claim notice at most once. UI-thread only, like shownView.
+    private boolean claimNoticeAsked;
 
     // NWP-20261128-10: Back (the button or the swipe) goes to the shown screen's parent, the one its on-screen Back
     // link names, not to a history: a screen reached through a side path still goes where its link says. backLink()
@@ -160,6 +170,8 @@ public class ProfileActivity extends Activity {
         }
         if (look == GatePalette.LIGHT) setTheme(android.R.style.Theme_Material_Light_NoActionBar);
         super.onCreate(b);
+        // NWP-20261208-02: registered before the auto check, so a new instance that signs out is seen at once.
+        LIVE.add(this);
         applyProfileLook(look);
         syncBackCallback();
         // L4: the failed-unlock auto-logoff backstop (AdminReceiver) launches this with auto=true -> skip the
@@ -225,20 +237,67 @@ public class ProfileActivity extends Activity {
             return;
         }
         openYourAppsIfAsked();
+        openUpdateIfAsked();
     }
 
     /** NWP-20261126-05: the landing card's "+<n> more" row starts this screen with EXTRA_OPEN = OPEN_YOUR_APPS, and it
      *  opens Your apps. Once: the extra is removed when honoured. Only after a screen is drawn (shownView), so an intent
      *  that arrives before the first menu waits for the probe's drawChecking. NWP-20261202-22: the "Finish setting up
-     *  Google Play" card sends OPEN_PLAY: the same Your apps, then the GrapheneOS App Store (openGosStore). */
+     *  Google Play" card sends OPEN_PLAY: the same Your apps, then the GrapheneOS App Store (openGosStore).
+     *  NWP-20261209-05: nApps' "Learn more" sends OPEN_HELP_YOUR_APPS: Help opens with its "Your apps" topic open,
+     *  through the topic row's own click, as a tap opens it. Once, as above. */
     private void openYourAppsIfAsked() {
         Intent in = getIntent();
         String open = in == null ? null : in.getStringExtra(LandingLine.EXTRA_OPEN);
+        if (in != null && shownView != null && LandingLine.OPEN_HELP_YOUR_APPS.equals(open)) {
+            in.removeExtra(LandingLine.EXTRA_OPEN);
+            showHelp();
+            // The row whose title reads "Your apps" (HelpPages.TITLES[1]): the topic bodies are empty until opened.
+            java.util.ArrayDeque<View> q = new java.util.ArrayDeque<>();
+            q.add(shownView);
+            while (!q.isEmpty()) {
+                View v = q.poll();
+                if (v instanceof TextView && HelpPages.TITLES[1].contentEquals(((TextView) v).getText())
+                        && v.getParent() instanceof View) {
+                    ((View) v.getParent()).performClick();
+                    break;
+                }
+                if (v instanceof android.view.ViewGroup) {
+                    android.view.ViewGroup g = (android.view.ViewGroup) v;
+                    for (int i = 0; i < g.getChildCount(); i++) q.add(g.getChildAt(i));
+                }
+            }
+            return;
+        }
         if (in == null || shownView == null
                 || !(LandingLine.OPEN_YOUR_APPS.equals(open) || PlayFinishPrompt.OPEN_PLAY.equals(open))) return;
         in.removeExtra(LandingLine.EXTRA_OPEN);
         showYourApps();
         if (PlayFinishPrompt.OPEN_PLAY.equals(open)) openGosStore();
+    }
+
+    /** NWP-20261208-32: the "update available" notice starts this screen with EXTRA_OPEN = UpdateNoticeTap.OPEN_UPDATE,
+     *  and it opens the hub scrolled to its Update card ("Sign out &amp; install"). UpdateNoticeTap.act decides: NONE (not
+     *  ours) and WAIT (the probe has not answered) keep the extra, so apply() asks again; DROP (no update offered) and
+     *  SCROLL remove it, so it is honoured once. UI thread only. */
+    private void openUpdateIfAsked() {
+        Intent in = getIntent();
+        String open = in == null ? null : in.getStringExtra(LandingLine.EXTRA_OPEN);
+        switch (UpdateNoticeTap.act(open, probed, updateStatus.avail)) {
+            case NONE:
+            case WAIT:
+                return;
+            case DROP:
+                in.removeExtra(LandingLine.EXTRA_OPEN);
+                return;
+            case SCROLL:
+                in.removeExtra(LandingLine.EXTRA_OPEN);
+                if (shownView != confirmView) showConfirm();
+                final View c = updateCard;
+                if (c != null) c.post(() -> c.requestRectangleOnScreen(
+                        new android.graphics.Rect(0, 0, c.getWidth(), c.getHeight()), false));
+                return;
+        }
     }
 
     /** The session probe: throwaway or stored, offline, the profile's name and the OS update offer. Re-run from the
@@ -267,7 +326,9 @@ public class ProfileActivity extends Activity {
                             if (r.name != null) sessionName = r.name;
                             updateStatus = OtaUpdate.parse(r.otaLines);
                             sweepGoogleMarks();
+                            probed = true;
                             if (shownView == confirmView) showConfirm();
+                            openUpdateIfAsked();
                         });
                     }
                 }), "nowhere-profile-probe").start();
@@ -307,6 +368,9 @@ public class ProfileActivity extends Activity {
 
     // NWP-20261011-05: the OTA-STATUS the session probe read -- drives the Update row (NONE until it answers).
     private volatile OtaUpdate.Status updateStatus = OtaUpdate.NONE;
+    // NWP-20261208-32 (UI thread only): the probe has answered, and the Update card last drawn -- openUpdateIfAsked.
+    private boolean probed;
+    private android.view.View updateCard;
     // NWP-20261011-05: this Profile instance's nonce for "Sign out & install": the request it makes carries it (with this
     // user's id, so only the reap of THIS session takes it), and a refused sign-out withdraws only that request.
     private final String otaReqNonce = java.util.UUID.randomUUID().toString();
@@ -513,6 +577,21 @@ public class ProfileActivity extends Activity {
         sc.addView(ll);
         confirmView = sc;
         setContentView(sc);
+        // NWP-20261208-04: codes the profile was not told about yet could not be used (h55 #1). Both buttons ack the
+        // count; Back or a touch outside acks nothing, so the next open asks again. Shown only over this menu.
+        if (!claimNoticeAsked) {
+            claimNoticeAsked = true;
+            new Thread(() -> {
+                final int n = ClaimNoticeCopy.count(sendDaemon(ClaimNoticeCopy.GET_REQUEST));
+                if (n > 0) runOnUiThread(() -> {
+                    if (!isFinishing() && !isDestroyed() && shownView == confirmView) {
+                        SheetDialog.confirm(this, ClaimNoticeCopy.sheet(n), new Runnable[] {
+                                () -> { new Thread(() -> sendDaemon(ClaimNoticeCopy.ackRequest(n))).start(); showAddCredits(); },
+                                () -> new Thread(() -> sendDaemon(ClaimNoticeCopy.ackRequest(n))).start() }, null);
+                    }
+                });
+            }).start();
+        }
     }
 
     /** Full-width primary (accent) button with its click. */
@@ -563,6 +642,7 @@ public class ProfileActivity extends Activity {
         LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(MATCH, WRAP);
         clp.topMargin = dp(20);
         parent.addView(card, clp);
+        updateCard = card;
 
         TextView title = new TextView(this);
         title.setText(OtaUpdate.profileRowTitle(us));
@@ -811,6 +891,7 @@ public class ProfileActivity extends Activity {
         if (!local) { labels.add("Tie to this phone"); actions.add(() -> showPhoneTie()); } // NWP-20261006-09: opt-in, undoable
         if (!throwaway) { labels.add("Auto standby when idle"); actions.add(() -> showIdlePicker()); } // #51 (Chester wording): idle = resumable cold standby, not a sign-out
         if (!throwaway) { labels.add("Auto-wipe when left locked"); actions.add(() -> showWipePicker()); }
+        if (!throwaway) { labels.add(CarriedAccess.ROW_LABEL); actions.add(() -> showCarriedAccess()); } // NWP-20261207-17 (#39, Q024): a throwaway is never saved, so nothing travels with it
         labels.add("Always-on VPN");                actions.add(() -> showVpnPicker());       // #159: kill-switch VPN that survives roam
         sectionCard(ll, null, labels.toArray(new String[0]), actions.toArray(new Runnable[0]), false);
         if (throwaway) {
@@ -825,6 +906,232 @@ public class ProfileActivity extends Activity {
         }
 
         finishMenuScreen(ll);
+    }
+
+    // ---- NWP-20261207-17 (#39, Q024; decision NWP-20261022-31): the accessibility services and the usage-access apps
+    // that travel with this profile, each with an off switch. Both roam exactly as set, captured from the live state at
+    // seal, so an off here is what stops one travelling: roamd's a11y_seal_capture reads the live
+    // enabled_accessibility_services, and capturePerms records usage access only on MODE_ALLOWED. A not-installed app's
+    // usage line is carried forward verbatim by capturePerms, so every usage off deletes that line in nowhere-perms, then
+    // checks the installation again and revokes an installed app's live grant. Accessibility entries still waiting for
+    // their app's install live only in roamd's nowhere-a11y (root, 600) and are not listed.
+    // There is no on path here: turning one on stays in Android Settings. Every word is a DRAFT in CarriedAccess.
+
+    /** The read and every off, one at a time, in tap order. */
+    private static final java.util.concurrent.ExecutorService CARRIED_ACCESS =
+            java.util.concurrent.Executors.newSingleThreadExecutor();
+
+    /** The screen is presented at once with Back (the #74b rule); the read fills its two sections only while it is still
+     *  the shown screen, so a late read never pulls the user back from another one. */
+    private void showCarriedAccess() {
+        LinearLayout ll = menuScreen(CarriedAccess.SCREEN_TITLE, CarriedAccess.SCREEN_SUBTITLE);
+        TextView note = carriedMuted(CarriedAccess.NOTE);
+        LinearLayout.LayoutParams nlp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        nlp.topMargin = dp(10);
+        ll.addView(note, nlp);
+        final LinearLayout a11yBody = new LinearLayout(this);
+        a11yBody.setOrientation(LinearLayout.VERTICAL);
+        final LinearLayout usageBody = new LinearLayout(this);
+        usageBody.setOrientation(LinearLayout.VERTICAL);
+        ll.addView(carriedHeader(CarriedAccess.A11Y_TITLE), new LinearLayout.LayoutParams(MATCH, WRAP));
+        a11yBody.addView(carriedMuted(CarriedAccess.LOADING), new LinearLayout.LayoutParams(MATCH, WRAP));
+        ll.addView(a11yBody, new LinearLayout.LayoutParams(MATCH, WRAP));
+        ll.addView(carriedHeader(CarriedAccess.USAGE_TITLE), new LinearLayout.LayoutParams(MATCH, WRAP));
+        usageBody.addView(carriedMuted(CarriedAccess.LOADING), new LinearLayout.LayoutParams(MATCH, WRAP));
+        ll.addView(usageBody, new LinearLayout.LayoutParams(MATCH, WRAP));
+        finishMenuScreen(ll, this::showSecurity);
+        final android.view.View screen = shownView;
+
+        CARRIED_ACCESS.execute(() -> {
+            // {component or package, label, sub-line or null}
+            final java.util.ArrayList<String[]> a11y = new java.util.ArrayList<>();
+            final java.util.ArrayList<String[]> usage = new java.util.ArrayList<>();
+            try {
+                String enabled = android.provider.Settings.Secure.getString(getContentResolver(),
+                        "enabled_accessibility_services");
+                for (String c : CarriedAccess.services(enabled))
+                    a11y.add(new String[]{c, appLabel(c.substring(0, c.indexOf('/'))), null});
+            } catch (Throwable t) {
+                Log.w("NowhereChooser", "carried access: a11y read failed: " + t.getClass().getName() + " (NWP-20261207-17)");
+            }
+            try {
+                PackageManager pm = getPackageManager();
+                android.app.AppOpsManager ao = getSystemService(android.app.AppOpsManager.class);
+                java.util.HashSet<String> installed = new java.util.HashSet<>();
+                for (android.content.pm.PackageInfo pi : pm.getInstalledPackages(PackageManager.GET_PERMISSIONS)) {
+                    if (pi.requestedPermissions == null || pi.applicationInfo == null) continue;
+                    installed.add(pi.packageName);
+                    if (getPackageName().equals(pi.packageName)) continue; // the chooser's own grant never travels
+                    if (!java.util.Arrays.asList(pi.requestedPermissions)
+                            .contains(android.Manifest.permission.PACKAGE_USAGE_STATS)) continue;
+                    if (ao != null && ao.unsafeCheckOpNoThrow(android.app.AppOpsManager.OPSTR_GET_USAGE_STATS,
+                            pi.applicationInfo.uid, pi.packageName) == android.app.AppOpsManager.MODE_ALLOWED)
+                        usage.add(new String[]{pi.packageName, appLabel(pi.packageName), null});
+                }
+                java.util.List<String> carried = CarriedAccess.splitLines(
+                        SettingsText.read(new java.io.File(getFilesDir(), "nowhere-perms")));
+                for (String p : CarriedAccess.usageLines(carried)) { // unreadable (null) -> none listed
+                    if (installed.contains(p) || getPackageName().equals(p)) continue;
+                    usage.add(new String[]{p, appLabel(p), CarriedAccess.NOT_INSTALLED});
+                }
+            } catch (Throwable t) {
+                Log.w("NowhereChooser", "carried access: usage read failed: " + t.getClass().getName() + " (NWP-20261207-17)");
+            }
+            Log.i("NowhereChooser", "carried access: " + a11y.size() + " services, " + usage.size() + " usage (NWP-20261207-17)");
+            runOnUiThread(() -> {
+                if (isFinishing() || isDestroyed()) return;
+                if (shownView != screen) return;
+                a11yBody.removeAllViews();
+                usageBody.removeAllViews();
+                if (a11y.isEmpty())
+                    a11yBody.addView(carriedMuted(CarriedAccess.A11Y_EMPTY), new LinearLayout.LayoutParams(MATCH, WRAP));
+                for (final String[] r : a11y)
+                    a11yBody.addView(carriedRow(r[1], r[2], "a11y", () -> carriedA11yOff(r[0])),
+                            new LinearLayout.LayoutParams(MATCH, WRAP));
+                if (usage.isEmpty())
+                    usageBody.addView(carriedMuted(CarriedAccess.USAGE_EMPTY), new LinearLayout.LayoutParams(MATCH, WRAP));
+                for (final String[] r : usage)
+                    usageBody.addView(carriedRow(r[1], r[2], "usage", () -> carriedUsageOff(r[0])),
+                            new LinearLayout.LayoutParams(MATCH, WRAP));
+            });
+        });
+    }
+
+    private TextView carriedMuted(String text) {
+        TextView line = new TextView(this);
+        line.setText(text);
+        line.setTextColor(MUTED);
+        line.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        line.setLineSpacing(dp(3), 1f);
+        line.setPadding(dp(4), dp(8), dp(4), dp(2));
+        return line;
+    }
+
+    private TextView carriedHeader(String text) {
+        TextView head = new TextView(this);
+        head.setText(text);
+        head.setTextColor(INK);
+        head.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        head.setPadding(dp(4), dp(22), dp(4), dp(2));
+        return head;
+    }
+
+    /** One carried row: its title, an optional muted sub-line and an on switch. Switching it off runs `off` on
+     *  CARRIED_ACCESS; the off always runs to its end, even when the user leaves the screen. Success leaves the switch
+     *  off and disabled (there is no on path here); a failure sets it back on and toasts OFF_FAILED while the screen is
+     *  still shown. `kind` is a fixed word for the log line, never a package or a component. */
+    private LinearLayout carriedRow(String title, String sub, final String kind,
+                                    final java.util.concurrent.Callable<Boolean> off) {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(dp(4), dp(12), dp(4), dp(2));
+        LinearLayout col = new LinearLayout(this);
+        col.setOrientation(LinearLayout.VERTICAL);
+        TextView lab = new TextView(this);
+        lab.setText(title);
+        lab.setTextColor(INK);
+        lab.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
+        col.addView(lab);
+        if (sub != null) {
+            TextView st = new TextView(this);
+            st.setText(sub);
+            st.setTextColor(MUTED);
+            st.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+            col.addView(st);
+        }
+        LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(0, WRAP, 1f);
+        clp.rightMargin = dp(10);
+        row.addView(col, clp);
+        final android.widget.Switch sw = GateSwitch.style(new android.widget.Switch(this), GatePalette.active());
+        sw.setChecked(true);
+        final android.view.View screen = shownView;
+        final android.widget.CompoundButton.OnCheckedChangeListener[] l = new android.widget.CompoundButton.OnCheckedChangeListener[1];
+        l[0] = (b, on) -> {
+            if (on) return;
+            sw.setEnabled(false);
+            CARRIED_ACCESS.execute(() -> {
+                boolean ok;
+                try { ok = off.call(); } catch (Throwable t) { ok = false; }
+                Log.i("NowhereChooser", "carried access: off " + kind + " " + (ok ? "OK" : "FAILED") + " (NWP-20261207-17)");
+                final boolean done = ok;
+                runOnUiThread(() -> {
+                    if (done) return;
+                    hsSetChecked(sw, l[0], true);
+                    sw.setEnabled(true);
+                    if (!isFinishing() && !isDestroyed() && shownView == screen)
+                        android.widget.Toast.makeText(ProfileActivity.this, CarriedAccess.OFF_FAILED,
+                                android.widget.Toast.LENGTH_LONG).show();
+                });
+            });
+        };
+        sw.setOnCheckedChangeListener(l[0]);
+        row.addView(sw, new LinearLayout.LayoutParams(WRAP, WRAP));
+        return row;
+    }
+
+    /** Turn an accessibility service off in this session (the session user's own Settings.Secure), in the order AOSP
+     *  Settings' AccessibilityUtils.setAccessibilityServiceState uses: the list without it, then accessibility_enabled 0
+     *  only when no `<pkg>/<cls>` entry is left, a framework one included. True only when a re-read no longer holds it. */
+    private boolean carriedA11yOff(String component) {
+        try {
+            android.content.ContentResolver cr = getContentResolver();
+            String cur = android.provider.Settings.Secure.getString(cr, "enabled_accessibility_services");
+            String next = CarriedAccess.without(cur, component);
+            boolean ok = android.provider.Settings.Secure.putString(cr, "enabled_accessibility_services", next);
+            if (ok && !CarriedAccess.anyComponent(next)) ok = android.provider.Settings.Secure.putString(cr, "accessibility_enabled", "0");
+            String back = android.provider.Settings.Secure.getString(cr, "enabled_accessibility_services");
+            return ok && !CarriedAccess.services(back).contains(component);
+        } catch (Throwable t) {
+            Log.w("NowhereChooser", "carried access: a11y off threw " + t.getClass().getName() + " (NWP-20261207-17)");
+            return false;
+        }
+    }
+
+    /** Usage access off for a listed app, by CarriedAccess.usageOff's order: the carried nowhere-perms line goes first,
+     *  then the installation is checked again NOW (an install and its restore can land while the screen is open) and an
+     *  installed app's appop is set to MODE_IGNORED, so capturePerms (MODE_ALLOWED only) records nothing for it at the
+     *  next capture. True when the line is gone and, if installed, a re-read is no longer MODE_ALLOWED. */
+    private boolean carriedUsageOff(final String pkg) {
+        try {
+            final android.app.AppOpsManager ao = getSystemService(android.app.AppOpsManager.class);
+            return CarriedAccess.usageOff(new CarriedAccess.UsageOps() {
+                @Override public boolean forget() { return carriedUsageForget(pkg); }
+                @Override public int uid() {
+                    try { return getPackageManager().getPackageUid(pkg, 0); }
+                    catch (PackageManager.NameNotFoundException e) { return -1; }
+                }
+                @Override public boolean ignore(int uid) {
+                    ao.setMode(android.app.AppOpsManager.OPSTR_GET_USAGE_STATS, uid, pkg, android.app.AppOpsManager.MODE_IGNORED);
+                    return ao.unsafeCheckOpNoThrow(android.app.AppOpsManager.OPSTR_GET_USAGE_STATS, uid, pkg)
+                            != android.app.AppOpsManager.MODE_ALLOWED;
+                }
+            });
+        } catch (Throwable t) {
+            Log.w("NowhereChooser", "carried access: usage off threw " + t.getClass().getName() + " (NWP-20261207-17)");
+            return false;
+        }
+    }
+
+    /** Delete one app's carried usage line from nowhere-perms (capturePerms carries a not-installed app's line forward
+     *  verbatim, and roamd's restore grants from it at the install), under the lock capturePerms holds and with its
+     *  atomic write. An unreadable file writes nothing. */
+    private boolean carriedUsageForget(String pkg) {
+        try {
+            synchronized (PERMS_CAPTURE_LOCK) {
+                java.io.File f = new java.io.File(getFilesDir(), "nowhere-perms");
+                String text = SettingsText.read(f);
+                if (text == null) return false;
+                java.util.List<String> in = CarriedAccess.splitLines(text);
+                java.util.List<String> out = CarriedAccess.withoutUsage(in, pkg);
+                if (out.size() == in.size()) return true; // already gone
+                StoreInstaller.writeAtomic(f, CarriedAccess.lines(out));
+                return true;
+            }
+        } catch (Throwable t) {
+            Log.w("NowhereChooser", "carried access: usage forget threw " + t.getClass().getName() + " (NWP-20261207-17)");
+            return false;
+        }
     }
 
     /** "Report an issue" (task ii): let the user file a diagnostic report with support. The daemon does the SCRUB
@@ -967,16 +1274,14 @@ public class ProfileActivity extends Activity {
             }).start();
         }), btnLp(dp(6)));
 
-        ll.addView(accentButton("Send report", () -> SheetDialog.confirm(this, ReportRepairSheets.sendReport(),
-                new Runnable[] { () -> {
-                    statusTv.setTextColor(MUTED);
-                    StatusLine.busy(statusTv, "Sending…");
-                    final String noteText = note.getText().toString();
-                    new Thread(() -> {
-                        final String reply = sendDaemon("REPORT-ISSUE\n" + reportRequestJson(noteText, false) + "\n").trim();
-                        runOnUiThread(() -> renderReportResult(reply, statusTv, noteText));
-                    }).start();
-                }, null }, null)), btnLp(dp(10)));
+        // NWP-20261208-28: Send changes the sheet in place to Sending report…, then to the reply; it never closes to here.
+        ll.addView(accentButton("Send report", () -> {
+            final SheetDialog.Live[] sheet = new SheetDialog.Live[1];
+            sheet[0] = SheetDialog.confirmLive(this, ReportRepairSheets.sendReport(), new Runnable[] { SheetDialog.inPlace(() -> {
+                final String noteText = note.getText().toString(); // read the EditText on the main thread
+                sendReportOn(sheet[0], statusTv, noteText);
+            }), null });
+        }), btnLp(dp(10)));
 
         ll.addView(statusTv, sglp);
         ticketTable(ll); // past reports (persisted locally, rides the profile seal)
@@ -1392,6 +1697,33 @@ public class ProfileActivity extends Activity {
             if (laneStack != null) st.put("lane_stack", laneStack);
             st.put("chooser_up_s", up);
         } catch (Throwable ignore) {}
+        // NWP-20261204-14: Q056 (docs/product-decisions.md, 2026-10-20) measures half-materialised apps before any Repair.
+        // od_half counts the profile's Auto and on-demand apps with code and no confirmed restore (on-demand split by our
+        // own install) and the restore-only replies this chooser process saw answer ERR-NOTREADY. Counts only, never a
+        // name (OdHalfStates). Nothing is logged; a throw puts no key.
+        try {
+            java.util.List<String> keep = new java.util.ArrayList<>();
+            java.io.File kf = new java.io.File(ctx.getFilesDir(), "nowhere-appkeep");
+            if (kf.exists()) {
+                try (java.io.BufferedReader br = new java.io.BufferedReader(new java.io.FileReader(kf))) {
+                    String l;
+                    while ((l = br.readLine()) != null) keep.add(l);
+                }
+            }
+            java.util.Set<String> mat = new java.util.HashSet<>();
+            java.io.File mf = new java.io.File(ctx.getFilesDir(), "nowhere-od-materialised");
+            if (mf.exists()) {
+                try (java.io.BufferedReader br = new java.io.BufferedReader(new java.io.FileReader(mf))) {
+                    String l;
+                    while ((l = br.readLine()) != null) {
+                        l = l.trim();
+                        if (!l.isEmpty()) mat.add(l);
+                    }
+                }
+            }
+            st.put("od_half", OdHalfStates.reportValue(keep, p -> UnarchiveService.hasInstalledCode(ctx, p),
+                    p -> UnarchiveService.odRestored(ctx, p), mat, UnarchiveService.RESTORE_NOTREADY.get()));
+        } catch (Throwable ignore) {}
         return st;
     }
 
@@ -1669,25 +2001,34 @@ public class ProfileActivity extends Activity {
         dlg.show();
     }
 
-    /** Map the daemon's REPORT-ISSUE reply to a user-facing status (and a ticket dialog on success). */
-    private void renderReportResult(String reply, TextView statusTv, String noteText) {
+    /** NWP-20261208-28: the sheet shows Sending report…, and the reply lands on the same sheet. Try again calls this
+     *  again with the same noteText, so the note is sent as typed. */
+    private void sendReportOn(SheetDialog.Live sheet, TextView statusTv, String noteText) {
+        sheet.progress(ReportRepairSheets.sending());
+        new Thread(() -> {
+            final String reply = sendDaemon("REPORT-ISSUE\n" + reportRequestJson(noteText, false) + "\n").trim();
+            runOnUiThread(() -> renderReportResult(reply, sheet, statusTv, noteText));
+        }).start();
+    }
+
+    /** Map the daemon's REPORT-ISSUE reply onto the live sheet: Report sent with the ticket, or Couldn't send the
+     *  report (Try again when a retry can help). The note field is never cleared. */
+    private void renderReportResult(String reply, SheetDialog.Live sheet, TextView statusTv, String noteText) {
         if (reply != null && reply.startsWith("OK ")) {
             final String ticket = reply.substring(3).trim();
-            appendTicket(ticket, noteText); // persist so the user can track it later
+            appendTicket(ticket, noteText); // persist so the user can track it later, even when the screen is gone
+            if (isFinishing() || isDestroyed()) return;
             statusTv.setTextColor(ACCENT);
             statusTv.setText("Sent · " + ticket);
             // Got it re-renders so the new row shows in the table; Back or a tap outside only closes, as before.
-            SheetDialog.confirm(this, ReportRepairSheets.reportSent(ticket), new Runnable[] { () -> showReportIssue() }, null);
+            sheet.confirm(ReportRepairSheets.reportSent(ticket), new Runnable[] { () -> showReportIssue() });
             return;
         }
-        String msg;
-        if ("ERR-NOGW".equals(reply))          msg = "Support reporting isn't available on this device.";
-        else if ("ERR-DISABLED".equals(reply)) msg = "Support isn't accepting reports right now. Try again later.";
-        else if ("ERR-TOOBIG".equals(reply))   msg = "The report was too large to send.";
-        else if ("ERR-NET".equals(reply) || reply == null || reply.isEmpty())
-                                               msg = "Couldn't reach support. Check your connection and try again.";
-        else                                   msg = "Couldn't send the report (" + reply + ").";
-        StatusLine.error(statusTv, msg);
+        if (isFinishing() || isDestroyed()) return;
+        // Not now and Got it only close the sheet.
+        sheet.confirm(ReportRepairSheets.failed(reply), ReportRepairSheets.retryable(reply)
+                ? new Runnable[] { SheetDialog.inPlace(() -> sendReportOn(sheet, statusTv, noteText)), null }
+                : null);
     }
 
     // Past "Report an issue" tickets persist in getFilesDir()/nowhere-tickets.json -- it rides the profile seal
@@ -2140,7 +2481,7 @@ public class ProfileActivity extends Activity {
                 // NWP-20261008-03/-04: photos and files and installed apps follow in the background, and the screen
                 // shows how far that has got (showTieProgress) -- until each is done, the passphrase still opens it.
                 if ("OK UNTIED".equals(st)) {
-                    body.setText("Right now your name and passphrase open this profile on any Nowhere phone.\n\n"
+                    body.setText("Right now your name and passphrase open this profile on any nowhere phone.\n\n"
                             + "Tied, this phone's security chip is needed as well to sign in and to open your apps' data, "
                             + "your settings and the keys that keep apps signed in, so a copy of them can't be opened by "
                             + "guessing your passphrase. Your photos and files and your installed apps follow in the "
@@ -2163,7 +2504,7 @@ public class ProfileActivity extends Activity {
                     body.setText("This profile is tied to this phone: its security chip is needed, with your passphrase, "
                             + "to sign in and to open your apps' data, your settings and the keys that keep apps signed "
                             + "in.\n\n"
-                            + "Untied, your name and passphrase alone open it on any Nowhere phone again, with no recovery "
+                            + "Untied, your name and passphrase alone open it on any nowhere phone again, with no recovery "
                             + "code. A copy of your stored data could then be opened by guessing your passphrase, so it "
                             + "should be a strong one.");
                     act.setText("Untie it from this phone");
@@ -2180,7 +2521,7 @@ public class ProfileActivity extends Activity {
                     showTieProgress(prog);
                 } else if ("OK NOCHIP".equals(st)) {
                     body.setText("This phone has no security chip, so a profile can't be tied to it. Your name and "
-                            + "passphrase open it on any Nowhere phone.");
+                            + "passphrase open it on any nowhere phone.");
                     return;
                 } else if ("OK OTHER".equals(st)) {
                     body.setText("This profile uses a security key, which already has to be present to open it. Tying it "
@@ -2756,7 +3097,7 @@ public class ProfileActivity extends Activity {
 
     /** The hand-change guard, called by each Security and Configuration write path before it writes, with the values it
      *  is about to write. PresetPicker.guardAction decides; this only runs it: write, write and save the Custom, or ask
-     *  REPLACE_ASK first (Cancel, or Back, writes nothing and runs onCancel). NWP-20261125-22: the Custom is saved only
+     *  with the replaceCustom sheet first (Not now, Back or a touch outside writes nothing and runs onCancel). NWP-20261125-22: the Custom is saved only
      *  when the files, read back after the write, hold the change; a write that did not land saves or replaces none. */
     private void presetGuard(java.util.Map<String, String> change, final Runnable write, final Runnable onCancel) {
         java.util.Map<String, String> cur = presetCurrent();
@@ -2771,19 +3112,16 @@ public class ProfileActivity extends Activity {
                 if (SettingLanded.landed(change, presetCurrent())) presetSaveCustom(g.save);
                 break;
             case ASK:
-                new android.app.AlertDialog.Builder(this)
-                        .setMessage(PresetPicker.replaceMessage())
-                        .setPositiveButton(PresetPicker.REPLACE, (d, w) -> {
+                // NWP-20261208-21: an amber sheet (LineReportPresetSheets.replaceCustom): slot 0 "Not now" writes nothing,
+                // slot 1 "Replace" writes and replaces the Custom. A button dismisses, which fires no cancel, so onCancel
+                // runs once: from slot 0, or from the cancel listener on Back or a touch outside.
+                android.app.Dialog d = SheetDialog.confirm(this, LineReportPresetSheets.replaceCustom(), new Runnable[] {
+                        () -> { if (onCancel != null) onCancel.run(); },
+                        () -> {
                             write.run();
                             if (SettingLanded.landed(change, presetCurrent())) presetSaveCustom(g.save);
-                        })
-                        .setNegativeButton(PresetPicker.CANCEL, (d, w) -> {
-                            if (onCancel != null) onCancel.run();
-                        })
-                        .setOnCancelListener(d -> {
-                            if (onCancel != null) onCancel.run();
-                        })
-                        .show();
+                        } }, null);
+                if (d != null) d.setOnCancelListener(x -> { if (onCancel != null) onCancel.run(); });
                 break;
         }
     }
@@ -3114,6 +3452,37 @@ public class ProfileActivity extends Activity {
         mrow.addView(msw, new LinearLayout.LayoutParams(WRAP, WRAP));
         ll.addView(mrow, new LinearLayout.LayoutParams(MATCH, WRAP));
 
+        // NWP-20261208-19: hold the Gallery's landed-media rescan for an unmetered network (default off = any network).
+        LinearLayout srow = new LinearLayout(this);
+        srow.setOrientation(LinearLayout.HORIZONTAL);
+        srow.setGravity(Gravity.CENTER_VERTICAL);
+        srow.setPadding(dp(4), dp(14), dp(4), dp(2));
+        LinearLayout scol = new LinearLayout(this);
+        scol.setOrientation(LinearLayout.VERTICAL);
+        TextView slab = new TextView(this);
+        slab.setText(ScanNetHold.LABEL);
+        slab.setTextColor(INK);
+        slab.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
+        scol.addView(slab);
+        TextView ssub = new TextView(this);
+        ssub.setText(ScanNetHold.SUB);
+        ssub.setTextColor(MUTED);
+        ssub.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        scol.addView(ssub);
+        srow.addView(scol, new LinearLayout.LayoutParams(0, WRAP, 1f));
+        android.widget.Switch ssw = GateSwitch.style(new android.widget.Switch(this), GatePalette.active());
+        ssw.setChecked(readScanUnmetered());
+        ssw.setOnCheckedChangeListener((b, on) -> {
+            // A failed save says so and redraws from the file, as the mobile-data switch does. No daemon call: the
+            // session's CredentialService reads the file at each ask, so a change applies to the next ask.
+            if (!writeScanUnmetered(on)) {
+                android.widget.Toast.makeText(this, SettingsSaveCopy.NOT_SAVED, android.widget.Toast.LENGTH_LONG).show();
+                showOfflineMedia();
+            }
+        });
+        srow.addView(ssw, new LinearLayout.LayoutParams(WRAP, WRAP));
+        ll.addView(srow, new LinearLayout.LayoutParams(MATCH, WRAP));
+
         // #172 (2026-07-16): a real spinner (not just faint "Loading…" text) so the tap gives obvious feedback
         // while LIST-MEDIA-APPS runs off-thread -- it now fetches BOTH the CE and #media heads, so the wait is a
         // touch longer and needs to visibly read as "working", not "frozen".
@@ -3168,6 +3537,7 @@ public class ProfileActivity extends Activity {
                     return;
                 }
                 int rows = 0;
+                java.util.Set<String> listed = new java.util.HashSet<>();
                 for (int i = 1; i < lines.length; i++) {
                     String[] parts = lines[i].trim().split(" ");
                     if (parts.length < 2) continue; // "<app.segment> <bytes> [<tier>]" -- segments never contain spaces
@@ -3178,6 +3548,13 @@ public class ProfileActivity extends Activity {
                     if (parts.length >= 3) try { daemonTier = Integer.parseInt(parts[2]); } catch (Throwable ignore) {}
                     sizes.put(app, bytes);
                     ll.addView(mediaAppRow(app, bytes, tierIndexFor(app, daemonTier, pins, overrides), updateUsage));
+                    listed.add(app);
+                    rows++;
+                }
+                // NWP-20261203-26: a segment kept Essential with no deferred file left is not in the listing, but its
+                // pin stands, so it keeps a row (no size: it is not in `sizes`) and the user can set it back.
+                for (String seg : OfflineMediaRows.keptWithoutListing(listed, pins, overrides, getPackageName())) {
+                    ll.addView(mediaAppRow(seg, -1, 0, updateUsage));
                     rows++;
                 }
                 if (rows == 0) {
@@ -3247,11 +3624,13 @@ public class ProfileActivity extends Activity {
         nm.setTextColor(INK);
         nm.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16);
         top.addView(nm, new LinearLayout.LayoutParams(0, WRAP, 1f));
-        TextView sz = new TextView(this);
-        sz.setText(android.text.format.Formatter.formatShortFileSize(this, bytes));
-        sz.setTextColor(MUTED);
-        sz.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
-        top.addView(sz, new LinearLayout.LayoutParams(WRAP, WRAP));
+        if (bytes >= 0) { // NWP-20261203-26: bytes < 0 = a kept row the listing did not size; it draws no size
+            TextView sz = new TextView(this);
+            sz.setText(android.text.format.Formatter.formatShortFileSize(this, bytes));
+            sz.setTextColor(MUTED);
+            sz.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+            top.addView(sz, new LinearLayout.LayoutParams(WRAP, WRAP));
+        }
         col.addView(top, new LinearLayout.LayoutParams(MATCH, WRAP));
 
         // Q074: the control below sets the app's maps & files, not the app's own keep mode (the Apps screens' chip).
@@ -3668,6 +4047,22 @@ public class ProfileActivity extends Activity {
         if (!on) { f.delete(); return !f.exists(); } // absent = Wi-Fi only (default)
         try { StoreInstaller.writeAtomic(f, "1"); }
         catch (Throwable t) { Log.w("NowhereChooser", "writePrefetchMetered", t); return false; }
+        return true;
+    }
+
+    /** NWP-20261208-19: getFilesDir/ScanNetHold.FILE ("1" = hold the Gallery's landed-media rescan for an unmetered
+     *  network). Absent/anything-else = any network (default). The file ROAMS with the profile; only the session's
+     *  CredentialService reads it, at each rescan ask (no daemon verb: the user-0 gate cannot read it). */
+    private boolean readScanUnmetered() {
+        return ScanNetHold.on(SettingsText.read(new java.io.File(getFilesDir(), ScanNetHold.FILE)));
+    }
+
+    /** True only when the file now holds the choice (the writePrefetchMetered shape). */
+    private boolean writeScanUnmetered(boolean on) {
+        java.io.File f = new java.io.File(getFilesDir(), ScanNetHold.FILE);
+        if (!on) { f.delete(); return !f.exists(); } // absent = any network (default)
+        try { StoreInstaller.writeAtomic(f, "1"); }
+        catch (Throwable t) { Log.w("NowhereChooser", "writeScanUnmetered", t); return false; }
         return true;
     }
 
@@ -4746,7 +5141,7 @@ public class ProfileActivity extends Activity {
         try {
             LocalSocket s = DaemonSocket.connect(); // NWP-20261005-19: bounded connect
             if (s == null) throw new java.io.IOException("daemon connect timed out");
-            s.setSoTimeout(90000);
+            s.setSoTimeout(DaemonReadCap.forRequest(msg)); // NWP-20261210-14: 10 s for a quick verb, else 90 s
             OutputStream os = s.getOutputStream();
             os.write(msg.getBytes("UTF-8"));
             os.flush();
@@ -5202,58 +5597,43 @@ public class ProfileActivity extends Activity {
      *  failedDialogExit's choice: "END" offers "End session without saving", "KEY-END" offers "Use your security
      *  key" and then "End session without saving" (Q016), "RESTART" offers "Restart without saving", "LOCK" offers
      *  Lock first, "LOCK-END" Lock and then "End session without saving" (no network: Q070), "" offers neither.
-     *  {@code reply} is the GET-LOGOFF-REFUSAL reply it was chosen from. */
+     *  {@code reply} is the GET-LOGOFF-REFUSAL reply it was chosen from. NWP-20261208-22: a held sheet that only a
+     *  button closes; LogoffFailSheets holds its words and the meaning of each button, "Report this" is a link line. */
     private void showLogoffFailedDialog(String msg, boolean reportable, String reply, String exit) {
-        boolean end = "END".equals(exit), keyEnd = "KEY-END".equals(exit), restart = "RESTART".equals(exit);
-        boolean lock = "LOCK".equals(exit), lockEnd = "LOCK-END".equals(exit);
-        android.app.AlertDialog.Builder b = new android.app.AlertDialog.Builder(this)
-                .setTitle(end || keyEnd || restart ? "Can't save this session" : "You're still signed in")
-                .setMessage(msg)
-                .setCancelable(false);
-        if (restart) {
-            b.setPositiveButton("Restart without saving", (d, w) -> confirmRestartUnsaved(msg));
-            b.setNeutralButton("Report this", (d, w) -> showReportIssue());
-            b.setNegativeButton("Stay signed in", null);
-        } else if (end) {
-            b.setPositiveButton("End session without saving", (d, w) -> confirmEndUnsaved(msg));
-            b.setNeutralButton("Report this", (d, w) -> showReportIssue());
-            b.setNegativeButton("Stay signed in", null);
-        } else if (keyEnd) {
-            // Q016 (NWP-20261111-07): the key exit first; three buttons is AlertDialog's limit, so no "Report this".
-            b.setPositiveButton("Use your security key", (d, w) -> {
-                // A failed adopt shows this dialog again with its reason first: drop an earlier one so they never stack.
-                String base = msg;
-                for (String p : new String[]{adoptFailMessage("ERR-NOKEY"), adoptFailMessage(null)}) {
-                    if (base.startsWith(p + "\n\n")) base = base.substring(p.length() + 2);
-                }
-                final String again = base;
-                final android.app.AlertDialog working = showWorking("Plug in your security key and touch it when it blinks.");
-                // Read past the daemon's 90 s ADOPT-FIDO2 deadline, which starts when it has READ the request:
-                // sendDaemon's fixed 90 s starts earlier, so it could give up on a key the daemon just adopted.
-                new Thread(() -> {
-                    final String r = DaemonSocket.roundTrip("ADOPT-FIDO2\n", 100000);
-                    runOnUiThread(() -> {
-                        working.dismiss();
-                        if ("OK".equals(r)) {
-                            doLogoff(); // the key is adopted: the normal sign-out seals with it
-                            return;
-                        }
-                        showLogoffFailedDialog(adoptFailMessage(r) + "\n\n" + again, reportable, reply, "KEY-END");
-                    });
-                }, "nowhere-fido2-adopt").start();
-            });
-            b.setNeutralButton("End session without saving", (d, w) -> confirmEndUnsaved(msg));
-            b.setNegativeButton("Stay signed in", null);
-        } else if (lock || lockEnd) {
-            // Q070: no network. Lock needs none and loses nothing until the 12-hour wipe, so it comes first.
-            b.setPositiveButton("Lock", (d, w) -> doColdLock());
-            if (lockEnd) b.setNeutralButton("End session without saving", (d, w) -> confirmEndUnsaved(msg));
-            b.setNegativeButton("Stay signed in", null);
-        } else {
-            b.setPositiveButton("OK", null);
-            if (reportable) b.setNeutralButton("Report this", (d, w) -> showReportIssue());
+        PopupSheet.Confirm m = LogoffFailSheets.failed(exit, msg, reportable);
+        java.util.List<LogoffFailSheets.Act> acts = LogoffFailSheets.acts(exit);
+        Runnable[] a = new Runnable[acts.size()];
+        for (int i = 0; i < a.length; i++) {
+            switch (acts.get(i)) {
+                case END_UNSAVED: a[i] = () -> confirmEndUnsaved(msg); break;
+                case RESTART_UNSAVED: a[i] = () -> confirmRestartUnsaved(msg); break;
+                case USE_KEY: a[i] = () -> {
+                    // A failed adopt shows this dialog again with its reason first: drop an earlier one so they never stack.
+                    String base = msg;
+                    for (String p : new String[]{adoptFailMessage("ERR-NOKEY"), adoptFailMessage(null)}) {
+                        if (base.startsWith(p + "\n\n")) base = base.substring(p.length() + 2);
+                    }
+                    final String again = base;
+                    final android.app.AlertDialog working = showWorking("Plug in your security key and touch it when it blinks.");
+                    // Read past the daemon's 90 s ADOPT-FIDO2 deadline, which starts when it has READ the request:
+                    // sendDaemon's fixed 90 s starts earlier, so it could give up on a key the daemon just adopted.
+                    new Thread(() -> {
+                        final String r = DaemonSocket.roundTrip("ADOPT-FIDO2\n", 100000);
+                        runOnUiThread(() -> {
+                            working.dismiss();
+                            if ("OK".equals(r)) {
+                                doLogoff(); // the key is adopted: the normal sign-out seals with it
+                                return;
+                            }
+                            showLogoffFailedDialog(adoptFailMessage(r) + "\n\n" + again, reportable, reply, "KEY-END");
+                        });
+                    }, "nowhere-fido2-adopt").start();
+                }; break;
+                case LOCK: a[i] = () -> doColdLock(); break;
+                default: a[i] = null; // STAY, GOT_IT: the button only closes the sheet
+            }
         }
-        b.show();
+        SheetDialog.confirmHeld(this, m, a, m.lines.isEmpty() ? null : key -> showReportIssue());
     }
 
     /** A plain message dialog that stays until it is answered. */
@@ -5282,14 +5662,20 @@ public class ProfileActivity extends Activity {
                     showNotice(endUnsavedReplyMessage("ERR-NOTREFUSED"));
                     return;
                 }
-                new android.app.AlertDialog.Builder(this)
-                        .setTitle("End this session without saving?")
-                        .setMessage(offline ? endUnsavedOfflineText(refusalRestSaved(fresh), this::fmtWhen)
-                                            : endUnsavedConfirmText(fresh, this::fmtWhen))
-                        .setCancelable(false)
-                        .setPositiveButton("End without saving", (d, w) -> endUnsaved(msg, offline))
-                        .setNegativeButton("Back", (d, w) -> showLogoffFailedDialog(msg, true, fresh, offline ? "LOCK-END" : "END"))
-                        .show();
+                java.util.List<LogoffFailSheets.Act> acts = LogoffFailSheets.END_CONFIRM_ACTS;
+                Runnable[] a = new Runnable[acts.size()];
+                for (int i = 0; i < a.length; i++) {
+                    switch (acts.get(i)) {
+                        case BACK:
+                            a[i] = () -> showLogoffFailedDialog(msg, true, fresh, offline ? "LOCK-END" : "END");
+                            break;
+                        case END_CONFIRMED: a[i] = () -> endUnsaved(msg, offline); break;
+                        default: a[i] = null;
+                    }
+                }
+                String text = offline ? endUnsavedOfflineText(refusalRestSaved(fresh), this::fmtWhen)
+                                      : endUnsavedConfirmText(fresh, this::fmtWhen);
+                SheetDialog.confirmHeld(this, LogoffFailSheets.endConfirm(text), a, null);
             });
         }, "nowhere-endconfirm").start();
     }
@@ -5338,13 +5724,17 @@ public class ProfileActivity extends Activity {
                     showNotice(restartUnsavedReplyMessage("ERR-NOTSTUCK"));
                     return;
                 }
-                new android.app.AlertDialog.Builder(this)
-                        .setTitle("Restart without saving?")
-                        .setMessage(restartUnsavedConfirmText(fresh, this::fmtWhen))
-                        .setCancelable(false)
-                        .setPositiveButton("Restart without saving", (d, w) -> restartUnsaved())
-                        .setNegativeButton("Back", (d, w) -> showLogoffFailedDialog(msg, true, fresh, "RESTART"))
-                        .show();
+                java.util.List<LogoffFailSheets.Act> acts = LogoffFailSheets.RESTART_CONFIRM_ACTS;
+                Runnable[] a = new Runnable[acts.size()];
+                for (int i = 0; i < a.length; i++) {
+                    switch (acts.get(i)) {
+                        case BACK: a[i] = () -> showLogoffFailedDialog(msg, true, fresh, "RESTART"); break;
+                        case RESTART_CONFIRMED: a[i] = () -> restartUnsaved(); break;
+                        default: a[i] = null;
+                    }
+                }
+                String text = restartUnsavedConfirmText(fresh, this::fmtWhen);
+                SheetDialog.confirmHeld(this, LogoffFailSheets.restartConfirm(text), a, null);
             });
         }, "nowhere-restartconfirm").start();
     }
@@ -6581,7 +6971,7 @@ public class ProfileActivity extends Activity {
                      + "or end it without saving.";
             }
             if (refusalNames(refusal, "unreadable-head")) {
-                return "Couldn't save this session — Nowhere couldn't read your stored copy to check it first, so "
+                return "Couldn't save this session — nowhere couldn't read your stored copy to check it first, so "
                      + "it didn't save over it. Your stored copy is intact and you're still signed in. "
                      + "Signing out again may work. If it keeps happening, please report it.";
             }
@@ -6625,7 +7015,7 @@ public class ProfileActivity extends Activity {
                  + lock
                  + "Or sign out again in a moment.";
         }
-        return "Couldn't save your data — Nowhere couldn't reach your storage, and you're still signed in.\n\n"
+        return "Couldn't save your data — nowhere couldn't reach your storage, and you're still signed in.\n\n"
              + lock
              + "Or sign out again once you're online.";
     }
@@ -6848,14 +7238,14 @@ public class ProfileActivity extends Activity {
             String s;
             switch (e.getKey()) {
                 case "shrink":
-                    s = "This phone's copy of " + what + " is missing data that your stored copy has, so Nowhere "
+                    s = "This phone's copy of " + what + " is missing data that your stored copy has, so nowhere "
                       + "won't save it over the stored copy.";
                     break;
                 case "no-receipt":
                     // Two causes leave no receipt: a load that never finished at sign-in, and a passphrase change
                     // made in this session (the receipts stay keyed to the old one -- docs/backlog.md NWP-20260916-03).
                     s = "This phone's copy of " + what + " can't be matched to your stored copy — it didn't finish "
-                      + "loading when you signed in, or your passphrase changed during this session — so Nowhere "
+                      + "loading when you signed in, or your passphrase changed during this session — so nowhere "
                       + "won't save it over the stored copy.";
                     break;
                 case "stale-base":
@@ -6863,7 +7253,7 @@ public class ProfileActivity extends Activity {
                       + "phone's copy would undo that change.";
                     break;
                 case "blind":
-                    s = "Nowhere couldn't read some of " + what + " on this phone, so its copy would be incomplete.";
+                    s = "nowhere couldn't read some of " + what + " on this phone, so its copy would be incomplete.";
                     break;
                 case "locks-changed":
                 case "locks-changed-key":
@@ -6881,17 +7271,17 @@ public class ProfileActivity extends Activity {
                 case "deleted":
                 case "fence":
                     s = deleted ? "This profile was deleted, so there is nothing to save it to."
-                                : "A safety check stopped Nowhere from saving " + what + ".";
+                                : "A safety check stopped nowhere from saving " + what + ".";
                     break;
                 default:
-                    s = "A safety check stopped Nowhere from saving " + what + ".";
+                    s = "A safety check stopped nowhere from saving " + what + ".";
                     break;
             }
             if (sb.indexOf(s) >= 0) continue; // two guards that end in the same sentence say it once
             if (sb.length() > 0) sb.append(' ');
             sb.append(s);
         }
-        if (sb.length() == 0) sb.append("A safety check stopped Nowhere from saving part of this session.");
+        if (sb.length() == 0) sb.append("A safety check stopped nowhere from saving part of this session.");
         return sb.toString();
     }
 
@@ -6987,7 +7377,7 @@ public class ProfileActivity extends Activity {
     /** What the user is told when the outcome could not be confirmed (round 6): only what is certain -- the phone has
      *  not restarted, and a restart discards what this phone hasn't saved. Never that the session is being saved. */
     private static String restartUnknownMessage() {
-        return "Your phone hasn't restarted, and Nowhere couldn't confirm what happened. Restarting the phone yourself "
+        return "Your phone hasn't restarted, and nowhere couldn't confirm what happened. Restarting the phone yourself "
              + "discards everything this phone hasn't saved.";
     }
 
@@ -7425,6 +7815,8 @@ public class ProfileActivity extends Activity {
     @Override
     protected void onDestroy() {
         super.onDestroy();
+        // NWP-20261208-02: this screen is no longer live for the L4 backstop's check.
+        LIVE.remove(this);
         // NWP-20261128-10: drop the Back callback with the activity.
         if (android.os.Build.VERSION.SDK_INT >= 33 && backRegistered) {
             try {
@@ -8218,10 +8610,12 @@ public class ProfileActivity extends Activity {
         // NWP-20261125-09 (h51 #4 A1): one row per top-level folder, plus one for the files outside them, in the
         // daemon's order, each with its plan and phone figures. A store-only folder (0 bytes here) is drawn too.
         // A reply with no folders (an older daemon) keeps the one row.
+        // NWP-20261210-22 (h51 #4, "a folder row gets the same for its streamed copies"): storageFolderRow draws the
+        // same title and line, and a named folder with store figures offers Free on this phone (FREE-MEDIA-FOLDER).
+        // The reply carries no per-folder streamed figure, so a folder with nothing fetched answers NOTHING.
         if (StorageFolders.useFolderRows(si.folders.size())) {
             for (StorageFolder f : si.folders) {
-                list.addView(storageInfoRow(StorageFolders.title(f.name),
-                        StorageFolders.line(humanBytes(f.bytes), humanBytes(f.store), si.foldersMeasured), null),
+                list.addView(storageFolderRow(f, si, list, device),
                         new LinearLayout.LayoutParams(MATCH, WRAP));
             }
         } else if (si.mediaBytes > 0) {
@@ -8305,6 +8699,45 @@ public class ProfileActivity extends Activity {
             alp.leftMargin = dp(8);
             row.addView(act, alp);
         }
+        return row;
+    }
+
+    /** A folder row of "What's using your space" (NWP-20261210-22, h51 #4): storageInfoRow's title and line, and,
+     *  when StorageFolders.freeOffer says so, Free on this phone under the line. A tap frees the folder's streamed
+     *  copies through FREE-MEDIA-FOLDER, the folder on the SECOND line, off the UI thread. No confirm: a fetched copy
+     *  is content-addressed and the store keeps it, and the daemon never names .under/ or parked data. The folder
+     *  name is user data, so nothing here logs it. */
+    private LinearLayout storageFolderRow(final StorageFolder f, final StorageInfo si, final LinearLayout list,
+                                          final TextView device) {
+        LinearLayout row = storageInfoRow(StorageFolders.title(f.name),
+                StorageFolders.line(humanBytes(f.bytes), humanBytes(f.store), si.foldersMeasured), null);
+        if (!StorageFolders.freeOffer(f.name, f.store, si.foldersMeasured)) return row;
+        final TextView link = new TextView(this);
+        link.setText(FreeOnPhone.LINK);
+        link.setTextColor(ACCENT);
+        link.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        link.setPadding(0, dp(6), 0, dp(2));
+        link.setOnClickListener(v -> {
+            link.setEnabled(false);
+            new Thread(() -> {
+                final String r = sendDaemon("FREE-MEDIA-FOLDER\n" + f.name + "\n").trim();
+                runOnUiThread(() -> {
+                    if (isFinishing() || isDestroyed()) return;
+                    long freed = StorageFolders.freedBytes(r);
+                    android.widget.Toast.makeText(this, StorageFolders.freeMessage(r, humanBytes(Math.max(freed, 0))),
+                            android.widget.Toast.LENGTH_LONG).show();
+                    // Measure again rather than zero the row (NWP-20261016-49), and only while this screen is still
+                    // the one showing.
+                    if (freed > 0 && list.isAttachedToWindow()) {
+                        showStorageBreakdown();
+                        return;
+                    }
+                    link.setEnabled(true);
+                    paintDeviceLine(device);
+                });
+            }, "nowhere-free-folder").start();
+        });
+        ((LinearLayout) row.getChildAt(0)).addView(link);
         return row;
     }
 
@@ -10702,7 +11135,7 @@ public class ProfileActivity extends Activity {
         try {
             LocalSocket s = DaemonSocket.connect(); // NWP-20261005-19: bounded connect
             if (s == null) throw new java.io.IOException("daemon connect timed out");
-            s.setSoTimeout(90000);
+            s.setSoTimeout(DaemonReadCap.forRequest(msg)); // NWP-20261210-14: 10 s for a quick verb, else 90 s
             OutputStream os = s.getOutputStream();
             os.write(msg.getBytes("UTF-8"));
             os.flush();
@@ -10767,10 +11200,11 @@ public class ProfileActivity extends Activity {
      *  failed second read never turns an answered OK into timedOut/unreachable. A daemon that sends one line closes
      *  the socket, so the read returns null at once. */
     private DaemonReply sendDaemonReply(String msg, String[] second) {
+        final int cap = DaemonReadCap.forRequest(msg); // NWP-20261210-14: 10 s for a quick verb, else 90 s
         try {
             LocalSocket s = DaemonSocket.connect(); // NWP-20261005-19: bounded connect
             if (s == null) throw new java.io.IOException("daemon connect timed out");
-            s.setSoTimeout(90000);
+            s.setSoTimeout(cap);
             OutputStream os = s.getOutputStream();
             os.write(msg.getBytes("UTF-8"));
             os.flush();
@@ -10784,7 +11218,7 @@ public class ProfileActivity extends Activity {
         } catch (java.io.InterruptedIOException te) {
             // SocketTimeoutException extends this; LocalSocket reports read timeouts here.
             String verb = msg == null ? "?" : msg.split("\n", 2)[0].trim();
-            android.util.Log.w("NowhereChooser", "daemon " + verb + ": TIMED OUT after 90s"
+            android.util.Log.w("NowhereChooser", "daemon " + verb + ": TIMED OUT after " + (cap / 1000) + "s"
                     + " -- the worker lock is contended (NWP-20260826-01)");
             return new DaemonReply("", true, false);
         } catch (Exception e) {

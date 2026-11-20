@@ -8,10 +8,14 @@
 # notice and re-opens Report an issue. Repair stored credit is a warning: the green Not now is the safe way out and the
 # red-outlined Repair runs the CONFIRM. ReportRepairSheets is pure java.util and is compiled here with PopupSheet,
 # WalletRepairCopy and its cases. Source pins over ProfileActivity (comments stripped) hold what the cases cannot:
-#   S1 showReportIssue and renderReportResult hold no AlertDialog.Builder;
-#   S2 the REPORT-ISSUE send with reportRequestJson(noteText, false) sits in action slot 0 of the sendReport sheet,
-#      and slot 1 is null;
-#   S3 renderReportResult calls appendTicket before the reportSent sheet and passes showReportIssue() in slot 0.
+#   S1 showReportIssue, sendReportOn and renderReportResult hold no AlertDialog.Builder;
+#   S2 (NWP-20261208-28) Send report opens a live sheet whose slot 0 is inPlace: it reads the note and calls
+#      sendReportOn, which changes the sheet to sending() before the REPORT-ISSUE send thread; slot 1 is null;
+#   S3 renderReportResult calls appendTicket before any isFinishing() check and before the reportSent change, which
+#      passes showReportIssue() in slot 0; a finished Activity gets no sheet change;
+#   S4 Send shows no "Sending…" status line, and sendReportOn and renderReportResult hold no StatusLine.busy( or
+#      StatusLine.error(;
+#   S5 a failure changes the sheet to failed(reply), and its Try again (inPlace) sends the same noteText again.
 # The repair sheet's wiring in showStorage is pinned by core/chooser/tests/wallet-repair/run.sh (U10 there).
 #
 # ⚠ IT FAILS WHEN THERE IS NO JAVAC, IT NEVER SKIPS. javac comes from PATH, else from the build host's JDK below;
@@ -85,37 +89,70 @@ has() { case "$1" in *"$2"*) return 0 ;; esac; return 1; }
 
 # pins <ProfileActivity.java> -> 0 when every pin holds, 1 (with each reason) when not.
 pins() {
-  local paf bad=0 b m rest open send call ticket
+  local paf bad=0 b m rest open send call ticket fin
   paf=$(mktemp -p "$W") || return 1
   code "$1" > "$paf"
 
-  for m in showReportIssue renderReportResult; do
+  for m in showReportIssue sendReportOn renderReportResult; do
     b=$(meth "$paf" "    private void $m(")
     [ -n "$b" ] || { echo "  FAIL  S1 $m( not found" >&2; bad=1; continue; }
     has "$b" "AlertDialog.Builder" && { echo "  FAIL  S1 $m holds an AlertDialog.Builder" >&2; bad=1; }
   done
 
   b=$(meth "$paf" "    private void showReportIssue(")
-  open='SheetDialog.confirm(this, ReportRepairSheets.sendReport(), new Runnable[] { () -> {'
+  open='SheetDialog.confirmLive(this, ReportRepairSheets.sendReport(), new Runnable[] { SheetDialog.inPlace(() -> {'
   send='sendDaemon("REPORT-ISSUE\n" + reportRequestJson(noteText, false) + "\n")'
   if ! has "$b" "$open"; then
-    echo "  FAIL  S2 showReportIssue does not open the sendReport sheet with an action in slot 0" >&2; bad=1
+    echo "  FAIL  S2 showReportIssue does not open a live sendReport sheet with an inPlace action in slot 0" >&2; bad=1
   else
     rest=${b#*"$open"}
-    if ! has "$rest" "}, null }, null)"; then
+    if ! has "$rest" "}), null });"; then
       echo "  FAIL  S2 showReportIssue's sendReport actions do not end with a null slot 1" >&2; bad=1
-    elif ! has "${rest%%"}, null }, null)"*}" "$send"; then
-      echo "  FAIL  S2 showReportIssue's REPORT-ISSUE send is not in slot 0 of the sendReport sheet" >&2; bad=1
+    else
+      rest=${rest%%"}), null });"*}
+      { has "$rest" "final String noteText = note.getText().toString();" && has "$rest" "sendReportOn(sheet[0], statusTv, noteText);"; } \
+        || { echo "  FAIL  S2 showReportIssue's slot 0 does not read the note and call sendReportOn" >&2; bad=1; }
     fi
   fi
+  has "$b" '"Sending…"' && { echo "  FAIL  S4 showReportIssue shows a Sending… status line" >&2; bad=1; }
+
+  b=$(meth "$paf" "    private void sendReportOn(")
+  if ! has "$b" "sheet.progress(ReportRepairSheets.sending()); new Thread(() -> {"; then
+    echo "  FAIL  S2 sendReportOn does not change the sheet to sending() before the send thread" >&2; bad=1
+  elif ! has "${b#*"new Thread(() -> {"}" "$send"; then
+    echo "  FAIL  S2 sendReportOn's thread does not send REPORT-ISSUE with reportRequestJson(noteText, false)" >&2; bad=1
+  fi
+  has "$b" "renderReportResult(reply, sheet, statusTv, noteText)" \
+    || { echo "  FAIL  S2 sendReportOn does not pass the reply to renderReportResult with the sheet" >&2; bad=1; }
 
   b=$(meth "$paf" "    private void renderReportResult(")
   ticket='appendTicket(ticket, noteText);'
-  call='SheetDialog.confirm(this, ReportRepairSheets.reportSent(ticket), new Runnable[] { () -> showReportIssue() }, null);'
+  fin='if (isFinishing() || isDestroyed()) return;'
+  call='sheet.confirm(ReportRepairSheets.reportSent(ticket), new Runnable[] { () -> showReportIssue() });'
   if ! has "$b" "$call"; then
-    echo "  FAIL  S3 renderReportResult does not open the reportSent sheet with showReportIssue() in slot 0" >&2; bad=1
+    echo "  FAIL  S3 renderReportResult does not change the sheet to reportSent with showReportIssue() in slot 0" >&2; bad=1
   elif ! has "${b%%"$call"*}" "$ticket"; then
-    echo "  FAIL  S3 renderReportResult does not call appendTicket before the reportSent sheet" >&2; bad=1
+    echo "  FAIL  S3 renderReportResult does not call appendTicket before the reportSent change" >&2; bad=1
+  elif ! has "${b%%"$fin"*}" "$ticket"; then
+    echo "  FAIL  S3 renderReportResult does not call appendTicket before its isFinishing() check" >&2; bad=1
+  fi
+  for m in sendReportOn renderReportResult; do
+    b=$(meth "$paf" "    private void $m(")
+    { has "$b" "StatusLine.busy(" || has "$b" "StatusLine.error("; } \
+      && { echo "  FAIL  S4 $m holds StatusLine.busy( or StatusLine.error(" >&2; bad=1; }
+  done
+
+  b=$(meth "$paf" "    private void renderReportResult(")
+  call='sheet.confirm(ReportRepairSheets.failed(reply),'
+  if ! has "$b" "$call"; then
+    echo "  FAIL  S5 renderReportResult does not change the sheet to failed(reply)" >&2; bad=1
+  else
+    rest=${b#*"$ticket"}
+    { has "${rest%%"sheet.confirm(ReportRepairSheets.reportSent("*}" "$fin" && rest=${rest#*"return; }"} \
+        && has "${rest%%"$call"*}" "$fin"; } \
+      || { echo "  FAIL  S3 renderReportResult changes the sheet of a finished Activity" >&2; bad=1; }
+    has "${b#*"$call"}" "SheetDialog.inPlace(() -> sendReportOn(sheet, statusTv, noteText))" \
+      || { echo "  FAIL  S5 the failure sheet's Try again does not send the same noteText in place" >&2; bad=1; }
   fi
   [ "$bad" -eq 0 ]
 }
@@ -133,7 +170,7 @@ check_all() {
 echo "== ReportRepairSheets, ProfileActivity's Report an issue sheets"
 check_all "$SHEETS" "$PA"; rc=$?
 [ "$rc" -eq 0 ] || { echo "FAILED"; exit 1; }
-echo "ok: cases + pins S1-S3"
+echo "ok: cases + pins S1-S5"
 [ "$MUTATE" = yes ] || exit 0
 
 command -v perl >/dev/null 2>&1 || { echo "FAIL: --mutate needs perl, and there is none -- refusing to report" >&2; exit 1; }
@@ -185,6 +222,14 @@ mut "R2 the ticket left out of reportSent"       sheets "reportSent context"   '
 mut "R3 Repair made GREEN_FILLED"                sheets "repairCredit buttons" 's/new PopupSheet\.Button\(WalletRepairCopy\.POSITIVE, PopupSheet\.Style\.RED_OUTLINED\)/new PopupSheet.Button(WalletRepairCopy.POSITIVE, PopupSheet.Style.GREEN_FILLED)/' || fails=$((fails+1))
 mut "R4 repairCredit's buttons swapped"          sheets "repairCredit buttons" 's/(new PopupSheet\.Button\(WalletRepairCopy\.NEGATIVE, PopupSheet\.Style\.GREEN_FILLED\)),(\s+)(new PopupSheet\.Button\(WalletRepairCopy\.POSITIVE, PopupSheet\.Style\.RED_OUTLINED\))/$3,$2$1/' || fails=$((fails+1))
 mut "R5 a MESSAGE sentence dropped from the lines" sheets "repairCredit message" 's/,\s+new PopupSheet\.Line\(REPAIR_LINE_2, null\)//' || fails=$((fails+1))
-mut "R6 the send moved to slot 1"                pa     "S2 showReportIssue"   's/(ReportRepairSheets\.sendReport\(\),\s+new Runnable\[\] \{ )(\(\) -> \{.*?)\}, null \}, null\)\)/${1}null, ${2}} }, null))/s' || fails=$((fails+1))
+mut "R6 the send moved to slot 1"                pa     "S2 showReportIssue"   's/(ReportRepairSheets\.sendReport\(\), new Runnable\[\] \{ )(SheetDialog\.inPlace\(\(\) -> \{.*?\}\)), null \}\);/${1}null, ${2} });/s' || fails=$((fails+1))
 mut "R7 a .setNegativeButton(\"Cancel\" builder put back" pa "S1 showReportIssue" 's/(\n    private void showReportIssue\(\) \{\n)/${1}        new android.app.AlertDialog.Builder(this).setNegativeButton("Cancel", null).show();\n/' rules || fails=$((fails+1))
-[ "$fails" -eq 0 ] && echo "== all 7 mutations convicted" || { echo "== $fails mutation(s) not convicted"; exit 1; }
+mut "R8 ERR-NET mapped to the notice"            sheets "failed ERR-NET"       's/return !"ERR-NOGW"\.equals\(reply\)/return !"ERR-NET".equals(reply) && !"ERR-NOGW".equals(reply)/' || fails=$((fails+1))
+mut "R9 ERR-TOOBIG retryable"                    sheets "failed ERR-TOOBIG"    's/ && !"ERR-TOOBIG"\.equals\(reply\)//' || fails=$((fails+1))
+mut "R10 a sentence's word changed"              sheets "failureSentence ERR-DISABLED" 's/accepting reports/taking reports/' || fails=$((fails+1))
+mut "R11 StatusLine.busy back in Send"           pa     "S4"                   's/(\n(\s*)final String noteText = note\.getText\(\)\.toString\(\);)/\n${2}StatusLine.busy(statusTv, "Sending…");$1/' || fails=$((fails+1))
+mut "R12 Try again sends an empty note"          pa     "S5"                   's/inPlace\(\(\) -> sendReportOn\(sheet, statusTv, noteText\)\)/inPlace(() -> sendReportOn(sheet, statusTv, ""))/' || fails=$((fails+1))
+mut "R13 appendTicket after the sheet"           pa     "S3"                   's/(\n[ \t]*appendTicket\(ticket, noteText\);[^\n]*)(.*?\n[^\n]*sheet\.confirm\(ReportRepairSheets\.reportSent\(ticket\)[^\n]*)/$2$1/s' || fails=$((fails+1))
+mut "R14 a failure changes a finished Activity's sheet" pa "S3"                 's/(\n\s*return;\n\s*\}\n)\s*if \(isFinishing\(\) \|\| isDestroyed\(\)\) return;\n/$1/' || fails=$((fails+1))
+mut "R15 the sending sheet dropped"              pa     "S2 sendReportOn"      's/\n\s*sheet\.progress\(ReportRepairSheets\.sending\(\)\);//' || fails=$((fails+1))
+[ "$fails" -eq 0 ] && echo "== all 15 mutations convicted" || { echo "== $fails mutation(s) not convicted"; exit 1; }

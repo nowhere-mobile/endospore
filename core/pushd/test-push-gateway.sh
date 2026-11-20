@@ -16,18 +16,20 @@
 #       device conf GATEWAY_URL=X -> X only; b4 a conf with no gateway key -> no nowhere.gateway_url call at all; b5 no
 #       conf -> no call.
 #   (c) sepolicy, each matched as a whole line: c1 the property_contexts label, c2 system_public_prop, c3 set_prop for
-#       the nowhere domain, c4 the file read for platform_app.
+#       the nowhere domain, c4 the file read for platform_app; c5 the same read for platform_app_all in the Endospore
+#       delta (editions/endospore/vendor/sepolicy/endospore.te): GrapheneOS runs a platform app in a per-SDK domain
+#       (platform_app_36), which c4's rule does not cover (NWP-20261117-47).
 # Mutants (--mutate), each CONVICTED by its named assertion (launcher mutants under every shell found):
 #   G1 the property name back to persist.nowhere.gateway_url (a5); G2 gatewayFrom always returns DEFAULT_GATEWAY (a3);
 #   G3 the slash strip removed (a4); G4 the login.sh setprop line removed (b1); G5 precedence swapped (b3); G6 the
 #   non-empty guard removed (b4); G7 the property_contexts line removed (c1); G8 set_prop removed (c3); G9 the
-#   platform_app read removed (c4).
+#   platform_app read removed (c4); G10 the Endospore platform_app_all read removed (c5).
 # On origin/main (a) prints EXTRACTION FAILED (no gatewayFrom), b1-b3 FAIL (no setprop call) and c1-c4 FAIL.
 #
 # Needs a JDK and FAILS (exit 2) without one: javac/java from PATH, then the build VM's prebuilt JDK 21.
 #   bash test-push-gateway.sh            # the cases
 #   bash test-push-gateway.sh --mutate   # ... plus mutants G1-G9
-# PUSH_SERVICE_SRC, LOGIN_SH_SRC and SEPOLICY_DIR override the files under test.
+# PUSH_SERVICE_SRC, LOGIN_SH_SRC, SEPOLICY_DIR and ENDOSPORE_TE override the files under test.
 # Exit: 0 pass, 1 a case failed, 2 cannot run (no JDK, EXTRACTION FAILED), 3 the harness does not compile.
 set -uo pipefail
 MUTATE=no; for a in "$@"; do [ "$a" = --mutate ] && MUTATE=yes; done
@@ -35,6 +37,7 @@ ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 SRC=${PUSH_SERVICE_SRC:-$ROOT/core/pushd/src/com/nowhere/push/PushService.java}
 LOGIN=${LOGIN_SH_SRC:-$ROOT/core/vendor-common/bin/nowhere_login.sh}
 SEPOL=${SEPOLICY_DIR:-$ROOT/core/vendor-common/sepolicy}
+ENDO=${ENDOSPORE_TE:-$ROOT/editions/endospore/vendor/sepolicy/endospore.te}
 VMJDK=/mnt/build/lineage/prebuilts/jdk/jdk21/linux-x86/bin
 if command -v javac >/dev/null 2>&1 && command -v java >/dev/null 2>&1; then
   JAVAC=$(command -v javac); JAVA=$(command -v java)
@@ -162,7 +165,8 @@ login_cases(){
 
 # sepol_cases <sepolicy dir> -> 0 pass, 1 a case failed
 sepol_cases(){
-  local d=$1 rc=0
+  local d=$1 rc=0 endo
+  endo=$ENDO; [ -f "$d/endospore.te" ] && endo=$d/endospore.te  # a mutant's copy, else the tree's delta
   grep -qxE 'nowhere\.gateway_url[[:space:]]+u:object_r:nowhere_gateway_prop:s0' "$d/property_contexts" \
     || { echo "FAIL c1: property_contexts does not label nowhere.gateway_url nowhere_gateway_prop"; rc=1; }
   grep -qxF 'system_public_prop(nowhere_gateway_prop)' "$d/nowhere.te" \
@@ -171,6 +175,8 @@ sepol_cases(){
     || { echo "FAIL c3: nowhere.te has no set_prop(nowhere, nowhere_gateway_prop)"; rc=1; }
   grep -qxF 'allow platform_app nowhere_gateway_prop:file { read open getattr map };' "$d/nowhere.te" \
     || { echo "FAIL c4: nowhere.te has no file read of nowhere_gateway_prop for platform_app"; rc=1; }
+  grep -qxF 'allow platform_app_all nowhere_gateway_prop:file { read open getattr map };' "$endo" \
+    || { echo "FAIL c5: endospore.te has no file read of nowhere_gateway_prop for platform_app_all"; rc=1; }
   return "$rc"
 }
 
@@ -192,18 +198,21 @@ all_cases(){
 out=$(all_cases "$SRC" "$LOGIN" "$SEPOL"); rc=$?
 [ -n "$out" ] && printf '%s\n' "$out"
 if [ "$rc" != 0 ]; then echo "test-push-gateway: FAIL (exit $rc)"; exit "$rc"; fi
-echo "test-push-gateway: PASS (a1-a6, b1-b5 per shell, c1-c4)"
+echo "test-push-gateway: PASS (a1-a6, b1-b5 per shell, c1-c5)"
 [ "$MUTATE" = yes ] || exit 0
 
 # ---- mutants ----
 MFAIL=0
-# copy_sepol -> a fresh copy of the sepolicy dir's two files
+# copy_sepol -> a fresh dir holding the sepolicy dir's two files and the Endospore delta (as endospore.te)
 copy_sepol(){
   local d
   d=$(mktemp -d -p "$W")
   cp "$SEPOL/property_contexts" "$SEPOL/nowhere.te" "$d/"
+  cp "$ENDO" "$d/endospore.te"
   echo "$d"
 }
+# sepol_src <file name> -> the original that copy_sepol copied it from
+sepol_src(){ if [ "$1" = endospore.te ]; then echo "$ENDO"; else echo "$SEPOL/$1"; fi; }
 # applied <orig> <copy> <id>: the mutant must change the file
 applied(){
   if cmp -s "$1" "$2"; then echo "MUTANT DID NOT APPLY: $3"; MFAIL=1; return 1; fi
@@ -242,8 +251,8 @@ login_mutant(){
 sepol_mutant(){
   local id=$1 as=$2 f=$3 line=$4 d o r
   d=$(copy_sepol)
-  awk -v l="$line" '$0!=l' "$SEPOL/$f" >"$d/$f.m" && mv "$d/$f.m" "$d/$f"
-  applied "$SEPOL/$f" "$d/$f" "$id" || return 0
+  awk -v l="$line" '$0!=l' "$(sepol_src "$f")" >"$d/$f.m" && mv "$d/$f.m" "$d/$f"
+  applied "$(sepol_src "$f")" "$d/$f" "$id" || return 0
   o=$(sepol_cases "$d"); r=$?
   convict "$id" "$as" "$o" "$r"
 }
@@ -259,6 +268,7 @@ login_mutant G6 b4 '$0 ~ /^  if \[ -n "\$_nwgw" \]; then setprop nowhere\.gatewa
 sepol_mutant G7 c1 property_contexts 'nowhere.gateway_url            u:object_r:nowhere_gateway_prop:s0'
 sepol_mutant G8 c3 nowhere.te 'set_prop(nowhere, nowhere_gateway_prop)'
 sepol_mutant G9 c4 nowhere.te 'allow platform_app nowhere_gateway_prop:file { read open getattr map };'
+sepol_mutant G10 c5 endospore.te 'allow platform_app_all nowhere_gateway_prop:file { read open getattr map };'
 
 if [ "$MFAIL" != 0 ]; then echo "test-push-gateway: --mutate FAIL (a mutant survived or did not apply)"; exit 1; fi
-echo "test-push-gateway: --mutate PASS (G1-G9 convicted)"
+echo "test-push-gateway: --mutate PASS (G1-G10 convicted)"

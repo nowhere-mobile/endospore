@@ -111,6 +111,7 @@ md_release() { rel_stub md "$1" "$2" "OK BASELINE mobile_data=1"; MD_VERDICT="$R
 dt_release() { rel_stub dt "$1" "$2" "OK RESTORED 1"; DT_VERDICT="$RV"; }
 dr_release() { rel_stub dr "$1" "$2" "BASELINE"; DR_VERDICT="$RV"; }
 hs_release() { rel_stub hs "$1" "$2" "OK RELEASED"; HS_VERDICT="$RV"; }
+np_release() { :; }; reap_live_other() { return 1; }   # NWP-20261210-19: the netpolicy reset and its guard are test-netpolicy-release.sh's
 getprop() { [ "$1" = sys.boot_completed ] && [ -f "$ROOT/bc" ] && cat "$ROOT/bc"; return 0; }
 service() { if [ -f "$ROOT/svc" ]; then cat "$ROOT/svc"; else echo "Service settings: found"; fi; }
 EOS

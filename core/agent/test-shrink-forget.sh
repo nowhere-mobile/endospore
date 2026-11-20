@@ -43,8 +43,8 @@ mut "M4 the forget removes the lock file" shrink_intent.go '\n\tif stuck == 0 \{
 	os.Remove(filepath.Join(dir, shrinkLockName))
 	if stuck == 0 {
 		shrinkDrop'
-mut "M5 a RESUME forgets" main.go '\tclaimLocGlobalsAsync\(dest, uid, "resume"\)' '	forgetShrinkIntents(dest)
-	claimLocGlobalsAsync(dest, uid, "resume")'
+mut "M5 a RESUME forgets" main.go '\tclaimSessionGlobalsAsync\(dest, uid, "resume"\)' '	forgetShrinkIntents(dest)
+	claimSessionGlobalsAsync(dest, uid, "resume")'
 mut "M6 markRoamSession forgets" roamsession_marker.go '(func markRoamSession\(dest, name, pass, uid, seSecret string\) error \{\n)' '\1	forgetShrinkIntents(dest)
 '
 [ "$fails" -eq 0 ] && echo "== all mutations convicted" || { echo "== $fails mutation(s) not convicted"; exit 1; }

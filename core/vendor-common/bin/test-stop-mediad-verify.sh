@@ -41,8 +41,20 @@
 # roamd runs `chmod 600` on the plant, which takes its x bit, so S13 restores it before it reads the case dir, and the
 # EXIT trap runs `chmod -R u+rwx` before its rm: a non-root rm cannot empty a directory without x.
 #
+# NWP-20261210-26: every wait is bounded and logged by the WALL CLOCK. The bounds were tick counts, and on lynx 2026111604
+# (624 mounts) 550 ticks took about 97 s while roam.log said `waited 55.0s`. The harness now keeps a clock in the case
+# dir (sleep 0.1 advances it 100 ms, a case may make getprop or sleep slower) and defines _ms from it, since
+# stop_mediad is extracted alone.
+#   S15 a slow getprop (400 ms), 624 mounts, no sweep end -> each marker wait ends in 55.0-55.5 s of clock, its waited
+#       line is that time, the call takes <= 121.5 s, getprop is read only after 2000 ms, ERR 624 (main: ~267 s, 55.0s)
+#   S16 the clock 0, a non-number, missing, 0 only at the marker wait's start (kick0), or stuck -> the waits run on
+#       ticks inside the cap, the valve never fires, each waited line ends ` (ticks)`
+#   S17 five mounts, a 1 s sweep -> clear, no waited line (a control: main passes it too)
+#   S18 a loaded phone (each sleep 400 ms of clock), a dead mediad -> the grace ends at 2000-2400 ms, not 20 ticks
+# Mutants T1-T8 each name the case that convicts them; C1 (a comment's wording) must survive.
+#
 # stop_mediad is extracted BY ANCHOR and run with setprop/getprop/sleep stubbed and /proc/mounts rewritten to a
-# fixture file, a path that does not exist, or an empty file. Every case runs under each of bash, dash and mksh found
+# fixture file, a path that does not exist, or an empty file. Every case runs under each of bash, sh, dash and mksh found
 # (mksh reads a non-number in `[ x -lt N ]` as 0, silently, where bash and dash error).
 #
 #   bash test-stop-mediad-verify.sh            # the cases
@@ -59,7 +71,7 @@ W=$(mktemp -d) || exit 2
 trap 'command chmod -R u+rwx "$W" 2>/dev/null; command rm -rf "$W"' EXIT
 
 SHELLS=""
-for s in bash dash mksh; do command -v "$s" >/dev/null 2>&1 && SHELLS="$SHELLS $s"; done
+for s in bash sh dash mksh; do command -v "$s" >/dev/null 2>&1 && SHELLS="$SHELLS $s"; done
 [ -n "$SHELLS" ] || { echo "no shell found" >&2; exit 2; }
 
 # The function runs from its `stop_mediad() {` line to the first column-0 `}` after it.
@@ -99,9 +111,32 @@ suite() {
     esac
     body=$(printf '%s\n' "$fn" | sed "s#/proc/mounts#$d/mounts#g")
     {
-      printf 'STATE=%s LOG=%s/log D=%s SWEEP_T=%s ALIVE=%s\n' "$d" "$d" "$d" "$st" "$al"
+      printf 'STATE=%s LOG=%s/log D=%s SWEEP_T=%s ALIVE=%s CLK=%s GPMS=%s SLMS=%s\n' "$d" "$d" "$d" "$st" "$al" \
+        "${CLK:-ok}" "${GPMS:-0}" "${SLMS:-100}"
       cat <<'STUBS'
 __tk=0; __st=0
+# NWP-20261210-26: the clock. $D/clock holds the ms since the run began (a small number, so mksh's 32-bit arithmetic
+# never wraps it here); _ms prints it after a 1792 prefix, a 13-digit epoch in ms like `date +%s%3N`, so the SUT's own
+# subtraction meets a real stamp. sleep 0.1 advances it SLMS ms, getprop GPMS ms. getprop (g), setprop ctl.start (k)
+# and a read of the fixture table (r) append "<letter> <clock>" to $D/events, in call order. CLK: ok, zero (_ms prints 0), junk (a non-number), kick0
+# (0 on the first read after each ctl.start, the marker wait's start stamp), missing (no _ms at all), stuck (one valid
+# stamp that never advances: only the tick backstop ends a wait).
+echo 0 > "$D/clock"
+# Every clock op is a read builtin and a redirection, never a $(...): one fork per tick more made the suite 2x slower.
+__clk(){ read -r __c < "$D/clock" 2>/dev/null || __c=0; }
+__adv(){ __clk; echo $((__c + $1)) > "$D/clock"; }
+if [ "$CLK" != missing ]; then
+  _ms(){
+    case "$CLK" in
+      zero) echo 0 ;;
+      junk) echo 12ab ;;
+      stuck) echo 1792000000000 ;;
+      kick0) if [ -e "$D/zeronext" ]; then rm -f "$D/zeronext"; echo 0; else __clk; command printf '1792%09d\n' "$__c"; fi ;;
+      *) __clk; command printf '1792%09d\n' "$__c" ;;
+    esac
+  }
+fi
+cat(){ case "$*" in "$D/mounts") __clk; echo "r $__c" >> "$D/events" ;; esac; command cat "$@"; }
 # The device's mksh has no printf builtin: printf goes through exec(2), and one argument over MAX_ARG_STRLEN (128 KB)
 # fails with E2BIG. bash and dash run a builtin that has no limit, so every shell gets the device's limit here.
 printf(){
@@ -114,13 +149,16 @@ printf(){
 setprop(){
   case "$1 $2" in
     "ctl.start nowhere_mediad")
-      echo x >> "$D/starts"
+      echo x >> "$D/starts"; __clk; echo "k $__c" >> "$D/events"; [ "$CLK" = kick0 ] && : > "$D/zeronext"
       if [ -n "$SWEEP_T" ] && [ ! -e "$D/live" ]; then : > "$D/live"; __st=$__tk; fi ;;
   esac
 }
-getprop(){ if [ "$ALIVE" = yes ] && [ -e "$D/live" ]; then echo running; else echo stopped; fi; }
+getprop(){
+  __clk; echo "g $__c" >> "$D/events"; [ "$GPMS" -gt 0 ] && echo $((__c + GPMS)) > "$D/clock"
+  if [ "$ALIVE" = yes ] && [ -e "$D/live" ]; then echo running; else echo stopped; fi
+}
 sleep(){
-  __tk=$((__tk+1))
+  __tk=$((__tk+1)); __adv "$SLMS"
   if [ "$__tk" -ge 5000 ]; then echo "$__tk" > "$D/ticks"; exit 3; fi
   if [ -e "$D/live" ] && [ "$SWEEP_T" != never ] && [ $((__tk - __st)) -ge "$SWEEP_T" ]; then
     rm -f "$STATE/mediad.sweep" "$D/live"
@@ -131,7 +169,7 @@ sleep(){
 STUBS
       printf '%s\n' 'command -v print >/dev/null 2>&1 || eval "$PSHIM"'
       printf '%s\n' "$QN"
-      printf '%s\nstop_mediad\necho "$__tk" > "$D/ticks"\n' "$body"
+      printf '%s\n__clk; echo "$__c" > "$D/t0"\nstop_mediad\n__clk; echo "$__c" > "$D/t1"\necho "$__tk" > "$D/ticks"\n' "$body"
     } > "$d/run.sh"
     PSHIM="$PRINT_SHIM" "$sh" ${SH_OPT:-} "$d/run.sh" >/dev/null 2>&1
   }
@@ -228,6 +266,90 @@ STUBS
     && ok "S13 an unwritable marker: two kicks, both reads judged, 96 media mount(s) survive, the call returns (bash as --posix)" \
     || no "S13 an unwritable marker: got '$R', want '2|0/1|dir|ran' (kicks|clear/survive96 lines|plant|after the call)"
   command rm -rf "$d13"
+
+  # NWP-20261210-26: the waits are bounded and logged by the clock. _clk_facts <dir> -> "<w1> <w2> <g1> <g2> <total>":
+  # wA = attempt A's marker wait (its kick to its table read), gA = its kick to its first getprop, total = the call.
+  _clk_facts() {
+    local t0 t1
+    t0=$(command cat "$1/t0" 2>/dev/null); t1=$(command cat "$1/t1" 2>/dev/null)
+    awk -v t0="${t0:-x}" -v t1="${t1:-x}" '
+      $1=="k" { a++; k[a]=$2; ng[a]=1; nr[a]=1; next }
+      $1=="g" && a && ng[a] { g[a]=$2-k[a]; ng[a]=0 }
+      $1=="r" && a && nr[a] { w[a]=$2-k[a]; nr[a]=0 }
+      END { tot = (t0 ~ /^[0-9]+$/ && t1 ~ /^[0-9]+$/) ? t1-t0 : "none"
+            printf "%s %s %s %s %s\n", (2 in w)?w[1]:"none", (2 in w)?w[2]:"none", (2 in g)?g[1]:"none", (2 in g)?g[2]:"none", tot }
+    ' "$1/events" 2>/dev/null
+  }
+  # _waited <dir> <attempt> -> that attempt's waited value and suffix ("55.0s" or "55.0s (ticks)"), or none
+  _waited() {
+    local v
+    v=$(sed -n "s/^\[roamd\] media sweep attempt $2 waited \([0-9]*\.[0-9]s\) for [0-9]* mount(s)\( (ticks)\)\{0,1\} .*/\1\2/p" "$1/log" 2>/dev/null)
+    printf '%s\n' "${v:-none}"
+  }
+  _num() { case "$1" in ''|*[!0-9]*) return 1 ;; esac; }
+  _sec() { printf '%d.%ds' "$(($1 / 1000))" "$(($1 % 1000 / 100))"; }
+  # S15: a slow getprop (400 ms a call), 624 mounts, a sweep that never ends. origin/main bounded the marker wait as 550
+  # ticks, about 267 s of this clock per attempt, and logged it as 55.0s.
+  local d15 F w1 w2 g1 g2 tot v15 c15 R15 want15
+  d15=$(mktemp -d -p "$W" s15.XXXXXX)
+  GPMS=400 _prep "$d15" never yes --media 624
+  F=$(_clk_facts "$d15"); read -r w1 w2 g1 g2 tot <<EOF_F
+$F
+EOF_F
+  c15=0; [ -f "$d15/starts" ] && c15=$(wc -l < "$d15/starts" | tr -d ' ')
+  v15=$(grep -c -F '[roamd] ERR-MEDIA-SWEEP: 624 media mount(s) survive 2 sweep attempt(s) ' "$d15/log" 2>/dev/null)
+  R15="$c15|${v15:-0}"
+  if _num "$w1" && _num "$w2" && [ "$w1" -ge 55000 ] && [ "$w1" -le 55500 ] && [ "$w2" -ge 55000 ] && [ "$w2" -le 55500 ]; then
+    R15="$R15|wait-ok"; want15="$(_sec "$w1")|$(_sec "$w2")"
+  else R15="$R15|wait=$w1,$w2"; want15="measured"; fi
+  R15="$R15|$(_waited "$d15" 1)|$(_waited "$d15" 2)"
+  [ "$R15" = "2|1|wait-ok|$want15" ] \
+    && ok "S15 a slow getprop, 624 mounts, no sweep end: each marker wait ends in 55.0-55.5 s of clock, its waited line is that time, ERR 624" \
+    || no "S15 a slow getprop: got '$R15', want '2|1|wait-ok|<the measured waits, 55.0-55.5 s>' (kicks|ERR 624|waits|logged)"
+  if _num "$tot" && [ "$tot" -le 121500 ]; then ok "S15 the whole call takes at most 3.5 + 2 x 55.5 + 2 x 3.5 s of clock ($tot ms)"
+  else no "S15 the whole call took '$tot' ms of clock, over 121500"; fi
+  if _num "$g1" && _num "$g2" && [ "$g1" -ge 2000 ] && [ "$g2" -ge 2000 ]; then ok "S15 each marker wait reads getprop only after 2000 ms of clock"
+  else no "S15 a marker wait read getprop before its 2000 ms start grace ($g1 ms, $g2 ms after the kick)"; fi
+  command rm -rf "$d15"
+  # S16: the clock cannot be read (_ms prints 0, prints a non-number, or does not exist): the waits run on ticks, the
+  # call ends inside the cap, the safety valve never fires, and each waited line says (ticks).
+  # S16b: _ms prints 0 only as each marker wait's start stamp, and reads the clock after: that wait runs on ticks too,
+  # and never ends at once on "now - 0". S16 stuck: a stamp that never advances; the tick backstop ends each wait and
+  # the waited line is the tick time. The other clocks run with 10 mounts (a 100-tick bound) to keep the suite fast:
+  # 0 + 2 x 100 + 2 x 30 = 260 ticks, each line `waited 10.0s ... (ticks)`.
+  local m16 d16 t16 R16 n16 lo16 hi16 s16
+  for m16 in zero:624 junk:10 missing:10 kick0:10 stuck:10; do
+    n16=${m16#*:}; m16=${m16%%:*}
+    if [ "$n16" = 624 ]; then lo16=1100; hi16=1200; s16=55.0s; else lo16=250; hi16=270; s16=10.0s; fi
+    d16=$(mktemp -d -p "$W" s16.XXXXXX)
+    CLK=$m16 _prep "$d16" never yes --media "$n16"
+    t16=$(command cat "$d16/ticks" 2>/dev/null)
+    if _num "$t16" && [ "$t16" -ge "$lo16" ] && [ "$t16" -le "$hi16" ]; then t16=in-range; else t16="ticks=$t16"; fi
+    R16="$t16|$(grep -c -F "[roamd] ERR-MEDIA-SWEEP: $n16 media mount(s) survive 2 sweep attempt(s) " "$d16/log" 2>/dev/null)"
+    R16="$R16|$(_waited "$d16" 1)|$(_waited "$d16" 2)"
+    [ "$R16" = "in-range|1|$s16 (ticks)|$s16 (ticks)" ] \
+      && ok "S16 clock $m16, $n16 mounts: the waits run on ticks ($lo16-$hi16 for the call, no valve), ERR $n16, both waited lines say (ticks)" \
+      || no "S16 clock $m16, $n16 mounts: got '$R16', want 'in-range|1|$s16 (ticks)|$s16 (ticks)' (ticks $lo16-$hi16|ERR $n16|logged)"
+    command rm -rf "$d16"
+  done
+  # S17: a fast clean sweep of five mounts (1 s): one attempt, clear, and no waited line.
+  R=$(_runx 10 yes --media 5)
+  [ "$R" = "1|clear|GONE|10|none|0" ] \
+    && ok "S17 five mounts, a 1 s sweep: one attempt, media mounts clear, no waited line" \
+    || no "S17 a fast sweep of five mounts changed its verdict or logged a wait ($R)"
+  # S18: a loaded phone (each sleep 0.1 takes 400 ms of clock) and a dead mediad: the start grace is 2000 ms of clock,
+  # not 20 ticks (8 s here), so each attempt reads getprop at 2000-2400 ms and stops there.
+  local d18 F18
+  d18=$(mktemp -d -p "$W" s18.XXXXXX)
+  SLMS=400 _prep "$d18" "" no --media 96
+  F18=$(_clk_facts "$d18"); read -r w1 w2 g1 g2 tot <<EOF_F
+$F18
+EOF_F
+  if _num "$g1" && _num "$g2" && [ "$g1" -ge 2000 ] && [ "$g1" -le 2400 ] && [ "$g2" -ge 2000 ] && [ "$g2" -le 2400 ] \
+     && [ "$(grep -c -F '[roamd] ERR-MEDIA-SWEEP: 96 media mount(s) survive 2 sweep attempt(s) ' "$d18/log" 2>/dev/null)" = 1 ]; then
+    ok "S18 a loaded phone and a dead mediad: each attempt ends on a 2000 ms clock grace, ERR 96"
+  else no "S18 a loaded phone: the grace read getprop at $g1 ms and $g2 ms after the kicks, want 2000-2400 (or no ERR 96)"; fi
+  command rm -rf "$d18"
   [ -n "$quiet" ] || printf '  -- %d ok, %d failed\n' "$p" "$x"
   [ "$x" -eq 0 ] && return 0 || return 1
 }
@@ -264,10 +386,32 @@ mut "S4 the unreadable verdict says clear"  's/(stop_mediad\(\) \{\n(?:.*\n)*?  
 mut "S6 stop_mediad's survivor line bare" 's/print -r -- "\[roamd\]   still mounted: \$\(qn "\$mnt"\)"/echo "[roamd]   still mounted: \$mnt"/' || fails=$((fails+1))
 # NWP-20261113-03: the wait follows the sweep, under a bound scaled by the count and capped inside the stall budget.
 mut "S7 the marker wait not scaled by the count" 's/_bound=\$\(\(50 \+ 5 \* _n\)\)/_bound=50/' || fails=$((fails+1))
-mut "S8 the stopped-oneshot early exit removed" 's/\n *\[ "\$i" -ge 20 \] && \[ "\$\(getprop init\.svc\.nowhere_mediad\)" != "running" \] && break//' || fails=$((fails+1))
+mut "S8 the stopped-oneshot early exit removed" 's/\n *\[ "\$_ce" -ge 2000 \] && \[ "\$\(getprop init\.svc\.nowhere_mediad\)" != "running" \] && break//' || fails=$((fails+1))
 mut "S9 the table read before the wait"         's/(stop_mediad\(\) \{\n(?:.*\n)*?    setprop ctl\.start nowhere_mediad\n)((?:.*\n)*?)(    _mt=\$\(cat \/proc\/mounts 2>>"\$LOG"\); _mtrc=\$\?\n)/$1$3$2/' || fails=$((fails+1))
 mut "S10 the cap raised to 1200 ticks"          's/\[ "\$_bound" -gt 550 \] && _bound=550/[ "\$_bound" -gt 1200 ] && _bound=1200/' || fails=$((fails+1))
 mut "S11 the cap removed"                       's/\n *\[ "\$_bound" -gt 550 \] && _bound=550//' || fails=$((fails+1))
 mut "S12 the table piped through printf"        's/left=\$\(grep (-e [^<]*)<<EOF_MT \| wc -l\n\$_mt\nEOF_MT\n\)/left=\$(printf "%s\\n" "\$_mt" | grep $1| wc -l)/' || fails=$((fails+1))
 mut "S14 the marker write is bare"              's/\( : > "\$STATE\/mediad\.sweep" \); chmod 600/: > "\$STATE\/mediad.sweep"; chmod 600/' || fails=$((fails+1))
+# NWP-20261210-26: the waits end by the clock, ticks only as a backstop and when the clock cannot be read.
+mut "T1 the marker wait's clock deadline removed (S15)"      's/\n *\[ "\$_ce" -ge "\$_dl" \] && break//' || fails=$((fails+1))
+mut "T2 the waited line back to ticks / 10 (S15)"            's/waited \$\(\(_ce \/ 1000\)\)\.\$\(\(_ce % 1000 \/ 100\)\)s/waited \$((i \/ 10)).\$((i % 10))s/' || fails=$((fails+1))
+mut "T3 the deadline in the wrong unit, _bound x 10 (S1)"    's/_dl=\$\(\(_bound \* 100\)\)/_dl=\$((_bound * 10))/' || fails=$((fails+1))
+mut "T4 the marker wait's tick backstop removed (S16 stuck)" 's/while \[ "\$i" -lt "\$_bound" \]; do/while true; do/' || fails=$((fails+1))
+mut "T5 the 0-stamp sanitising removed (S16 kick0)"          's/; case "\$_c0" in \x27\x27\|0\|\*\[!0-9\]\*\) _c0= ;; esac//g' || fails=$((fails+1))
+mut "T6 the idle wait's clock removed (S15's total)"         's/(_ce=\$\(\(j \* 100\)\)\n *)\[ "\$_ce" -lt 3000 \] && /$1/' || fails=$((fails+1))
+mut "T7 getprop read from the first pass again (S15 grace)"  's/\[ "\$_ce" -ge 2000 \] && (\[ "\$\(getprop)/$1/' || fails=$((fails+1))
+mut "T8 the start grace back on 20 ticks (S18)"              's/\[ "\$_ce" -ge 2000 \] && (\[ "\$\(getprop)/[ "\$i" -ge 20 ] && $1/' || fails=$((fails+1))
+# The control: a comment's wording changes nothing the cases see, so it must SURVIVE under every shell.
+ctl() { # ctl <label> <perl-expr>
+  local m rc sh bad=0; m=$(mktemp -p "$W")
+  perl -0pe "$2" "$SUT" > "$m" || { echo "  ERROR     $1 -- perl failed"; command rm -f "$m"; return 1; }
+  if cmp -s "$SUT" "$m"; then echo "  INERT     $1 -- the control changed nothing"; command rm -f "$m"; return 1; fi
+  for sh in $SHELLS; do
+    suite "$m" quiet "$sh"; rc=$?
+    if [ "$rc" = 0 ]; then echo "  survived  $1 [$sh] (the control, as it must)"; else echo "  KILLED    $1 [$sh] -- the control failed the suite (rc=$rc)"; bad=1; fi
+  done
+  command rm -f "$m"
+  return $bad
+}
+ctl "C1 a comment's wording" 's/a tick count is not a time/a tick count was never a time/' || fails=$((fails+1))
 [ "$fails" -eq 0 ] && echo "== all mutations convicted" || { echo "== $fails mutation(s) not convicted"; exit 1; }

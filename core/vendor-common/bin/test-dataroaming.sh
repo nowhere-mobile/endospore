@@ -48,6 +48,8 @@ END_HDR='# ---- NWP-20261028-07: SESSION-SCOPED DATA ROAMING (end) -------------
 MD_BEGIN_HDR='# ---- NWP-20261026-05: SESSION-SCOPED MOBILE DATA (begin) ------------------------------------------------------------'
 HS_BEGIN_HDR='# ---- NWP-20261028-10: SESSION HOTSPOT RELEASE (begin) ----------------------------------------------------------------'
 HS_END_HDR='# ---- NWP-20261028-10: SESSION HOTSPOT RELEASE (end) ------------------------------------------------------------------'
+NP_BEGIN_HDR='# ---- NWP-20261210-19: NETPOLICY WI-FI TEMPLATE RESET (begin) ---------------------------------------------------------'
+NP_END_HDR='# ---- NWP-20261210-19: NETPOLICY WI-FI TEMPLATE RESET (end) -----------------------------------------------------------'
 LBEGIN_HDR='# ---- NWP-20261016-45: SESSION-SCOPED LOCATION GLOBALS (begin) -------------------------------------------------------'
 LEND_HDR='# ---- NWP-20261016-45: SESSION-SCOPED LOCATION GLOBALS (end) ---------------------------------------------------------'
 OP_HDR='if [ "$op" = "mdapply" ] || [ "$op" = "mdrelease" ]; then'
@@ -332,9 +334,11 @@ suite() {
     /echo "\[roamd\] bootsweep result:\$_swept/ {res = NR} END {print (op && p > op && blk > p && res > blk) ? "in" : "out"}' "$f")
   [ "$at" = in ] && [ "$(grep -cxF "$BOOT_HDR" "$f")" = 1 ] \
     && ok "P2 the category sits inside the bootsweep op, once, after fix 13 and before the result line" || no "P2 the category is misplaced"
-  at=$(awk -v e="$END_HDR" -v m="$MD_BEGIN_HDR" -v hb="$HS_BEGIN_HDR" -v he="$HS_END_HDR" '$0 == e {el = NR} $0 == m {ml = NR} $0 == hb {hl = NR} $0 == he {hel = NR}
-    END {print (el && (ml == el + 1 || (hl == el + 1 && hel > hl && ml == hel + 1))) ? "ok" : "no"}' "$f")
-  [ "$at" = ok ] && ok "P3 the data roaming block ends directly before the mobile data block (only the hotspot release block may sit between)" || no "P3 the block is misplaced"
+  # NWP-20261210-19: the netpolicy block may follow the hotspot block, still before mobile data.
+  at=$(awk -v e="$END_HDR" -v m="$MD_BEGIN_HDR" -v hb="$HS_BEGIN_HDR" -v he="$HS_END_HDR" -v nb="$NP_BEGIN_HDR" -v ne="$NP_END_HDR" '
+    $0 == e {el = NR} $0 == m {ml = NR} $0 == hb {hl = NR} $0 == he {hel = NR} $0 == nb {nbl = NR} $0 == ne {nel = NR}
+    END {print (el && (ml == el + 1 || (hl == el + 1 && hel > hl && (ml == hel + 1 || (nbl == hel + 1 && nel > nbl && ml == nel + 1))))) ? "ok" : "no"}' "$f")
+  [ "$at" = ok ] && ok "P3 the data roaming block ends directly before the mobile data block (only the hotspot release block, then the netpolicy block, may sit between)" || no "P3 the block is misplaced"
   x=$(grep -v '^[[:space:]]*#' "$R/dr.sh" | grep -E '(^|[^A-Za-z_./-])settings([^A-Za-z_]|$)' || true)
   [ -z "$x" ] && ok "R11 the block has no settings command" || no "R11 settings in live code: $x"
 

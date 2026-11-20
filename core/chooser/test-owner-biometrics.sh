@@ -215,8 +215,9 @@ mutant "M1 withBiometricsOff returns the mask alone" NWP_OB_OK "$OK" \
   's/return current \| biometricsMask;/return biometricsMask;/'
 mutant "M2 needsWrite always false" NWP_OB_OK "$OK" \
   's/return \(current & biometricsMask\) != biometricsMask;/return false;/'
+# M3 carries the NWP-20261208-20 GateBiometricRemove lines after the catch along with the block it moves.
 mutant "M3 the call moved outside the isDeviceOwnerApp branch" NWP_OB_CA "$CA" \
-  's/(\n[ ]+\/\/ NWP-20261114-12 \(docs.*?"NWP-20261114-12 keyguard biometrics off \(DO\)", t\);\n[ ]+\}\n)(            \}\n        \} catch \(Throwable t\) \{\n            android\.util\.Log\.w\("NowhereChooser", "clearAffiliationIds", t\);\n        \}\n)/\n$2$1/s'
+  's/(\n[ ]+\/\/ NWP-20261114-12 \(docs.*?"NWP-20261114-12 keyguard biometrics off \(DO\)", t\);\n[ ]+\}\n(?:[ ]+(?:\/\/|GateBiometricRemove\.)[^\n]*\n)*)(            \}\n        \} catch \(Throwable t\) \{\n            android\.util\.Log\.w\("NowhereChooser", "clearAffiliationIds", t\);\n        \}\n)/\n$2$1/s'
 mutant "M4 FINGERPRINT in place of BIOMETRICS" NWP_OB_CA "$CA" \
   's/DevicePolicyManager\.KEYGUARD_DISABLE_BIOMETRICS;/DevicePolicyManager.KEYGUARD_DISABLE_FINGERPRINT;/'
 mutant "M5 the disable-keyguard-features element removed" NWP_OB_XML "$XML" \

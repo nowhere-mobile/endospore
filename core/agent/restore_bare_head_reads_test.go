@@ -118,12 +118,16 @@ func bhrPlainEnv(t *testing.T) *bhrStore {
 // itself makes these calls, in this order, with one memo.
 func bhrRestoreHead(base, profile, pass string) (deleted, locked bool, head string, ok bool) {
 	memo := refProbeMemo{}
+	joinScopeHead := scopeHeadOverlap(base, profile, pass, memo)
 	if profileDeletedWith(base, profile, pass, memo) {
+		joinScopeHead()
 		return true, false, "", false
 	}
 	if l, u := scopeOwnerLockedWith(base, profile, pass, memo); l || u {
+		joinScopeHead()
 		return false, true, "", false
 	}
+	joinScopeHead()
 	_, _, head, ok = resolveKeyHeadForLoginWith(base, profile, pass, memo)
 	return false, false, head, ok
 }
@@ -150,8 +154,10 @@ func TestBareHeadReads_RestoreCaseUsesOneMemo(t *testing.T) {
 	}
 	last := -1
 	for _, call := range []string{
+		"scopeHeadOverlap(base, profile, pass, memo)",
 		"profileDeletedWith(base, profile, pass, memo)",
 		"scopeOwnerLockedWith(base, profile, pass, memo)",
+		"joinScopeHead()",
 		"resolveKeyHeadForLoginWith(base, profile, pass, memo)",
 	} {
 		k := strings.Index(c, call)

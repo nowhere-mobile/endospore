@@ -5,13 +5,18 @@
 # combo", NWP-20261105-27): the gate's ? opens a hero card, a skippable three-step intro, six topic tiles and a
 # "Forgot your passphrase?" card, in the gate's light and dark colours. The chooser cannot be compiled off the build
 # host, so this suite compiles GateHelpHome, GateHelpArt, GateHelpPages, HelpPages, GatePalette, GateHelpScreen,
-# GateHelpTileGrid and GateHelpArtView against the stubs in core/chooser/tests/gate-help-combo/stubs, which record text,
-# descriptions, clicks and colours. GateHelpComboCases then builds and walks the real view trees:
-#   T1-T3 hero, grid, and each control's action; T4-T6, T9, T10 what each tile and the card open; T7, T8 the intro, its
+# GateHelpTileGrid, GateHelpArtView, GateHelpTopic and HelpCards against the stubs in core/chooser/tests/gate-help-combo/stubs,
+# which record text, descriptions, clicks, visibility, rotation and colours. GateHelpComboCases then builds and walks
+# the real view trees:
+#   T1-T3 hero, grid, and each control's action (T3: a tile or the Forgot card opens its topic in place, under its row,
+#   and a second tap closes it; NWP-20261208-26); T4-T6, T9, T10 what each tile and the card open; T7, T8 the intro, its
 #   three steps, Next and Skip; T11 no B4 word (decision 2026-10-31, Part B) in any word the screen shows, says or draws;
 #   T12, T13 both palettes resolve, the contrast floors hold, and no colour comes from outside GatePalette; T14 every
-#   control and picture has its own TalkBack description; T15-T17 source checks: no activity, link, pref, daemon or profile
-#   name in the new classes, the icons are vector drawables in tile order, and ChooserActivity's three methods are wired.
+#   control and picture has its own TalkBack description, with each topic open; T15-T17 source checks: no activity, link,
+#   dialog, pref, daemon or profile name in the Help classes, the icons are vector drawables in tile order, and
+#   ChooserActivity's two methods are wired with no dialog and no showGateHelpPage; T18 each topic's step cards read its
+#   words verbatim, in order, then the support line, tile 0's "Also see: Gate settings" opens that page, and Back on the
+#   first card closes the topic; T19 a chevron turns 90 exactly while its topic is open.
 #
 # ⚠ IT FAILS WHEN THERE IS NO JAVAC, IT NEVER SKIPS. javac comes from PATH, else from the build host's JDK below;
 # the version is printed first so the log proves which compiler ran.
@@ -33,7 +38,7 @@ RES="$root/core/chooser/res"
 T="$root/core/chooser/tests/gate-help-combo"
 HELP_CASES="$root/core/chooser/tests/help-pages/HelpPagesCases.java"
 HOST_JDK=/mnt/build/lineage/prebuilts/jdk/jdk21/linux-x86/bin
-COMPILED='GateHelpHome GateHelpArt GateHelpPages HelpPages GatePalette GateHelpScreen GateHelpTileGrid GateHelpArtView'
+COMPILED='GateHelpHome GateHelpArt GateHelpPages HelpPages GatePalette GateHelpScreen GateHelpTileGrid GateHelpArtView GateHelpTopic HelpCards'
 
 if command -v javac >/dev/null 2>&1 && command -v java >/dev/null 2>&1; then
   JAVAC=$(command -v javac); JAVA=$(command -v java)
@@ -140,8 +145,8 @@ mut "H13 two tile icons out of order" GateHelpTileGrid "T16" \
   's/R\.drawable\.ic_help_signin, R\.drawable\.ic_help_apps/R.drawable.ic_help_apps, R.drawable.ic_help_signin/ or die' || fails=$((fails+1))
 mut "H14 a startActivity added to the screen" GateHelpScreen "T15" \
   's/(static View home\(Context c, GatePalette p, Nav nav\) \{\n)/$1        if (c == null) c.startActivity(null);\n/ or die' || fails=$((fails+1))
-mut "H15 showGateHelp shows the old dialog list" ChooserActivity "T17" \
-  's/runOnUiThread\(\(\) -> setContentView\(GateHelpScreen\.home\(this, GatePalette\.active\(\), gateHelpNav\(\)\)\)\);/runOnUiThread(() -> new android.app.AlertDialog.Builder(this).setItems(GateHelpPages.TITLES, null).show());/ or die' \
+mut "H15 showGateHelpPage's dialog put back after gateHelpNav" ChooserActivity "T17" \
+  's/(\n    \/\/ #113: whether the multi-device)/\n    private void showGateHelpPage(String title, String body) {\n        new android.app.AlertDialog.Builder(this).setTitle(title).setMessage(body).show();\n    }\n$1/ or die' \
   || fails=$((fails+1))
 mut "H16 Gate settings unreachable" GateHelpHome "T5" \
   's/TILE_ALSO = \{ 1, /TILE_ALSO = { -1, / or die' || fails=$((fails+1))
@@ -152,9 +157,27 @@ mut "H18 HERO_DESCRIPTION says the encrypted store" GateHelpHome "T11" \
   's/saves your profile to your store/saves your profile to the encrypted store/ or die' || fails=$((fails+1))
 mut "H19 the art view draws a literal, not HERO_NODES" GateHelpArtView "T11" \
   's/GateHelpHome\.HERO_NODES\[i\]/(i == 1 ? "Encrypted store" : GateHelpHome.HERO_NODES[i])/ or die' || fails=$((fails+1))
-mut "H20 a tile's click goes to the wrong topic" GateHelpTileGrid "T3" \
-  's/nav\.openTile\(index\)/nav.openTile((index + 1) % GateHelpHome.TILES.length)/ or die' || fails=$((fails+1))
+mut "H20 a tile's click opens the next tile's topic" GateHelpTileGrid "T3" \
+  's/topics\.tap\(index\)/topics.tap((index + 1) % GateHelpHome.TILES.length)/ or die' || fails=$((fails+1))
 mut "H21 the light palette ignored" GateHelpScreen "T13" \
   's/(static View intro\(Context c, GatePalette p, int step, Nav nav\) \{\n\s*GateHelpArt\.Roles r = GateHelpArt\.of\()p\)/$1GatePalette.DARK)/ or die' \
+  || fails=$((fails+1))
+mut "H22 a second tap never closes a topic" GateHelpHome "T3" \
+  's/return tapped == open \? -1 : tapped;/return tapped;/ or die' || fails=$((fails+1))
+mut "H23 a tile opens the next tile's steps" GateHelpScreen "T3 T18" \
+  's/GateHelpHome\.tileSteps\(i\)/GateHelpHome.tileSteps((i + 1) % GateHelpHome.TILES.length)/ or die' || fails=$((fails+1))
+mut "H24 the Also-see line dropped" GateHelpScreen "T18" \
+  's/GateHelpHome\.alsoLine\(i\)/null/ or die' || fails=$((fails+1))
+mut "H25 Also see shows the tile's own steps" GateHelpScreen "T18" \
+  's/GateHelpPages\.steps\(GateHelpHome\.tileAlso\(i\)\)/GateHelpHome.tileSteps(i)/ or die' || fails=$((fails+1))
+mut "H26 Back on the first card does not close the topic" GateHelpTopic "T18" \
+  's/if \(at\[0\] == 0\) close\.run\(\);\n\s*else go\.accept\(-1\);/go.accept(-1);/ or die' || fails=$((fails+1))
+mut "H27 the chevron never turns" GateHelpScreen "T19" \
+  's/GateHelpHome\.chevronRotation\(true\)/GateHelpHome.chevronRotation(false)/ or die' || fails=$((fails+1))
+mut "H28 the topic runs HelpCards.text on a step" GateHelpTopic "T18" \
+  's/text\.setText\(String\.join\("\\n", cards\[at\[0\]\]\)\);/text.setText(HelpCards.text(String.join("\\n", cards[at[0]])));/ or die' \
+  || fails=$((fails+1))
+mut "H29 an AlertDialog back in a tile's click" ChooserActivity "T17" \
+  's/(\@Override public void close\(\) \{ setContentView\(gateView\); \}\n)/$1            public void openTile(int i) { new android.app.AlertDialog.Builder(ChooserActivity.this).setMessage(GateHelpHome.tileBody(i)).show(); }\n/ or die' \
   || fails=$((fails+1))
 [ "$fails" -eq 0 ] && echo "== all mutations convicted" || { echo "== $fails mutation(s) not convicted"; exit 1; }

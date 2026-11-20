@@ -172,8 +172,8 @@ func firePendingClaimDrain(dest, name, pass, gen string, seq uint64) {
 		name, got, publish, outcome)
 }
 
-// pendingClaimState is the wallet's pending codes and miss hashes as one comparable string, "" when it cannot be read.
-// It holds codes: it is compared, never logged.
+// pendingClaimState is the wallet's pending codes, miss hashes and unusable-claim notices (NWP-20261208-03) as one
+// comparable string, "" when it cannot be read. It holds codes: it is compared, never logged.
 func pendingClaimState(walletPath string) string {
 	w, err := loadWallet(walletPath)
 	if err != nil {
@@ -185,6 +185,10 @@ func pendingClaimState(walletPath string) string {
 	}
 	s += "\x00"
 	for _, k := range w.PendingClaimMisses {
+		s += k + "\n"
+	}
+	s += "\x00"
+	for _, k := range w.UnusableClaims {
 		s += k + "\n"
 	}
 	return s

@@ -34,6 +34,12 @@
 # 5; any other failure: the partial set kept, return 0); the REAL keystore_restore, still after ks_signin_reset, moves
 # the .pre dir onto keystore-in/<uid> and sends no store request. S1, S2, K1 and K2 therefore prove the bundle reaches
 # keystore-in/11 through the promotion. A roamd without keystore_fetch is not an extraction failure: the cases fail.
+# NWP-20261210-03: keystore_fetch runs in lane K, a background group beside the #media and #apps lanes, joined before
+# the verdict; K2 no longer pins its order against the #apps restore. test-in-scope-lanes.sh runs the lanes.
+#
+# NWP-20261208-29 (U9; V4): the #keys restore reports its progress under its own phase `keys`. With no phase the agent
+# wrote `data`, which the gate shows as "Restoring your profile", after "Restoring your apps"; `appcode` would make the
+# sign-in summary write a second scope=apps line. U9 asserts what keystore_fetch's agent call sees in NOWHERE_PHASE.
 #
 #   bash test-signin-keystore-staging.sh              # the cases
 #   bash test-signin-keystore-staging.sh --mutate     # ... plus mutants of roamd that must each CONVICT under every shell
@@ -131,7 +137,7 @@ agent_sim() {
         blanknet) return 5 ;;
       esac
       case "$3" in *'#apps') [ -n "$SIM_APPCODE" ] && : > "$5/manifest.tsv" ;; esac
-      case "$3" in *'#keys') echo r > "$5/com.ex.r.keys" ;; esac
+      case "$3" in *'#keys') echo r > "$5/com.ex.r.keys"; printf 'phase=%s\n' "${NOWHERE_PHASE:-}" > "$ROOT/keys-phase" ;; esac
       # NWP-20261207-06: keys5 / keys1 -- the #keys restore wrote its bundle and then exited 5 / 1
       case "$3:$SIM_MODE" in *'#keys:keys5') return 5 ;; *'#keys:keys1') return 1 ;; esac
       return 0 ;;
@@ -139,10 +145,12 @@ agent_sim() {
   esac
 }
 pw() { printf '%s\n' "$ROOT/sim/pw"; }
+pwv() { [ -z "$1" ] || pw "$1"; }
+_se_v=""; _fh_v=""   # set at the top level in the script (NWP-20261205-18)
 _ms() { echo 0; }
 od_fetch_data() { return 0; }; od_listed() { return 1; }; od_block_app() { return 0; }; od_unblock_app() { :; }; od_pending_clear() { :; }; od_block_installed() { :; }; od_shipped_prep() { return 0; }; od_park_var() { :; }; od_unf_path() { echo "$STATE/odfetch.$1/unfetched.$2"; }   # NWP-20261130-03
 sleep() { return 0; }
-for t in stop_mediad usb_host relabel_launcher remap_media_db insert_deferred_media remap_per_pkg _tlog _ssum acct_restore remap_tree reown_ext_appdata \
+for t in stop_mediad usb_host relabel_launcher remap_per_pkg _tlog _ssum acct_restore remap_tree reown_ext_appdata \
          hold_ondemand od_parked_report reap_stale_ondemand reap_orphan_provisioned restorecon \
          uiderrors_floor_take uiderrors_floor_commit tz_surface sroam_surface; do
   eval "$t() { :; }"
@@ -245,7 +253,9 @@ EOF
     chk "S2 [$sh] the earlier session's bundle did not" absent "$R/data/nowhere/keystore-in/11/com.ex.a.keys"
     chk "K2 [$sh] with a manifest: the #keys fetch ran exactly once" eqv "$(nlines "$R/calls" 'restore zqprofile#keys')" 1
     a=$(calline "$R/calls" 'restore zqprofile#apps'); b=$(calline "$R/calls" 'restore zqprofile#keys')
-    chk "K2 [$sh] it follows the #apps restore in the calls file" eval '[ -n "$a" ] && [ -n "$b" ] && [ "$a" -lt "$b" ]'
+    # NWP-20261210-03: the #apps and #keys restores run as two lanes at once, so their order in the calls file is not
+    # fixed; both run, once each, before the landing promotes the .pre dir.
+    chk "K2 [$sh] the #apps restore ran too, in its own lane" eval '[ -n "$a" ] && [ -n "$b" ]'
     command rm -rf "$R"
 
     say "== [$sh] S3: a refused or failed sign-in touches nothing =="
@@ -344,6 +354,11 @@ EOF
     chk "U7 [$sh] keystore-in/11 is as mkroot planted it" eval '[ "$(ls -A "$R/data/nowhere/keystore-in/11" 2>/dev/null)" = com.ex.a.keys ] && held "$R/data/nowhere/keystore-in/11/com.ex.a.keys" a'
     command rm -rf "$R"
 
+    say "== [$sh] U9: keystore_fetch runs the #keys restore under NOWHERE_PHASE=keys (NWP-20261208-29) =="
+    mkroot; run_fn "$R" "$sh" 11 'unset NOWHERE_PHASE; keystore_fetch'
+    chk "U9 [$sh] the #keys restore runs under NOWHERE_PHASE=keys" held "$R/keys-phase" "phase=keys"
+    command rm -rf "$R"
+
     say "== [$sh] U8: keystore_restore moves keystore-in/11.pre onto keystore-in/11, with no store request (NWP-20261207-06) =="
     mkroot; mkdir -p "$R/data/nowhere/keystore-in/11.pre"; echo r > "$R/data/nowhere/keystore-in/11.pre/com.ex.r.keys"
     run_fn "$R" "$sh" 11 keystore_restore
@@ -416,6 +431,7 @@ L_IKEEP='    if [ -n "$_kso" ] && [ "$_kso" != "$_ksu" ] && userdir_has_record "
 L_KFR='  if [ "$_kfr" = 5 ]; then rm -rf "$_krd" 2>>"$LOG"; return 5; fi'
 L_PROM='  if [ -e "$_krd" ] || ! mv "$_krd.pre" "$_krd" 2>>"$LOG"; then'
 L_PRE='  _krd="$_krd.pre"'
+L_KFETCH='"$AGENT" restore s3 "${name}#keys"'   # NWP-20261208-29: a part of keystore_fetch's agent line (V4)
 M_P2='      case "$_ksn" in '"''"'|*[!0-9]*) ;; ??????*) _kso=${_ksn%"${_ksn#?????}"} ;; esac'
 M_P3='    if [ -n "$_kso" ] && userdir_has_record "$_kso"; then _ksj=$((_ksj + 1)); continue; fi'
 M_P4='    if [ -n "$_kso" ] && [ "$_kso" != "$_ksu" ] && userdir_has_record "$_kso"; then continue; fi'
@@ -423,8 +439,9 @@ for l in "$L_CALL" "$L_RF" "$L_PRUNE" "$L_EXP" "$L_KR" "$L_RMIN" "$L_AC" "$L_WB"
          "$L_KRRM" "$L_KEEP" "$L_GONE" "$L_FLAT" "$L_KID" "$L_IOWN" "$L_IKEEP" "$L_KFR" "$L_PROM" "$L_PRE"; do
   [ "$(grep -cxF -- "$l" "$SUT")" = 1 ] || { echo "EXTRACTION FAILED: anchor line not unique in $SUT: $l" >&2; exit 2; }
 done
+[ "$(grep -cF -- "$L_KFETCH" "$SUT")" = 1 ] || { echo "EXTRACTION FAILED: keystore_fetch's agent line not unique in $SUT" >&2; exit 2; }
 export L_CALL L_RF L_PRUNE L_EXP L_KR L_RMIN L_AC L_WB L_RIN L_KRRM L_KEEP L_GONE L_FLAT L_KID L_IOWN L_IKEEP \
-       L_KFR L_PROM L_PRE M_P2 M_P3 M_P4
+       L_KFR L_PROM L_PRE L_KFETCH M_P2 M_P3 M_P4
 MFAIL=0
 # mut <name> <awk-program>: awk reads the anchors from the environment
 mut() {
@@ -464,5 +481,6 @@ mut "P4 the kept count never incremented" '$0 == ENVIRON["L_IKEEP"] {print ENVIR
 mut "V1 keystore_fetch's rc-5 return dropped (U6 convicts: rc=0, .pre left)" '$0 == ENVIRON["L_KFR"] {next} {print}'
 mut "V2 keystore_restore's promotion dropped (U8, S1, K1 convict)" '$0 == ENVIRON["L_PROM"] {print "  if [ -e \"$_krd\" ]; then"; next} {print}'
 mut "V3 keystore_fetch writes keystore-in/<uid> directly (U6, U7 convict)" '$0 == ENVIRON["L_PRE"] {next} {print}'
+mut "V4 keystore_fetch's NOWHERE_PHASE=keys dropped (U9 convicts)" 'index($0, ENVIRON["L_KFETCH"]) {sub(/NOWHERE_PHASE=keys /, "")} {print}'
 [ "$MFAIL" = 0 ] || exit 1
 echo "all mutants convicted"

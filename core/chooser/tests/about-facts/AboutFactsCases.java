@@ -24,7 +24,7 @@ public final class AboutFactsCases {
     public static void main(String[] args) {
         final String green = "Verified — checked at boot against the phone maker's key";
         final String yellow = "Verified with a custom key — checked at boot against a key installed on this phone, "
-                + "not the phone maker's. A locked Nowhere phone boots this way.";
+                + "not the phone maker's. A locked nowhere phone boots this way.";
         final String orange = "Not verified — the bootloader is unlocked, so the software was not checked at boot";
         final String nr = "Not reported";
 

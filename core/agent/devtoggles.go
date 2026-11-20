@@ -49,14 +49,6 @@ func claimDevToggles(dest, uid, why string) string {
 	return out
 }
 
-// claimDevTogglesAsync is claimDevToggles off the caller's path, correct in any order for claimLocGlobalsAsync's reason.
-func claimDevTogglesAsync(dest, uid, why string) {
-	if !devTogglesSupported() {
-		return
-	}
-	goSafe("devtoggles-claim", func() { claimDevToggles(dest, uid, why) })
-}
-
 // releaseDevTogglesAsync puts the gate's values back for a session that is no longer in front, off the caller's path.
 // roamd leaves the values alone if another session owns them by the time it runs.
 func releaseDevTogglesAsync(dest, uid, why string) {

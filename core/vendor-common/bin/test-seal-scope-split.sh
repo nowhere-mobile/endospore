@@ -79,7 +79,7 @@ EOF
     printf 'unset NOWHERE_PUSH_STAT APPCODE_PUSH_MS\n'
     for f in bt_seal_capture nav_seal_capture aod_seal_capture a11y_seal_capture autofill_seal_capture shortcut_seal_capture tz_seal_capture \
              vpn_deferred_retry vpn_seal_capture sync_apply_retry sync_seal_capture sroam_seal_capture ks_stage_drop restorecon chown \
-             seal_wl_release seal_susp seal_wl_end bt_reset am; do
+             seal_wl_release seal_susp seal_wl_end bt_reset am calllog_late; do   # calllog_late: NWP-20261206-22
       printf '%s(){ :; }\n' "$f"
     done
     printf 'pw(){ echo pw; }\n'

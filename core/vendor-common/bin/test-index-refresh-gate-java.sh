@@ -4,8 +4,8 @@
 #
 # WHY THIS IS COMMITTED. The chooser cannot be compiled off the build host. core/chooser/tests/index-refresh-gate/run.sh
 # lifts the pure gate (StoreService.indexRefreshAllowed) and runs Cases under javac; the source checks below pin what a
-# lift cannot see: refreshIndex is declared once, directly before materializeOwn, which is LAST since NWP-20261119-19
-# (methods are only ever appended, so existing transaction codes stay unchanged), refreshIndex checks the caller and
+# lift cannot see: refreshIndex is declared once, directly before materializeOwn (NWP-20261119-19; later methods are
+# appended after materializeOwn, NWP-20261209-05, so existing transaction codes stay unchanged), refreshIndex checks the caller and
 # the gate before it sends REFRESH-INDEX, and StoreActivity calls it off the main thread inside a catch of Throwable.
 #
 # ⚠ IT FAILS WHEN THERE IS NO JAVAC, IT NEVER SKIPS. javac comes from PATH, else the build host's JDK below.
@@ -51,12 +51,16 @@ pcheck() {
 
 # suite <StoreService.java> <INowhereStore.aidl> <StoreActivity.java> -> 0 pass, 1 a check or case failed, 2/3 broken run.
 suite() {
-  local svc="$1" aidl="$2" app="$3" decls rc body
-  # S1: the AIDL's LAST method is materializeOwn (NWP-20261119-19), and refreshIndex is declared once, directly before
-  # it, after getApp.
+  local svc="$1" aidl="$2" app="$3" decls rc body nr nm ng
+  # S1: refreshIndex is declared once, directly before materializeOwn (NWP-20261119-19), and after getApp. Methods
+  # added later are appended after materializeOwn (NWP-20261209-05), so the order of these three never changes.
   decls=$(perl -0pe 's{/\*.*?\*/}{}gs; s{//[^\n]*}{}g' "$aidl" | grep -E '^\s*\S.*\(.*\);\s*$')
-  [ "$(printf '%s\n' "$decls" | tail -n 1 | tr -d ' ')" = "StringmaterializeOwn(Stringpkg);" ] || { echo "  CHECK AIDL: materializeOwn is not the last method" >&2; return 1; }
-  [ "$(printf '%s\n' "$decls" | tail -n 2 | head -n 1 | tr -d ' ')" = "StringrefreshIndex();" ] || { echo "  CHECK AIDL: refreshIndex is not directly before materializeOwn" >&2; return 1; }
+  nr=$(printf '%s\n' "$decls" | tr -d ' ' | grep -n -x 'StringrefreshIndex();' | head -n 1 | cut -d: -f1)
+  nm=$(printf '%s\n' "$decls" | tr -d ' ' | grep -n -x 'StringmaterializeOwn(Stringpkg);' | head -n 1 | cut -d: -f1)
+  ng=$(printf '%s\n' "$decls" | tr -d ' ' | grep -n 'StringgetApp(' | head -n 1 | cut -d: -f1)
+  [ -n "$nr" ] && [ -n "$nm" ] && [ -n "$ng" ] || { echo "  CHECK AIDL: getApp, refreshIndex or materializeOwn is missing" >&2; return 1; }
+  [ "$nm" -eq $((nr + 1)) ] || { echo "  CHECK AIDL: refreshIndex is not directly before materializeOwn" >&2; return 1; }
+  [ "$ng" -lt "$nr" ] || { echo "  CHECK AIDL: refreshIndex is not after getApp" >&2; return 1; }
   [ "$(printf '%s\n' "$decls" | grep -c 'refreshIndex')" = 1 ] || { echo "  CHECK AIDL: refreshIndex declared other than once" >&2; return 1; }
   [ "$(printf '%s\n' "$decls" | grep -c 'materializeOwn')" = 1 ] || { echo "  CHECK AIDL: materializeOwn declared other than once" >&2; return 1; }
   printf '%s\n' "$decls" | grep -q 'String getApp(' || { echo "  CHECK AIDL: getApp is gone" >&2; return 1; }

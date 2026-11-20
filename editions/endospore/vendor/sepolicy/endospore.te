@@ -561,10 +561,9 @@ allow nowhere system_file:file execute_no_trans;
 binder_use(nowhere)
 allow nowhere system_server:binder call;
 allow nowhere connectivity_service:service_manager find;
-# Wi-Fi mirror capture (#98): the login daemon reads the saved-network store under the wifi APEX's data dir
-# to carry ssid/psk/mac across a roam. Denied on an enforcing build, and wifi_store.go swallows the error
-# with a bare return -- so on a Wi-Fi-only phone the gate silently cannot rejoin the network after a roam,
-# which means no network and no way back in. (DIA-20260806-10)
+# Wi-Fi mirror capture (#98): the login daemon read the saved-network store under the wifi APEX's data dir
+# to carry ssid/psk/mac across a roam. NWP-20261210-28 removed that capture (it read an empty per-user
+# store). The search rule stays until a device shows nothing else needs it. (DIA-20260806-10)
 allow nowhere apex_module_data_file:dir search;
 allow system_server nowhere:fd use;
 allow system_server nowhere:fifo_file write;
@@ -621,6 +620,34 @@ allow bluetooth endospore_priv:fd use;
 # through it. This file already carries that exact pair for the nowhere domain (`allow system_server
 # nowhere:fd use` + `allow system_server nowhere:fifo_file write`); -08 copied one line of a two-line idiom.
 allow bluetooth endospore_priv:fifo_file write;
+
+# ---- phone, Data Saver and NFC from roamd (NWP-20261210-15) ------------------------------------------
+# Mobile data: md_write runs cmd phone data enable or disable. The phone service lives in the radio domain,
+# not system_server, so none of the rules above reach it. SEEN on lynx 2026102901 (userdebug, enforcing,
+# NWP-20261029-24), on 2026-10-29, with the result mobile_data=1 NOT APPLIED (reads 0):
+#   avc: denied { find } for ... name=phone scontext=u:r:endospore_priv:s0 tcontext=u:object_r:radio_service:s0 permissive=0
+# The find and the binder_call are the denied lookup and the call it leads to. The callback and fd lines are
+# the cmd idiom system_server already needed (fd use and binder call for system_server above): cmd hands its
+# stdio fds over binder, and its result callback calls back into this domain. INFERRED for radio, not yet
+# seen. No fifo_file write: md_write sends the cmd stdio to /dev/null and reads back through settings.
+allow endospore_priv radio_service:service_manager find;
+binder_call(endospore_priv, radio)
+allow radio endospore_priv:binder call;
+allow radio endospore_priv:fd use;
+# Data Saver: dt_read and dt_write run cmd netpolicy. NetworkPolicyManagerService lives in system_server, so the
+# fd, fifo_file and binder rules for system_server above cover it; only the lookup is missing. INFERRED from
+# the policy, not seen on a device.
+allow endospore_priv netpolicy_service:service_manager find;
+# NFC: dt_read runs dumpsys nfc and dt_write runs svc nfc. The NFC service lives in the nfc app domain, so this
+# is the lookup, the binder pair, and the fd use plus fifo_file write pair the bluetooth dump above needed:
+# dumpsys nfc writes into the pipe roamd hands it. Read from the policy, NOT seen on a device. If the svc nfc
+# path needs more, the device proof shows it.
+allow endospore_priv nfc_service:service_manager find;
+binder_call(endospore_priv, nfc)
+allow nfc endospore_priv:binder call;
+allow nfc endospore_priv:fd use;
+allow nfc endospore_priv:fifo_file write;
+# Airplane mode and battery saver need nothing new: connectivity_service, power_service and settings_service are already found above.
 
 # ---- USB-C FIDO2 key (#142 on Endospore, NWP-20260823-06) --------------------------------------------
 # Device-proven missing on lynx 2026-08-23 (Chester, enrolling a YubiKey over USB-C): the kernel enumerated
@@ -702,3 +729,14 @@ allow endospore_priv self:global_capability2_class_set block_suspend;
 # node is its own type (sysfs_suspend_stats, genfs_contexts:178), a directory, so it needs the search too.
 allow endospore_priv sysfs_suspend_stats:dir search;
 allow endospore_priv sysfs_suspend_stats:file r_file_perms;
+
+# NWP-20261117-47: NowherePush reads the push gateway (nowhere.gateway_url, nowhere_gateway_prop) on GrapheneOS too.
+# core/vendor-common/sepolicy/nowhere.te grants the read to platform_app, which is the domain NowherePush runs in on
+# LineageOS. GrapheneOS puts a platform app in a per-target-SDK domain instead (seapp_contexts: seinfo=platform
+# domain=platform_app_36), so on Endospore every read was refused (avc: denied { read } ... scontext=
+# u:r:platform_app_36), PushService fell back to the production default, and a beta-ring image minted push
+# endpoints on prod (lynx 2026111604, 2026-11-17, S14 of the device-proof round). Grant it to the attribute every
+# such domain carries (platform_app_all, set by platform_app_domain() in public/te_macros), not to platform_app_36:
+# the per-SDK name moves with the target SDK, the attribute does not. LineageOS has no platform_app_all, which is
+# why this lives in the Endospore delta and not in the shared nowhere.te.
+allow platform_app_all nowhere_gateway_prop:file { read open getattr map };

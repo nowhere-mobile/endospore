@@ -43,7 +43,7 @@ PY
   restore
 }
 mut "P1 the UNLINK line back to %s" mediafs.go 'dlog("mediad: UNLINK deferred %q (' 'dlog("mediad: UNLINK deferred %s (' TestMediaLogLinesQuotePaths
-mut "P2 the media-sync SKIPPED line back to a bare rel" media_span.go $'fetchEssSpan(base, key, m, r)\n\t\tif err != nil {\n\t\t\tfmt.Printf("  media-sync: %q SKIPPED (%v)\\n", rel, errCode(err))' $'fetchEssSpan(base, key, m, r)\n\t\tif err != nil {\n\t\t\tfmt.Printf("  media-sync: %s SKIPPED (%v)\\n", rel, err)' TestMediaLogLinesQuotePaths TestMediaSyncSkippedLineIsScrubbed
+mut "P2 the media-sync SKIPPED line back to a bare rel" media_span.go $'fetchEssSpan(base, key, m, r, prog)\n\t\tif err != nil {\n\t\t\tfmt.Printf("  media-sync: %q SKIPPED (%v)\\n", rel, errCode(err))' $'fetchEssSpan(base, key, m, r, prog)\n\t\tif err != nil {\n\t\t\tfmt.Printf("  media-sync: %s SKIPPED (%v)\\n", rel, err)' TestMediaLogLinesQuotePaths TestMediaSyncSkippedLineIsScrubbed
 mut "P3 markDamaged's line back to %s" media_server.go 'dlog("mediad: %q is CORRUPT' 'dlog("mediad: %s is CORRUPT' TestMediaLogLinesQuotePaths TestMediaDamagedLineIsScrubbed
 mut "P4 the recreated-dir line back to %s" mediafs.go 'dlog("mediad: recreated missing deferred dir %q", target)' 'dlog("mediad: recreated missing deferred dir %s", target)' TestMediaLogLinesQuotePaths
 mut "P5 fetchFile's damaged-chunk error back to a bare rel" media_server.go 'fmt.Errorf("mediad: %q: %w (not retrying)", rel, errDamagedChunk)' 'fmt.Errorf("mediad: %s: %w (not retrying)", rel, errDamagedChunk)' TestMediaLogLinesQuotePaths TestMediaFetchErrorQuotesItsPath

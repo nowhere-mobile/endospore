@@ -219,7 +219,7 @@ func TestMediaLander_L1_LandsARealHeadInOrder(t *testing.T) {
 					fetched = append(fetched, rel)
 				}
 			}
-			return fetchEssSpan(base, key, m, r)
+			return fetchEssSpan(base, key, m, r, nil)
 		},
 		sleep: func(time.Duration) bool { t.Error("a clean run must not sleep"); return false },
 	}

@@ -5,9 +5,11 @@ import android.content.Context;
 import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Paint;
+import android.graphics.RectF;
 import android.graphics.Typeface;
 import android.graphics.drawable.ColorDrawable;
 import android.graphics.drawable.GradientDrawable;
+import android.os.SystemClock;
 import android.util.Log;
 import android.util.TypedValue;
 import android.view.Gravity;
@@ -21,6 +23,7 @@ import android.widget.ScrollView;
 import android.widget.TextView;
 
 import java.util.List;
+import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
 import java.util.function.IntConsumer;
 
@@ -31,7 +34,9 @@ import java.util.function.IntConsumer;
  * acts; the isShowing check keeps a second queued tap from acting twice. A model that breaks a rule of PopupSheet is
  * logged by count and shown anyway. A slot sheet (NWP-20261206-05) holds the caller's view between the text and the
  * buttons and is not scrolled. A box under a picker's cards saves through its callback and never closes the sheet
- * (NWP-20261206-04).
+ * (NWP-20261206-04). A live sheet (confirmLive, NWP-20261208-28) is one Dialog whose content changes in place: a
+ * progress state with a spinner and no buttons, which Back and a touch outside do not close, then a confirmation; an
+ * action wrapped in inPlace runs without closing it, and a tap on a button a change replaced does nothing.
  */
 final class SheetDialog {
     private SheetDialog() {}
@@ -125,6 +130,43 @@ final class SheetDialog {
         return confirmSheet(ctx, m, actions, null, true);
     }
 
+    /** NWP-20261208-28: the confirm sheet as a Live sheet, whose content progress() and confirm() change in place.
+     *  actions as confirm's; an action wrapped in inPlace runs and leaves the sheet open. Returns the shown sheet, or
+     *  null for a null model. */
+    static Live confirmLive(Context ctx, PopupSheet.Confirm m, Runnable[] actions) {
+        if (m == null) {
+            warn(PopupSheet.violations(m));
+            return null;
+        }
+        Live live = new Live(ctx);
+        live.confirm(m, actions);
+        window(live.dialog, live.scroll);
+        return live;
+    }
+
+    /** NWP-20261208-28: a button action that runs without closing the sheet (for a Live sheet that changes in place). */
+    static Runnable inPlace(Runnable r) {
+        return new InPlace(r);
+    }
+
+    private static final class InPlace implements Runnable {
+        private final Runnable r;
+
+        InPlace(Runnable r) {
+            this.r = r;
+        }
+
+        @Override public void run() {
+            if (r != null) r.run();
+        }
+    }
+
+    /** confirmHeld with link lines: a line with a linkKey closes the sheet and calls onLink with the key
+     *  (NWP-20261208-22). Returns the shown sheet, or null for a null model. */
+    static Dialog confirmHeld(Context ctx, PopupSheet.Confirm m, Runnable[] actions, Consumer<String> onLink) {
+        return confirmSheet(ctx, m, actions, onLink, true);
+    }
+
     private static Dialog confirmSheet(Context ctx, PopupSheet.Confirm m, Runnable[] actions, Consumer<String> onLink,
             boolean held) {
         warn(PopupSheet.violations(m));
@@ -193,6 +235,63 @@ final class SheetDialog {
         w.setGravity(Gravity.BOTTOM);
         w.setLayout(MATCH, WRAP);
         dlg.show();
+    }
+
+    /** NWP-20261208-28: one Dialog and one panel; progress() and confirm() replace the panel's children, so the window
+     *  is set up once. Each change bumps generation, and a button of an earlier content checks it and does nothing. */
+    static final class Live {
+        private final Context ctx;
+        private final Dialog dialog;
+        private final LinearLayout panel;
+        private final ScrollView scroll;
+        private int generation;
+
+        private Live(Context ctx) {
+            this.ctx = ctx;
+            dialog = new Dialog(ctx);
+            panel = panel(ctx, GatePalette.active());
+            scroll = new ScrollView(ctx);
+            scroll.addView(panel, new ViewGroup.LayoutParams(MATCH, WRAP));
+        }
+
+        /** A spinner, the title, the context and the line, and no buttons. Back and a touch outside do not close it. */
+        void progress(PopupSheet.Progress m) {
+            warn(PopupSheet.violations(m));
+            if (m == null) return;
+            generation++;
+            dialog.setCancelable(false);
+            dialog.setCanceledOnTouchOutside(false);
+            GatePalette p = GatePalette.active();
+            panel.removeAllViews();
+            panel.addView(new SpinnerIcon(ctx, p), new LinearLayout.LayoutParams(dp(ctx, 44), dp(ctx, 44)));
+            panel.addView(title(ctx, p, m.title), topMargin(ctx, 12));
+            panel.addView(text(ctx, m.context, 14, p.muted), topMargin(ctx, 4));
+            panel.addView(line(ctx, p, new PopupSheet.Line(m.line, null), dialog, null), topMargin(ctx, 4));
+        }
+
+        /** The confirm sheet of m with actions as confirm's; Back and a touch outside close it again. */
+        void confirm(PopupSheet.Confirm m, Runnable[] actions) {
+            warn(PopupSheet.violations(m));
+            if (m == null) return;
+            final int gen = ++generation;
+            dialog.setCancelable(true);
+            dialog.setCanceledOnTouchOutside(true);
+            GatePalette p = GatePalette.active();
+            panel.removeAllViews();
+            panel.addView(toneIcon(ctx, p, m.tone));
+            panel.addView(title(ctx, p, m.title), topMargin(ctx, 12));
+            panel.addView(text(ctx, m.context, 14, p.muted), topMargin(ctx, 4));
+            for (PopupSheet.Line l : m.lines) if (l != null) panel.addView(line(ctx, p, l, dialog, null), topMargin(ctx, 4));
+            panel.addView(buttons(ctx, p, m, dialog, actions, () -> gen == generation), topMargin(ctx, 16));
+        }
+
+        boolean showing() {
+            return dialog.isShowing();
+        }
+
+        void close() {
+            if (dialog.isShowing()) dialog.dismiss();
+        }
     }
 
     private static LinearLayout panel(Context ctx, GatePalette p) {
@@ -315,6 +414,13 @@ final class SheetDialog {
 
     /** A routine sheet's buttons sit side by side; a warning's and a destructive sheet's are stacked. */
     private static View buttons(Context ctx, GatePalette p, PopupSheet.Confirm m, Dialog dlg, Runnable[] actions) {
+        return buttons(ctx, p, m, dlg, actions, null);
+    }
+
+    /** fresh: null, or false once the sheet's content was replaced, so a stale tap does nothing. An inPlace action runs
+     *  without closing the sheet; any other closes it first. */
+    private static View buttons(Context ctx, GatePalette p, PopupSheet.Confirm m, Dialog dlg, Runnable[] actions,
+            BooleanSupplier fresh) {
         boolean beside = m.tone == PopupSheet.Tone.ROUTINE;
         LinearLayout row = new LinearLayout(ctx);
         row.setOrientation(beside ? LinearLayout.HORIZONTAL : LinearLayout.VERTICAL);
@@ -324,8 +430,8 @@ final class SheetDialog {
             final Runnable action = actions != null && i < actions.length ? actions[i] : null;
             Button b = button(ctx, p, m.buttons.get(i));
             b.setOnClickListener(v -> {
-                if (!dlg.isShowing()) return;
-                dlg.dismiss();
+                if (!dlg.isShowing() || (fresh != null && !fresh.getAsBoolean())) return;
+                if (!(action instanceof InPlace)) dlg.dismiss();
                 if (action != null) action.run();
             });
             LinearLayout.LayoutParams lp = beside ? new LinearLayout.LayoutParams(0, WRAP, 1f)
@@ -383,6 +489,34 @@ final class SheetDialog {
 
     private static int dp(Context ctx, int v) {
         return Math.round(v * ctx.getResources().getDisplayMetrics().density);
+    }
+
+    /** NWP-20261208-28: a progress sheet's tone icon, a 270° arc in the accent colour that turns once every 900 ms
+     *  while it is attached (StatusLine.Spinner's arc). A change of the sheet removes it, which stops it. */
+    private static final class SpinnerIcon extends View {
+        private static final long TURN_MS = 900;
+        private final Paint arc = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final RectF box = new RectF();
+
+        SpinnerIcon(Context ctx, GatePalette p) {
+            super(ctx);
+            arc.setStyle(Paint.Style.STROKE);
+            arc.setStrokeCap(Paint.Cap.ROUND);
+            arc.setColor(p.accent);
+            setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
+        }
+
+        @Override protected void onDraw(Canvas c) {
+            float size = Math.min(getWidth(), getHeight());
+            float stroke = size * 0.12f;
+            arc.setStrokeWidth(stroke);
+            float left = (getWidth() - size) / 2f + stroke;
+            float top = (getHeight() - size) / 2f + stroke;
+            box.set(left, top, left + size - 2 * stroke, top + size - 2 * stroke);
+            float angle = (SystemClock.uptimeMillis() % TURN_MS) * 360f / TURN_MS;
+            c.drawArc(box, angle, 270f, false, arc);
+            if (isAttachedToWindow()) postInvalidateOnAnimation();
+        }
     }
 
     /** A round icon: a mini five-step scale with one step filled, or a ring when step is off the scale. */

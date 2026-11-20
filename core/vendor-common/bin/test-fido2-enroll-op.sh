@@ -7,12 +7,13 @@
 #     wrong key) leaves the phone in forced USB host mode until reboot, supplying VBUS from its battery and refusing
 #     to act as a USB device.
 #   - the passphrase reaches the agent only as `@file:` (pw), never in argv, where /proc/<pid>/cmdline shows it.
-#   - NOWHERE_FIDO2_HMAC is exported only when the stash exists: UNSET, not merely empty, otherwise a first enrolment
-#     is handed a hmac of "".
+#   - the stash's hmac reaches the agent only as a staged `@file:` (pwv, NWP-20261205-18), and only when the stash
+#     exists. With no stash, no hmac is handed: the variable is empty or unset AND no .pw.roamd.* file was staged for
+#     it, otherwise a first enrolment is handed a hmac of "". (Empty reads as absent: fido2HMAC in fido2.go.)
 #   - an empty name or passphrase answers ERR-ARGS before the agent or the USB role is touched.
 #   - the profile name reaches the log only through qn's quoting, on the success AND the failure line.
 #
-# usb_host(), pw(), qn() and the op block are extracted from nowhere_roamd.sh BY ANCHOR, never copied; if an anchor
+# usb_host(), pw(), pwv(), qn() and the op block are extracted from nowhere_roamd.sh BY ANCHOR, never copied; if an anchor
 # moves, extraction fails loudly (exit 2). THE ONE TRANSFORM, stated because a test that quietly rewrites its subject
 # is not testing it: the two absolute /sys paths of usb_host are re-rooted into a temp tree, and the suite asserts
 # that the rewrite applied.
@@ -75,7 +76,8 @@ fn(){  # fn <file> <name>: a column-0 function, from its opener to its closing c
 #   layout: ssusb = T/sys/ssusb + T/sys/typec, ssusb/mode starts "untouched"; typec = the same two dirs, only
 #   typec/data_role starts "untouched" (no ssusb/mode, so usb_host takes its typec arm); typec-only = T/sys/typec alone
 #   with data_role; none = an empty T/sys. call: op = the fido2-enroll block; on|off = a bare `usb_host <on|off>`.
-#   T/argv, T/passfile, T/hmacset, T/hmacval, T/ran are what the stub agent saw; T/res and T/log are roamd's.
+#   T/argv, T/passfile, T/hmacset, T/hmacval, T/hmacfile, T/ran are what the stub agent saw; T/res and T/log are
+#   roamd's. The stub leaves every staged file in T/state, so a case can count what was staged.
 runcase(){
   local sh="$1" layout="$2" call="$3" nm="${4-}" pw_="${5-}" rc="${6-0}" stash="${7-}" r
   T=$(mktemp -d -p "$W") || exit 2; mkdir -p "$T/state" "$T/sys"
@@ -92,7 +94,9 @@ runcase(){
 for x in "$@"; do printf '%s\n' "$x"; done > "$d/argv"
 case "$4" in @file:*) cat "${4#@file:}" > "$d/passfile" ;; esac
 printf '%s' "${NOWHERE_FIDO2_HMAC+set}" > "$d/hmacset"
-printf '%s' "${NOWHERE_FIDO2_HMAC-}" > "$d/hmacval"
+h=${NOWHERE_FIDO2_HMAC-}
+case "$h" in @file:*) f=${h#@file:}; printf '%s' "$f" > "$d/hmacfile"; h=$(cat "$f") ;; esac
+printf '%s' "$h" > "$d/hmacval"
 STUB
     printf 'exit %s\n' "$rc"
   } > "$T/agent"
@@ -102,14 +106,14 @@ STUB
   {
     printf '%s; printf "%%s|%%s\\n" "$_id" "$_pr" >> %s\n' "$IDPROBE" "$(sq "$T/shell.id")"
     printf '%s\n' "$PRINT_SHIM"
-    printf 'unset NOWHERE_FIDO2_HMAC\n'
+    printf 'unset NOWHERE_FIDO2_HMAC; _fh_v=; _se_v=\n'
     printf 'SYSROOT=%s; LOG=%s; RES=%s; STATE=%s; AGENT=%s; LANE=rw; op=fido2-enroll; name=%s; pass=%s\n' \
       "$(sq "$T/sys")" "$(sq "$T/log")" "$(sq "$T/res")" "$(sq "$T/state")" "$(sq "$T/agent")" "$(sq "$nm")" "$(sq "$pw_")"
     cat <<'STUB'
 : > "$LOG"
 sleep() { :; }
 STUB
-    printf '%s\n%s\n%s\n' "$USB_R" "$PW" "$QN"
+    printf '%s\n%s\n%s\n%s\n' "$USB_R" "$PW" "$PWV" "$QN"
     case "$call" in op) printf '%s\n' "$BLOCK" ;; *) printf 'usb_host %s\n' "$call" ;; esac
   } > "$r"
   runsh "$sh" "$r"
@@ -123,12 +127,14 @@ suite() {  # suite <roamd.sh> <shell> [quiet] -> 0 all ok, 1 a case failed, 2 th
   no() { x=$((x+1)); [ -n "$quiet" ] || printf '  FAIL  [%s] %s\n' "$s" "$1"; }
   eq() { [ "$1" = "$2" ] && ok "$3" || no "$3 (got '$1', want '$2')"; }
   USB=$(fn "$f" usb_host); PW=$(fn "$f" pw); QN=$(fn "$f" qn)
+  PWV=$(awk 'index($0, "pwv() {") == 1 { print; exit }' "$f")
   BLOCK=$(awk '
     $0 == "if [ \"$op\" = \"fido2-enroll\" ]; then" { on = 1 }
     on { print }
     on && $0 == "fi" { exit }' "$f")
   case "$USB" in *'no ssusb/typec role-switch found'*) ;; *) echo "EXTRACTION FAILED: usb_host in $f" >&2; return 2 ;; esac
   case "$PW" in *'@file:'*) ;; *) echo "EXTRACTION FAILED: pw in $f" >&2; return 2 ;; esac
+  case "$PWV" in 'pwv() {'*'pw "$1"'*) ;; *) echo "EXTRACTION FAILED: pwv in $f" >&2; return 2 ;; esac
   case "$QN" in *'sed '*) ;; *) echo "EXTRACTION FAILED: qn in $f" >&2; return 2 ;; esac
   case "$BLOCK" in *'fido2-enroll s3'*'ERR-ENROLL'*) ;; *) echo "EXTRACTION FAILED: the fido2-enroll op in $f" >&2; return 2 ;; esac
 
@@ -138,9 +144,9 @@ suite() {  # suite <roamd.sh> <shell> [quiet] -> 0 all ok, 1 a case failed, 2 th
   [ "$(printf "%s\n" "$USB_R" | grep -o SYSROOT | wc -l)" -eq 2 ] || { echo "TRANSFORM FAILED: expected both paths re-rooted" >&2; return 2; }
 
   chk=$(mktemp -p "$W") || return 2
-  printf '%s\n%s\n%s\n%s\n' "$USB_R" "$PW" "$QN" "$BLOCK" > "$chk"
+  printf '%s\n%s\n%s\n%s\n%s\n' "$USB_R" "$PW" "$PWV" "$QN" "$BLOCK" > "$chk"
   if ! bash -n "$chk" || ! "$s" -n "$chk"; then
-    echo "EXTRACTION FAILED: usb_host, pw, qn or the fido2-enroll op does not parse under $s in $f" >&2; rm -f "$chk"; return 2
+    echo "EXTRACTION FAILED: usb_host, pw, pwv, qn or the fido2-enroll op does not parse under $s in $f" >&2; rm -f "$chk"; return 2
   fi
   rm -f "$chk"
   : > "$W/notrun"; : > "$W/harness"
@@ -192,9 +198,13 @@ suite() {  # suite <roamd.sh> <shell> [quiet] -> 0 all ok, 1 a case failed, 2 th
 
   [ -n "$quiet" ] || echo "== [$s] the hmac stash =="
   runcase "$s" ssusb op alice "$SECRET" 0 "stash-hmac-77"
-  eq "$(cat "$T/hmacset")|$(cat "$T/hmacval")" "set|stash-hmac-77" "F4 stash present: the agent sees it SET and equal"; notrun "$s" "$T"; rm -rf "$T"
+  eq "$(cat "$T/hmacset")|$(cat "$T/hmacval")" "set|stash-hmac-77" "F4 stash present: the agent sees it SET and equal"
+  case "$(cat "$T/hmacfile" 2>/dev/null)" in "$T/state/.pw.roamd."*) ok "F4 stash present: the hmac came as a file staged under STATE" ;; *) no "F4 stash present: the hmac came as a file staged under STATE (got '$(cat "$T/hmacfile" 2>/dev/null)')" ;; esac
+  notrun "$s" "$T"; rm -rf "$T"
   runcase "$s" ssusb op alice "$SECRET" 0
-  eq "$(cat "$T/hmacset")" "" "F4 no stash: NOWHERE_FIDO2_HMAC is NOT SET (empty is not enough)"; notrun "$s" "$T"; rm -rf "$T"
+  eq "$(cat "$T/hmacval")|$([ -e "$T/hmacfile" ] && echo file)|$(find "$T/state" -name '.pw.roamd.*' | wc -l | tr -d ' ')" "||1" \
+    "F4 no stash: no hmac is handed (empty or unset, and no file staged for it: one staged file, the passphrase's)"
+  notrun "$s" "$T"; rm -rf "$T"
 
   [ -n "$quiet" ] || echo "== [$s] the name in the log =="
   NM='a b"c'; TOK='"a b\"c"'
@@ -248,8 +258,12 @@ if [ "$MUTATE" = yes ]; then
     "$R { /^  usb_host off\$/d; s/; echo \"OK\" > \"\\\$RES\"\$/&; usb_host off/; }"
   mutate "passphrase passed in argv instead of by file" \
     "$R s/\"\\\$(pw \"\\\$pass\")\"/\"\\\$pass\"/"
-  mutate "hmac stash guard dropped (variable set to empty)" \
-    "$R s/\\[ -f \"\\\$STATE\\/.fido2hmac\" \\] && export/export/"
+  # retired (NWP-20261205-18): "hmac stash guard dropped". An unguarded _fh_v is empty with no stash, pwv stages
+  # nothing, so empty and absent are the same by design (fido2HMAC reads empty as absent): an equivalent mutant.
+  mutate "hmac staged even when empty (pwv -> pw)" \
+    "$R s/\"\\\$(pwv \"\\\$_fh_v\")\"/\"\\\$(pw \"\\\$_fh_v\")\"/"
+  mutate "hmac passed raw, not staged" \
+    "$R s/\"\\\$(pwv \"\\\$_fh_v\")\"/\"\\\$_fh_v\"/"
   mutate "ERR-ARGS guard removed" "$R { /ERR-ARGS/d; }"
   mutate "ssusb off value is host" '/^usb_host() {$/,/^}$/ s/echo peripheral > "\$m"/echo host > "$m"/'
   mutate "typec off value is host" '/^usb_host() {$/,/^}$/ s/echo device > "\$t"/echo host > "$t"/'

@@ -3,7 +3,7 @@ package com.nowhere.chooser;
 /**
  * The words and the mappings of the gate's Help combo screen (NWP-20261130-11; chosen by Chester on 2026-11-06, "Go with
  * combo", NWP-20261105-27). GateHelpScreen draws them. The tiles open the gate's own pages (GateHelpPages) and three
- * short pages here. A session topic's short page says where it is in Profile › Help, so the split of decision 2026-11-02
+ * short pages here, in place, as step cards (GateHelpTopic, NWP-20261208-26). A session topic's short page says where it is in Profile › Help, so the split of decision 2026-11-02
  * stays: GateHelpPages keeps its four pages, and Profile › Help keeps HelpPages.
  *
  * B4 (decision 2026-10-31, Part B): a line says what a feature is and how to use it, never what it protects;
@@ -19,7 +19,7 @@ final class GateHelpHome {
     /** The art kinds GateHelpArtView draws. */
     static final int ART_HERO = 0, ART_ANY_PHONE = 1, ART_SAVING = 2, ART_LOCK = 3;
 
-    static final String HERO_TITLE = "How Nowhere works";
+    static final String HERO_TITLE = "How nowhere works";
     static final String HERO_BODY = "Sign in on any phone and your profile comes down from your store.";
     // GateHelpArtView draws these under the hero's first three pictures; the fourth, the check, has no label.
     static final String[] HERO_NODES = { "This phone", "Your store", "Any phone" };
@@ -33,12 +33,16 @@ final class GateHelpHome {
     static final String DONE = "Done";
     static final String SKIP = "Skip";
     static final String SKIP_DESCRIPTION = "Skip the intro";
+    // The link under a topic's last card, before the related page's title (approved 2026-11-17, NWP-20261116-48).
+    static final String ALSO_SEE = "Also see: ";
+    // A tile's and the Forgot card's chevron: ProfileActivity.sectionCard's. It turns while the topic is open.
+    static final String CHEVRON = "›";
 
     // One row per step: the title, then its two lines.
     static final String[][] INTRO = {
         { "Your profile on any phone",
             // ChooserActivity: field("profile"), field("passphrase")
-            "Sign in on any Nowhere phone with your name and passphrase.",
+            "Sign in on any nowhere phone with your name and passphrase.",
             "Your profile comes down from your store." },
         { "Saving",
             // HelpPages page 2: "Profile › Your data: your profile saves to your store automatically while you use it."
@@ -66,7 +70,7 @@ final class GateHelpHome {
 
     // A tile's GateHelpPages page, or -1 for a short page below.
     private static final int[] TILE_PAGE = { 0, -1, -1, 3, -1, 2 };
-    // The GateHelpPages page a tile's dialog also opens, or -1. Gate settings has no tile of its own in the chosen six.
+    // The GateHelpPages page a tile's topic also opens, or -1. Gate settings has no tile of its own in the chosen six.
     private static final int[] TILE_ALSO = { 1, -1, -1, -1, -1, -1 };
     // A short page: one String per step, as GateHelpPages.
     private static final String[][] SHORT_PAGES = {
@@ -140,15 +144,20 @@ final class GateHelpHome {
 
     /** The body of the page tile i opens, a blank line between steps. An index outside the six tiles throws. */
     static String tileBody(int i) {
-        return TILE_PAGE[i] >= 0 ? GateHelpPages.body(TILE_PAGE[i]) : String.join("\n\n", SHORT_PAGES[i]);
+        return String.join("\n\n", tileSteps(i));
     }
 
-    /** The GateHelpPages page tile i's dialog also opens, or -1. */
+    /** The steps of the page tile i opens, a copy, one a card. An index outside the six tiles throws. */
+    static String[] tileSteps(int i) {
+        return TILE_PAGE[i] >= 0 ? GateHelpPages.steps(TILE_PAGE[i]) : SHORT_PAGES[i].clone();
+    }
+
+    /** The GateHelpPages page tile i's topic also opens, or -1. */
     static int tileAlso(int i) {
         return TILE_ALSO[i];
     }
 
-    /** The label of that dialog button, or null. */
+    /** The title of that page, or null. */
     static String alsoLabel(int i) {
         return TILE_ALSO[i] < 0 ? null : GateHelpPages.TITLES[TILE_ALSO[i]];
     }
@@ -161,5 +170,26 @@ final class GateHelpHome {
     /** The page the Forgot card opens. It holds no profile name and no secret. */
     static String forgotBody() {
         return String.join("\n\n", FORGOT_STEPS);
+    }
+
+    /** The steps of that page, a copy, one a card. */
+    static String[] forgotSteps() {
+        return FORGOT_STEPS.clone();
+    }
+
+    /** The link under tile i's last card: ALSO_SEE and the related page's title, or null when it has none. */
+    static String alsoLine(int i) {
+        String label = alsoLabel(i);
+        return label == null ? null : ALSO_SEE + label;
+    }
+
+    /** The open topic after a tap on topic tapped: a tap on the open one closes it (-1), any other opens it. */
+    static int toggle(int open, int tapped) {
+        return tapped == open ? -1 : tapped;
+    }
+
+    /** A chevron's rotation in degrees: turned down while its topic is open, else pointing right. */
+    static float chevronRotation(boolean open) {
+        return open ? 90f : 0f;
     }
 }

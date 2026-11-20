@@ -67,7 +67,7 @@ build() {
     printf 'op=seedssaid; name=x; uid=11; sesec=%s\n' "$KEY64"
     cat <<'EOF_STUBS'
 LOG="$ROOT/roam.log"; RES="$ROOT/res"
-_ms() { echo 0; }; chown() { :; }; restorecon() { :; }
+_ms() { echo 0; }; chown() { :; }; restorecon() { :; }; ssaid_census() { :; }
 if ! command -v print >/dev/null 2>&1; then
   print() {  # mksh's builtin, as the arm uses it: print -rn --
     local nl=1

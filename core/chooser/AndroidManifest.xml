@@ -1,8 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.nowhere.chooser"
-    android:versionCode="704"
-    android:versionName="9.39">
+    android:versionCode="724"
+    android:versionName="9.59">
   <uses-sdk android:minSdkVersion="24" android:targetSdkVersion="34"/>
   <!-- #747 (DIA-20260818-08): the storefront UI now lives in its OWN package (nApps) so it appears in
        Settings > Apps as its own app. It cannot talk to the login daemon: the daemon pins the first peer's
@@ -75,6 +75,15 @@
        directly on Developer options -> OEM unlocking, instead of the 7-tap Build-number ritual. signature
        protection -> granted via our platform signature, same route as MANAGE_APP_OPS_MODES above. -->
   <uses-permission android:name="android.permission.WRITE_SECURE_SETTINGS"/>
+  <!-- NWP-20261208-20 (h45 #1): the gate counts and removes a fingerprint or face enrolled in user 0
+       (GateBiometricRemove: getEnrolledFingerprints / getEnrolledFaces, removeAll / remove). Signature-level
+       (signature or signature|privileged), granted by our platform certificate. The chooser is not a priv-app
+       (core/vendor-common/Android.bp NowhereChooser has no privileged: true), so no privapp-permissions entry is
+       needed; the #70 change that adds privileged: true must add one for these three. Which one each biometric
+       service checks is the merger's handset read (dumpsys package com.nowhere.chooser shows all three granted). -->
+  <uses-permission android:name="android.permission.MANAGE_FINGERPRINT"/>
+  <uses-permission android:name="android.permission.MANAGE_BIOMETRIC"/>
+  <uses-permission android:name="android.permission.USE_BIOMETRIC_INTERNAL"/>
   <!-- Logout reboots (the ephemeral roamed user auto-wipes on boot + the gate returns). -->
   <uses-permission android:name="android.permission.REBOOT"/>
   <!-- L4: briefly wake the screen on the logoff reap so the gate repaints after an idle / failed-attempt
@@ -127,6 +136,10 @@
        argv. -->
   <uses-permission android:name="android.permission.TETHER_PRIVILEGED"/>
   <uses-permission android:name="android.permission.NETWORK_SETTINGS"/>
+  <!-- NWP-20261210-17: NetPolicyReceiver removes netpolicy's Wi-Fi-template policies through NetworkPolicyManager
+       (docs/product-decisions.md 2026-11-14, G06). MANAGE_NETWORK_POLICY is a signature permission, granted by the
+       platform certificate. -->
+  <uses-permission android:name="android.permission.MANAGE_NETWORK_POLICY"/>
   <!-- Scanned-network picker (DIA-45): NEARBY_WIFI_DEVICES lets getScanResults() return SSIDs without the
        location toggle (neverForLocation = we don't derive location from it). Runtime perm, self-granted by
        the device owner. Best-effort: without it the scan returns empty and the manual SSID field still works. -->
@@ -250,6 +263,13 @@
        bound to no profile. -->
   <uses-permission android:name="android.permission.SEND_SMS"/>
   <uses-permission android:name="android.permission.CALL_PHONE"/>
+  <!-- NWP-20261210-11, R0 (docs/call-relay.md section 14): the debug-only call-relay spike, CallRelaySpikeReceiver.
+       CALL_AUDIO_INTERCEPTION (signature|privileged|role) is granted by the platform certificate; no privapp entry,
+       because the chooser is not privileged. MODIFY_AUDIO_SETTINGS is for setMode and setMicrophoneMute. RECORD_AUDIO
+       is declared only so the run procedure can `pm grant` it on a userdebug build; nothing grants it on a user build. -->
+  <uses-permission android:name="android.permission.CALL_AUDIO_INTERCEPTION"/>
+  <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS"/>
+  <uses-permission android:name="android.permission.RECORD_AUDIO"/>
   <!-- NWP-20261001-05: DEVICE_POWER (signature|role; granted because the chooser is platform-signed) lets
        ensurePushDozeExemption keep sandboxed Play services on the Doze allow-list by appId (PowerExemptionManager
        getAllowListedAppIds, removeFromPermanentAllowList, addToPermanentAllowList), so FCM push - and a WhatsApp
@@ -407,6 +427,13 @@
     <activity android:name=".LastSaveNoticeActivity" android:exported="false"
               android:theme="@android:style/Theme.Material.Dialog.NoActionBar"
               android:excludeFromRecents="true"/>
+    <!-- NWP-20261207-12 (Q106 S6b, O3): the one-line media card a sign-in shows when its background media set is over
+         200 files or 50 MiB and no Auto sweep card is open. Started by MediaLandingNoticeActivity.check from
+         UnarchiveService's switch-landing start, once per sign-in. At the bottom of the screen. Dismissible, not
+         pinned; excluded from recents. -->
+    <activity android:name=".MediaLandingNoticeActivity" android:exported="false"
+              android:theme="@android:style/Theme.Material.Dialog.NoActionBar"
+              android:excludeFromRecents="true"/>
     <!-- NWP-20261202-22 (2026-11-10, item 1): the one-time "Finish setting up Google Play" card of a profile created
          with Play on. Started by PlayFinishActivity.check from UnarchiveService's switch-landing start. Dismissible,
          not pinned; excluded from recents. Not exported: only the chooser's own process starts it. -->
@@ -548,6 +575,8 @@
     <receiver android:name=".OdDataAddedReceiver" android:exported="false"/>
     <!-- NWP-20261028-08: roamd releases a session's hotspot here by explicit component; no intent-filter. -->
     <receiver android:name=".HotspotReceiver" android:exported="false"/>
+    <!-- NWP-20261210-17: roamd resets netpolicy's Wi-Fi templates here by explicit component, as root; no intent-filter. -->
+    <receiver android:name=".NetPolicyReceiver" android:exported="false"/>
     <!-- #204 on-demand apps: the OS routes ACTION_UNARCHIVE_PACKAGE to the installer of record (us) IN THE
          ROAMED user when the user taps an archived placeholder. This receiver materialises the app's deferred
          APK bytes (MATERIALIZE-APP) then installs them, completing the unarchival. Exported because the system
@@ -596,6 +625,9 @@
     <!-- NWP-20261119-21: applies, in user 0, a Security-screen idle or wipe change the running session saved. Not
          exported: only the chooser sends it, from its own process in the foreground user. -->
     <receiver android:name=".PrefsLiveReceiver" android:exported="false"/>
+    <!-- NWP-20261210-11, R0: the debug-only call-relay spike. Not exported and no intent-filter, so only root or the
+         chooser itself can reach it; it refuses the verb unless ro.debuggable=1. -->
+    <receiver android:name=".CallRelaySpikeReceiver" android:exported="false"/>
     <!-- NWP-20261127-07: takes, in user 0, the choice made on the session's blocked-encrypted-DNS dialog to
          PrivateDnsWatch's Gate. Not exported: only the chooser sends it, from its own process in the foreground user. -->
     <receiver android:name=".PrivateDnsChoiceReceiver" android:exported="false"/>

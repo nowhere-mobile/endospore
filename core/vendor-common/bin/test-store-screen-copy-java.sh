@@ -9,7 +9,7 @@
 # no-store strings are byte-identical to before; isError only for the key-set state) and pins that the store screen's
 # GET-STORE thread renders through StoreScreenCopy with managed= and holds neither old literal itself.
 # NWP-20261124-16 (decision #15, 2026-11-02, option A): a managed phone still showed empty S3 fields, Save store and
-# Test connection under "This phone saves to the managed Nowhere store.", so the owner could save an endpoint over the
+# Test connection under "This phone saves to the managed nowhere store.", so the owner could save an endpoint over the
 # managed configuration. StoreScreenCopy.showS3Fields / subtitle now decide it; run.sh pins that the GET-STORE thread
 # hides the four plain fields, the secret's reveal wrapper, Save store and Test connection and sets the managed subtitle
 # when showS3Fields(managed) is false, and that the initial build still shows every field (first run is unchanged).

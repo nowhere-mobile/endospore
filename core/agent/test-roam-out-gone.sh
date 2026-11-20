@@ -41,7 +41,7 @@ PY
   else echo "  SURVIVED  $label -- no --- FAIL with: ${missing:-the assertions named}"; fails=$((fails+1)); fi
   cp -f "$W/orig" "$P/main.go"
 }
-LOGOUT='if name == "LOGOUT" {\n\t\tcaptureWifiMirror(dest)'
+LOGOUT='if name == "LOGOUT" {\n\t\thandleLogout(conn, dest)'
 mut "M1 the arm restored" "$LOGOUT" 'if name == "ROAM-OUT" {\n\t\tfmt.Fprint(conn, "OK\\n")\n\t\treturn\n\t}\n\t' 'handleLogin still dispatches "ROAM-OUT"' 'ROAM-OUT reply "OK", want BLANK'
 mut "M2 the handler back" 'func rebootNow(reason string) {' 'func handleRoamOut(conn net.Conn, dest string) {}\n\n' 'main.go still names handleRoamOut'
 mut "M3 a hidden arm ends the session" "$LOGOUT" 'if name == "ROAM"+"-OUT" {\n\t\tos.Remove(filepath.Join(dest, ".roamsession"))\n\t\tfmt.Fprint(conn, "BLANK\\n")\n\t\treturn\n\t}\n\t' 'the live session marker did not survive'

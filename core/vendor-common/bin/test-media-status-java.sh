@@ -26,6 +26,10 @@
 # body reads WAITING_BODY, B5 the line in writeProg, and F1 that WAITING_BODY is the O3 words of
 # docs/product-decisions.md.
 #
+# NWP-20261208-09: the watcher holds the landed rescan while GET-SWEEP reports a live Auto sweep, capped at
+# RESCAN_SWEEP_CAP_MS (60 min). Cases H1-H10 and C1 run MediaStatus.holdRescanForSweep; E2 and E7-E9 pin the
+# watcher's hold, its single requestMediaRescan call and both resets; E10 pins the premise in auto_sweep.go and main.go.
+#
 # ⚠ IT FAILS WHEN THERE IS NO JAVAC, IT NEVER SKIPS.
 #
 #   bash test-media-status-java.sh            # the cases and the source checks
@@ -45,6 +49,7 @@ SUT="${MEDIA_STATUS_SRC:-$SRC/MediaStatus.java}"
 CHOOSER="$SRC/ChooserActivity.java"
 MEDIA_GO="$root/core/agent/media_server.go"
 MAIN_GO="$root/core/agent/main.go"
+SWEEP_GO="$root/core/agent/auto_sweep.go"
 DECISIONS="$root/docs/product-decisions.md"
 CASES="$root/core/chooser/tests/media-status/MediaStatusCases.java"
 HOST_JDK=/mnt/build/lineage/prebuilts/jdk/jdk21/linux-x86/bin
@@ -93,12 +98,12 @@ has() {
   return 1
 }
 
-# source_check <ChooserActivity.java> <media_server.go> <main.go> <product-decisions.md> -> 0 when the wiring holds,
-# 1 otherwise.
+# source_check <ChooserActivity.java> <media_server.go> <main.go> <product-decisions.md> <auto_sweep.go> -> 0 when the
+# wiring holds, 1 otherwise.
 source_check() {
-  local chooser="$1" mediago="$2" maingo="$3" decisions="$4" code body raw bad=0
+  local chooser="$1" mediago="$2" maingo="$3" decisions="$4" sweepgo="$5" code body raw nb bad=0
   command -v perl >/dev/null 2>&1 || { echo "  FAIL  no perl: the comment-stripped source checks cannot run" >&2; return 1; }
-  [ -f "$chooser" ] && [ -f "$mediago" ] && [ -f "$maingo" ] && [ -f "$decisions" ] \
+  [ -f "$chooser" ] && [ -f "$mediago" ] && [ -f "$maingo" ] && [ -f "$decisions" ] && [ -f "$sweepgo" ] \
     || { echo "  FAIL  a source file is missing" >&2; return 1; }
 
   # (a) the watcher reads every line and routes them through MediaStatus.
@@ -188,16 +193,41 @@ source_check() {
   # session user; the daemon relays media.landed; materialize raises the counter after a run that landed files.
   code=$(strip_java "$chooser")
   body=$(printf '%s\n' "$code" | awk '/private void startSyncStatusWatcher\(\) \{/ { on = 1 } on { print } on && /^    }$/ { exit }')
+  nb=$(tr -s ' \n' '  ' <<<"$body")
   has E1 'the watcher does not poll GET-MEDIA-LANDED' "$body" 'pollDaemon("GET-MEDIA-LANDED\n")' || bad=1
-  has E2 'the watcher does not start the rescan through MediaStatus.rescanAfterLanding' \
-    "$body" 'if (MediaStatus.rescanAfterLanding(landedSeen, landedReply)) requestMediaRescan(app, uid,' || bad=1
-  has E3 'the watcher does not reset its count for a new session' "$body" 'if (uid != landedUid) { landedUid = uid; landedSeen = "0"; }' || bad=1
+  # NWP-20261208-09: a landing is held (rescanHeld), not started at once; the hold asks GET-SWEEP each tick.
+  has E2 'a landing does not set the held rescan through MediaStatus.rescanAfterLanding' \
+    "$nb" 'if (MediaStatus.rescanAfterLanding(landedSeen, landedReply)) { rescanHeld = MediaStatus.landed(landedReply);' \
+    || bad=1
+  has E3 'the watcher does not reset its count for a new session' "$nb" 'if (uid != landedUid) { landedUid = uid; landedSeen = "0";' \
+    || bad=1
+  has E7 'the held rescan does not poll GET-SWEEP' "$nb" 'String sw = pollDaemon("GET-SWEEP\n");' || bad=1
+  has E7 'the held rescan does not decide with MediaStatus.holdRescanForSweep on the GET-SWEEP reply and the cap' \
+    "$nb" 'MediaStatus.holdRescanForSweep(sw, heldMs, MediaStatus.RESCAN_SWEEP_CAP_MS)' || bad=1
+  local rq='requestMediaRescan(' hr='MediaStatus.holdRescanForSweep(' rest n pre ih irq
+  rest=${nb//"$rq"/}; n=$(( (${#nb} - ${#rest}) / ${#rq} ))
+  if [ "$n" -ne 1 ]; then
+    echo "  FAIL  E8 the watcher calls requestMediaRescan( $n times, want exactly 1" >&2; bad=1
+  fi
+  has E8 'the watcher does not start the held rescan with requestMediaRescan(app, uid, rescanHeld)' \
+    "$nb" 'requestMediaRescan(app, uid, rescanHeld);' || bad=1
+  if [[ $nb == *"$hr"* && $nb == *"$rq"* ]]; then
+    pre=${nb%%"$hr"*}; ih=${#pre}
+    pre=${nb%%"$rq"*}; irq=${#pre}
+    if ! [ "$ih" -lt "$irq" ]; then
+      echo "  FAIL  E8 requestMediaRescan( comes before MediaStatus.holdRescanForSweep(" >&2; bad=1
+    fi
+  fi
+  has E9 'the gate branch does not clear the held rescan' "$nb" 'landedUid = -1; rescanHeld = null; rescanHeldSince = -1;' \
+    || bad=1
+  has E9 'a new session does not clear the held rescan' \
+    "$nb" 'if (uid != landedUid) { landedUid = uid; landedSeen = "0"; rescanHeld = null; rescanHeldSince = -1; }' || bad=1
   local rmr
   rmr=$(printf '%s\n' "$code" \
     | awk '/private static void requestMediaRescan\(Context app, int uid, String count\) \{/ { on = 1 } on { print } on && /^    }$/ { exit }')
   rmr=$(tr -s ' \n' '  ' <<<"$rmr")
   has E4 'requestMediaRescan does not start CredentialService rescanmedia as the session user' \
-    "$rmr" 'app.startServiceAsUser( new android.content.Intent(app, CredentialService.class).putExtra("rescanmedia", true), android.os.UserHandle.of(uid));' || bad=1
+    "$rmr" 'app.startServiceAsUser( new android.content.Intent(app, CredentialService.class).putExtra(ScanNetHold.EXTRA_LANDED, true).putExtra("rescanmedia", true), android.os.UserHandle.of(uid));' || bad=1
   raw=$(awk '/^\tif name == "GET-MEDIA-LANDED" \{/ { on = 1 } on { print } on && /^\t}$/ { exit }' "$maingo")
   body=$(strip_go <<<"$raw")
   has E5 'the daemon has no GET-MEDIA-LANDED arm reading mediaLandedFile' "$body" 'filepath.Join(dest, mediaLandedFile)' || bad=1
@@ -205,13 +235,22 @@ source_check() {
   body=$(strip_go <<<"$raw")
   has E6 'materialize does not raise the landed counter after a run that landed files' \
     "$body" 'bumpMediaLanded(s.stateDir, label+" materialize")' || bad=1
+  # NWP-20261208-09, the premise: GET-SWEEP answers "LIVE <s>" or "NONE" and is on the lock-free list.
+  raw=$(awk '/^func handleGetSweep\(conn net\.Conn\) \{/ { on = 1 } on { print } on && /^}$/ { exit }' "$sweepgo")
+  body=$(strip_go <<<"$raw")
+  has E10 'handleGetSweep does not write "LIVE <seconds>\n" while the lease is live' \
+    "$body" 'fmt.Fprintf(conn, "LIVE %d\n", int(age.Seconds()))' || bad=1
+  has E10 'handleGetSweep does not write "NONE\n" otherwise' "$body" 'fmt.Fprint(conn, "NONE\n")' || bad=1
+  raw=$(awk '/^func concurrentSafeCmd\(name string\) bool \{/ { on = 1 } on { print } on && /^}$/ { exit }' "$maingo")
+  body=$(strip_go <<<"$raw")
+  has E10 'GET-SWEEP is not on the lock-free list (concurrentSafeCmd)' "$body" '"GET-SWEEP",' || bad=1
 
   [ "$bad" -eq 0 ]
 }
 
 echo "== $SUT"
 suite "$SUT" || { echo "FAILED"; exit 1; }
-source_check "$CHOOSER" "$MEDIA_GO" "$MAIN_GO" "$DECISIONS" || { echo "FAILED (source)"; exit 1; }
+source_check "$CHOOSER" "$MEDIA_GO" "$MAIN_GO" "$DECISIONS" "$SWEEP_GO" || { echo "FAILED (source)"; exit 1; }
 echo "source: ok"
 [ "$MUTATE" = yes ] || exit 0
 
@@ -230,18 +269,19 @@ mut() { # mut <label> <perl-expr>   (mutates MediaStatus.java; the cases must fa
     *) echo "  BROKEN    $1 -- the mutant did not compile (rc=$rc)"; return 1 ;;
   esac
 }
-mutsrc() { # mutsrc <label> <chooser|media|main|decisions> <perl-expr>   (mutates one source copy; the source check must fail)
-  local label="$1" kind="$2" expr="$3" d orig c rc ch="$CHOOSER" md="$MEDIA_GO" mn="$MAIN_GO" dc="$DECISIONS"
+mutsrc() { # mutsrc <label> <chooser|media|main|decisions|sweep> <perl-expr>   (mutates one source copy; the source check must fail)
+  local label="$1" kind="$2" expr="$3" d orig c rc ch="$CHOOSER" md="$MEDIA_GO" mn="$MAIN_GO" dc="$DECISIONS" sw="$SWEEP_GO"
   case "$kind" in
     chooser) orig="$CHOOSER" ;; media) orig="$MEDIA_GO" ;; main) orig="$MAIN_GO" ;; decisions) orig="$DECISIONS" ;;
+    sweep) orig="$SWEEP_GO" ;;
     *) echo "  ERROR     $label -- unknown source kind $kind"; return 1 ;;
   esac
   d=$(mktemp -d -p "$W") || return 1; c="$d/$(basename "$orig")"
   cp "$orig" "$c"
   if ! perl -0pi -e "$expr" "$c"; then echo "  ERROR     $label -- perl failed on the mutation"; rm -rf "$d"; return 1; fi
   if cmp -s "$orig" "$c"; then echo "  INERT     $label -- the mutation changed nothing"; rm -rf "$d"; return 1; fi
-  case "$kind" in chooser) ch="$c" ;; media) md="$c" ;; main) mn="$c" ;; decisions) dc="$c" ;; esac
-  source_check "$ch" "$md" "$mn" "$dc" >/dev/null 2>&1; rc=$?
+  case "$kind" in chooser) ch="$c" ;; media) md="$c" ;; main) mn="$c" ;; decisions) dc="$c" ;; sweep) sw="$c" ;; esac
+  source_check "$ch" "$md" "$mn" "$dc" "$sw" >/dev/null 2>&1; rc=$?
   rm -rf "$d"
   if [ "$rc" -eq 0 ]; then echo "  SURVIVED  $label"; return 1; fi
   echo "  convicted $label"
@@ -293,11 +333,10 @@ mut "R18 rescanAfterLanding fires on a 0 count (case L10)" 's/now != null && !no
 mut "R19 rescanAfterLanding fires on an unchanged count (case L9)" 's/ && !now\.equals\(seen\);/;/' || fails=$((fails+1))
 mut "R20 landed accepts a negative (case L7)" "s/if \\(c < '0' \\|\\| c > '9'\\) return null;/if ((c < '0' || c > '9') \\&\\& c != '-') return null;/" \
   || fails=$((fails+1))
-mutsrc "R21 the watcher never starts the rescan (E2)" chooser \
-  's/if \(MediaStatus\.rescanAfterLanding\(landedSeen, landedReply\)\) requestMediaRescan\(app, uid, MediaStatus\.landed\(landedReply\)\);//' \
-  || fails=$((fails+1))
+mutsrc "R21 the watcher never starts the held rescan (E8)" chooser \
+  's/\n\s*requestMediaRescan\(app, uid, rescanHeld\);//' || fails=$((fails+1))
 mutsrc "R22 requestMediaRescan starts the service as user 0 (E4)" chooser \
-  's/(putExtra\("rescanmedia", true\),\s*)android\.os\.UserHandle\.of\(uid\)/$1android.os.UserHandle.SYSTEM/' || fails=$((fails+1))
+  's/(EXTRA_LANDED, true\)\.putExtra\("rescanmedia", true\),\s*)android\.os\.UserHandle\.of\(uid\)/$1android.os.UserHandle.SYSTEM/' || fails=$((fails+1))
 mutsrc "R23 materialize no longer raises the counter (E6)" media \
   's/\n\s*bumpMediaLanded\(s\.stateDir, label\+" materialize"\)[^\n]*//' || fails=$((fails+1))
 # NWP-20261207-11: the RESTORE-WAITING slot, restoreWaiting, the watcher's argument, the body and the O3 words.
@@ -312,4 +351,19 @@ mutsrc "R29 the RESTORE-WAITING token is misspelt (B5)" media 's/"RESTORE-WAITIN
   || fails=$((fails+1))
 mutsrc "R30 the O3 words change (F1)" decisions \
   's/\*"Waiting for a network"\* while parked/*"Waiting for network"* while parked/' || fails=$((fails+1))
+# NWP-20261208-09: the hold behind the Auto sweep, its cap, the watcher's wiring and the GET-SWEEP premise.
+mut "R31 any non-empty reply holds (case H3)" \
+  's/(String v = sweepReply\.trim\(\);)/$1\n        if (!v.isEmpty()) return true;/' || fails=$((fails+1))
+mut "R32 the cap is ignored (case H8)" 's/ \|\| heldMs >= capMs\) return false;/) return false;/' || fails=$((fails+1))
+mut "R33 the cap admits heldMs == capMs (case H8)" 's/heldMs >= capMs/heldMs > capMs/' || fails=$((fails+1))
+mut "R34 a negative held time holds (case H10)" 's/ \|\| heldMs < 0 \|\|/ ||/' || fails=$((fails+1))
+mutsrc "R35 the watcher passes NONE, not the GET-SWEEP reply (E7)" chooser \
+  's/holdRescanForSweep\(sw, /holdRescanForSweep("NONE", /' || fails=$((fails+1))
+mutsrc "R36 the old direct call on landing is restored (E2, E8)" chooser \
+  's/if \(MediaStatus\.rescanAfterLanding\(landedSeen, landedReply\)\) \{/if (MediaStatus.rescanAfterLanding(landedSeen, landedReply)) requestMediaRescan(app, uid, MediaStatus.landed(landedReply));\n                if (false) {/' \
+  || fails=$((fails+1))
+mutsrc "R37 a new session keeps the held rescan (E9)" chooser \
+  's/landedSeen = "0"; rescanHeld = null; /landedSeen = "0"; /' || fails=$((fails+1))
+mutsrc "R38 handleGetSweep writes SWEEP, not LIVE (E10)" sweep 's/"LIVE %d\\n"/"SWEEP %d\\n"/' || fails=$((fails+1))
+mut "R39 the cap is 24 hours (case C1)" 's/60L \* 60 \* 1000/24L * 60 * 60 * 1000/' || fails=$((fails+1))
 [ "$fails" -eq 0 ] && echo "== all mutations convicted" || { echo "== $fails mutation(s) not convicted"; exit 1; }

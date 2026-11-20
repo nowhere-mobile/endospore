@@ -29,7 +29,7 @@ final class HelpPages {
     // One String per step; a step holds no line break. body() puts a blank line between steps.
     private static final String[][] STEPS = {
         { // page 0: Your profile on any phone
-            "Sign in on any Nowhere phone with your profile name and passphrase.",
+            "Sign in on any nowhere phone with your profile name and passphrase.",
             "The apps you keep come back with you. Choose them in Profile › Preferences › Your apps.",
             "Profile › Security › Use a security key: add a key that you touch when you sign in.",
             "Profile › Security › Tie to this phone: choose whether this phone's security chip is needed to open your "

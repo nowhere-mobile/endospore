@@ -19,7 +19,10 @@ import java.util.Locale;
  * button is the safe way out and the risky choice is red-outlined. Destructive: a red filled button, then an outlined
  * "Keep ...". Plain information is the routine tone with one "Got it". A failure the user can only acknowledge is the
  * warning tone with one green "Got it" and nothing else (Chester, 2026-11-15, NWP-20261206-08: "3301 amber"); it has no
- * risky choice to outline in red. A lone "Got it" is never destructive.
+ * risky choice to outline in red. A warning whose green button retries the same action may have an outlined Not now
+ * and no red-outlined risk (NWP-20261208-28): the Confirm says so with retry. A lone "Got it" is never destructive.
+ * A progress sheet (Progress) is the routine tone with no buttons: a title that ends in "…", one context sentence and
+ * one line; SheetDialog.Live shows it, then changes it in place to the result (NWP-20261208-28).
  *
  * Pure java.util so a javac suite can compile it off the build host (core/vendor-common/bin/test-popup-sheet-java.sh).
  */
@@ -46,6 +49,7 @@ final class PopupSheet {
     static final String R_DESTRUCTIVE_ORDER = "a destructive sheet needs one red filled button first, then an outlined \"Keep ...\"";
     static final String R_GOT_IT_TONE = "a lone \"Got it\" is only for the routine or the warning tone";
     static final String R_TWO_CURRENT = "a picker has more than one current option";
+    static final String R_PROGRESS = "a progress sheet needs a title ending in …, one context sentence and one line";
 
     /** One card of a picker. */
     static final class Option {
@@ -114,13 +118,33 @@ final class PopupSheet {
         final String context;
         final List<Line> lines;
         final List<Button> buttons;
+        /** The green button retries the action that failed; see violations(Confirm). */
+        final boolean retry;
 
         Confirm(Tone tone, String title, String context, List<Line> lines, List<Button> buttons) {
+            this(tone, title, context, lines, buttons, false);
+        }
+
+        Confirm(Tone tone, String title, String context, List<Line> lines, List<Button> buttons, boolean retry) {
             this.tone = tone;
             this.title = title;
             this.context = context;
             this.lines = copy(lines);
             this.buttons = copy(buttons);
+            this.retry = retry;
+        }
+    }
+
+    /** A sheet that shows work in progress: the routine tone, no buttons. */
+    static final class Progress {
+        final String title;
+        final String context;
+        final String line;
+
+        Progress(String title, String context, String line) {
+            this.title = title;
+            this.context = context;
+            this.line = line;
         }
     }
 
@@ -161,6 +185,22 @@ final class PopupSheet {
         return out;
     }
 
+    /** One fixed reason per breach of a progress sheet's rules; empty when it has none. Never throws. */
+    static List<String> violations(Progress p) {
+        List<String> out = new ArrayList<>();
+        if (p == null) {
+            out.add(R_EMPTY);
+            return out;
+        }
+        ampersand(p.title, out);
+        ampersand(p.context, out);
+        ampersand(p.line, out);
+        if (p.title == null || !p.title.endsWith("…") || p.context == null || p.context.isEmpty()
+                || p.line == null || p.line.isEmpty())
+            out.add(R_PROGRESS);
+        return out;
+    }
+
     /** One fixed reason per breach of a confirmation's rules; empty when it has none. Never throws. */
     static List<String> violations(Confirm c) {
         List<String> out = new ArrayList<>();
@@ -182,9 +222,13 @@ final class PopupSheet {
         // A warning notice: one green "Got it" and no other button. It answers the warning rule (NWP-20261206-08).
         boolean warningNotice = c.tone == Tone.WARNING && buttons.size() == 1
                 && GOT_IT.equals(buttons.get(0).label) && buttons.get(0).style == Style.GREEN_FILLED;
+        // A retry warning: a green retry of the same action, then an outlined Not now; no red-outlined risk (NWP-20261208-28).
+        boolean retryWarning = c.tone == Tone.WARNING && c.retry && buttons.size() == 2
+                && buttons.get(0).style == Style.GREEN_FILLED
+                && buttons.get(1).style == Style.OUTLINED && NOT_NOW.equals(buttons.get(1).label);
         if (c.tone == Tone.ROUTINE && (green != 1 || count(buttons, Style.OUTLINED) != buttons.size() - 1))
             out.add(R_ROUTINE_BUTTONS);
-        if (c.tone == Tone.WARNING && !warningNotice
+        if (c.tone == Tone.WARNING && !warningNotice && !retryWarning
                 && (green != 1 || count(buttons, Style.RED_OUTLINED) < 1 || count(buttons, Style.RED_FILLED) != 0))
             out.add(R_WARNING_BUTTONS);
         if (c.tone == Tone.DESTRUCTIVE && green != 0) out.add(R_DESTRUCTIVE_GREEN);

@@ -167,7 +167,7 @@ func TestBgSplit_SealedFixture_PreGateUntarsToTheRest(t *testing.T) {
 
 	// Each background rel still lands on its own from its region, which is what the later lander relies on.
 	for _, rel := range bg {
-		frag, err := fetchEssSpan(a.base, key, m, m.Ess[rel])
+		frag, err := fetchEssSpan(a.base, key, m, m.Ess[rel], nil)
 		if err != nil {
 			t.Errorf("fetch the region of %s: %v", rel, err)
 			continue

@@ -70,7 +70,7 @@ suite() {
   local src; src=$(cat "$f")
   case "$src" in *'|| failWhy.isEmpty() ? logoffRefusal() : null;'*) ;; *)
     echo "  PIN   the generic failure is not asked for the refusal (failWhy.isEmpty())" >&2; return 1 ;; esac
-  local lockarm; lockarm=$(grep -cF 'b.setPositiveButton("Lock", (d, w) -> doColdLock());' "$f")
+  local lockarm; lockarm=$(grep -cF 'case LOCK: a[i] = () -> doColdLock(); break;' "$f")
   [ "$lockarm" = 1 ] || { echo "  PIN   the LOCK arms no longer call doColdLock()" >&2; return 1; }
   case "$src" in *'pushStuckCount(fresh) < 2'*) ;; *)
     echo "  PIN   confirmEndUnsaved does not admit a second unreachable-store sign-out" >&2; return 1 ;; esac

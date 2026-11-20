@@ -5,7 +5,8 @@
 # WHY THIS IS COMMITTED. remap_per_pkg runs for CE (`remap_per_pkg "$USERDIR"`) and DE (`remap_per_pkg "$DEDIR"`)
 # and carries three rules its comments call load-bearing, which no suite executed (test-in-refused-noop.sh and
 # test-userdir-orphan.sh stub it to `:`):
-#   RULE 1  an app-owned package dir (owner >= 100000) has each child chowned -R to that owner;
+#   RULE 1  an app-owned package dir (owner >= 100000) has each child chowned -R to that owner, all of them in ONE
+#           chown per package (NWP-20261210-04; R1 compares the (owner, path) pairs, R17 the call count);
 #   RULE 2  a ROOT-owned (restore-created) package dir goes to reown_restored, which chowns it to
 #           uid*100000+appId from packages.list -- NEVER to the dir's own owner (root), or the data stays 0:0 and
 #           installd "recovers" it by deleting it (DIA-20260625-03);
@@ -102,6 +103,14 @@ STUBS
   ok() { p=$((p+1)); say "  ok    [$sh] $1"; }
   bad() { x=$((x+1)); say "  FAIL  [$sh] $1 -- $2"; [ -z "$quiet" ] || echo "FAILED [$sh] $1 -- $2"; }
   norm() { sed "s#$T#R#g" "$1"; }
+  # pairs <chown log>: one sorted "<owner> <path>" line per path any chown -R names, whatever the batching
+  pairs() { norm "$1" | awk '$1 == "chown" && $2 == "-R" { for (i = 4; i <= NF; i++) print $3, $i }' | LC_ALL=C sort; }
+  expect_pairs() {  # expect_pairs <label> <want pairs, any order> <want-out>
+    local got out want
+    got=$(pairs "$T/chown.log"); out=$(norm "$T/out"); want=$(printf '%s\n' "$2" | LC_ALL=C sort)
+    if [ "$got" = "$want" ] && [ "$out" = "$3" ]; then ok "$1"
+    else bad "$1" "pairs [$got] out [$out]; wanted [$want] [$3]; stderr [$(head -n 1 "$T/err" 2>/dev/null)]"; fi
+  }
   expect() {  # expect <label> <want-chown-log> <want-out>
     local got out
     got=$(norm "$T/chown.log"); out=$(norm "$T/out")
@@ -117,10 +126,10 @@ STUBS
     fresh; mkdir -p "$D/com.app/"{files,databases,shared_prefs,cache,code_cache}; own 1110123 "$D/com.app"
     own 1110123 "$D/com.app/cache" 1120123; own 1110123 "$D/com.app/code_cache" 1120123   # EMPTY: no chown at all
     run_case "$sh" "$T" "$CALL"
-    expect "R1 app-owned dir: files, databases, shared_prefs re-owned, nothing else" \
-"chown -R 1110123:1110123 R/data/user/11/com.app/databases
-chown -R 1110123:1110123 R/data/user/11/com.app/files
-chown -R 1110123:1110123 R/data/user/11/com.app/shared_prefs" "rc=0"
+    expect_pairs "R1 app-owned dir: files, databases, shared_prefs re-owned, nothing else (the (owner, path) pairs)" \
+"1110123:1110123 R/data/user/11/com.app/databases
+1110123:1110123 R/data/user/11/com.app/files
+1110123:1110123 R/data/user/11/com.app/shared_prefs" "rc=0"
     # R1b RULE 4 (#100 row, MECHANISM (3)): the contents of cache/code_cache go to the dir's own uid:gid, never the dir
     fresh; mkdir -p "$D/com.app/"{files,cache/image_manager_disk_cache,code_cache/startup_agents}
     : > "$D/com.app/cache/journal"; : > "$D/com.app/code_cache/x.prof"
@@ -186,10 +195,10 @@ profile-x P O S L D A T CL CU CG CD CP CS"
     # R9 RULE 5 (#100 row, second seam): dot-named children are re-owned; . and .. never
     fresh; mkdir -p "$D/com.app/files" "$D/com.app/.hidden" "$D/com.app/..x"; own 1110123 "$D/com.app"
     run_case "$sh" "$T" "$CALL"
-    expect "R9 dot-named children (.hidden, ..x) re-owned to the package owner" \
-"chown -R 1110123:1110123 R/data/user/11/com.app/files
-chown -R 1110123:1110123 R/data/user/11/com.app/.hidden
-chown -R 1110123:1110123 R/data/user/11/com.app/..x" "rc=0"
+    expect_pairs "R9 dot-named children (.hidden, ..x) re-owned to the package owner" \
+"1110123:1110123 R/data/user/11/com.app/files
+1110123:1110123 R/data/user/11/com.app/.hidden
+1110123:1110123 R/data/user/11/com.app/..x" "rc=0"
     n=$(grep -cE '/com\.app/\.\.?$' "$T/chown.log")
     if [ "$n" = 0 ]; then ok "R9 . and .. never chowned"; else bad "R9 . and .. never chowned" "$(cat "$T/chown.log")"; fi
 
@@ -246,6 +255,15 @@ chown -R 1110123:1110123 R/data/user/11/com.app/..x" "rc=0"
     # count at all on it, not 0.
     lg=$(grep 'reowned restored' "$T/roam.log" 2>/dev/null)
     if [ -z "$lg" ]; then ok "R16 no reowned line logged"; else bad "R16 no reowned line logged" "$lg"; fi
+
+    # R17 RULE 1 (NWP-20261210-04): ONE chown per app-owned package, carrying every child (a dot-named one included);
+    # a package with no child (cache/ aside) gets none. The cache pass's own chown is the only other line.
+    fresh; mkdir -p "$D/com.app/"{files,databases,.hidden,cache} "$D/com.empty/cache"; : > "$D/com.app/cache/a"
+    own 1110123 "$D/com.app"; own 1110123 "$D/com.app/cache" 1120123; own 1110124 "$D/com.empty"; own 1110124 "$D/com.empty/cache" 1120124
+    run_case "$sh" "$T" "$CALL"
+    expect "R17 one chown for com.app's three children, none for com.empty, one for com.app's cache contents" \
+"chown -R 1110123:1110123 R/data/user/11/com.app/databases R/data/user/11/com.app/files R/data/user/11/com.app/.hidden
+chown -R 1110123:1120123 R/data/user/11/com.app/cache/a" "rc=0"
   done
   [ -z "$HARN" ] || { echo "HARNESS ERROR:$HARN" >&2; return 2; }
   say "passed $p, failed $x (shells:$SHELLS)"
@@ -277,7 +295,9 @@ L_CNUM='    case "$cu:$cg" in :*|*:|*:*:*|*[!0-9:]*) echo "[roamd] remap: cache 
 L_CFOR='    for csub in "$cdir"/* "$cdir"/.[!.]* "$cdir"/..?*; do'
 L_CE='      if [ -e "$csub" ]; then set -- "$@" "$csub"; fi'
 L_CCH='    if [ "$#" -gt 0 ]; then chown -R "$cu:$cg" "$@" 2>> "$LOG"; fi'
-for l in "$L_CACHE" "$L_IF" "$L_LOC1" "$L_LOC2" "$L_DIR" "$L_NUM" "$L_E" "$L_FOR" "$L_CLIST" "$L_CLT" "$L_CNUM" "$L_CFOR" "$L_CE" "$L_CCH" "$L_AWK"; do
+L_PADD='      set -- "$@" "$sub"'   # NWP-20261210-04: the package loop's collection, and its one chown
+L_PCH='    if [ "$#" -gt 0 ]; then chown -R "$own:$own" "$@" 2>> "$LOG"; fi'
+for l in "$L_CACHE" "$L_IF" "$L_LOC1" "$L_LOC2" "$L_DIR" "$L_NUM" "$L_E" "$L_FOR" "$L_CLIST" "$L_CLT" "$L_CNUM" "$L_CFOR" "$L_CE" "$L_CCH" "$L_AWK" "$L_PADD" "$L_PCH"; do
   [ "$(grep -cxF -- "$l" "$SUT")" = 1 ] || { echo "EXTRACTION FAILED: anchor line not unique in $SUT: $l" >&2; exit 2; }
 done
 # L_TGT also occurs elsewhere in roamd: it is mutated in reown_restored only (the first occurrence, asserted here).
@@ -324,5 +344,20 @@ mut "M15 the dot globs dropped from the cache children test (R10)" "$L_CFOR" '  
 mut "M16 the [ -e ] test on cache children dropped (R1)" "$L_CE" '      set -- "$@" "$csub"' 'R1 '
 mut "M17 cdir dropped from the cache pass locals (R8)" "$L_LOC1" '  local pkg own sub listing clisting cu cg cpkg csub' 'R8 '
 mut "M18 the exact awk lookup reverted to the old grep regex (R15)" "$L_AWK" "$L_OLDGREP" 'R15 '
+# NWP-20261210-04: mut replaces one line, so the per-child form is the collection line turned into the chown, and the
+# batched chown dropped. R1 and R9 still pass on it (the same pairs); only R17's call count convicts.
+mut2() {  # mut2 <name> <awk-program> <regex the failure detail must match>: a whole-file awk transform
+  local name="$1" t out r s conv=1
+  t=$(mktemp -p "$W")
+  awk -v PADD="$L_PADD" -v PCH="$L_PCH" "$2" "$SUT" > "$t"
+  if cmp -s "$t" "$SUT"; then echo "  FAIL  mutant did not apply: $name"; MFAIL=1; command rm -f "$t"; return; fi
+  out=$(suite "$t" quiet 2>&1); r=$?
+  command rm -f "$t"
+  for s in $SHELLS; do grep -qE -- "FAILED \[$s\] $3" <<< "$out" || conv=0; done
+  if [ "$r" = 1 ] && [ "$conv" = 1 ]; then echo "  ok    CONVICTED: $name"
+  else echo "  FAIL  NOT CONVICTED (rc=$r): $name"; MFAIL=1; fi
+}
+mut2 "M19 one chown per child restored (R17)" \
+  '$0==PADD{print "      chown -R \"$own:$own\" \"$sub\" 2>> \"$LOG\""; next} $0==PCH{next} {print}' 'R17 '
 [ "$MFAIL" = 0 ] || exit 1
 echo "all mutants convicted"

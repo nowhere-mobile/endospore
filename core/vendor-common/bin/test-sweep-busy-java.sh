@@ -84,7 +84,7 @@ sources() {
   fi
   loop=$(perl -0e '
       my $c = do { local $/; <STDIN> };
-      $c =~ /(for \(int i = 0; i < work\.size\(\); i\+\+\) \{.*?)\}\s*finally\s*\{\s*DaemonSocket\.roundTrip\("AUTO-SWEEP\\n0\\n"/s
+      $c =~ /(for \(int i = 0; i < work\.size\(\); i\+\+\) \{.*?)\}\s*finally\s*\{\s*qDrop\(queued\);\s*DaemonSocket\.roundTrip\("AUTO-SWEEP\\n0\\n"/s
         or exit 1;
       print $1;' <<<"$sweep")
   [ -n "$loop" ] || { echo "FAIL P0 sweepAuto's materialise loop not found"; return 1; }

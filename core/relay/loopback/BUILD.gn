@@ -1,0 +1,42 @@
+# The two-process loopback call of slice R1 (NWP-20261210-12, docs/call-relay.md section 14).
+#
+# build-libwebrtc.sh copies this directory to src/nowhere_relay_loopback in the pinned WebRTC checkout and
+# runs `gn gen <out> --root-target=//nowhere_relay_loopback:relay_loopback`, so no upstream file is edited.
+# The same target builds for linux x64 (run on the build box) and for android arm64 (stripped, then measured:
+# the per-ABI cost section 5.2 names). It is not the relay app: that is R5a/R5b.
+
+import("//webrtc.gni")
+
+rtc_executable("relay_loopback") {
+  testonly = true
+  sources = [ "relay_loopback.cc" ]
+  deps = [
+    "//api:audio_options_api",
+    "//api:candidate",
+    "//api:create_peerconnection_factory",
+    "//api:dtls_transport_interface",
+    "//api:jsep",
+    "//api:make_ref_counted",
+    "//api:media_stream_interface",
+    "//api:peer_connection_interface",
+    "//api:rtc_error",
+    "//api:rtp_parameters",
+    "//api:rtp_sender_interface",
+    "//api:rtp_transceiver_interface",
+    "//api:scoped_refptr",
+    "//api:set_local_description_observer_interface",
+    "//api:set_remote_description_observer_interface",
+    "//api/audio:audio_device",
+    "//api/audio_codecs:builtin_audio_decoder_factory",
+    "//api/audio_codecs:builtin_audio_encoder_factory",
+    "//api/environment",
+    "//api/environment:environment_factory",
+    "//modules/audio_device:test_audio_device_module",
+    "//rtc_base:buffer",
+    "//rtc_base:ip_address",
+    "//rtc_base:logging",
+    "//rtc_base:network_constants",
+    "//rtc_base:socket_address",
+    "//rtc_base:threading",
+  ]
+}

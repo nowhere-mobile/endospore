@@ -111,7 +111,7 @@ sources() {
       $c =~ /if \(!work\.isEmpty\(\)\) \{\s*String ev = DiagSweepEvent\.arg\(/ or exit 1;
       exit 0;' <<<"$sweep" || bad=1
   pin P5 "the send follows the done log, the done log follows the AUTO-SWEEP 0 finally, and no MAT_LOCK follows the done log" '
-      $c =~ /finally \{\s*DaemonSocket\.roundTrip\("AUTO-SWEEP\\n0\\n", 30000\);\s*\}\s*android\.util\.Log\.i\("NowhereChooser", "#130 sweep done: "/s
+      $c =~ /finally \{\s*qDrop\(queued\);\s*DaemonSocket\.roundTrip\("AUTO-SWEEP\\n0\\n", 30000\);\s*\}\s*android\.util\.Log\.i\("NowhereChooser", "#130 sweep done: "/s
         or exit 1;
       my $at = index($c, "\"#130 sweep done: \""); exit 1 if $at < 0;
       my $tail = substr($c, $at);

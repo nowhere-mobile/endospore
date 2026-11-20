@@ -47,6 +47,8 @@ BEGIN_HDR='# ---- NWP-20261028-10: SESSION HOTSPOT RELEASE (begin) -------------
 END_HDR='# ---- NWP-20261028-10: SESSION HOTSPOT RELEASE (end) ------------------------------------------------------------------'
 DR_END_HDR='# ---- NWP-20261028-07: SESSION-SCOPED DATA ROAMING (end) --------------------------------------------------------------'
 MD_BEGIN_HDR='# ---- NWP-20261026-05: SESSION-SCOPED MOBILE DATA (begin) ------------------------------------------------------------'
+NP_BEGIN_HDR='# ---- NWP-20261210-19: NETPOLICY WI-FI TEMPLATE RESET (begin) ---------------------------------------------------------'
+NP_END_HDR='# ---- NWP-20261210-19: NETPOLICY WI-FI TEMPLATE RESET (end) -----------------------------------------------------------'
 LBEGIN_HDR='# ---- NWP-20261016-45: SESSION-SCOPED LOCATION GLOBALS (begin) -------------------------------------------------------'
 LEND_HDR='# ---- NWP-20261016-45: SESSION-SCOPED LOCATION GLOBALS (end) ---------------------------------------------------------'
 OP_HDR='if [ "$op" = "mdapply" ] || [ "$op" = "mdrelease" ]; then'
@@ -156,9 +158,11 @@ suite() {
   }
 
   # --- placement ------------------------------------------------------------------------------------------------
-  at=$(awk -v d="$DR_END_HDR" -v b="$BEGIN_HDR" -v e="$END_HDR" -v m="$MD_BEGIN_HDR" '$0 == d {dl = NR} $0 == b {bl = NR} $0 == e {el = NR} $0 == m {ml = NR}
-    END {print (dl && bl == dl + 1 && el > bl && ml == el + 1) ? "ok" : "no"}' "$f")
-  [ "$at" = ok ] && ok "P0 the block sits between data roaming's end and the mobile data block" || no "P0 the block is misplaced"
+  # NWP-20261210-19: the netpolicy block (its own suite, test-netpolicy-release.sh) may sit between this block and mobile data.
+  at=$(awk -v d="$DR_END_HDR" -v b="$BEGIN_HDR" -v e="$END_HDR" -v m="$MD_BEGIN_HDR" -v nb="$NP_BEGIN_HDR" -v ne="$NP_END_HDR" '
+    $0 == d {dl = NR} $0 == b {bl = NR} $0 == e {el = NR} $0 == m {ml = NR} $0 == nb {nbl = NR} $0 == ne {nel = NR}
+    END {print (dl && bl == dl + 1 && el > bl && (ml == el + 1 || (nbl == el + 1 && nel > nbl && ml == nel + 1))) ? "ok" : "no"}' "$f")
+  [ "$at" = ok ] && ok "P0 the block sits between data roaming's end and the mobile data block (or the netpolicy block before it)" || no "P0 the block is misplaced"
 
   # --- the mdrelease arm ----------------------------------------------------------------------------------------
   mkdev; reply 'OK RELEASED'

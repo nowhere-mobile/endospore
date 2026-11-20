@@ -570,6 +570,46 @@ func subtreeBytes(dir string) int64 {
 	return n
 }
 
+// unfetchedLocalMax bounds unfetchedLocalFiles: it stops after this many entries.
+const unfetchedLocalMax = 10000
+
+// unfetchedLocalFiles counts the regular files, and their apparent bytes, under an unfetched package's dir that
+// the seal walk skips (NWP-20261203-29). lstat only: no file is opened. The top-level cache/ and code_cache/
+// subtrees are skipped, because an installed app's empty data dir holds only those. It stops after
+// unfetchedLocalMax entries, and an entry it cannot read counts toward that bound too, so a dir without search
+// permission cannot make it visit every child. An entry it cannot read counts no file and no byte, and it never
+// changes the walk's blind count.
+func unfetchedLocalFiles(dir string) (files int, bytes int64) {
+	n := 0
+	filepath.Walk(dir, func(p string, fi os.FileInfo, err error) error {
+		n++
+		if n > unfetchedLocalMax {
+			return filepath.SkipAll
+		}
+		if err != nil {
+			return nil
+		}
+		if fi.IsDir() {
+			if rel, _ := filepath.Rel(dir, p); rel == "cache" || rel == "code_cache" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if fi.Mode().IsRegular() {
+			files++
+			bytes += fi.Size()
+		}
+		return nil
+	})
+	return files, bytes
+}
+
+// unfetchedLocalLine is the seal's evidence line for NWP-20261203-29: counts only, never a package name or a path.
+func unfetchedLocalLine(profile string, st walkStats) string {
+	return fmt.Sprintf("push: profile %s unfetched: %d skipped package dir(s) held %d local file(s), %d byte(s) outside cache/ the seal did not read (NWP-20261203-29)\n",
+		logProfile(profile), st.unfLocalPkgs, st.unfLocalFiles, st.unfLocalBytes)
+}
+
 func dropPkgForRel(rel string, drop map[string]bool) bool {
 	if len(drop) == 0 {
 		return false
@@ -1094,12 +1134,15 @@ type walkEnt struct {
 // entries vs files vs large is the distinction that ends that class of mistake: a scope with entries>0 and
 // large==0 is holding small files and is FINE; entries==0 is a genuinely empty walk and is not.
 type walkStats struct {
-	entries int    // every entry visit() handled -- regular files of any size, dirs, symlinks
-	files   int    // regular files only
-	large   int    // regular files >= threshold (or force-deferred): the ones that enter `seen`
-	bytes   int64  // total regular-file bytes offered to the walk, before dedup/carry
-	under   int    // entries read through a .under substitution rather than the live overlay (#84)
-	digest  string // NWP-20261123-04: hex SHA-256 of the walk's policy and every entry it handled (media_nochange.go)
+	entries       int    // every entry visit() handled -- regular files of any size, dirs, symlinks
+	files         int    // regular files only
+	large         int    // regular files >= threshold (or force-deferred): the ones that enter `seen`
+	bytes         int64  // total regular-file bytes offered to the walk, before dedup/carry
+	under         int    // entries read through a .under substitution rather than the live overlay (#84)
+	digest        string // NWP-20261123-04: hex SHA-256 of the walk's policy and every entry it handled (media_nochange.go)
+	unfLocalPkgs  int    // NWP-20261203-29: excl-skipped package dirs that held a local file outside cache/ and code_cache/
+	unfLocalFiles int    // NWP-20261203-29: the regular files in those dirs (lstat only, never read)
+	unfLocalBytes int64  // NWP-20261203-29: their apparent bytes
 }
 
 func walkChunks(src string, sc *fileScanCache, threshold int64, forceFull bool, od bool, prevDef map[string]deferredFile,
@@ -1555,6 +1598,13 @@ func walkChunksExcl(src string, sc *fileScanCache, threshold int64, forceFull bo
 				return filepath.SkipDir
 			}
 			if info.IsDir() && dropPkgForRel(rel, excl) {
+				if !strings.Contains(filepath.ToSlash(rel), "/") { // NWP-20261203-29: the package dir itself, not a hold
+					if f, b := unfetchedLocalFiles(p); f > 0 {
+						st.unfLocalPkgs++
+						st.unfLocalFiles += f
+						st.unfLocalBytes += b
+					}
+				}
 				return filepath.SkipDir // NWP-20261130-03: unfetched in this scope -- the carry re-emits its stored span, never the phone's copy
 			}
 			if isOdFetchStagePath(rel) {

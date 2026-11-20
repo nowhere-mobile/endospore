@@ -414,6 +414,10 @@ func TestSigninSummaryWidestFits(t *testing.T) {
 	for _, w := range []string{"in", "reap", "reap", "reown", "reown", "reown", "acct"} {
 		b.WriteString("v=1 phase=" + w + " ms=" + n + "\n")
 	}
+	n9 := "999999999" // NWP-20261208-01: the #apps index count and the last #apps seal's record
+	b.WriteString("v=1 appsindex pkgs=" + n9 + "\n")
+	b.WriteString("v=1 appsseal stored=" + n9 + " dormant=" + n9 + " adopted=" + n9 + " carried=" + n9 + " dropped=" + n9 +
+		" published=" + n9 + " lost=" + n9 + " vanished=" + n9 + " guard=refused\n")
 	if b.Len() > signinSummaryMaxBytes {
 		t.Fatalf("the widest file is %d bytes, over the reader's %d", b.Len(), signinSummaryMaxBytes)
 	}
@@ -424,6 +428,10 @@ func TestSigninSummaryWidestFits(t *testing.T) {
 	if got["signin_media_unfetched_bytes"] != b15 || got["signin_vault_fetched_bytes"] != b15 || got["signin_sys_write_ms"] != n {
 		t.Errorf("the widest file: media unfetched_bytes %q vault fetched_bytes %q sys write_ms %q", got["signin_media_unfetched_bytes"],
 			got["signin_vault_fetched_bytes"], got["signin_sys_write_ms"])
+	}
+	if got["signin_apps_index_pkgs"] != n9 || got["lastseal_apps_vanished"] != n9 || got["lastseal_apps_guard"] != "refused" {
+		t.Errorf("the widest file: apps index %q lastseal vanished %q guard %q", got["signin_apps_index_pkgs"],
+			got["lastseal_apps_vanished"], got["lastseal_apps_guard"])
 	}
 }
 

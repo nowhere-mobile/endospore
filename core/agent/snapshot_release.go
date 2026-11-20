@@ -46,7 +46,13 @@ func manifestBlobsStrict(base string, dk []byte, manifestHash string, into map[s
 	if manifestHash == "" {
 		return errors.New("empty manifest hash")
 	}
-	pt := unseal(dk, getBlob(base, manifestHash))
+	return manifestPlainBlobs(manifestHash, unseal(dk, getBlob(base, manifestHash)), into)
+}
+
+// manifestPlainBlobs is manifestBlobsStrict's parse over a manifest already opened: pt is the plaintext of
+// blob/<manifestHash>. The seal's #media release reads the export's pinned manifest through it
+// (sealPruneMediaPin, NWP-20261208-14), so the two readers cannot disagree on what a manifest names.
+func manifestPlainBlobs(manifestHash string, pt []byte, into map[string]bool) error {
 	if !bytes.HasPrefix(pt, cdcMagic) {
 		into["blob/"+manifestHash] = true
 		return nil
@@ -113,17 +119,32 @@ func snapshotReleaseSet(base string, dk []byte, removed headSnap, kept *vault) (
 // returns (nil, err): a skipped KEPT manifest would put its chunks in a release set. A nil kept keeps nothing. Both
 // release paths use it: snapshotReleaseSet and the seal's prune release (seal_prune_release.go, NWP-20261204-06).
 func manifestKeepSet(base string, dk []byte, kept *vault) (map[string]bool, error) {
+	return manifestKeepSetEach(base, dk, kept, nil)
+}
+
+// manifestKeepSetEach is manifestKeepSet that calls each, when not nil, after every manifest it reads; an error from
+// each returns (nil, err). The seal's #media release bounds its compare with it (NWP-20261208-14).
+func manifestKeepSetEach(base string, dk []byte, kept *vault, each func(keep map[string]bool) error) (map[string]bool, error) {
 	keep := map[string]bool{}
 	if kept == nil {
 		return keep, nil
 	}
+	read := func(m string) error {
+		if err := manifestBlobsStrict(base, dk, m, keep); err != nil {
+			return err
+		}
+		if each != nil {
+			return each(keep)
+		}
+		return nil
+	}
 	if kept.Manifest != "" {
-		if err := manifestBlobsStrict(base, dk, kept.Manifest, keep); err != nil {
+		if err := read(kept.Manifest); err != nil {
 			return nil, err
 		}
 	}
 	for _, h := range kept.History {
-		if err := manifestBlobsStrict(base, dk, h.Manifest, keep); err != nil {
+		if err := read(h.Manifest); err != nil {
 			return nil, err
 		}
 	}

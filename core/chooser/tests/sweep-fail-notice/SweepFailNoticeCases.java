@@ -1,6 +1,6 @@
 package com.nowhere.chooser;
 
-/** NWP-20261203-17: the cases for SweepFailNotice, run by core/vendor-common/bin/test-sweep-fail-notice-java.sh. */
+/** NWP-20261203-17, NWP-20261208-17: the cases for SweepFailNotice, run by core/vendor-common/bin/test-sweep-fail-notice-java.sh. */
 public final class SweepFailNoticeCases {
     static int bad = 0;
 
@@ -13,6 +13,15 @@ public final class SweepFailNoticeCases {
     static void act(int total, int done, int hardFailed, SweepFailNotice.Act want) {
         eq("C2", "action(" + total + ", " + done + ", " + hardFailed + ")", want,
                 SweepFailNotice.action(total, done, hardFailed));
+    }
+
+    static void recheck(int total, int done, int ranFailed, int missing, SweepFailNotice.Act want) {
+        eq("C8", "afterRecheck(" + total + ", " + done + ", " + ranFailed + ", " + missing + ")", want,
+                SweepFailNotice.afterRecheck(total, done, ranFailed, missing));
+    }
+
+    static java.util.Set<String> set(String... p) {
+        return new java.util.HashSet<>(java.util.Arrays.asList(p));
     }
 
     public static void main(String[] a) {
@@ -72,6 +81,37 @@ public final class SweepFailNoticeCases {
         b0 = bad;
         eq("C6", "RETRY", "Try again", SweepFailNotice.RETRY);
         if (bad == b0) System.out.println("ok C6 the draft action label");
+
+        b0 = bad;
+        java.util.List<String> abc = java.util.Arrays.asList("a", "b", "c");
+        java.util.Set<String> onlyB = set("b");
+        eq("C7", "stillMissing([a, b, c], {b})", java.util.List.of("a", "c"),
+                SweepFailNotice.stillMissing(abc, onlyB::contains));
+        eq("C7", "stillMissing([a, b, c], {a, b, c})", java.util.List.of(),
+                SweepFailNotice.stillMissing(abc, set("a", "b", "c")::contains));
+        eq("C7", "stillMissing([a, b, c], {})", java.util.List.of("a", "b", "c"),
+                SweepFailNotice.stillMissing(abc, p -> false));
+        eq("C7", "stillMissing([a, a, b], {})", java.util.List.of("a", "b"),
+                SweepFailNotice.stillMissing(java.util.Arrays.asList("a", "a", "b"), p -> false));
+        eq("C7", "stillMissing([a, b], a throws, b installed)", java.util.List.of("a"),
+                SweepFailNotice.stillMissing(java.util.Arrays.asList("a", "b"), p -> {
+                    if ("a".equals(p)) throw new RuntimeException("x");
+                    return true;
+                }));
+        eq("C7", "stillMissing([a, null], {})", java.util.List.of("a"),
+                SweepFailNotice.stillMissing(java.util.Arrays.asList("a", null), p -> false));
+        eq("C7", "stillMissing(null, {})", java.util.List.of(), SweepFailNotice.stillMissing(null, p -> false));
+        if (bad == b0) System.out.println("ok C7 stillMissing keeps the failed apps still not installed, in order, once; a throw is missing");
+
+        b0 = bad;
+        recheck(1, 0, 1, 0, SweepFailNotice.Act.CANCEL); // Chester's case: the only failure installed by hand
+        recheck(5, 3, 2, 1, SweepFailNotice.Act.POST);   // one of two failures installed by hand: still one missing
+        recheck(3, 0, 2, 2, SweepFailNotice.Act.POST);   // none installed meanwhile: as action(3, 0, 2)
+        recheck(3, 0, 2, 0, SweepFailNotice.Act.CANCEL); // both failures installed by hand
+        recheck(3, 1, 0, 0, SweepFailNotice.Act.CANCEL); // nothing failed, one landed: as action(3, 1, 0)
+        recheck(3, 0, 0, 0, SweepFailNotice.Act.KEEP);   // a pass cut before any app ran
+        recheck(0, 0, 0, 0, SweepFailNotice.Act.KEEP);   // nothing to do
+        if (bad == b0) System.out.println("ok C8 afterRecheck counts the apps installed meanwhile as landed");
 
         System.exit(bad == 0 ? 0 : 1);
     }

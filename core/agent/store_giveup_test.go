@@ -22,6 +22,10 @@ func resetStoreGiveUpForTest() {
 	storeGiveUp.answeredAt = time.Time{}
 	storeGiveUp.logged = false
 	storeGiveUp.mu.Unlock()
+	// NWP-20261210-02: a real-clock stamp left by an earlier test reads as a byte after every fake t0
+	// (time.Unix(1_000_000, 0)) and would mute the throttle.
+	storeXferByteAt.Store(0)
+	storeBytesNotedAt.Store(0)
 }
 
 // setupStoreGiveUp zeroes the backoff, fakes the give-up clock and returns it for the test to advance.

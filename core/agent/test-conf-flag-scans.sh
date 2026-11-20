@@ -57,7 +57,7 @@ mut "M4 listDaemonScripts drops the nowhere_roamd.sh control" agent/$SRC 'if !ro
 mut "F1 nowhere_login.sh no longer exports NOWHERE_GATEWAY_DEFAULT" vendor-common/bin/nowhere_login.sh \
   '\n  export NOWHERE_GATEWAY_DEFAULT\n' '\n' '--- FAIL: TestEveryDocumentedConfFlagIsExportedByADaemon'
 mut "F2 the #keys push stops pinning NOWHERE_CARRY_ESSENTIAL, a suite spells a correct one" vendor-common/bin/nowhere_roamd.sh \
-  'NOWHERE_CARRY_ESSENTIAL=0 (NOWHERE_CARRY_ESSENTIAL_MEDIA=0 \\\n\s+timeout -k 5 3600 "\$AGENT" push s3 "\$\{name\}#keys")' '\1' \
+  'NOWHERE_CARRY_ESSENTIAL=0 (NOWHERE_CARRY_ESSENTIAL_MEDIA=0 \\\n\s+NOWHERE_SE_SECRET="\$\(pwv "\$_se_v"\)" NOWHERE_FIDO2_HMAC="\$\(pwv "\$_fh_v"\)" timeout -k 5 3600 "\$AGENT" push s3 "\$\{name\}#keys")' '\1' \
   '--- FAIL: TestScopeRestrictedFlagsArePinnedOffAtEveryOtherPush' \
   'NOWHERE_CARRY_ESSENTIAL=0 NOWHERE_CARRY_ESSENTIAL_MEDIA=0 "$AGENT" push s3 "${name}#keys"'
 [ "$fails" -eq 0 ] && echo "== all mutations convicted" || { echo "== $fails mutation(s) not convicted"; exit 1; }

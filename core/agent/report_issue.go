@@ -49,6 +49,14 @@ const (
 	maxIssuePrevBootLines = 200
 	maxIssueAnrLines      = 60
 	maxIssueReportBytes   = 200 << 10
+	// NWP-20261208-18. A Nowhere process's trace also carries its "main" stack and its binder targets: at most
+	// 2 x (1 + 120 + 4) lines of ~100 B, about 25 KiB against maxIssueReportBytes, and "anr" still goes before "gms"
+	// in issueTrimOrder. maxIssueAnrMainLines caps one main stack, the "main" line included.
+	maxIssueAnrMainLines = 120
+	// maxIssueAnrMainTraces caps the Nowhere traces given a stack, newest first: the ANR being reported is the last.
+	maxIssueAnrMainTraces = 2
+	// maxIssueAnrTargets caps the target lines of one trace: the main thread waits on one call, the rest are context.
+	maxIssueAnrTargets = 4
 	// NWP-20261010-06. uiderrors lines run ~150 B, so 120 is ~18 KiB: room for every destroy of one bad resume
 	// (the stallion shape is a few dozen packages) without letting a years-old file crowd out the nowhere logs.
 	// uiderrorsTailBytes bounds what the worker reads at all: the framework only ever appends to the file.
@@ -226,17 +234,24 @@ func applyIssueNameRules(line string) string {
 // mangle the build of any device whose profile happens to be named after a fingerprint token (a profile
 // called "lynx" would render google/<name>/<name>:17/...), and it protects nothing, since a fingerprint
 // reads identically whatever the profile is called and so cannot disclose it.
+//
+// The store pass (scrubStoreStrings, NWP-20261205-13) DOES run first: the field charset admits a hostname,
+// a host:port and a bucket, so a fingerprint-shaped caller value can carry a self-hosted store's endpoint
+// and bucket. A real fingerprint holding no store string comes back byte-identical; one whose token equals
+// a store string loses the shape and is then fully scrubbed (the safe direction).
 func statusValue(v string, secrets []string) string {
-	if reIssueBuildFp.MatchString(v) {
-		return v
+	if s := scrubStoreStrings(v); reIssueBuildFp.MatchString(s) {
+		return s
 	}
 	return redactIssueSecrets(v, secrets)
 }
 
 // redactIssueSecrets applies the literal-secret pass then the generic pattern pass. Used for log lines AND the
 // note (the note is never line-dropped -- the user typed it on purpose -- but it is still pattern-scrubbed so an
-// accidentally-pasted number/token/email does not leak).
+// accidentally-pasted number/token/email does not leak). It also replaces a self-hosted store's endpoint and bucket
+// (scrubStoreStrings).
 func redactIssueSecrets(s string, secrets []string) string {
+	s = scrubStoreStrings(s)
 	for _, sec := range secrets {
 		if len(sec) < 3 { // never redact 1-2 char "secrets" -- would shred normal text
 			continue
@@ -473,6 +488,38 @@ func otaStatusMarker() map[string]string {
 		"ota_refreshing":     strconv.FormatBool(refreshing),
 		"ota_store":          store,
 		"ota_running":        runningOtaVersion(),
+	}
+}
+
+// otaInstallMarker reports the install in flight for an issue report (NWP-20261206-12): what OTA-STATUS's
+// in-flight half answers (ota_install), how old ota.res is in wall seconds (ota_res_age_s, -1 absent) and the
+// class of init.svc.nowhere_otad (ota_otad_svc). Gate report NW-c865 showed an apply running while the card
+// offered Install update again, and could not say whether the service read came back empty or ota.res was
+// missing; these keys answer that. They are DEVICE-level -- an OTA phase, a file age and a service state --
+// carrying no session, profile or user fact, so they are safe under the gate reporter's scope. ota_otad_svc is
+// a fixed class, never the raw getprop output.
+func otaInstallMarker(dest string) map[string]string {
+	install := strings.ReplaceAll(otaResState(dest), " ", "_")
+	if install == "" {
+		install = "none"
+	}
+	age := "-1"
+	if fi, err := os.Stat(filepath.Join(dest, "ota.res")); err == nil {
+		age = strconv.FormatInt(int64(time.Since(fi.ModTime()).Seconds()), 10)
+	}
+	svc := "other"
+	switch s, err := otadSvcState(); {
+	case err != nil:
+		svc = "error"
+	case s == "":
+		svc = "empty"
+	case s == "running", s == "stopping", s == "restarting", s == "stopped":
+		svc = s
+	}
+	return map[string]string{
+		"ota_install":   install,
+		"ota_res_age_s": age,
+		"ota_otad_svc":  svc,
 	}
 }
 
@@ -878,6 +925,12 @@ func readAnrSeen(dest string) map[string]bool {
 // the nowhere logs under maxIssueReportBytes. The header carries what triage needs -- which process, what reason.
 // Newest first, because the ANR being reported is the last one.
 //
+// NWP-20261208-18: the one exception is a Nowhere process's trace (its first process's `Cmd line:` starts with
+// com.nowhere.). Up to maxIssueAnrMainTraces of them also carry their "main" stack and the command line of each
+// process their outgoing binder transactions wait on (anrMainExtras): a chooser ANR with no stack cannot name the
+// call it was blocked in. Other apps keep the header cut. The header cut has its own counter, so these lines never
+// take header lines from another trace, and they go through anrSection's scrub with the rest.
+//
 // seen is the snapshot recordAnrSeen took when this session began: a trace named in it is an earlier session's (or
 // this session's own restore) and is left out BEFORE it is read. nil -- no snapshot -- returns nothing at all.
 // The skipped files are never counted, named or logged: a count would tell this session an earlier one had ANRs.
@@ -908,8 +961,9 @@ func anrHeaders(dir string, seen map[string]bool, maxLines int) ([]string, []dia
 	sort.Slice(files, func(i, j int) bool { return files[i].mod.After(files[j].mod) })
 	var out []string
 	var srcs []diagSource
+	hdr, stacks := 0, 0 // header lines (the separators included) and the traces given a main stack
 	for _, f := range files {
-		if len(out) >= maxLines {
+		if hdr >= maxLines {
 			break
 		}
 		raw, rerr := os.ReadFile(f.path)
@@ -921,8 +975,10 @@ func anrHeaders(dir string, seen map[string]bool, maxLines int) ([]string, []dia
 		}
 		srcs = append(srcs, s)
 		out = append(out, "--- "+filepath.Base(f.path)+" ---")
+		hdr++
+		text := string(raw)
 		// The header is the block before the first thread dump ("----- pid ..." / "DALVIK THREADS").
-		for _, ln := range strings.Split(string(raw), "\n") {
+		for _, ln := range strings.Split(text, "\n") {
 			t := strings.TrimSpace(ln)
 			if strings.HasPrefix(t, "DALVIK THREADS") || strings.HasPrefix(t, "\"main\"") {
 				break
@@ -931,12 +987,133 @@ func anrHeaders(dir string, seen map[string]bool, maxLines int) ([]string, []dia
 				continue
 			}
 			out = append(out, t)
-			if len(out) >= maxLines {
+			hdr++
+			if hdr >= maxLines {
 				break
+			}
+		}
+		if stacks < maxIssueAnrMainTraces && strings.HasPrefix(anrCmdLine(text, anrFirstPid(text)), "com.nowhere.") {
+			if extra := anrMainExtras(text); len(extra) > 0 {
+				out = append(out, extra...)
+				stacks++
 			}
 		}
 	}
 	return out, srcs
+}
+
+var (
+	reAnrPid      = regexp.MustCompile(`^----- pid (\d+) at `)
+	reAnrOutgoing = regexp.MustCompile(`outgoing transaction\b.*?\bfrom (\d+):\d+ to (\d+)\b`)
+)
+
+// anrFirstPid is the pid of a trace file's first `----- pid <N> at` line: the process the ANR is about. "" when none.
+func anrFirstPid(raw string) string {
+	for _, ln := range strings.Split(raw, "\n") {
+		if m := reAnrPid.FindStringSubmatch(strings.TrimSpace(ln)); m != nil {
+			return m[1]
+		}
+	}
+	return ""
+}
+
+// anrCmdLine is the `Cmd line:` value of the block `----- pid <pid> at` in this trace file, read up to the block's
+// next `----- ` line. "" when pid is "", the block is absent or it has no `Cmd line:`.
+func anrCmdLine(raw, pid string) string {
+	if pid == "" {
+		return ""
+	}
+	in := false
+	for _, ln := range strings.Split(raw, "\n") {
+		t := strings.TrimSpace(ln)
+		if m := reAnrPid.FindStringSubmatch(t); m != nil {
+			in = m[1] == pid
+			continue
+		}
+		if !in {
+			continue
+		}
+		if strings.HasPrefix(t, "----- ") {
+			in = false
+			continue
+		}
+		if v, ok := strings.CutPrefix(t, "Cmd line:"); ok {
+			return strings.TrimSpace(v)
+		}
+	}
+	return ""
+}
+
+// anrMainExtras (NWP-20261208-18) is what a Nowhere process's trace carries past its header: an
+// `anr main (nowhere process, <k> lines[, cut at 120]):` heading, the first process's "main" block (from the
+// "main" line to the first blank line, at most maxIssueAnrMainLines), then `anr target pid <T>: <Cmd line>` for each
+// distinct process an outgoing transaction FROM that pid waits on (`to <T>` or `to <T>:<tid>`), at most
+// maxIssueAnrTargets. Both come from this file only, never /proc: the pid may have been reused since the ANR, and
+// the agent's domain is not widened to read other processes. A target with no block here is "not in trace". A
+// temp_anr_ file still being written yields fewer lines, or none.
+func anrMainExtras(raw string) []string {
+	pid := anrFirstPid(raw)
+	if pid == "" {
+		return nil
+	}
+	lines := strings.Split(raw, "\n")
+	var block []string
+	cut, in, inMain := false, false, false
+	for _, ln := range lines {
+		t := strings.TrimSpace(ln)
+		if !in {
+			if m := reAnrPid.FindStringSubmatch(t); m != nil && m[1] == pid {
+				in = true
+			}
+			continue
+		}
+		if strings.HasPrefix(t, "----- ") {
+			break // the end of the first process's block
+		}
+		if !inMain {
+			inMain = strings.HasPrefix(t, "\"main\"")
+			if !inMain {
+				continue
+			}
+		}
+		if t == "" {
+			break
+		}
+		if len(block) >= maxIssueAnrMainLines {
+			cut = true
+			break
+		}
+		block = append(block, t)
+	}
+	if len(block) == 0 {
+		return nil
+	}
+	head := "anr main (nowhere process, " + strconv.Itoa(len(block)) + " lines"
+	if cut {
+		head += ", cut at " + strconv.Itoa(maxIssueAnrMainLines)
+	}
+	out := append([]string{head + "):"}, block...)
+	var targets []string
+	have := map[string]bool{}
+	for _, ln := range lines {
+		m := reAnrOutgoing.FindStringSubmatch(strings.TrimSpace(ln))
+		if m == nil || m[1] != pid {
+			continue
+		}
+		if have[m[2]] || len(targets) >= maxIssueAnrTargets {
+			continue
+		}
+		have[m[2]] = true
+		targets = append(targets, m[2])
+	}
+	for _, tp := range targets {
+		name := "not in trace"
+		if c := anrCmdLine(raw, tp); c != "" {
+			name = c
+		}
+		out = append(out, "anr target pid "+tp+": "+name)
+	}
+	return out
 }
 
 // anrSection renders anrHeaders the same always-honest way. Unlike avc/prev_boot this section is OMITTED when
@@ -1161,20 +1338,29 @@ func fetchVpnState(dest, name, uid string) string {
 	}
 }
 
-// vpnStateReplyRe is roamd's vpnstate reply, the only one accepted: four codes, nothing else. A package name, an
-// extra field or a second line fails it.
-var vpnStateReplyRe = regexp.MustCompile(`^VPNSTATE app=(1|0|-) lock=(1|0|-) pend=(1|0|-) net=(1|0|-)$`)
+// vpnStateReplyRe is roamd's vpnstate reply, the only one accepted: four codes and the refused token, nothing else.
+// A package name, an extra field or a second line fails it. refused (NWP-20261208-10) is none, - or
+// n<N>.inst<c>.hid<c>.en<c>.stop<c>.svc<c>.tsdk<c>.usr<u>.lock<l>, N 1-999 with no leading 0. A four-field reply,
+// from a roamd before NWP-20261208-10, now fails it too: one image ships roamd and the agent together.
+var vpnStateReplyRe = regexp.MustCompile(`^VPNSTATE app=(1|0|-) lock=(1|0|-) pend=(1|0|-) net=(1|0|-) ` +
+	`refused=(none|-|n([1-9][0-9]{0,2})\.inst(1|0|-)\.hid(1|0|-)\.en(1|0|-)\.stop(1|0|-)\.svc(1|0|-)\.tsdk(1|0|-)` +
+	`\.usr(unlocked|locked|unlocking|booting|stopping|shutdown|notstarted|-)\.lock(0|1))$`)
 
 // mergeVpnState sets the report's vpn_state key (NWP-20261202-43): the always-on VPN's live state for the session's
 // user, "app=<c> lock=<c> pend=<c> net=<c>" with each code 1, 0 or -, or "unavailable" (no session, a busy lane, a
-// timeout or any other reply). A caller-sent vpn_state is removed at every scope. Device scope (the gate, or no
-// session) asks nothing and sets nothing. It returns the value it set from a valid reply, else "". The value is
-// rebuilt from the reply's codes, never copied from it, so no package name can reach the report.
+// timeout or any other reply). It also sets vpn_refused (NWP-20261208-10): the last always-on apply Android refused
+// this session and their count, "n=<N> inst=<c> hid=<c> en=<c> stop=<c> svc=<c> tsdk=<c> usr=<u> lock=<l>", or
+// "none" (no refusal), "unreadable" (roamd's record was malformed), or "unavailable" whenever vpn_state is. A
+// caller-sent vpn_state or vpn_refused is removed at every scope. Device scope (the gate, or no session) asks nothing
+// and sets nothing. It returns the vpn_state value it set from a valid reply, else "", so the ev=vpnstate day-summary
+// line stays the four codes. Both values are rebuilt from the reply's codes, never copied from it, so no package
+// name can reach the report.
 func mergeVpnState(rep *issueReport, fetch func() string, deviceScope bool) string {
 	if rep == nil {
 		return ""
 	}
 	delete(rep.Status, "vpn_state")
+	delete(rep.Status, "vpn_refused")
 	if deviceScope {
 		return ""
 	}
@@ -1184,10 +1370,20 @@ func mergeVpnState(rep *issueReport, fetch func() string, deviceScope bool) stri
 	m := vpnStateReplyRe.FindStringSubmatch(strings.TrimSuffix(fetch(), "\n"))
 	if m == nil {
 		rep.Status["vpn_state"] = "unavailable"
+		rep.Status["vpn_refused"] = "unavailable"
 		return ""
 	}
 	v := fmt.Sprintf("app=%s lock=%s pend=%s net=%s", m[1], m[2], m[3], m[4])
 	rep.Status["vpn_state"] = v
+	switch m[5] {
+	case "none":
+		rep.Status["vpn_refused"] = "none"
+	case "-":
+		rep.Status["vpn_refused"] = "unreadable"
+	default:
+		rep.Status["vpn_refused"] = fmt.Sprintf("n=%s inst=%s hid=%s en=%s stop=%s svc=%s tsdk=%s usr=%s lock=%s",
+			m[6], m[7], m[8], m[9], m[10], m[11], m[12], m[13], m[14])
+	}
 	return v
 }
 
@@ -1305,6 +1501,48 @@ func storeMode() string {
 	default:
 		return "local"
 	}
+}
+
+// scrubStoreStrings replaces each storeScrubPairs string in s, case-insensitively and anywhere (inside URLs and
+// paths too). redactIssueSecrets and statusValue both call it.
+func scrubStoreStrings(s string) string {
+	for _, p := range storeScrubPairs() { // a self-hosted store's endpoint and bucket (NWP-20261205-13)
+		s = regexp.MustCompile(`(?i)`+regexp.QuoteMeta(p[0])).ReplaceAllString(s, p[1])
+	}
+	return s
+}
+
+// storeScrubPairs is what an issue report replaces for a self-hosted store (h57 #5, NWP-20261205-13): the endpoint
+// as configured, its host:port and its hostname map to <store-host>, the bucket to <bucket>. The device's own
+// login.log keeps them (handleSetStore, logSafeStoreErr); only the report loses them. Empty in managed and local
+// mode, so those reports are unchanged. Longest first, so a string that contains another goes whole.
+func storeScrubPairs() [][2]string {
+	if storeMode() != "self-hosted" {
+		return nil
+	}
+	var pairs [][2]string
+	seen := map[string]bool{}
+	add := func(s, rep string) {
+		if len(s) < 3 || seen[strings.ToLower(s)] { // the floor redactIssueSecrets keeps for names
+			return
+		}
+		seen[strings.ToLower(s)] = true
+		pairs = append(pairs, [2]string{s, rep})
+	}
+	if ep := strings.TrimRight(os.Getenv("S3_ENDPOINT"), "/"); ep != "" {
+		add(ep, "<store-host>")
+		raw := ep
+		if !strings.Contains(raw, "://") {
+			raw = "https://" + raw
+		}
+		if u, err := url.Parse(raw); err == nil {
+			add(u.Host, "<store-host>")
+			add(u.Hostname(), "<store-host>")
+		}
+	}
+	add(os.Getenv("S3_BUCKET"), "<bucket>")
+	sort.SliceStable(pairs, func(i, j int) bool { return len(pairs[i][0]) > len(pairs[j][0]) })
+	return pairs
 }
 
 // issueGatewayURL is where a report goes: GATEWAY_URL when enrolled, else NOWHERE_GATEWAY_DEFAULT
@@ -1523,6 +1761,25 @@ func buildIssueReportWith(name string, deviceScope bool, note string, extra map[
 	// is a bare device-level integer, carrying no session or profile fact, so it is safe at the gate. It counts
 	// since the DAEMON started, not since boot -- read it against boot_id and uptime_s above.
 	status["roam_lost_starts"] = strconv.FormatInt(roamLostStarts.Load(), 10)
+	// NWP-20261204-16 (Q182, docs/product-decisions.md 2026-10-20): the ERR-TIMEOUT expiries since the daemon started
+	// (how many after a lost-start re-fire, how many with the request never read, by op) and the lost starts by op, at
+	// EVERY scope. Fixed op words and integers, no uid or profile (worker_timeouts.go), so they skip statusValue like
+	// conf_ring_keys.
+	status["roam_worker_timeouts"] = workerTimeoutsValue()
+	status["roam_lost_starts_by_op"] = lostStartsByOpValue()
+	// NWP-20261204-21 (Q039, docs/product-decisions.md 2026-10-20): every cleanstorage op's RW-lane hold, and the slot
+	// wait of each sign-in that queued behind one, in <1 / 1-5 / 5-20 / >=20 s buckets with the max, at EVERY scope. The
+	// HELD and waited lines go to login.log and the reap's loop= to roam.log, and a gate report carries neither, yet the
+	// report most likely to follow a reap is a gate one. Device-level integers only (no uid, profile or time), so they
+	// skip statusValue, like roam_lost_starts. Since the daemon started: read them against boot_id and uptime_s.
+	status["reap_lane_hold"] = reapHold.value()
+	status["signin_wait_behind_reap"] = signinWaitBehindReap.value()
+	// NWP-20261208-11: RW-lane slot waits of 5 s or more by waiting op and the op that held the slot when it queued,
+	// and holds of 5 s or more by op, at EVERY scope (rw_slot_waits.go). login.log has the waited and HELD lines, but
+	// a gate report excludes it and the waited line never names the holder. Digits, fixed words and daemon op codes
+	// only (no uid, profile or app), so it skips statusValue, like roam_lost_starts. Since the daemon started: read
+	// it against boot_id and uptime_s.
+	status["rw_slot_waits"] = rwSlotWaits.value()
 	// NWP-20261104-18 (Q152, docs/product-decisions.md): the NAMES of the conf keys this device has set, so a
 	// hand-set flag such as NOWHERE_MULTIDEVICE shows in a report, at EVERY scope. roamd prints the same names in
 	// roam.log, which a report can lose to trimming and a gate report excludes. These are status keys, never
@@ -1544,6 +1801,13 @@ func buildIssueReportWith(name string, deviceScope bool, note string, extra map[
 	for k, v := range reapLedgerCounts(reapLedgerPath) {
 		status[k] = v
 	}
+	// NWP-20261204-20 (backlog: Four sibling Wi-Fi/network stores nothing sweeps ...): the boot sweep's siblings line
+	// (fix 18, the row's HW3 evidence), at EVERY scope. roamd prints it to roam.log only, which a gate report excludes
+	// and a session report trims to its last 300 lines. This is a status key, never trimmed. Its values are fixed
+	// tokens only (SELinux labels without categories, w0/w1, absent, unreachable, OTHER, missing): device-policy facts
+	// with no session, profile, SSID or app in them, so it skips statusValue and is safe at the gate. The gate report
+	// still carries no roam.log section: the bases below do not change.
+	status["bootsweep_siblings"] = bootsweepSiblingsStatus(filepath.Join(issueLogDir(), "roam.log"))
 	// NWP-20261119-07 (backlog: 0.5.49's grant op runs the Keystore sweep, ...): the last grant op's bundle count and
 	// step timings (grant_bundles, grant_keystore_ms, grant_perms_ms, grant_total_ms), SESSION SCOPE ONLY. roam.log's
 	// TIMING lines fall outside the report's trimmed tail, and status keys are never trimmed. A bundle count is a fact
@@ -1558,6 +1822,20 @@ func buildIssueReportWith(name string, deviceScope bool, note string, extra map[
 		// time, the largest size in KiB. An app's data size is a profile fact, so session scope only. Digits only
 		// (odGrowTimingStatus copies nothing else), so they skip statusValue.
 		for k, v := range odGrowTimingStatus(filepath.Join(loginStateDir(), odGrowTimingFile)) {
+			status[k] = v
+		}
+		// NWP-20261207-16 (backlog: on a boot after a flash or an OTA, the bundled apps of every sign-in share one
+		// ANDROID_ID): what SettingsProvider had pre-filled in the new user's settings_ssaid.xml before seedssaid removed
+		// it -- its rows, a userkey row, its app rows, their distinct values, the largest group sharing one value.
+		// Session scope: it is the sign-in's own user table. Digits and fixed words only (ssaidPrefillStatus copies
+		// nothing else), so they skip statusValue. The file is the LAST seedssaid's: a sign-in that sends none, or is
+		// refused before roamd (a cold-lock resume, an agent-side ERR-KEY), reports the one before.
+		for k, v := range ssaidPrefillStatus(filepath.Join(loginStateDir(), ssaidPrefillFile)) {
+			status[k] = v
+		}
+		// NWP-20261206-23: whether and when this session's account file was re-created during its cold lock is a
+		// profile fact, so session scope only. Digits and `na` only (coldDeUnparkStatus), so they skip statusValue.
+		for k, v := range coldDeUnparkStatus(filepath.Join(loginStateDir(), coldDeUnparkFile)) {
 			status[k] = v
 		}
 	}
@@ -1626,6 +1904,9 @@ func buildIssueReportWith(name string, deviceScope bool, note string, extra map[
 	logs["prev_boot"] = prevBootSection(pb, pbSrc, secrets)
 	// DIA-20260811-10: ANR headers -- the process and the reason, which is the part worth having. The full thread
 	// dumps are deliberately NOT carried: they are megabytes and would crowd out the logs under the size ceiling.
+	// NWP-20261208-18 is the one exception: a Nowhere process's trace also carries its "main" stack and the command
+	// line of each process its binder calls wait on (bounded by maxIssueAnrMain*), because a chooser ANR with no
+	// stack cannot name the call it was blocked in. Other apps keep the header cut.
 	// The section carries only traces that were NOT already present when this session began (the anr.seen
 	// snapshot), because /data/anr is shared by every session of the boot; no snapshot, no section.
 	// NWP-20260819-01 review: EXCLUDED at device scope. `Cmd line: <package>` names the app a DEPARTED
@@ -1671,7 +1952,7 @@ func buildIssueReportWith(name string, deviceScope bool, note string, extra map[
 // reachability test checked its own duplicate and stayed green when a key was removed from the real one.
 // "ota.log" sits AFTER the session logs: on a gate report it is the payload (often the only reason the
 // report exists), so every session log must go before it does.
-var issueTrimOrder = []string{"provision.log", "mediad.log", "roam.log", "login.log", "gate.log", "ota.log", "crashes", "anr", "gms", "uiderrors", "prev_boot", "avc"}
+var issueTrimOrder = []string{"provision.log", "mediad.log", "roam.log", "login.log", "gate.log", "ota.log", "crashes", "anr", "gms", "uiderrors", "odhold_log", "prev_boot", "avc"}
 
 func trimIssueReport(rep *issueReport) {
 	// Trim least-useful first. "avc" is LAST deliberately (DIA-20260806-04): a denial names the missing
@@ -1686,6 +1967,7 @@ func trimIssueReport(rep *issueReport) {
 	// already a cut of five records.
 	// NWP-20261201-01: "gms" sits just before "uiderrors": it is at most 41 lines, and its parsed values are also in the
 	// status keys, which no trim touches.
+	// NWP-20261206-15: "odhold_log" sits after "uiderrors": counts and fixed classes only, at most 41 lines.
 	order := issueTrimOrder
 	for {
 		b, _ := json.Marshal(rep)
@@ -1776,8 +2058,14 @@ func handleReportIssue(conn net.Conn, dest, reqLine string) {
 	// warm-switched session is still live, so the gate can never render session logs (the preview oracle).
 	deviceScope := req.Gate || name == ""
 	rep := buildIssueReportWith(name, deviceScope, req.Note, req.Status, func() string { return fetchUiderrors(dest, name, uid) }, readAnrSeen(dest))
+	// NWP-20261206-12: device-level, every scope. Set AFTER buildIssueReportWith merged the chooser's status, and
+	// unconditionally, so a chooser-sent key of the same name never replaces the daemon's own read.
+	for k, v := range otaInstallMarker(dest) {
+		rep.Status[k] = v
+	}
 	mergeCrashes(&rep, req.CrashAccess, req.Crashes, name, deviceScope)                                               // NWP-20261128-17 (Q121): session scope only
 	mergeGmsState(&rep, func() string { return fetchGmsState(dest, name, uid) }, deviceScope, nameSpellings(name)...) // NWP-20261201-01: session scope only
+	mergeOdholdLog(&rep, uid, deviceScope, nameSpellings(name)...)                                                    // NWP-20261206-15: session scope only, this session's uid only
 	trimIssueReport(&rep)                                                                                             // the crash section can be about 20 KiB: trim again
 	// After trimIssueReport, so outside the size limit: about 200 bytes against 200 KiB, harmless.
 	// NWP-20261202-43: session scope only. A sent report also appends the codes to the day summary, before
@@ -1790,8 +2078,11 @@ func handleReportIssue(conn net.Conn, dest, reqLine string) {
 	mergeDaySummary(rep.Status, uid, deviceScope)              // NWP-20261124-12: session scope only, this session's uid only
 	// NWP-20261201-02: session scope only; the fetch waits at most gmsExitsWait.
 	mergeGmsExits(rep.Status, func() string { return fetchGmsExits(dest, name, uid) }, dest, deviceScope)
+	// NWP-20261208-06: session scope only; the fetch waits at most mediaExitsWait.
+	mergeMediaExits(rep.Status, func() string { return fetchMediaExits(dest, name, uid) }, dest, deviceScope)
 	mergeHealth(rep.Status, uid, deviceScope)        // NWP-20261201-08: session scope only, this session's uid only
 	mergeMediaIO(rep.Status, dest, uid, deviceScope) // NWP-20261205-08: session scope only, this session's uid only
+	mergeCredChange(rep.Status, dest, deviceScope)   // NWP-20261208-05: session scope only, the signed-in profile only
 
 	if req.Preview {
 		// "View what's sent": hand the chooser the EXACT scrubbed bytes to show the user before they consent.

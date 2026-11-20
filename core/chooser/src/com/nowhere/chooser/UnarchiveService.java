@@ -58,6 +58,9 @@ public class UnarchiveService extends Service {
     static final String EXTRA_BY_HAND = "nowhere.unarchive.byhand";
     // NWP-20261201-13: with EXTRA_SWEEP. RESUME: the landing card's Resume -- only the sweep, and the Wi-Fi rule applies.
     static final String EXTRA_RESUME = "nowhere.unarchive.resume";
+    // NWP-20261208-23: with EXTRA_SWEEP. WAITING: the gate's start at the switch-landing, 15 s before the sweep start --
+    // only the landing card in its waiting state (showWaitingCard). It reads and shows, and writes nothing.
+    static final String EXTRA_WAITING = "nowhere.unarchive.waiting";
     // NET_REKICK: the gate's re-kick when the network rule turns to yes mid-session -- only the sweep, nothing else.
     static final String EXTRA_NET_REKICK = "nowhere.unarchive.netrekick";
     // NWP-20261203-18: the progress notification's Pause or Stop (HoldNotice.HOLD_PAUSE / HOLD_STOP), with the card closed.
@@ -85,6 +88,9 @@ public class UnarchiveService extends Service {
     /** NWP-20261118-05: the last materializeMember's MATERIALIZE-APP answered ERR-WORKER-BUSY, so the group's dep abort
      *  records BUSY, not FETCH_FAILED. Written and read under MAT_LOCK, like matEnd. */
     private static boolean depBusy;
+    /** NWP-20261210-20: false when the last materializeAndInstall ran nothing (the Play-stack ask was declined before
+     *  qEnqueue(group)), so the entry point is released, not counted done. Written and read under MAT_LOCK. */
+    private static boolean matRan;
     /** NWP-20261203-03: the thread running the current Auto sweep pass, or null when no sweep runs. Set at the top of
      *  each pass of sweepAutoJoined's loop (sweepPassBegin) and cleared in its outer finally (sweepPassEnd), both under
      *  the SweepStall class monitor, with the pass's SweepStall.reset. A step mark (step) counts only on it, so a tap on
@@ -115,12 +121,11 @@ public class UnarchiveService extends Service {
      *    (c) "(n of m)" is not the number of apps coming, so "2 of 3" can be followed by a fourth.
      *
      *  Every producer ENQUEUES its whole set BEFORE doing any work, so the count is the union from the first
-     *  frame and a queued app is named immediately. Q_DONE + Q_PENDING.size() is the honest total; the batch
-     *  resets when the queue drains, so the next batch counts from 1 again rather than accumulating forever. */
-    private static final Object Q_LOCK = new Object();
-    private static final java.util.LinkedHashSet<String> Q_PENDING = new java.util.LinkedHashSet<>();
-    private static int Q_DONE = 0;
-    private static String Q_CURRENT = null;
+     *  frame and a queued app is named immediately. Finished + pending is the honest total; ~~the batch
+     *  resets when the queue drains, so the next batch counts from 1 again rather than accumulating forever.~~
+     *  (Superseded by NWP-20261210-20: a drain still ends the batch, but a batch keyed by the landing card's sweep
+     *  is remembered, and the Resume of that card counts on from it. The set and its counting rules are FetchQueue.) */
+    static final FetchQueue FQ = new FetchQueue();
     /** NWP-20261122-11 (h51 #1): the taps this process is serving now -- a tap worker's, or a remembered tap the sweep
      *  claimed. A tap in TapMemory's file but not here was queued by a chooser that has since restarted. */
     private static final java.util.Set<String> LIVE_TAPS =
@@ -153,6 +158,13 @@ public class UnarchiveService extends Service {
     private static final Object SWEEP_SLOT = new Object();
     static volatile long SWEEP_SINCE;
 
+    /** NWP-20261204-14: the restore-only REPLIES this chooser process saw answer ERR-NOTREADY (Q056's data folder the app
+     *  does not own), for the od_half key of the session report (OdHalfStates). Per chooser process: it resets to 0 when
+     *  the process restarts. With OdRestoreOnce (NWP-20261202-38) a later sender can take an earlier sender's reply, so
+     *  this counts the replies seen, not the apps. */
+    static final java.util.concurrent.atomic.AtomicInteger RESTORE_NOTREADY =
+            new java.util.concurrent.atomic.AtomicInteger(0);
+
     /** NWP-20261122-15 (h50 #5): true on the sweep thread of a switch-landing start, so sweepAuto may show the landing
      *  line. Set by that start only (never by a network re-kick); read and removed by sweepAuto. */
     private static final ThreadLocal<Boolean> LANDING = new ThreadLocal<>();
@@ -161,6 +173,9 @@ public class UnarchiveService extends Service {
      *  card. Set by sweepAuto, reset at the start of each pass. */
     private static volatile long PASS_CARD;
     static long passCard() { return PASS_CARD; }
+    /** NWP-20261208-23: the waiting card the switch-landing showed (showWaitingCard), 0 for none. sweepAuto's card block
+     *  takes it (sets 0) and adopts or drops it; the landing arm's finally drops one that no card block took. */
+    private static final java.util.concurrent.atomic.AtomicLong WAITING_CARD = new java.util.concurrent.atomic.AtomicLong(0);
 
     /** NWP-20260901-32: hold the CPU up for the whole materialise.
      *
@@ -258,6 +273,7 @@ public class UnarchiveService extends Service {
         final boolean byHand = intent != null && intent.getBooleanExtra(EXTRA_BY_HAND, false);
         final boolean netRekick = intent != null && intent.getBooleanExtra(EXTRA_NET_REKICK, false);
         final boolean resumeSweep = intent != null && intent.getBooleanExtra(EXTRA_RESUME, false);
+        final boolean waitingStart = intent != null && intent.getBooleanExtra(EXTRA_WAITING, false);
         final String[] restoredOk = intent != null ? intent.getStringArrayExtra(EXTRA_WAKE) : null;
         final String hold = intent != null ? intent.getStringExtra(EXTRA_HOLD) : null;
         if (hold != null) {
@@ -284,7 +300,18 @@ public class UnarchiveService extends Service {
             fetchWakeAcquire(); // NWP-20260901-32: paired with workerDone()
             // NWP-20261201-13: "Install pending apps now" is the user asking for every app now: it ends a pause or a stop.
             if (byHand) SweepHold.clear();
+            // NWP-20261208-23: a waiting start takes its ticket here, on the main thread, so before the landing start the
+            // gate sends 15 s later; a landing start that came after it refuses its card (Sweep.beginWaiting).
+            final long waitTicket = waitingStart ? LandingLine.Sweep.landingTicket() : 0L;
             Thread sw = new Thread(() -> {
+                if (waitingStart) {
+                    // NWP-20261208-23: the landing card in its waiting state, inside the switch-landing's 15 s. Only the
+                    // card: the sweep, the presence snapshot and the rest wait for the start that follows.
+                    try { showWaitingCard(waitTicket); }
+                    catch (Throwable t) { android.util.Log.w("NowhereChooser", "#130 landing card (waiting)", t); }
+                    finally { workerDone(); }
+                    return;
+                }
                 if (netRekick) {
                     // NWP-20261112-11 (Q042): the gate's re-kick once the network allows the sweep. Only the sweep:
                     // the presence snapshot, the held-list seed, the phantom reconcile and the restored wake belong to
@@ -304,6 +331,8 @@ public class UnarchiveService extends Service {
                     return;
                 }
                 LANDING.set(!byHand);
+                // NWP-20261208-23: from here no waiting card is shown (Sweep.beginWaiting); landingEnds() is in the finally below.
+                LandingLine.Sweep.landingStarts();
                 // NWP-20260821-15: take the SESSION-PRESENCE SNAPSHOT first -- before the sweep materialises
                 // anything, and regardless of whether there is anything to sweep. This kick is the one thing that
                 // fires on EVERY login/resume switch-landing (kickAutoMaterialise, ~15s after the switch, after
@@ -361,6 +390,17 @@ public class UnarchiveService extends Service {
                         ls.setDaemon(true);
                         ls.start();
                     } catch (Throwable t) { android.util.Log.w("NowhereChooser", "last save line start", t); }
+                    // NWP-20261207-12 (Q106 S6b, O3): the media half of the landing line, once per sign-in (the user
+                    // serial), only for a background set over 200 files or 50 MiB. Its own daemon thread: the read may
+                    // poll for up to 30 s.
+                    try {
+                        final android.content.Context mlCtx = getApplicationContext();
+                        final String mlSerial = landingSerial();
+                        final File mlStamp = new File(getNoBackupFilesDir(), "media-landing-shown");
+                        Thread ml = new Thread(() -> MediaLandingNoticeActivity.check(mlCtx, mlSerial, mlStamp), "nowhere-media-landing");
+                        ml.setDaemon(true);
+                        ml.start();
+                    } catch (Throwable t) { android.util.Log.w("NowhereChooser", "media landing line start", t); }
                     try {
                         final android.content.Context appCtx = getApplicationContext();
                         Thread sn = new Thread(() -> SkipNoticeActivity.check(appCtx), "nowhere-skip-notice");
@@ -379,7 +419,15 @@ public class UnarchiveService extends Service {
                 catch (Throwable t) { android.util.Log.w("NowhereChooser", "wake restored", t); }
                 try { sweepAutoJoined(byHand); }
                 catch (Throwable t) { android.util.Log.w("NowhereChooser", "#130 auto sweep", t); }
-                finally { workerDone(); }
+                finally {
+                    // NWP-20261208-23: a waiting card that no card block took (an early return, a throw, a join) is dropped.
+                    // The take comes before landingEnds(): a waiting card shown after it is kept for the next landing start.
+                    long left = WAITING_CARD.getAndSet(0);
+                    if (left != 0L) { LandingLine.Sweep.drop(left); tellCard(); }
+                    LandingLine.Sweep.landingEnds();
+                    LandingQueue.decided(0); // NWP-20261208-24: no card decided: free the notices
+                    workerDone();
+                }
             });
             sw.setDaemon(true);
             sw.start();
@@ -458,7 +506,7 @@ public class UnarchiveService extends Service {
             // still be immediate and unconditional (the FGS start window), so it re-states what is already on
             // screen rather than skipping: title, byte line and determinate bar when a batch is already running.
             String bPkg;
-            synchronized (Q_LOCK) { bPkg = Q_CURRENT; }
+            bPkg = FQ.current();
             long[] bt = ACTIVE.get() > 0 ? bytesFor(bPkg) : null;
             CharSequence t = ACTIVE.get() > 0 ? curTitle : "Getting your app";
             Notification.Builder nb = new Notification.Builder(this, CHANNEL)
@@ -503,7 +551,7 @@ public class UnarchiveService extends Service {
      *  -- so it lasts the whole dexopt window, "tens of seconds for a big app" by this file's own reckoning.
      *
      *  ⚠ KEYED, NOT MERELY CLEARED AT qStart. Between `qFinish(A)` and `qStart(B)` the renderer ALREADY names B
-     *  (renderQueue's `Q_CURRENT == null` fallback picks the first pending), so a cache cleared only at qStart
+     *  (renderQueue's no-current fallback picks the first pending), so a cache cleared only at qStart
      *  would print A's byte figures under B's name. That is worse than the bug being fixed: a blank line is
      *  visibly missing, whereas wrong numbers under the right name look entirely correct. */
     private volatile String bytesPkg = null;
@@ -534,11 +582,20 @@ public class UnarchiveService extends Service {
 
     /** NWP-20260822-12: add a producer's whole set to the outstanding queue and render it at once. Called
      *  BEFORE any work, which is the whole point -- it is what makes a tapped app visible while it waits behind
-     *  the sweep. Already-queued and already-done members are ignored (LinkedHashSet), so a tap for something
-     *  the sweep is already carrying does not double-count it. */
+     *  the sweep. ~~Already-queued and already-done members are ignored (LinkedHashSet), so a tap for something
+     *  the sweep is already carrying does not double-count it.~~ (Superseded by NWP-20261210-20: the set never
+     *  held the done members, so a finished app queued again was counted twice. In FetchQueue a finished member
+     *  is ignored, and an already-queued one gains a holder, so each producer takes back only its own claim.) */
     private void qEnqueue(java.util.List<String> pkgs) {
         if (pkgs == null || pkgs.isEmpty()) return;
-        synchronized (Q_LOCK) { Q_PENDING.addAll(pkgs); }
+        FQ.enqueue(pkgs);
+        renderQueue();
+    }
+
+    /** NWP-20261210-20: the batch's key, the landing card's sweep id (0: none). The Resume of a paused card gives the
+     *  same id, so the batch keeps the apps that card already finished and its total. */
+    private void qBatch(long card) {
+        FQ.batch(card);
         renderQueue();
     }
 
@@ -547,30 +604,31 @@ public class UnarchiveService extends Service {
         // NWP-20260901-04: a new member owns the surface -- drop the previous one's byte frame and phase verb.
         // Clearing the KEY first is what makes the cache safe to read concurrently (see bytesFor).
         bytesPkg = null; bytesDone = 0; bytesTotal = 0; curVerb = null;
-        synchronized (Q_LOCK) { Q_PENDING.add(pkg); Q_CURRENT = pkg; }
+        FQ.start(pkg);
         renderQueue();
     }
 
     /** This member is finished (installed, already-whole, or failed -- all three leave the queue, or the
      *  denominator would stall at a number that never comes down). */
     private void qFinish(String pkg) {
-        synchronized (Q_LOCK) {
-            if (Q_PENDING.remove(pkg)) Q_DONE++;
-            if (pkg != null && pkg.equals(Q_CURRENT)) Q_CURRENT = null;
-            if (Q_PENDING.isEmpty()) Q_DONE = 0; // batch drained -> the next one counts from 1
-        }
+        FQ.finish(pkg);
         renderQueue();
     }
 
     /** Abandon members that will never run -- the fail-fast abort drops the rest of a group. Without this the
-     *  total keeps counting apps that are not coming, which is failure (c) in a different disguise. */
+     *  total keeps counting apps that are not coming, which is failure (c) in a different disguise.
+     *  NWP-20261210-20: a release takes back ONE holder per member, the caller's own claim, so a member another
+     *  producer still holds stays counted. An empty list still ends a batch that has nothing pending. */
     private void qDrop(java.util.Collection<String> pkgs) {
-        if (pkgs == null || pkgs.isEmpty()) return;
-        synchronized (Q_LOCK) {
-            for (String p : pkgs) Q_PENDING.remove(p);
-            if (Q_PENDING.isEmpty()) Q_DONE = 0;
-        }
+        FQ.release(pkgs);
         renderQueue();
+    }
+
+    /** NWP-20261210-25: the app the notification names: the running member, else the first pending app, else null.
+     *  It reads the same {@link FetchQueue.Snapshot#named} renderQueue names as {@code cur}, so the card and the
+     *  notification cannot name two apps (FetchQueue replaced the Q_* fields in NWP-20261210-20). */
+    private String qNamed() {
+        return FQ.snapshot().named;
     }
 
     /** Compose the title (and the expanded roster) from the QUEUE rather than from any one caller's loop.
@@ -578,23 +636,16 @@ public class UnarchiveService extends Service {
      *  still coming BY NAME, which is the literal thing that was missing -- a user with two producers running
      *  could not see both. */
     private void renderQueue() {
-        final String cur;
-        final int pos, total;
-        final java.util.List<String> rest = new ArrayList<>();
-        synchronized (Q_LOCK) {
-            total = Q_DONE + Q_PENDING.size();
-            pos = Math.min(Q_DONE + 1, Math.max(total, 1));
-            String c = Q_CURRENT;
-            if (c == null) { for (String p : Q_PENDING) { c = p; break; } }
-            cur = c;
-            for (String p : Q_PENDING) if (!p.equals(cur)) rest.add(p);
-        }
+        final FetchQueue.Snapshot q = FQ.snapshot(); // NWP-20261210-20: one read for the count, the name and the verb
+        final String cur = q.named;
+        final int pos = q.position, total = q.total;
+        final java.util.List<String> rest = new ArrayList<>(q.rest);
         if (cur == null) return; // nothing outstanding; the finishing worker tears the notice down
         // NWP-20260901-04: honour a phase verb already in effect ("Installing", "Setting up") instead of
         // recomposing the title back to "Downloading". Only the CURRENT member's verb applies -- qStart clears
         // it -- so a queue mutation can never carry a previous member's beat onto a new name.
         String cv = curVerb;
-        String verb = cv != null ? cv + " " : (Q_CURRENT == null ? "Waiting for " : "Downloading ");
+        String verb = cv != null ? cv + " " : (q.current == null ? "Waiting for " : "Downloading ");
         curTitle = verb + friendlyName(cur) + (total > 1 ? " (" + pos + " of " + total + ")" : "") + "…";
         queueRoster = rest;
         updateNotice(curTitle, cur);
@@ -793,7 +844,8 @@ public class UnarchiveService extends Service {
         // when the service dies mid-work, e.g. a group abandoned by a crash rather than the fail-fast abort,
         // inflates the NEXT batch's denominator for the rest of the session. Only reached via workerDone() with
         // the refcount at zero, so there is no live worker whose member this could drop.
-        synchronized (Q_LOCK) { Q_PENDING.clear(); Q_DONE = 0; Q_CURRENT = null; }
+        // NWP-20261210-20: the remembered batch survives the clear, because the service stops between a Pause and its Resume.
+        FQ.clear();
         try { stopForeground(Service.STOP_FOREGROUND_REMOVE); } catch (Throwable ignore) {}
         try { stopSelf(); } catch (Throwable ignore) {}
     }
@@ -1135,6 +1187,7 @@ public class UnarchiveService extends Service {
     private boolean restoreOnlyReplied(String pkg, String rr) {
         boolean ok = rr != null && rr.startsWith("OK");
         if (ok) markOdRestored(pkg);
+        if (rr != null && rr.startsWith("ERR-NOTREADY")) RESTORE_NOTREADY.incrementAndGet(); // NWP-20261204-14: od_half
         // NWP-20261005-14, exactly as the materialise path does: odrestore force-stops an app whose hold it hands
         // back, and a stopped app gets no broadcast -- FCM included -- until something starts it, so wake a
         // MESSAGING app once its restore is CONFIRMED. A tap launches the app as well, which unstops it anyway.
@@ -1338,7 +1391,7 @@ public class UnarchiveService extends Service {
         long since;
         synchronized (SWEEP_SLOT) { sweep = SWEEP_THREAD; since = SWEEP_SINCE; }
         int queue;
-        synchronized (Q_LOCK) { queue = Q_PENDING.size(); }
+        queue = FQ.pendingSize();
         return new SweepSnapshot.Input(sweep, since, MAT_LOCK.owner(), MAT_LOCK.getQueueLength(), LIVE_TAPS.size(),
                 queue, ACTIVE.get());
     }
@@ -1402,17 +1455,24 @@ public class UnarchiveService extends Service {
             String tapEnd = SweepOutcome.BUSY;
             int tapTries = 0;
             long tapWaited = 0;
+            // NWP-20261210-20 (RF-002): true while this loop holds its own claim on pkg in the queue. Each call of
+            // materializeAndInstall takes the claim back or finishes it, so a retry claims it again, and the cleanup
+            // releases only a claim still held: a live tap's holder on the same app is never taken.
+            boolean tapHeld = false;
             try {
                 qEnqueue(java.util.Collections.singletonList(pkg));
+                tapHeld = true;
                 while (!SignOutGate.begun()) {
                     // NWP-20261113-17's rule: MAT_LOCK is held across the call and the read of matEnd.
                     step(SweepStall.LOCK);
                     MAT_LOCK.lock();
                     try {
+                        tapHeld = false; // materializeAndInstall's end takes the claim back or finishes it
                         materializeAndInstall(pkg, true);
                         tapEnd = matEnd;
                     } catch (Throwable t) {
                         tapEnd = SweepOutcome.ERROR;
+                        qDrop(java.util.Collections.singletonList(pkg)); // the throw skipped that end: take the claim back here
                         android.util.Log.w("NowhereChooser", "#130 sweep: a remembered tap threw", t);
                     } finally {
                         MAT_LOCK.unlock();
@@ -1432,10 +1492,16 @@ public class UnarchiveService extends Service {
                         catch (InterruptedException ie) { Thread.currentThread().interrupt(); break; }
                         left -= 1000L;
                     }
+                    // NWP-20261210-20 (RF-002): the busy exit took the claim back; the retry claims the app again.
+                    qEnqueue(java.util.Collections.singletonList(pkg));
+                    tapHeld = true;
                 }
             } finally {
+                // NWP-20261210-20 (RF-002): release only the claim this loop still holds (a sign-out before a call, or
+                // after a retry's claim), so a second release never takes another producer's holder.
+                if (tapHeld) qDrop(java.util.Collections.singletonList(pkg));
                 if (SweepOutcome.BUSY.equals(tapEnd)) {
-                    qDrop(java.util.Collections.singletonList(pkg)); // nothing ran; a no-op when the busy arm dropped it
+                    // nothing ran: the line stays for a later sweep
                 } else if (!TapMemory.remove(tapFile, tapSerial, pkg)) {
                     android.util.Log.w("NowhereChooser", "tap memory remove failed (NWP-20261122-11)");
                 }
@@ -1499,6 +1565,9 @@ public class UnarchiveService extends Service {
             cardResumed(card);
             landing = false;
         }
+        // NWP-20261208-23: the waiting card the switch-landing showed, taken by the landing pass only. Adopted below when
+        // its rows are the same, else dropped.
+        long waitCard = landing ? WAITING_CARD.getAndSet(0) : 0L;
         try {
             File stamp = new File(getNoBackupFilesDir(), "landing-line-shown");
             String serial = landingSerial();
@@ -1506,13 +1575,28 @@ public class UnarchiveService extends Service {
                 step(SweepStall.CARD, 0, work.size()); // NWP-20261203-03: the card writes its stamp, reads each app's deps
                 StoreInstaller.writeAtomic(stamp, serial);
                 String[] cardRows = LandingLine.cardPkgs(work, p -> ProfileActivity.appDeps(this, p), p -> hasInstalledCode(p));
-                card = LandingLine.Sweep.begin(cardRows);
-                startActivity(new Intent(this, LandingNoticeActivity.class).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                        .putExtra(LandingNoticeActivity.EXTRA_COUNT, cardRows.length)
-                        .putExtra(LandingNoticeActivity.EXTRA_PKGS, cardRows)
-                        .putExtra(LandingNoticeActivity.EXTRA_SWEEP, card));
+                if (waitCard != 0L && LandingLine.Sweep.waiting(waitCard)
+                        && LandingLine.sameRows(LandingLine.Sweep.pkgs(waitCard), cardRows)) {
+                    card = waitCard; // the waiting card becomes the running card: no second card
+                    LandingLine.Sweep.go(waitCard);
+                    tellCard();
+                } else {
+                    if (waitCard != 0L) { LandingLine.Sweep.drop(waitCard); tellCard(); }
+                    card = LandingLine.Sweep.begin(cardRows);
+                    startActivity(new Intent(this, LandingNoticeActivity.class).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                            .putExtra(LandingNoticeActivity.EXTRA_COUNT, cardRows.length)
+                            .putExtra(LandingNoticeActivity.EXTRA_PKGS, cardRows)
+                            .putExtra(LandingNoticeActivity.EXTRA_SWEEP, card));
+                }
+            } else if (waitCard != 0L) {
+                LandingLine.Sweep.drop(waitCard);
+                tellCard();
             }
-        } catch (Throwable t) { android.util.Log.w("NowhereChooser", "landing line", t); }
+        } catch (Throwable t) {
+            android.util.Log.w("NowhereChooser", "landing line", t);
+            if (waitCard != 0L && waitCard != card) { LandingLine.Sweep.drop(waitCard); tellCard(); }
+        }
+        LandingQueue.decided(card); // NWP-20261208-24: the notices fold into this card, or wait for it to close; 0: none
         PASS_CARD = card; // NWP-20261203-18, -23: the card a Pause, from the notification or Your apps, keeps
         // NWP-20261012-04: BOTH lists. A profile whose only outstanding app is an installed one with an unconfirmed
         // restore (Chester's App store case) has an empty work list, and returning on that alone never retries it.
@@ -1521,9 +1605,17 @@ public class UnarchiveService extends Service {
         if (work.isEmpty() && retry.isEmpty()) { android.util.Log.i("NowhereChooser", "#130 sweep: nothing to materialise"); return; }
         // NWP-20260822-12: the sweep's whole set joins the SHARED queue up front. It no longer composes a count
         // over work.size() -- that denominator was invisible to a concurrent tap and vice versa.
-        qEnqueue(work);
+        // NWP-20261210-20: the set is the card's rows (the Play-stack deps that ride with the work list, then the work
+        // list), from the card's own inputs, so the notification counts what the card counts from the first frame. The
+        // batch is keyed by the card: a Resume of a paused card counts on from the apps that card already finished.
+        // `queued` is the sweep's own claim: one holder per member. An app leaves it when its claim is taken back or
+        // finished (materializeAndInstall's end, the catch, an exit's rest()), so the end release takes back only what
+        // the sweep still holds, never a tap's holder (RF-001).
+        java.util.List<String> queued = new ArrayList<>(java.util.Arrays.asList(LandingLine.cardPkgs(work, p -> ProfileActivity.appDeps(this, p), p -> hasInstalledCode(p))));
+        qBatch(card);
+        qEnqueue(queued);
         int done = 0, failed = 0;
-        int hardFailed = 0; // NWP-20261203-17: apps that ran and did not land (SweepFailNotice.hard)
+        java.util.List<String> hardFailedPkgs = new ArrayList<>(); // NWP-20261203-17, NWP-20261208-17: apps that ran and did not land (SweepFailNotice.hard)
         boolean cut = false; // NWP-20261201-13: Pause or Stop left apps not started
         // NWP-20261005-01: hold the periodic seal back for the WHOLE sweep, not just one app. RESTORE-ODDATA closes
         // the per-app window, and a seal that starts in the install gap before the next app holds the worker for up
@@ -1610,8 +1702,9 @@ public class UnarchiveService extends Service {
                 // overwrite matEnd in between.
                 step(SweepStall.LOCK, i + 1, work.size());
                 MAT_LOCK.lock();
+                cardStarted(card, pkg); // NWP-20261210-25: the lock is the sweep's now: its own app
                 try { ok = materializeAndInstall(pkg, true); end = matEnd; }
-                catch (Throwable t) { end = SweepOutcome.ERROR; android.util.Log.w("NowhereChooser", "#130 sweep " + pkg, t); }
+                catch (Throwable t) { end = SweepOutcome.ERROR; qDrop(java.util.Collections.singletonList(pkg)); android.util.Log.w("NowhereChooser", "#130 sweep " + pkg, t); }
                 finally { MAT_LOCK.unlock(); }
                 // NWP-20261118-05: a busy worker lane ran nothing, so the app has not failed. RETRY waits with MAT_LOCK
                 // released (a tap can run), ends the wait at once for a sign-out, and takes the SAME app again; the top
@@ -1628,11 +1721,16 @@ public class UnarchiveService extends Service {
                         try { Thread.sleep(Math.min(left, 1000L)); }
                         catch (InterruptedException ie) { Thread.currentThread().interrupt(); break; }
                     }
+                    // NWP-20261210-20: the busy exit took back the sweep's claim on this app; the retry claims it again,
+                    // under the card's key, so a batch that drained on that release counts on from the card's finished.
+                    qBatch(card);
+                    qEnqueue(java.util.Collections.singletonList(pkg));
                     i--;
                     continue;
                 }
+                queued.remove(pkg); // NWP-20261210-20: materializeAndInstall or the catch took back or finished this claim
                 if (ok) done++; else if (step == SweepBusy.Step.NEXT) failed++;
-                if (!ok && step == SweepBusy.Step.NEXT && SweepFailNotice.hard(end)) hardFailed++;
+                if (!ok && step == SweepBusy.Step.NEXT && SweepFailNotice.hard(end)) hardFailedPkgs.add(pkg);
                 android.util.Log.i("NowhereChooser", "#130 sweep " + pkg + " -> " + ok);
                 // NWP-20261113-17: the outcome to login.log (AUTO-SWEEP-APP), by index and token only -- never the
                 // package. Sent after the unlock, so a slow reply never holds a tap back.
@@ -1658,7 +1756,9 @@ public class UnarchiveService extends Service {
                     break;
                 }
             }
+            queued.removeAll(work); // NWP-20261210-20: every exit above took the rest(work, ...) claims back already
         } finally {
+            qDrop(queued); // NWP-20261210-20: the sweep's claim on what it did not run; a finished member is untouched
             DaemonSocket.roundTrip("AUTO-SWEEP\n0\n", 30000);
         }
         android.util.Log.i("NowhereChooser", "#130 sweep done: " + done + "/" + work.size() + " materialised"
@@ -1723,10 +1823,16 @@ public class UnarchiveService extends Service {
                 } catch (Throwable t) { android.util.Log.w("NowhereChooser", "#130 sweep: the Play Store line", t); }
             }
         }
+        // NWP-20261208-17: an app that failed and was installed by hand before the pass ended is not a failure
+        // (backlog section C, "The Auto sweep's failed-apps notice counts an app the user installed by hand ...").
+        java.util.List<String> stillFailed = SweepFailNotice.stillMissing(hardFailedPkgs, p -> hasInstalledCode(p));
+        int hardFailed = stillFailed.size();
+        if (hardFailed < hardFailedPkgs.size()) android.util.Log.i("NowhereChooser", "#130 sweep: "
+                + (hardFailedPkgs.size() - hardFailed) + " failed app(s) installed meanwhile -- not counted (NWP-20261208-17)");
         // NWP-20261203-17 (Chester 2026-11-12, "Notice with a count"): a pass with an app that fetch-failed,
         // install-failed or ended in error says how many, and a tap opens Your apps. A later pass that lands apps with
         // none failing clears it. Its own id: the FG_ID notice goes with the service. Counts only. Draft words.
-        SweepFailNotice.Act act = SweepFailNotice.action(work.size(), done, hardFailed);
+        SweepFailNotice.Act act = SweepFailNotice.afterRecheck(work.size(), done, hardFailedPkgs.size(), hardFailed);
         if (act != SweepFailNotice.Act.KEEP) {
             try {
                 NotificationManager nm = getSystemService(NotificationManager.class);
@@ -1771,6 +1877,41 @@ public class UnarchiveService extends Service {
         }
     }
 
+    /** NWP-20261208-23 (backlog: "After sign-in lands on the home screen, about 15 s pass with no sign that the Auto apps
+     *  are coming"): the landing card in its waiting state. READ-ONLY: it runs inside the switch-landing's 15 s (see
+     *  ChooserActivity.kickAutoMaterialise), so it writes no stamp and folds nothing; sweepAuto still does both, and adopts
+     *  this card only when its rows are the same (LandingLine.sameRows). The list and the network rule are the ones
+     *  sweepAuto reads. GET-PREFETCH-METERED is lock-free in the daemon, so this never waits on sessionMu. Nothing when a
+     *  sweep runs (it shows its own card) or is held (a held sweep shows no card, and a paused card keeps its record).
+     *  The reads take time, so the card is shown only by Sweep.beginWaiting(ticket, rows, publish): it refuses, under the
+     *  lock Sweep.begin takes, when a landing start came after {@code ticket}, runs, or has an open card, and it sets
+     *  WAITING_CARD under that lock (RF-002), so a landing start's take sees every recorded card. After the card is
+     *  recorded, a card block may take it before the start below: an adopted card still starts (it is the running card),
+     *  a dropped or replaced one does not (Sweep.gone). */
+    private void showWaitingCard(long ticket) {
+        if (SweepJoin.running() || SweepHold.held()) return;
+        java.util.List<String> work = pendingAutoApps(this, false);
+        work.removeAll(OLDER_COPY);
+        if (!work.isEmpty() && !AutoSweepNet.mayFetch(false,
+                AutoSweepNet.meteredAllowed(daemon("GET-PREFETCH-METERED\n")),
+                ChooserActivity.onWifiCtx(this), ChooserActivity.hasInternetCtx(this))) work.clear();
+        File stamp = new File(getNoBackupFilesDir(), "landing-line-shown");
+        if (!LandingLine.show(true, work.size(), readLandingStamp(stamp), landingSerial())) return;
+        String[] rows = LandingLine.cardPkgs(work, p -> ProfileActivity.appDeps(this, p), p -> hasInstalledCode(p));
+        // RF-002: the record and WAITING_CARD are set under one lock, so a landing start's take cannot miss the card.
+        long w = LandingLine.Sweep.beginWaiting(ticket, rows, WAITING_CARD::set);
+        if (w == 0L) { android.util.Log.i("NowhereChooser", "#130 landing card (waiting): a landing start or an open card came first"); return; }
+        if (LandingLine.Sweep.gone(w)) { // a card block dropped it, or its begin replaced it: no card from here
+            WAITING_CARD.compareAndSet(w, 0);
+            return;
+        }
+        startActivity(new Intent(this, LandingNoticeActivity.class).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                .putExtra(LandingNoticeActivity.EXTRA_COUNT, rows.length)
+                .putExtra(LandingNoticeActivity.EXTRA_PKGS, rows)
+                .putExtra(LandingNoticeActivity.EXTRA_SWEEP, w));
+        android.util.Log.i("NowhereChooser", "#130 landing card (waiting): " + rows.length + " row(s)");
+    }
+
     /** NWP-20261122-15: this sign-in's key for the landing line, the Android user's serial (new at every sign-in,
      *  unchanged across a cold-lock resume). A negative serial or a failed read is null, and null shows nothing. */
     private String landingSerial() {
@@ -1799,6 +1940,7 @@ public class UnarchiveService extends Service {
         MAT_LOCK.lock();
         try {
             matEnd = SweepOutcome.ERROR; // NWP-20261113-17: an exit that records nothing reads `error`
+            matRan = true; // NWP-20261210-20: only the declined ask clears it
             // placeholder=true: every caller holds one (a tap's unarchive) or a sweep work item, which pendingAutoApps
             // admitted with a placeholder, or with neither it nor code and no entry point to ride (NWP-20261207-07):
             // true makes that orphan AUTO_INSTALL, a fresh install as a dep's is. It is only read when there is no code.
@@ -1824,9 +1966,14 @@ public class UnarchiveService extends Service {
             }
             boolean ok = materializeLocked(pkg, quiet);
             if (ok) noteSeen(pkg);
-            // Success, failure and the fail-fast abort all retire the entry point. qDrop has already removed it
-            // on the abort path; qFinish on an absent member is a no-op, so the double call is safe.
-            qFinish(pkg);
+            // Success, failure and the fail-fast abort all retire the entry point. ~~qDrop has already removed it
+            // on the abort path; qFinish on an absent member is a no-op, so the double call is safe.~~ (Superseded by
+            // NWP-20261210-20: the abort's qDrop(group) takes back only the group's claim, so a member the sweep or a
+            // tap also queued is still pending here, and qFinish counts it done, as a failed app always was.)
+            // NWP-20261210-20: an exit that ran nothing (the declined ask, a busy worker lane) takes back only the
+            // caller's claim, so the app stays counted while another producer still carries it, and is never done.
+            if (!matRan || SweepOutcome.BUSY.equals(matEnd)) qDrop(java.util.Collections.singletonList(pkg));
+            else qFinish(pkg);
             return ok;
         } finally {
             MAT_LOCK.unlock();
@@ -1901,6 +2048,7 @@ public class UnarchiveService extends Service {
                         + "download was not confirmed (" + a + ") -- leaving the placeholder for a retry");
                 // NWP-20261113-17: never reached from the Auto sweep (`quiet` is never asked); recorded as ERROR, the
                 // token for an exit the sweep cannot name, so every exit of this method still records one.
+                matRan = false; // NWP-20261210-20: nothing ran, so materializeAndInstall releases the caller's claim
                 matEnd = SweepOutcome.ERROR;
                 return false;
             }
@@ -1924,10 +2072,13 @@ public class UnarchiveService extends Service {
             // and only another roam can recover it. Observed on odtest4: a false timeout on gms (fixed separately)
             // left Ring installed and unusable. Aborting instead keeps the placeholder, and the worker's
             // reportUnarchivalStatus(UNARCHIVAL_GENERIC_ERROR) resets the icon so the next tap retries the whole
-            // group. That retry re-fetches the group from the store rather than resuming -- this path has NO local
+            // group. ~~That retry re-fetches the group from the store rather than resuming -- this path has NO local
             // chunk cache (roamd's materializeapp never exports NOWHERE_CHUNK_CACHE, rm -rf's .appcode/<pkg> first,
             // materializeDeferred writes O_TRUNC, and both materialise paths rmTree in their finally) -- so a retry
-            // costs the full download again. Still the right trade: expensive-but-recoverable beats a cheap dead end.
+            // costs the full download again.~~ SUPERSEDED by NWP-20261210-10: the restore-app verb keeps the sealed
+            // chunks a failed try landed in .appcode/.odchunks, which none of those removals touches, so a retry
+            // fetches only the chunks an earlier try did not land. Still the right trade: expensive-but-recoverable
+            // beats a cheap dead end.
             // KNOWN NARROW COST: usesPlayServices only tests for the gms.version marker, which any app linking a
             // Play/Firebase library carries, so a SOFT client that would have run degraded (analytics dead, app fine)
             // now also declines to install when a dep fetch fails. Accepted because that outcome is retryable while
@@ -2198,11 +2349,13 @@ public class UnarchiveService extends Service {
             final int action = autoAction(code, code && odRestored(dep), false);
             if (action == AUTO_WHOLE) {
                 cardDepLanded(dep); // another path restored it (the install heal): its row must not read "coming back"
+                qFinish(dep); // NWP-20261210-20: counted done, as the card ticks it
                 android.util.Log.i("NowhereChooser", "app dep " + dep + " -> already installed + restored, skipping");
                 continue;
             }
             if (action == AUTO_RESTORE_ONLY) {
                 cardDepLanded(dep); // installApks' latch can time out while PackageManager finishes: the code is there
+                qFinish(dep); // NWP-20261210-20: counted done, as the card ticks it
                 // NWP-20261012-04: installed (by us or by anything else, e.g. Play Services from an app store) and
                 // its restore unconfirmed. Its code is live and usable, so it is never re-fetched or re-installed
                 // over -- only its restore is retried.
@@ -2248,9 +2401,14 @@ public class UnarchiveService extends Service {
     }
 
     /** NWP-20261201-34: the landing card shows this app as installing. Recorded first and broadcast after, with no
-     *  extras. A retry that finds the same installing row changes nothing and sends nothing. */
+     *  extras. A retry that finds the same installing row changes nothing and sends nothing. NWP-20261210-25: while
+     *  another thread (a tap) holds MAT_LOCK, the installing row is the app the notification names (qNamed), or none
+     *  when that app has no row, so the card and the notification name one app. When this thread holds the lock, or
+     *  nobody does, the row is {@code pkg}. */
     private void cardStarted(long card, String pkg) {
-        if (!LandingLine.Sweep.started(card, pkg)) return;
+        Thread o = MAT_LOCK.owner();
+        String named = (o != null && o != Thread.currentThread()) ? qNamed() : null;
+        if (!LandingLine.Sweep.startedBehind(card, pkg, named)) return;
         try {
             sendBroadcast(new Intent(LandingNoticeActivity.ACTION_STARTED).setPackage(getPackageName()));
         } catch (Throwable t) { android.util.Log.w("NowhereChooser", "#130 sweep: tell the landing card", t); }

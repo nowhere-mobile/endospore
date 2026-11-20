@@ -25,8 +25,14 @@
 # behaviour as before. A fork without a sed would pass every count, so W3 pins the loop byte for byte.
 #
 # Blocks are extracted from nowhere_roamd.sh BY ANCHOR, never copied, and each extraction is asserted. `stat`,
-# `find`, `chcon` and `restorecon` are stubbed as shell functions that RECORD their arguments; /proc/self/mountinfo
-# is re-pointed at a fixture. The suite asserts the arguments roamd builds, not toybox's behaviour -- that half was
+# `find`, `xargs`, `chcon` and `restorecon` are stubbed as shell functions that RECORD their arguments;
+# /proc/self/mountinfo is re-pointed at a fixture.
+#
+# NWP-20261209-04: the chcon walk is od_walk's bounded `find -print0 | xargs -0 -r -n 256 sh -c <batch>` (extracted
+# too). The xargs stub records its argv with the batch script shown as <batch>, then runs that script (the real one,
+# from roamd) on the entries find listed, so the chcon it records is the call the batch would make. F1/F2 pin that a
+# find error in the listing or in the walk fails the relabel (rc 2, a WARN, no `relabelled` line), and every case
+# checks that the status files in $STATE are removed. The suite asserts the arguments roamd builds, not toybox's behaviour -- that half was
 # proven on the device (a tmpfs mounted under a category-labelled app dir kept its own label; without the prune it
 # was relabelled).
 #
@@ -49,21 +55,40 @@ for s in bash sh dash mksh; do command -v "$s" >/dev/null 2>&1 && SHELLS="$SHELL
 # The same shim as test-mediad-sweep.sh's PRINT_SHIM: bash and dash have no `print`; mksh (the device's sh) does.
 PRINT_SHIM='print() { local nl=1; while [ $# -gt 0 ]; do case "$1" in -rn|-nr) nl=0; shift ;; -r) shift ;; --) shift; break ;; *) break ;; esac; done; if [ "$nl" = 1 ]; then printf "%s\n" "$*"; else printf "%s" "$*"; fi; }'
 
-extract_fns() { sed -n '/^mi_path() {$/,/^}$/p; /^od_relabel() {$/,/^}$/p; /^relabel_restored() {$/,/^}$/p' "$1"; }
+extract_fns() { sed -n '/^mi_path() {$/,/^}$/p; /^od_walk() {$/,/^}$/p; /^od_relabel() {$/,/^}$/p; /^relabel_restored() {$/,/^}$/p' "$1"; }
 # The odrestore op's copy branch, from its case label to the next op's.
 extract_odrestore() { sed -n '/^  odrestore)$/,/^  silence-alarm)$/p' "$1"; }
 
 # Each stub appends one line per call to $D/calls, with printf, never echo: dash's and mksh's echo expand the
-# backslashes the N2 case is about. find answers $D/nfind lines to a -print walk (the number of entries whose
-# context differs) and nothing to an -exec walk.
+# backslashes the N2 case is about. find answers $D/nfind entries (e0, e1, ...: the entries whose context differs),
+# one a line to -print and NUL-terminated to -print0, and exits with field 1 of $D/findrc for -print (the listing)
+# and field 2 for -print0 (the walk). xargs drains its input first (so its line follows find's), records its argv,
+# and runs the batch script once on every entry (no case lists 256), returning 123 if the batch failed, as toybox does.
 STUBS=$(cat <<'EOF'
 stat() {
   [ "$1" = -c ] && [ "$2" = "%C" ] && [ $# = 3 ] || { printf '%s\n' "stat $*" >> "$D/unexpected"; return 1; }
   cat "$D/ctx" 2>/dev/null
 }
 find() {
+  local i=0 n r1 r2
   printf '%s\n' "find $*" >> "$D/calls"
-  case " $* " in *" -print "*) local i=0 n; n=$(cat "$D/nfind"); while [ "$i" -lt "$n" ]; do echo "e$i"; i=$((i+1)); done ;; esac
+  n=$(cat "$D/nfind"); read -r r1 r2 < "$D/findrc"
+  case " $* " in
+    *" -print ") while [ "$i" -lt "$n" ]; do echo "e$i"; i=$((i+1)); done; return "$r1" ;;
+    *" -print0 ") while [ "$i" -lt "$n" ]; do printf 'e%s\0' "$i"; i=$((i+1)); done; return "$r2" ;;
+  esac
+  return 0
+}
+xargs() {
+  local items scr
+  items=$(tr '\0' '\n'; echo x); items=${items%x}
+  [ "$1 $2 $3 $4 $5 $6" = "-0 -r -n 256 sh -c" ] && [ $# -ge 8 ] || { printf '%s\n' "xargs $*" >> "$D/unexpected"; return 1; }
+  scr=$7; shift 7
+  printf '%s\n' "xargs -0 -r -n 256 sh -c <batch> $*" >> "$D/calls"
+  [ -n "$items" ] || return 0
+  shift
+  ( IFS='
+'; set -f; set -- "$@" $items; IFS=' '; set +f; eval "$scr" ) || return 123
   return 0
 }
 chcon() { printf '%s\n' "chcon $*" >> "$D/calls"; }
@@ -73,22 +98,25 @@ EOF
 )
 
 # run <sh> <fns> <vol> <dir> <ctx> <nfind> <mountinfo-mountpoints...>  ->  "rc|<calls>|<log>", one line each joined
-# by ;. A mountpoint is written to the fixture as given (printf, never echo), so `\040` stays the kernel's escape.
+# by ;. find's two statuses come from $FRC ("<listing> <walk>", default "0 0"). A status file left in $STATE is
+# reported in the last field. A mountpoint is written to the fixture as given (printf, never echo), so `\040` stays the kernel's escape.
 run() {
   local sh="$1" fns="$2" vol="$3" dir="$4" ctx="$5" nf="$6" rc D m i=30; shift 6
   D=$(mktemp -d -p "$W")
   printf '%s' "$ctx" > "$D/ctx"; echo "$nf" > "$D/nfind"; : > "$D/calls"; : > "$D/log"; : > "$D/seds"
+  echo "${FRC:-0 0}" > "$D/findrc"; mkdir "$D/state"
   : > "$D/mountinfo"
   for m in "$@"; do printf '%s\n' "$i 1 0:$i / $m rw,relatime - fuse.nowheremedia nowheremedia rw" >> "$D/mountinfo"; i=$((i+1)); done
   {
     printf '%s\n' "command -v print >/dev/null 2>&1 || $PRINT_SHIM"
-    printf "D='%s'; LOG=\"\$D/log\"; MI=\"\$D/mountinfo\"\n" "$D"
+    printf "D='%s'; LOG=\"\$D/log\"; MI=\"\$D/mountinfo\"; STATE=\"\$D/state\"\n" "$D"
     printf '%s\n' "$STUBS"
     cat "$fns"
     printf '%s\n' 'od_relabel "$1" "$2"' 'echo "$?" > "$D/rc"'
   } > "$D/runner.sh"
   "$sh" "$D/runner.sh" "$vol" "$dir" >/dev/null 2>&1
   rc=$(cat "$D/rc" 2>/dev/null)
+  [ -z "$(ls -A "$D/state")" ] || printf '%s\n' "status file left in STATE" >> "$D/unexpected"
   printf '%s|%s|%s|%s\n' "${rc:-none}" "$(tr '\n' ';' < "$D/calls")" "$(tr '\n' ';' < "$D/log")" "$(cat "$D/unexpected" 2>/dev/null)"
   # The sed calls of this run, for P1-P3. run is called in a command substitution, so a variable would not survive it.
   wc -l < "$D/seds" | tr -d ' ' > "$W/seds"
@@ -105,13 +133,17 @@ suite() {
   extract_fns "$f" | sed 's#< /proc/self/mountinfo#< "$MI"#' > "$fns"
   # Fail CLOSED on the extraction: an empty function file would make every case below a no-op that "passes".
   grep -q '^od_relabel() {$' "$fns" && grep -q '^relabel_restored() {$' "$fns" && grep -q '^mi_path() {$' "$fns" \
-    || { no "EXTRACTION FAILED -- od_relabel/relabel_restored/mi_path moved or changed shape in $f"; command rm -f "$fns"; return 1; }
+    && grep -q '^od_walk() {$' "$fns" \
+    || { no "EXTRACTION FAILED -- od_relabel/relabel_restored/mi_path/od_walk moved or changed shape in $f"; command rm -f "$fns"; return 1; }
   grep -q '< "\$MI"' "$fns" && ! grep -q '/proc/self/mountinfo' "$fns" \
     || { no "RE-POINT FAILED -- relabel_restored no longer reads /proc/self/mountinfo as expected"; command rm -f "$fns"; return 1; }
 
   ctx='u:object_r:app_data_file:s0:c89,c257,c523,c768'
   d=/data/user/11/com.example.app
   tab=$(printf '\t')
+  # xr: od_walk's xargs, as the stub records it; w1: the chcon of a walk over one entry.
+  xr="xargs -0 -r -n 256 sh -c <batch> od_walk 3 chcon -h $ctx"
+  w1="$xr;chcon -h $ctx e0;"
   rel="|[roamd] relabelled 1 restored entr(ies) of com.example.app to the app's context (NWP-20261005-03);|"
   # P1's mountinfo: 200 mountpoints with no escape, none under the dir. P2's: 200 that hold an escape, none under
   # the dir, then 20 escaped look-alike siblings of it. P3's: three under the dir with nothing to decode or escape.
@@ -131,8 +163,8 @@ suite() {
   # one elsewhere. Only the first may be pruned.
   out=$(run "$sh" "$fns" /data/user/11 "$d" "$ctx" 3 "$d/files/big" "${d}2/files/x" /data/media/11/x)
   case "$out" in
-    "0|find $d -xdev -path $d/files/big -prune -o ! -context $ctx -print;find $d -xdev -path $d/files/big -prune -o ! -context $ctx -exec chcon -h $ctx {} +;|[roamd] relabelled 3 restored entr(ies) of com.example.app to the app's context (NWP-20261005-03);|")
-      ok "R1 CE: walks one filesystem, prunes the overlay under the dir (not the look-alike sibling), relabels to the dir's context" ;;
+    "0|find $d -xdev -path $d/files/big -prune -o ! -context $ctx -print;find $d -xdev -path $d/files/big -prune -o ! -context $ctx -print0;$xr;chcon -h $ctx e0 e1 e2;|[roamd] relabelled 3 restored entr(ies) of com.example.app to the app's context (NWP-20261005-03);|")
+      ok "R1 CE: walks one filesystem, prunes the overlay under the dir (not the look-alike sibling), relabels to the dir's context in a bounded batch" ;;
     *) no "R1 got '$out'" ;;
   esac
   # R2: nothing differs -> count only, no chcon walk.
@@ -140,27 +172,37 @@ suite() {
   case "$out" in "0|find $d -xdev ! -context $ctx -print;|[roamd] relabelled 0 "*) ok "R2 nothing to relabel: no chcon walk" ;; *) no "R2 got '$out'" ;; esac
   # R3: DE takes the same path.
   out=$(run "$sh" "$fns" /data/user_de/11 /data/user_de/11/com.example.app "$ctx" 2)
-  case "$out" in "0|find /data/user_de/11/com.example.app -xdev ! -context $ctx -print;find "*"-exec chcon -h $ctx {} +;|"*) ok "R3 DE is relabelled like CE" ;; *) no "R3 got '$out'" ;; esac
+  case "$out" in "0|find /data/user_de/11/com.example.app -xdev ! -context $ctx -print;find "*"-print0;$xr;chcon -h $ctx e0 e1;|"*) ok "R3 DE is relabelled like CE" ;; *) no "R3 got '$out'" ;; esac
   # R4: a privileged app's dir is privapp_data_file and is accepted.
   out=$(run "$sh" "$fns" /data/user/11 "$d" 'u:object_r:privapp_data_file:s0:c512,c768' 1)
-  case "$out" in "0|"*"-exec chcon -h u:object_r:privapp_data_file:s0:c512,c768 {} +;|"*) ok "R4 privapp_data_file is accepted" ;; *) no "R4 got '$out'" ;; esac
+  case "$out" in "0|"*"od_walk 3 chcon -h u:object_r:privapp_data_file:s0:c512,c768;chcon -h u:object_r:privapp_data_file:s0:c512,c768 e0;|"*) ok "R4 privapp_data_file is accepted" ;; *) no "R4 got '$out'" ;; esac
   # R5: a dir with any other context is left alone and reported.
   out=$(run "$sh" "$fns" /data/user/11 "$d" 'u:object_r:media_rw_data_file:s0' 4)
   case "$out" in "1||[roamd] WARN relabel com.example.app: unexpected dir context [u:object_r:media_rw_data_file:s0] -- left as is"*) ok "R5 an unexpected dir context: no walk, a WARN, rc 1" ;; *) no "R5 got '$out'" ;; esac
   out=$(run "$sh" "$fns" /data/user/11 "$d" '' 4)
   case "$out" in "1||[roamd] WARN relabel com.example.app: unexpected dir context [none]"*) ok "R6 an unreadable dir context: no walk" ;; *) no "R6 got '$out'" ;; esac
-  # R7: the external volumes keep restorecon and never reach the copy-the-context walk.
+  # R7: the external volumes keep restorecon and never reach the copy-the-context walk. Since NWP-20261209-04 that is
+  # od_walk's bounded restorecon walk in both forms (was `restorecon -R <dir>` with no count file), so the foreground
+  # form of od_label_watched checks its status too.
+  xe="xargs -0 -r -n 256 sh -c <batch> od_walk 1 restorecon  ;restorecon e0 e1 e2 e3 e4;"
   out=$(run "$sh" "$fns" /data/media/11/Android/data /data/media/11/Android/data/com.example.app "$ctx" 5)
-  case "$out" in "0|restorecon -R /data/media/11/Android/data/com.example.app;||") ok "R7 Android/data keeps restorecon" ;; *) no "R7 got '$out'" ;; esac
+  case "$out" in "0|find /data/media/11/Android/data/com.example.app -print0;$xe||") ok "R7 Android/data keeps restorecon, in a bounded walk" ;; *) no "R7 got '$out'" ;; esac
   out=$(run "$sh" "$fns" /data/media/11/Android/obb /data/media/11/Android/obb/com.example.app "$ctx" 5)
-  case "$out" in "0|restorecon -R /data/media/11/Android/obb/com.example.app;||") ok "R8 Android/obb keeps restorecon" ;; *) no "R8 got '$out'" ;; esac
+  case "$out" in "0|find /data/media/11/Android/obb/com.example.app -print0;$xe||") ok "R8 Android/obb keeps restorecon, in a bounded walk" ;; *) no "R8 got '$out'" ;; esac
+  # R9: an external walk whose find failed fails the relabel with 2, with no count file set (the foreground form).
+  out=$(FRC="0 1" run "$sh" "$fns" /data/media/11/Android/obb /data/media/11/Android/obb/com.example.app "$ctx" 1)
+  case "$out" in
+    "2|find /data/media/11/Android/obb/com.example.app -print0;xargs -0 -r -n 256 sh -c <batch> od_walk 1 restorecon  ;restorecon e0;|[roamd] WARN od_walk restorecon: walk FAILED (find status 1, xargs status 0) (NWP-20261209-04);[roamd] WARN od_relabel: the restorecon walk FAILED -- status 2 (NWP-20261209-04);|")
+      ok "R9 an external walk that failed returns 2 with no count file" ;;
+    *) no "R9 got '$out'" ;;
+  esac
 
   # N: the mountpoints arrive as mountinfo writes them (NWP-20261112-30). find must get the DECODED path, its glob
   # metacharacters escaped, so -path matches that one mountpoint and nothing else.
   # N1: a space, written \040.
   out=$(run "$sh" "$fns" /data/user/11 "$d" "$ctx" 1 "$d"'/files/My\040Maps')
   case "$out" in
-    "0|find $d -xdev -path $d/files/My Maps -prune -o ! -context $ctx -print;find $d -xdev -path $d/files/My Maps -prune -o ! -context $ctx -exec chcon -h $ctx {} +;$rel")
+    "0|find $d -xdev -path $d/files/My Maps -prune -o ! -context $ctx -print;find $d -xdev -path $d/files/My Maps -prune -o ! -context $ctx -print0;$w1$rel")
       ok "N1 a mountpoint with a space (\\040) is decoded before it is pruned" ;;
     *) no "N1 got '$out'" ;;
   esac
@@ -169,14 +211,14 @@ suite() {
   n2='a\\040b'
   out=$(run "$sh" "$fns" /data/user/11 "$d" "$ctx" 1 "$d"'/files/a\134040b')
   case "$out" in
-    "0|find $d -xdev -path $d/files/$n2 -prune -o ! -context $ctx -print;find $d -xdev -path $d/files/$n2 -prune -o ! -context $ctx -exec chcon -h $ctx {} +;$rel")
+    "0|find $d -xdev -path $d/files/$n2 -prune -o ! -context $ctx -print;find $d -xdev -path $d/files/$n2 -prune -o ! -context $ctx -print0;$w1$rel")
       ok "N2 \\134 is decoded last, and the decoded backslash is escaped for -path" ;;
     *) no "N2 got '$out'" ;;
   esac
   # N3: [, * and ? are escaped, so -path does not read them as a glob.
   out=$(run "$sh" "$fns" /data/user/11 "$d" "$ctx" 1 "$d/files/x[1]" "$d/files/a*b?")
   case "$out" in
-    "0|find $d -xdev -path $d/files/x\\[1] -prune -o -path $d/files/a\\*b\\? -prune -o ! -context $ctx -print;find $d -xdev -path $d/files/x\\[1] -prune -o -path $d/files/a\\*b\\? -prune -o ! -context $ctx -exec chcon -h $ctx {} +;$rel")
+    "0|find $d -xdev -path $d/files/x\\[1] -prune -o -path $d/files/a\\*b\\? -prune -o ! -context $ctx -print;find $d -xdev -path $d/files/x\\[1] -prune -o -path $d/files/a\\*b\\? -prune -o ! -context $ctx -print0;$w1$rel")
       ok "N3 [, * and ? in a mountpoint are escaped for -path" ;;
     *) no "N3 got '$out'" ;;
   esac
@@ -184,35 +226,35 @@ suite() {
   # pruned. The raw "$d/" test drops it before any decode; P4 holds the same rule on decoded paths.
   out=$(run "$sh" "$fns" /data/user/11 "$d" "$ctx" 1 "${d}-x"'/files/My\040Maps' "$d"'/files/My\040Maps')
   case "$out" in
-    "0|find $d -xdev -path $d/files/My Maps -prune -o ! -context $ctx -print;find $d -xdev -path $d/files/My Maps -prune -o ! -context $ctx -exec chcon -h $ctx {} +;$rel")
+    "0|find $d -xdev -path $d/files/My Maps -prune -o ! -context $ctx -print;find $d -xdev -path $d/files/My Maps -prune -o ! -context $ctx -print0;$w1$rel")
       ok "N4 an escaped look-alike sibling (\$d-x/...) is not pruned" ;;
     *) no "N4 got '$out'" ;;
   esac
   # N5: a tab (\011) and an interior newline (\012, shown as ; by the harness).
   out=$(run "$sh" "$fns" /data/user/11 "$d" "$ctx" 1 "$d"'/files/t\011u' "$d"'/files/m\012n')
   case "$out" in
-    "0|find $d -xdev -path $d/files/t${tab}u -prune -o -path $d/files/m;n -prune -o ! -context $ctx -print;find $d -xdev -path $d/files/t${tab}u -prune -o -path $d/files/m;n -prune -o ! -context $ctx -exec chcon -h $ctx {} +;$rel")
+    "0|find $d -xdev -path $d/files/t${tab}u -prune -o -path $d/files/m;n -prune -o ! -context $ctx -print;find $d -xdev -path $d/files/t${tab}u -prune -o -path $d/files/m;n -prune -o ! -context $ctx -print0;$w1$rel")
       ok "N5 a tab and a newline in a mountpoint are decoded" ;;
     *) no "N5 got '$out'" ;;
   esac
   # N6: a trailing newline survives the decode and the escape (a command substitution would strip it).
   out=$(run "$sh" "$fns" /data/user/11 "$d" "$ctx" 1 "$d"'/files/n\012')
   case "$out" in
-    "0|find $d -xdev -path $d/files/n; -prune -o ! -context $ctx -print;find $d -xdev -path $d/files/n; -prune -o ! -context $ctx -exec chcon -h $ctx {} +;$rel")
+    "0|find $d -xdev -path $d/files/n; -prune -o ! -context $ctx -print;find $d -xdev -path $d/files/n; -prune -o ! -context $ctx -print0;$w1$rel")
       ok "N6 a decoded trailing newline is kept" ;;
     *) no "N6 got '$out'" ;;
   esac
   # N7: a glob character and a trailing newline in one mountpoint: escaped for -path, and the newline kept.
   out=$(run "$sh" "$fns" /data/user/11 "$d" "$ctx" 1 "$d"'/files/n*\012')
   case "$out" in
-    "0|find $d -xdev -path $d/files/n\\*; -prune -o ! -context $ctx -print;find $d -xdev -path $d/files/n\\*; -prune -o ! -context $ctx -exec chcon -h $ctx {} +;$rel")
+    "0|find $d -xdev -path $d/files/n\\*; -prune -o ! -context $ctx -print;find $d -xdev -path $d/files/n\\*; -prune -o ! -context $ctx -print0;$w1$rel")
       ok "N7 a glob character and a trailing newline: escaped, and the newline kept" ;;
     *) no "N7 got '$out'" ;;
   esac
   # N8: a ? is the mountpoint's only glob character, so only the glob test's ? arm sends it to the escape.
   out=$(run "$sh" "$fns" /data/user/11 "$d" "$ctx" 1 "$d/files/a?b")
   case "$out" in
-    "0|find $d -xdev -path $d/files/a\\?b -prune -o ! -context $ctx -print;find $d -xdev -path $d/files/a\\?b -prune -o ! -context $ctx -exec chcon -h $ctx {} +;$rel")
+    "0|find $d -xdev -path $d/files/a\\?b -prune -o ! -context $ctx -print;find $d -xdev -path $d/files/a\\?b -prune -o ! -context $ctx -print0;$w1$rel")
       ok "N8 a ? on its own is escaped for -path" ;;
     *) no "N8 got '$out'" ;;
   esac
@@ -243,7 +285,7 @@ suite() {
   # P3: three mountpoints under the dir with nothing to decode or escape: each pruned as written, not one sed.
   out=$(run "$sh" "$fns" /data/user/11 "$d" "$ctx" 1 $p3)
   case "$out|$(cat "$W/seds")" in
-    "0|find $d -xdev -path $d/files/m0 -prune -o -path $d/files/m1 -prune -o -path $d/cache/m2 -prune -o ! -context $ctx -print;find $d -xdev -path $d/files/m0 -prune -o -path $d/files/m1 -prune -o -path $d/cache/m2 -prune -o ! -context $ctx -exec chcon -h $ctx {} +;$rel|0")
+    "0|find $d -xdev -path $d/files/m0 -prune -o -path $d/files/m1 -prune -o -path $d/cache/m2 -prune -o ! -context $ctx -print;find $d -xdev -path $d/files/m0 -prune -o -path $d/files/m1 -prune -o -path $d/cache/m2 -prune -o ! -context $ctx -print0;$w1$rel|0")
       ok "P3 a mountpoint under the dir with nothing to decode or escape is pruned without a sed" ;;
     *) no "P3 got '$out|$(cat "$W/seds")'" ;;
   esac
@@ -251,9 +293,24 @@ suite() {
   # is pruned by its decoded path, and its escaped look-alike sibling is not pruned.
   out=$(run "$sh" "$fns" /data/user/11 "$d4" "$ctx" 1 "$d4w/files/x" "${d4w}2/files/y")
   case "$out" in
-    "0|find $d4 -xdev -path $d4/files/x -prune -o ! -context $ctx -print;find $d4 -xdev -path $d4/files/x -prune -o ! -context $ctx -exec chcon -h $ctx {} +;|[roamd] relabelled 1 restored entr(ies) of com.example app to the app's context (NWP-20261005-03);|")
+    "0|find $d4 -xdev -path $d4/files/x -prune -o ! -context $ctx -print;find $d4 -xdev -path $d4/files/x -prune -o ! -context $ctx -print0;$w1|[roamd] relabelled 1 restored entr(ies) of com.example app to the app's context (NWP-20261005-03);|")
       ok "P4 a dir holding a space is compared after the decode; its look-alike sibling is not pruned" ;;
     *) no "P4 got '$out'" ;;
+  esac
+
+  # F (NWP-20261209-04): a find error fails the relabel. F1: the listing's -> no walk, rc 2, no `relabelled` line.
+  out=$(FRC="1 0" run "$sh" "$fns" /data/user/11 "$d" "$ctx" 2)
+  case "$out" in
+    "2|find $d -xdev ! -context $ctx -print;|[roamd] WARN relabel: the listing FAILED (find status 1) -- not relabelled, status 2 (NWP-20261209-04);|")
+      ok "F1 a listing that failed is not read as nothing to relabel: no walk, rc 2" ;;
+    *) no "F1 got '$out'" ;;
+  esac
+  # F2: the walk's find fails after its batch ran -> rc 2, od_walk's and relabel's WARN lines, no `relabelled` line.
+  out=$(FRC="0 1" run "$sh" "$fns" /data/user/11 "$d" "$ctx" 1)
+  case "$out" in
+    "2|find $d -xdev ! -context $ctx -print;find $d -xdev ! -context $ctx -print0;$w1|[roamd] WARN od_walk chcon: walk FAILED (find status 1, xargs status 0) (NWP-20261209-04);[roamd] WARN relabel: the chcon walk FAILED -- not relabelled, status 2 (NWP-20261209-04);|")
+      ok "F2 a walk whose find failed fails the relabel: rc 2, no relabelled line" ;;
+    *) no "F2 got '$out'" ;;
   esac
   done
 
@@ -364,11 +421,15 @@ EOF
 )"
   mutate 'a decoded trailing newline is dropped'       's@mi_path "\$\{mp\}x"\); mp=\$\{mp%x\}@mi_path "$mp")@'
   mutate 'the glob copy drops a trailing newline'      's@g=\$\(print -r -- "\$\{mp\}x" (\| sed .*)\); g=\$\{g%x\};; esac$@g=$(print -r -- "$mp" \1);; esac@'
-  mutate 'the chcon walk crosses filesystems'          's@^    \[ "\$n" -gt 0 \] && find "\$d" -xdev @    [ "$n" -gt 0 ] \&\& find "$d" @'
-  mutate 'the chcon walk runs when nothing differs'    's@^    \[ "\$n" -gt 0 \] && (find "\$d" -xdev .* -exec chcon -h )@    \1@'
-  mutate 'chcon follows symlinks'                      's@-exec chcon -h "\$ctx"@-exec chcon "$ctx"@'
+  mutate 'the chcon walk crosses filesystems'          's@^(    od_walk none 3 chcon -h "\$ctx" "\$d") -xdev @\1 @'
+  mutate 'the chcon walk runs when nothing differs'    's@^  if \[ "\$n" -gt 0 \]; then$@  if true; then@'
+  mutate 'chcon follows symlinks'                      's@^    od_walk none 3 chcon -h "\$ctx" "\$d"@    od_walk none 2 chcon "$ctx" "$d"@'
+  mutate 'the listing status is not checked'           's@^    0:\[0-9\]\*\) ;;$@    *:[0-9]*) ;;@'
+  mutate 'the walk is not bounded'                     's@xargs -0 -r -n 256 sh -c@xargs -0 -r sh -c@'
+  mutate "the walk ignores find's status"              's@^  if \[ "\$rc" = 0 \] && \[ "\$fs" = 0 \]; then return 0; fi$@  if [ "$rc" = 0 ]; then return 0; fi@'
+  mutate 'a status file is left in STATE'              's@^  rm -f "\$st"$@  :@'
   mutate 'any dir context is accepted'                 's@^    u:object_r:app_data_file:s0\*\|u:object_r:privapp_data_file:s0\*\) ;;$@    *) ;;@'
-  mutate 'the external volumes take the CE walk'       's@^        restorecon -R "\$2" 2>>"\$LOG"$@        relabel_restored "$2"@'
+  mutate 'the external volumes take the CE walk'       's@^      od_walk prune 1 restorecon "\$2" \\$@      relabel_restored "$2" \\@'
   mutate 'the clean copy goes back to restorecon'      '0,/^          od_label_watched "\$vol" "\$dst"$/ s@^          od_label_watched "\$vol" "\$dst"$@          restorecon -R "$dst" 2>>"$LOG"@' any
   echo
   [ "${MFAIL:-0}" = 0 ] && echo "ALL MUTATIONS BEHAVED" || { echo "PROBLEM: a mutation did not behave"; FAILED=1; }

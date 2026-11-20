@@ -55,6 +55,17 @@ import android.widget.TextView;
  * NWP-20261201-13 (backlog "An Auto sweep cannot be paused or stopped"): one row of two text buttons, Pause and Stop. Each
  * raises {@link SweepHold} and sweepAuto ends after the app in flight. A paused card stays and its Pause reads Resume; a
  * stopped one closes as an ended sweep does.
+ *
+ * NWP-20261207-12 (Q106 S6b, O3): a sign-in whose background media set is large says so once. When this card's sweep
+ * is open, MediaLandingNoticeActivity.check records the decision in MediaLanding and sends {@link #ACTION_MEDIA}; the
+ * card then shows {@link MediaLanding#IN_CARD} between the rows and the line under them. sync() reads the record too,
+ * so a card that starts or is recreated after the decision still shows it.
+ *
+ * NWP-20261208-24 (backlog "Up to four separate pop-ups can land together right after sign-in ..."; design approved
+ * 2026-11-17, NWP-20261116-48): the last-save line and the skip notice fold into this card while it is up. Each check
+ * adds its words to {@link LandingQueue} and sends {@link #ACTION_NOTICE}; sync() draws every line not drawn yet, in
+ * the gate's amber, under the title (or the from-5 headline), and records each folded skip notice shown. The card
+ * reports itself shown at onCreate and gone when it finishes, so the Google Play setup card waits until it closes.
  */
 public class LandingNoticeActivity extends Activity {
     static final String EXTRA_COUNT = "nowhere.landing.count";
@@ -64,6 +75,10 @@ public class LandingNoticeActivity extends Activity {
     static final String ACTION_APP = "com.nowhere.chooser.action.LANDING_APP";
     /** An app or a dep started installing: read the record again. Package-local, no extras. */
     static final String ACTION_STARTED = "com.nowhere.chooser.action.LANDING_STARTED";
+    /** NWP-20261207-12: the media sentence goes into the card (MediaLandingNoticeActivity.check). Package-local. */
+    static final String ACTION_MEDIA = "com.nowhere.chooser.action.LANDING_MEDIA";
+    /** NWP-20261208-24: a notice was folded: read LandingQueue.lines() again. Package-local, no extras. */
+    static final String ACTION_NOTICE = "com.nowhere.chooser.action.LANDING_NOTICE";
     static final String EXTRA_PKG = "nowhere.landing.pkg";
     static final String EXTRA_OK = "nowhere.landing.ok";
     /** long: the card's sweep in {@link LandingLine.Sweep}. */
@@ -87,6 +102,11 @@ public class LandingNoticeActivity extends Activity {
     private Button pauseBtn, stopBtn;
     /** The small card's line under the rows: KEEP, or the paused or stopped line. */
     private TextView holdLine;
+    /** NWP-20261207-12: the media sentence, hidden until this sign-in's decision put it in the card. */
+    private TextView mediaLine;
+    /** NWP-20261208-24: the folded notices' lines, hidden until the first one; and how many of them are drawn. */
+    private LinearLayout noticeBox;
+    private int noticeDrawn;
     private BroadcastReceiver receiver;
 
     @Override protected void onCreate(Bundle b) {
@@ -106,6 +126,7 @@ public class LandingNoticeActivity extends Activity {
         labels = new String[n];
         landed = new boolean[n];
         sweep = getIntent().getLongExtra(EXTRA_SWEEP, 0L);
+        LandingQueue.cardShown(sweep); // NWP-20261208-24: the Play card and the alone notices wait until it is gone
         big = LandingLine.big(n);
 
         // The window is transparent, so the card's rounded corners show.
@@ -126,7 +147,9 @@ public class LandingNoticeActivity extends Activity {
         card.addView(title);
 
         if (!LandingLine.big(n)) {
+            addNoticeBox(card);
             addRows(card, n);
+            addMediaLine(card);
             TextView keep = new TextView(this);
             keep.setText(LandingLine.KEEP);
             keep.setTextSize(15);
@@ -143,6 +166,7 @@ public class LandingNoticeActivity extends Activity {
             headline.setTextColor(look.ink);
             headline.setPadding(0, dp(12), 0, dp(8));
             card.addView(headline);
+            addNoticeBox(card);
 
             bar = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
             bar.setMax(n);
@@ -151,6 +175,7 @@ public class LandingNoticeActivity extends Activity {
                     LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
 
             addRows(card, LandingLine.ROWS_BIG);
+            addMediaLine(card);
             moreRow = new TextView(this);
             moreRow.setTextSize(15);
             moreRow.setTextColor(look.accent);
@@ -176,11 +201,15 @@ public class LandingNoticeActivity extends Activity {
             @Override public void onReceive(Context c, Intent in) {
                 String a = in.getAction();
                 if (ACTION_APP.equals(a) || ACTION_STARTED.equals(a) || UnarchiveService.ACTION_SWEEP_DONE.equals(a)) sync();
+                if (ACTION_MEDIA.equals(a)) showMedia();
+                if (ACTION_NOTICE.equals(a)) sync();
             }
         };
         IntentFilter f = new IntentFilter(ACTION_APP);
         f.addAction(ACTION_STARTED);
         f.addAction(UnarchiveService.ACTION_SWEEP_DONE);
+        f.addAction(ACTION_MEDIA);
+        f.addAction(ACTION_NOTICE);
         registerReceiver(receiver, f, Context.RECEIVER_NOT_EXPORTED);
         // AFTER the receiver: what the sweep recorded before this point is read here, anything later is broadcast.
         sync();
@@ -188,6 +217,7 @@ public class LandingNoticeActivity extends Activity {
 
     /** Read the card's sweep from LandingLine.Sweep, draw it, and close CLOSE_AFTER_MS after the sweep ended. */
     private void sync() {
+        if (LandingLine.Sweep.dropped(sweep)) { finish(); return; } // NWP-20261208-23: the running card replaced this one
         boolean[] l = LandingLine.Sweep.landed(sweep);
         if (l != null && l.length == landed.length) {
             landed = l;
@@ -196,10 +226,56 @@ public class LandingNoticeActivity extends Activity {
         lastLanded = LandingLine.Sweep.lastLanded(sweep);
         render();
         if (LandingLine.Sweep.done(sweep)) closeSoon();
+        showMedia();
+        // NWP-20261208-24: the folded notices, in the order they came. The skip times are taken BEFORE the lines are
+        // read, so a time is only recorded shown with its line drawn here.
+        long[] skipShown = LandingQueue.takeSkipTimes();
+        java.util.List<String> notices = LandingQueue.lines();
+        for (; noticeDrawn < notices.size(); noticeDrawn++) {
+            TextView t = new TextView(this);
+            t.setText(notices.get(noticeDrawn));
+            t.setTextSize(15);
+            t.setTextColor(look.warn);
+            t.setPadding(0, dp(8), 0, 0);
+            noticeBox.addView(t);
+        }
+        if (noticeDrawn > 0) noticeBox.setVisibility(View.VISIBLE);
+        for (long time : skipShown) {
+            Thread th = new Thread(() -> SkipNoticeActivity.markShown(time), "nowhere-skip-notice-shown");
+            th.setDaemon(true);
+            th.start();
+        }
+    }
+
+    /** NWP-20261208-24: the folded notices' box, under the title or the headline, hidden until sync() draws a line. */
+    private void addNoticeBox(LinearLayout card) {
+        noticeBox = new LinearLayout(this);
+        noticeBox.setOrientation(LinearLayout.VERTICAL);
+        noticeBox.setVisibility(View.GONE);
+        card.addView(noticeBox);
+    }
+
+    /** NWP-20261207-12: show the media sentence when this sign-in's decision put it in the card. */
+    private void showMedia() {
+        if (mediaLine != null && MediaLanding.shownFor(MediaLandingNoticeActivity.serial(this))) mediaLine.setVisibility(View.VISIBLE);
+    }
+
+    /** NWP-20261207-12: the media sentence's slot, under the rows, hidden by default. */
+    private void addMediaLine(LinearLayout card) {
+        TextView t = new TextView(this);
+        t.setText(MediaLanding.IN_CARD);
+        t.setTextSize(15);
+        t.setTextColor(look.ink);
+        t.setPadding(0, dp(12), 0, 0);
+        t.setVisibility(View.GONE);
+        card.addView(t);
+        mediaLine = t;
     }
 
     @Override protected void onDestroy() {
         handler.removeCallbacksAndMessages(null);
+        // NWP-20261208-24: closed, not recreated. The Play card and the alone notices may show now.
+        if (isFinishing()) LandingQueue.cardGone(sweep);
         if (receiver != null) {
             try { unregisterReceiver(receiver); } catch (Throwable ignore) {}
             receiver = null;
@@ -322,23 +398,25 @@ public class LandingNoticeActivity extends Activity {
         for (boolean l : landed) if (l) got++;
         boolean paused = LandingLine.Sweep.paused(sweep);
         boolean ended = LandingLine.Sweep.done(sweep);
+        boolean waiting = LandingLine.Sweep.waiting(sweep); // NWP-20261208-23: the sweep has not started
         String line = LandingLine.heldLine(paused, LandingLine.Sweep.stopped(sweep), got, pkgs.length);
         pauseBtn.setText(paused ? LandingLine.RESUME : LandingLine.PAUSE);
         stopBtn.setText(LandingLine.STOP);
-        setHoldButton(pauseBtn, !ended);
-        setHoldButton(stopBtn, !ended && !paused);
+        setHoldButton(pauseBtn, !ended && !waiting);
+        setHoldButton(stopBtn, !ended && !paused && !waiting);
         if (!big) {
-            for (int i = 0; i < pkgs.length; i++) paintRow(i, i);
+            for (int i = 0; i < pkgs.length; i++) paintRow(i, i, waiting);
             holdLine.setText(line != null ? line : LandingLine.KEEP);
             return;
         }
         headline.setText(LandingLine.headline(got, pkgs.length));
         if (line != null) headline.setText(line);
-        if (bar != null) bar.setProgress(got);
+        if (waiting) headline.setText(LandingLine.waitingHeadline(pkgs.length));
+        if (bar != null) bar.setProgress(waiting ? 0 : got);
         int[] show = LandingLine.rows(pkgs, landed, installing, lastLanded);
         for (int s = 0; s < rowViews.length; s++) {
             if (s < show.length) {
-                paintRow(s, show[s]);
+                paintRow(s, show[s], waiting);
                 rowViews[s].setVisibility(View.VISIBLE);
             } else {
                 rowViews[s].setVisibility(View.INVISIBLE); // INVISIBLE, not GONE: the card keeps one size
@@ -349,9 +427,9 @@ public class LandingNoticeActivity extends Activity {
         moreRow.setVisibility(more > 0 ? View.VISIBLE : View.INVISIBLE);
     }
 
-    private void paintRow(int slot, int i) {
+    private void paintRow(int slot, int i, boolean waiting) {
         rowLabels[slot].setText(label(i));
-        rowStates[slot].setText(LandingLine.state(landed[i], i == installing));
+        rowStates[slot].setText(LandingLine.state(landed[i], i == installing, waiting));
         rowStates[slot].setTextColor(landed[i] ? look.accent : i == installing ? look.ink : look.muted);
     }
 

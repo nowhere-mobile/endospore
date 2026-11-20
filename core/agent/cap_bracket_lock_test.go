@@ -1403,8 +1403,8 @@ func TestKeyRemovalOfAKeyRemovedMeanwhileSucceeds(t *testing.T) {
 // A session verb pending in the daemon holds the background re-key off: rekeyOnce starts no batch, so the verb
 // waits for at most one batch that was already open (NWP-20261009-07).
 func TestRekeyOnceStandsDownWhileASessionVerbIsPending(t *testing.T) {
-	for _, verb := range []string{"ROTATE", "SET-PIN", "REMOVE-FIDO2-KEY", "FIDO2-NFC-ENROLL-FINISH", "ROLLBACK",
-		"DELETE-SNAPSHOT", "EXPORT", "EXPORT-MEDIA", "DELETE"} { // DELETE: NWP-20261010-02, its export purge is a bracket
+	for _, verb := range []string{"ROTATE", "SET-PIN", "REMOVE-FIDO2-KEY", "REMOVE-FIDO2-KEY-NFC", "FIDO2-NFC-ENROLL-FINISH",
+		"ROLLBACK", "DELETE-SNAPSHOT", "EXPORT", "EXPORT-MEDIA", "DELETE"} { // DELETE: NWP-20261010-02, its export purge is a bracket
 		if !rekeyHoldingVerb(verb) || concurrentSafeCmd(verb) {
 			t.Errorf("%s: holds the re-key off %v, waits for sessionMu %v -- it must do both, or the dispatch never "+
 				"counts it", verb, rekeyHoldingVerb(verb), !concurrentSafeCmd(verb))

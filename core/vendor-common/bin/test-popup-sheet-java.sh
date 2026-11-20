@@ -12,6 +12,12 @@
 #   S3 the two "offered" expressions of the preview, byte for byte;
 #   S4 SheetDialog sets Gravity.BOTTOM and calls PopupSheet.violations;
 #   S5 PresetPicker.java does not reference PopupSheet (four suites compile it alone).
+# NWP-20261208-28, the live sheet (SheetDialog.Live, a sheet whose content changes in place):
+#   P-a Live.progress() calls setCancelable(false) and setCanceledOnTouchOutside(false) and never buttons(;
+#   P-b Live holds the class's only "new Dialog(" of its own, each change warns and replaces the panel's children, and
+#       requestWindowFeature runs once, in window();
+#   P-c buttons() skips the dismiss only for the inPlace marker;
+#   P-d a tap on a button that a change replaced does nothing (the generation check).
 #
 # ⚠ IT FAILS WHEN THERE IS NO JAVAC, IT NEVER SKIPS. javac comes from PATH, else from the build host's JDK below;
 # the version is printed first so the log proves which compiler ran.
@@ -78,12 +84,18 @@ code() { sed -E -e '/^[[:space:]]*(\/\/|\*|\/\*)/d' -e 's/[[:space:]]+\/\/[[:spa
 meth() {
   awk -v n="$2" '$0 ~ ("^    [a-zA-Z].* " n "\\(") && !f { f = 1 } f { print } f && /^    }$/ { exit }' "$1"
 }
+# inner <code file> <8-space declaration start> -> a nested class's method, to its 8-space closing brace.
+inner() {
+  D="        $2" awk '!f && index($0, ENVIRON["D"]) == 1 { f = 1 } f { print } f && /^        }$/ { exit }' "$1"
+}
+# count <text> <fixed string> -> how many times the text holds it.
+count() { local t="$1" n=0; while case "$t" in *"$2"*) true ;; *) false ;; esac; do t=${t#*"$2"}; n=$((n+1)); done; echo "$n"; }
 # has <text> <fixed string> -> 0 when the text holds it.
 has() { case "$1" in *"$2"*) return 0 ;; esac; return 1; }
 
 # pins <ProfileActivity.java> <SheetDialog.java> <PresetPicker.java> -> 0 when every pin holds, 1 (with each reason) when not.
 pins() {
-  local paf bad=0 b m k dlg pp
+  local paf bad=0 b m k dlg pp dlf live
   [ -f "$2" ] || { echo "  FAIL  S4 SheetDialog.java does not exist" >&2; return 1; }
   paf=$(mktemp -p "$W") || return 1
   code "$1" > "$paf"
@@ -112,6 +124,40 @@ pins() {
   done
 
   has "$pp" "PopupSheet" && { echo "  FAIL  S5 PresetPicker.java references PopupSheet" >&2; bad=1; }
+
+  dlf=$(mktemp -p "$W") || return 1
+  code "$2" > "$dlf"
+  live=$(awk '/^    static final class Live \{/ { f = 1 } f { print } f && /^    }$/ { exit }' "$dlf")
+  b=$(inner "$dlf" "void progress(")
+  if [ -z "$b" ]; then
+    echo "  FAIL  P-a Live.progress( not found" >&2; bad=1
+  else
+    for k in "dialog.setCancelable(false);" "dialog.setCanceledOnTouchOutside(false);"; do
+      has "$b" "$k" || { echo "  FAIL  P-a Live.progress does not call $k" >&2; bad=1; }
+    done
+    has "$b" "buttons(" && { echo "  FAIL  P-a Live.progress calls buttons(" >&2; bad=1; }
+  fi
+  [ "$(count "$live" "new Dialog(")" -eq 1 ] || { echo "  FAIL  P-b Live does not hold exactly one new Dialog(" >&2; bad=1; }
+  [ "$(count "$dlg" "requestWindowFeature(")" -eq 1 ] && has "$(meth "$dlf" window)" "requestWindowFeature(" \
+    || { echo "  FAIL  P-b requestWindowFeature is not once, in window()" >&2; bad=1; }
+  has "$live" "window(" && { echo "  FAIL  P-b Live calls window( on a change" >&2; bad=1; }
+  for m in "void progress(" "void confirm("; do
+    b=$(inner "$dlf" "$m")
+    for k in "warn(PopupSheet.violations(m));" "panel.removeAllViews();"; do
+      has "$b" "$k" || { echo "  FAIL  P-b Live.${m#void } does not hold $k" >&2; bad=1; }
+    done
+  done
+  b=$(awk '/^            BooleanSupplier fresh\) \{$/ { f = 1 } f { print } f && /^    }$/ { exit }' "$dlf")
+  if [ -z "$b" ]; then
+    echo "  FAIL  P-c buttons( with BooleanSupplier fresh not found" >&2; bad=1
+  else
+    { [ "$(count "$b" "if (!(action instanceof InPlace)) dlg.dismiss();")" -eq 1 ] && [ "$(count "$b" "dlg.dismiss();")" -eq 1 ]; } \
+      || { echo "  FAIL  P-c buttons() does not skip the dismiss for the inPlace marker only" >&2; bad=1; }
+    has "$b" "if (!dlg.isShowing() || (fresh != null && !fresh.getAsBoolean())) return;" \
+      || { echo "  FAIL  P-d buttons() does not ignore a tap on a replaced button" >&2; bad=1; }
+  fi
+  has "$(inner "$dlf" "void confirm(")" "buttons(ctx, p, m, dialog, actions, () -> gen == generation)" \
+    || { echo "  FAIL  P-d Live.confirm does not pass its generation check to buttons(" >&2; bad=1; }
   [ "$bad" -eq 0 ]
 }
 
@@ -128,15 +174,15 @@ check_all() {
 echo "== PopupSheet, PresetSheet, SheetDialog"
 check_all "$POPUP" "$SHEET"; rc=$?
 [ "$rc" -eq 0 ] || { echo "FAILED"; exit 1; }
-echo "ok: cases + pins S1-S5"
+echo "ok: cases + pins S1-S5, P-a-P-d"
 [ "$MUTATE" = yes ] || exit 0
 
 command -v perl >/dev/null 2>&1 || { echo "FAIL: --mutate needs perl, and there is none -- refusing to report" >&2; exit 1; }
 echo "== mutations (each must be CONVICTED by its own assertion -- a mutant that does not compile or does not apply proves nothing)"
-mut() { # mut <label> <popup|sheet|pa> <the assertion that must convict it> <perl-expr>
+mut() { # mut <label> <popup|sheet|dialog|pa> <the assertion that must convict it> <perl-expr>
   local d c rc orig out
   d=$(mktemp -d -p "$W") || return 1
-  case "$2" in popup) orig="$POPUP" ;; sheet) orig="$SHEET" ;; *) orig="$PA" ;; esac
+  case "$2" in popup) orig="$POPUP" ;; sheet) orig="$SHEET" ;; dialog) orig="$DIALOG" ;; *) orig="$PA" ;; esac
   c="$d/$(basename "$orig")"
   cp "$orig" "$c"
   if ! perl -0pi -e "$4" "$c"; then echo "  ERROR     $1 -- perl failed on the mutation"; rm -rf "$d"; return 1; fi
@@ -144,6 +190,7 @@ mut() { # mut <label> <popup|sheet|pa> <the assertion that must convict it> <per
   case "$2" in
     popup) out=$(check_all "$c" "$SHEET" 2>&1); rc=$? ;;
     sheet) out=$(check_all "$POPUP" "$c" 2>&1); rc=$? ;;
+    dialog) out=$(pins "$PA" "$c" "$PICKER" 2>&1); rc=$? ;;
     *) out=$(pins "$c" "$DIALOG" "$PICKER" 2>&1); rc=$? ;;
   esac
   rm -rf "$d"
@@ -173,4 +220,11 @@ mut "M12 a lone Got it of any style is a warning notice" popup "R_WARNING_BUTTON
 mut "M13 a warning notice breaks the rules again" popup "a warning notice: one green Got it" 's/if \(c\.tone == Tone\.WARNING && !warningNotice/if (c.tone == Tone.WARNING/' || fails=$((fails+1))
 mut "M14 a lone Got it allowed on a destructive sheet" popup "R_GOT_IT_TONE destructive" 's/if \(c\.tone == Tone\.DESTRUCTIVE && buttons\.size\(\) == 1 && GOT_IT\.equals\(buttons\.get\(0\)\.label\)\) out\.add\(R_GOT_IT_TONE\);//' || fails=$((fails+1))
 mut "M10 the loc expression changed"                 pa    "S3 showPresetPreview"       's/locOffered\(sessionType, offlineSession, locServicesAvailable\(\)\);\n(\s+linkOffered)/locOffered(sessionType, false, locServicesAvailable());\n$1/' || fails=$((fails+1))
-[ "$fails" -eq 0 ] && echo "== all 14 mutations convicted" || { echo "== $fails mutation(s) not convicted"; exit 1; }
+mut "M15 the retry exemption removed"              popup "a retry warning passes"     's/ && !retryWarning//' || fails=$((fails+1))
+mut "M16 the exemption ignores the Not now label"   popup "R_WARNING_BUTTONS retry not Not now" 's/ && NOT_NOW\.equals\(buttons\.get\(1\)\.label\)//' || fails=$((fails+1))
+mut "M17 the progress title check removed"          popup "R_PROGRESS no …"            's/p\.title == null \|\| !p\.title\.endsWith\("…"\) \|\| //' || fails=$((fails+1))
+mut "M18 progress() closable on Back"               dialog "P-a"                       's/(void progress\(.*?)setCancelable\(false\)/${1}setCancelable(true)/s' || fails=$((fails+1))
+mut "M19 an inPlace action closes the sheet"        dialog "P-c"                       's/if \(!\(action instanceof InPlace\)\) dlg\.dismiss\(\);/dlg.dismiss();/' || fails=$((fails+1))
+mut "M20 a stale tap acts"                          dialog "P-d"                       's/ \|\| \(fresh != null && !fresh\.getAsBoolean\(\)\)//' || fails=$((fails+1))
+mut "M21 Live.confirm makes a second Dialog"        dialog "P-b"                       's/(void confirm\(PopupSheet\.Confirm m, Runnable\[\] actions\) \{\n)/${1}            new Dialog(ctx).show();\n/' || fails=$((fails+1))
+[ "$fails" -eq 0 ] && echo "== all 21 mutations convicted" || { echo "== $fails mutation(s) not convicted"; exit 1; }

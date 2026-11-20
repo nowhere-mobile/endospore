@@ -171,7 +171,7 @@ $pa" || bad=1
 
   pin R6 "sweepAuto sets PASS_CARD = card after the landing catch and before the empty-work end; each pass resets it first; passCard() returns it" '
       my ($s, $j, $f) = split /\n<<<SPLIT>>>\n/, $c, 3;
-      my $lc = index($s, "\"landing line\", t); }");
+      my $lc = index($s, "\"landing line\", t);");
       my $pc = index($s, "PASS_CARD = card;");
       my $ce = index($s, "if (card != 0 && work.isEmpty() && retry.isEmpty())");
       exit 1 unless $lc >= 0 && $lc < $pc && $pc < $ce;

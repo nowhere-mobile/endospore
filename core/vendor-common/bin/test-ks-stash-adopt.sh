@@ -49,12 +49,14 @@ suite() {
     { printf '%s\n' "$PRINT_SHIM"; printf 'KS_CREDS=%q\nop=%q uid=%q name=%q pass=%q sesec=%q\n' "$d/ks" "$2" "$3" "$4" "$5" "$6"; printf '%s\n' "$wblk"; } > "$d/w.sh"
     "$1" "$d/w.sh" >/dev/null 2>&1
   }
-  # adopt <sh> <uid> <name> <pass> -> $d/res as NAME=<..> PASS=<..> SE=<set|unset:..>
+  # adopt <sh> <uid> <name> <pass> -> $d/res as NAME=<..> PASS=<..> SE=<..>|unset ENV=unset|<..>. Since NWP-20261205-18
+  # the adopt holds the chip secret in the unexported _se_v (each agent call stages its own copy), so SE reads _se_v
+  # and ENV pins that NOWHERE_SE_SECRET itself is still unset after the block: an export put back is caught.
   adopt() {
     command rm -f "$d/log"
-    { printf '%s\n' "$PRINT_SHIM"; printf 'KS_CREDS=%q LOG=%q\nuid=%q name=%q pass=%q\nunset NOWHERE_SE_SECRET\n' "$d/ks" "$d/log" "$2" "$3" "$4"
+    { printf '%s\n' "$PRINT_SHIM"; printf 'KS_CREDS=%q LOG=%q\nuid=%q name=%q pass=%q\nunset NOWHERE_SE_SECRET; _se_v=\n' "$d/ks" "$d/log" "$2" "$3" "$4"
       printf '%s\n' "$ablk"
-      printf 'printf "NAME=<%%s>\\nPASS=<%%s>\\n" "$name" "$pass" > %q\nif [ "${NOWHERE_SE_SECRET+set}" = set ]; then printf "SE=<%%s>\\n" "$NOWHERE_SE_SECRET" >> %q; else echo SE=unset >> %q; fi\n' "$d/res" "$d/res" "$d/res"
+      printf 'printf "NAME=<%%s>\\nPASS=<%%s>\\n" "$name" "$pass" > %q\nif [ -n "$_se_v" ]; then printf "SE=<%%s>\\n" "$_se_v" >> %q; else echo SE=unset >> %q; fi\nif [ "${NOWHERE_SE_SECRET+set}" = set ]; then printf "ENV=<%%s>\\n" "$NOWHERE_SE_SECRET" >> %q; else echo ENV=unset >> %q; fi\n' "$d/res" "$d/res" "$d/res" "$d/res" "$d/res"
     } > "$d/a.sh"
     "$1" "$d/a.sh" >/dev/null 2>&1
   }
@@ -62,25 +64,25 @@ suite() {
   for sh in "${SHELLS[@]}"; do
     command rm -f "$d/ks" "$d/log" "$d/res"
     write_stash "$sh" out 11 "$N" "$P" "$S"; adopt "$sh" 11 x ""
-    [ "$(cat "$d/res" 2>/dev/null)" = "NAME=<$N>"$'\n'"PASS=<$P>"$'\n'"SE=<$S>" ] && ok "A1 own uid adopts name, passphrase and chip secret byte for byte [$sh]" || no "A1 own-uid adopt wrong [$sh]: $(cat "$d/res" 2>/dev/null)"
+    [ "$(cat "$d/res" 2>/dev/null)" = "NAME=<$N>"$'\n'"PASS=<$P>"$'\n'"SE=<$S>"$'\nENV=unset' ] && ok "A1 own uid adopts name, passphrase and chip secret byte for byte [$sh]" || no "A1 own-uid adopt wrong [$sh]: $(cat "$d/res" 2>/dev/null)"
     [ ! -s "$d/log" ] && ok "A1b the adopt logs nothing [$sh]" || no "A1b the adopt logged [$sh]"
 
     command rm -f "$d/ks"; write_stash "$sh" out 11 "$N" "$P" "$S"; adopt "$sh" 12 x ""
-    [ "$(cat "$d/res" 2>/dev/null)" = $'NAME=<x>\nPASS=<>\nSE=unset' ] && ok "A2 foreign uid: name/pass untouched, no chip secret [$sh]" || no "A2 foreign-uid stash adopted [$sh]: $(cat "$d/res" 2>/dev/null)"
+    [ "$(cat "$d/res" 2>/dev/null)" = $'NAME=<x>\nPASS=<>\nSE=unset\nENV=unset' ] && ok "A2 foreign uid: name/pass untouched, no chip secret [$sh]" || no "A2 foreign-uid stash adopted [$sh]: $(cat "$d/res" 2>/dev/null)"
     if grep -q 'cleanstorage uid 12: keystore stash belongs to uid 11 -- NOT adopting it' "$d/log" 2>/dev/null \
        && ! grep -qF -e "$N" -e "$P" -e "$S" "$d/log"; then ok "A2b refusal logged with both uids and no credential [$sh]"; else no "A2b refusal log wrong [$sh]: $(cat "$d/log" 2>/dev/null)"; fi
 
     command rm -f "$d/ks"; write_stash "$sh" out 11 "$N" "$P" ""; adopt "$sh" 11 x ""
-    [ "$(cat "$d/res" 2>/dev/null)" = "NAME=<$N>"$'\n'"PASS=<$P>"$'\n'"SE=unset" ] && ok "A3 no chip secret: adopted, secret not exported [$sh]" || no "A3 wrong [$sh]: $(cat "$d/res" 2>/dev/null)"
+    [ "$(cat "$d/res" 2>/dev/null)" = "NAME=<$N>"$'\n'"PASS=<$P>"$'\n'"SE=unset"$'\nENV=unset' ] && ok "A3 no chip secret: adopted, secret not exported [$sh]" || no "A3 wrong [$sh]: $(cat "$d/res" 2>/dev/null)"
 
     printf 'alice\nsecret\n' > "$d/ks"; adopt "$sh" 11 x ""
-    [ "$(cat "$d/res" 2>/dev/null)" = $'NAME=<x>\nPASS=<>\nSE=unset' ] && grep -q 'stash belongs to uid none' "$d/log" 2>/dev/null && ok "A4 legacy 2-line stash refused as 'uid none' [$sh]" || no "A4 legacy stash handled wrong [$sh]"
+    [ "$(cat "$d/res" 2>/dev/null)" = $'NAME=<x>\nPASS=<>\nSE=unset\nENV=unset' ] && grep -q 'stash belongs to uid none' "$d/log" 2>/dev/null && ok "A4 legacy 2-line stash refused as 'uid none' [$sh]" || no "A4 legacy stash handled wrong [$sh]"
 
     command rm -f "$d/ks"; adopt "$sh" 11 x ""
-    [ "$(cat "$d/res" 2>/dev/null)" = $'NAME=<x>\nPASS=<>\nSE=unset' ] && [ ! -e "$d/log" ] && ok "A5 no stash: nothing changes, nothing logged [$sh]" || no "A5 no-stash case wrong [$sh]"
+    [ "$(cat "$d/res" 2>/dev/null)" = $'NAME=<x>\nPASS=<>\nSE=unset\nENV=unset' ] && [ ! -e "$d/log" ] && ok "A5 no stash: nothing changes, nothing logged [$sh]" || no "A5 no-stash case wrong [$sh]"
 
     command rm -f "$d/ks"; write_stash "$sh" out 11 "$N" "$P" "$S"; adopt "$sh" 11 given givenpass
-    [ "$(cat "$d/res" 2>/dev/null)" = $'NAME=<given>\nPASS=<givenpass>\nSE=unset' ] && [ ! -e "$d/log" ] && ok "A6 given creds are kept over a same-uid stash [$sh]" || no "A6 given creds overwritten [$sh]: $(cat "$d/res" 2>/dev/null)"
+    [ "$(cat "$d/res" 2>/dev/null)" = $'NAME=<given>\nPASS=<givenpass>\nSE=unset\nENV=unset' ] && [ ! -e "$d/log" ] && ok "A6 given creds are kept over a same-uid stash [$sh]" || no "A6 given creds overwritten [$sh]: $(cat "$d/res" 2>/dev/null)"
 
     command rm -f "$d/ks"; write_stash "$sh" in 11 "$N" "$P" "$S"
     [ ! -e "$d/ks" ] && ok "A7a the writer ignores an op other than out [$sh]" || no "A7a the writer fired for op in [$sh]"
@@ -116,7 +118,7 @@ mut() { # mut <label> <sed-expr>
 fails=0
 mut "M1 the uid comparison removed"        's/\[ -n "\$_ksu" \] && \[ "\$_ksu" = "\$uid" \]/[ -n "$_ksu" ]/' || fails=$((fails+1))
 mut "M2 passphrase read from line 1"        's/pass=\$(sed -n 2p "\$KS_CREDS")/pass=$(sed -n 1p "$KS_CREDS")/' || fails=$((fails+1))
-mut "M3 chip-secret export deleted"         '/\[ -n "\$_kss" \] && export NOWHERE_SE_SECRET/d' || fails=$((fails+1))
+mut "M3 chip-secret hold deleted"           '/\[ -n "\$_kss" \] && _se_v="\$_kss"/d' || fails=$((fails+1))
 mut "M4 refusal log line deleted"           's/^      echo "\[roamd\] cleanstorage uid \$uid: keystore stash belongs.*$/      :/' || fails=$((fails+1))
 mut "M5 adopt guard made unconditional"     's/{ \[ -z "\$name" \] || \[ -z "\$pass" \]; } && \[ -f "\$KS_CREDS" \]/{ [ -z "$name" ] || [ -z "$pass" ] || true; } \&\& [ -f "$KS_CREDS" ]/' || fails=$((fails+1))
 mut "M6 writer uid and passphrase swapped" 's/print -r -- "\$pass"; print -r -- "\$uid";/print -r -- "$uid"; print -r -- "$pass";/' || fails=$((fails+1))

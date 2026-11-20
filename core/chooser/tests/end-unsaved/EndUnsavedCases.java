@@ -16,7 +16,7 @@ public final class EndUnsavedCases {
     static final String OLD_NOCREDIT = "Couldn't save your data — your storage plan is out. You're still signed in. "
             + "Add storage, then sign out again.";
     // NWP-20261101-08 (Q070): the generic failure is what an ERR-PUSH sign-out shows; it names Lock first.
-    static final String NEW_OTHER = "Couldn't save your data — Nowhere couldn't reach your storage, and you're still signed in.\n\n"
+    static final String NEW_OTHER = "Couldn't save your data — nowhere couldn't reach your storage, and you're still signed in.\n\n"
             + "Tap Lock to keep this session safe: it locks with no connection needed and stays on this phone, "
             + "encrypted, until you come back, or until it's wiped 12 hours after locking. Nothing is lost. "
             + "Or sign out again once you're online.";
@@ -137,7 +137,7 @@ public final class EndUnsavedCases {
 
         String fin = lfm("REFUSED", FINAL_DE);
         String wantFin = "Couldn't save this session, and signing out again will most likely fail the same way.\n\n"
-                + "This phone's copy of your settings is missing data that your stored copy has, so Nowhere won't save "
+                + "This phone's copy of your settings is missing data that your stored copy has, so nowhere won't save "
                 + "it over the stored copy.\n\n"
                 + "Your stored copy is intact, and you're still signed in. You can keep using this session, "
                 + "or end it without saving.";
@@ -162,14 +162,14 @@ public final class EndUnsavedCases {
                 .contains("Your stored copy of your settings changed after this phone loaded it"), "stale-base");
         String delTok = lfm("REFUSED", "REFUSED FINAL 1\nSCOPE vault refused:deleted 0\nSAVED 0\n");
         check("msg: a deleted TOKEN alone never says deleted", !delTok.contains("deleted")
-                && delTok.contains("A safety check stopped Nowhere from saving your app data, texts and call history."), delTok);
+                && delTok.contains("A safety check stopped nowhere from saving your app data, texts and call history."), delTok);
         String del = lfm("REFUSED",
                 "REFUSED FINAL 1\nSCOPE vault refused:deleted 0\nSCOPE de refused:fence 0\nSAVED 0\nDELETED\n");
         check("msg: deleted (store-confirmed) said once", del.indexOf("This profile was deleted") >= 0
                 && del.indexOf("This profile was deleted") == del.lastIndexOf("This profile was deleted"), del);
         String mixed = lfm("REFUSED", "REFUSED FINAL 1\nSCOPE de refused:shrink 0\nSCOPE media refused:stale 0\nSAVED 0\n");
         check("msg: a retryable scope beside a final one is still named, without a cause",
-                mixed.contains("A safety check stopped Nowhere from saving your photos & media."), mixed);
+                mixed.contains("A safety check stopped nowhere from saving your photos & media."), mixed);
 
         // ---- NWP-20261111-02 (Q016): the stranded phone's cause lines (the four NWP-20261111-01 reasons) ----
         String[] stranded = {"locks-changed", "locks-changed-key", "unlock-lost", "unlock-lost-key"};
@@ -353,7 +353,7 @@ public final class EndUnsavedCases {
         check("watch: NONE at 90 s -> UNKNOWN", "UNKNOWN".equals(Lifted.restartWatchAction("NONE", 120000, false)), "");
         check("watch: FAILED after 90 s is still FAILED", "FAILED".equals(Lifted.restartWatchAction("FAILED", 120000, true)), "");
         String ru = Lifted.restartUnknownMessage();
-        check("restart unknown: exact", ("Your phone hasn't restarted, and Nowhere couldn't confirm what happened. "
+        check("restart unknown: exact", ("Your phone hasn't restarted, and nowhere couldn't confirm what happened. "
                 + "Restarting the phone yourself discards everything this phone hasn't saved.").equals(ru), ru);
         check("restart unknown: never claims the session is saved",
                 !ru.contains("being saved") && !ru.contains("nothing was discarded") && !ru.contains("signed in"), ru);

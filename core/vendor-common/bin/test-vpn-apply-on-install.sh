@@ -110,6 +110,7 @@ settings(){
   return 0
 }
 cmd(){ echo "cmd $*" >> "$ROOT/cmdcalls"; return 0; }
+bootwake_vpnapp(){ echo no; }   # NWP-20261205-16: test-bootwake.sh runs the real one
 app_process(){
   echo "helper $3 $4 $5" >> "$ROOT/calls"
   if [ -e "$RES" ]; then echo present >> "$ROOT/atreply"; else echo absent >> "$ROOT/atreply"; fi
@@ -355,7 +356,7 @@ if [ "$MUTATE" = yes ]; then
     '              echo "$_p"
               [ -z "$srcunit" ] || vpn_deferred_retry "$uid" "$srcunit"
             done; } > "$_bf"'
-  mutate A8 "the call moves after the reply" "$CALL$REPLY" "$REPLY$CALL"
+  mutate A8 "the call moves after the reply" "$CALL" '' "$REPLY" "$REPLY$CALL"
   mutate A8 "the call moves before the boot pass" "$CALL" '' "$UNSTOP" "$CALL$UNSTOP"
   mutate A9 "the srcunit guard is removed from the arm's call" '[ -z "$srcunit" ] || vpn_deferred_retry "$uid" "$srcunit"' \
     'vpn_deferred_retry "$uid" "$srcunit"'

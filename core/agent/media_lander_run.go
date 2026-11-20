@@ -280,7 +280,7 @@ func startBgLander(base, scope, pass, mediaDir, stateDir string, mounts []mediaM
 	if err := recovered(func() { key, _, ok = bgResolveKey(base, scope, pass) }); err != nil || !ok {
 		return refuse("store")
 	}
-	m, load := classifyManifestLoad(base, key, rh)
+	m, load := classifyManifestLoad(base, key, rosterManifest(base, rh)) // NWP-20261119-33: a vault head names its manifest
 	if load != mlOK {
 		return refuse("manifest")
 	}

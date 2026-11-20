@@ -96,6 +96,9 @@ is REFUSED cred gmsstate ""         "cred lane refuses gmsstate (no credential, 
 is ALLOWED ro  gmsexits ""          "ro lane accepts gmsexits (NWP-20261201-02: the issue report's Play services exit records)"
 is REFUSED ro  gmsexits "x"         "ro lane refuses a passphrase on gmsexits (it needs only the uid)"
 is REFUSED cred gmsexits ""         "cred lane refuses gmsexits (no credential, so it is not that lane's)"
+is ALLOWED ro  mediaexits ""        "ro lane accepts mediaexits (NWP-20261208-06: the issue report's media service exit records)"
+is REFUSED ro  mediaexits "x"       "ro lane refuses a passphrase on mediaexits (it needs only the uid)"
+is REFUSED cred mediaexits ""       "cred lane refuses mediaexits (no credential, so it is not that lane's)"
 is ALLOWED ro  healthprobe ""       "ro lane accepts healthprobe (NWP-20261201-08: the health checks' one dumpsys read)"
 is REFUSED ro  healthprobe "x"      "ro lane refuses a passphrase on healthprobe (it needs only the uid)"
 is REFUSED cred healthprobe ""      "cred lane refuses healthprobe (no credential, so it is not that lane's)"
@@ -174,6 +177,10 @@ if [ "$MUTATE" = yes ]; then
          's@^\(    storagebreakdown|sealdelta|uiderrors|alarmrelay.*\)|gmsstate@\1@'
   mutate "ro lane closed to gmsexits (every session report says not-collected-lane: ERR-LANE)" \
          's@^\(    storagebreakdown|sealdelta|uiderrors|alarmrelay.*\)|gmsexits@\1@'
+  mutate "ro lane closed to mediaexits (every session report says media_exits=not-collected-lane: ERR-LANE)" \
+         's@^\(    storagebreakdown|sealdelta|uiderrors|alarmrelay.*\)|mediaexits@\1@'
+  mutate "userdir_recheck's guard comment drops mediaexits from the read-only lane's ops" \
+         's@, gmsexits, mediaexits, odblock@, gmsexits, odblock@' static
   mutate "ro lane closed to healthprobe (every health check is unmeasured: ERR-LANE)" \
          's@^\(    storagebreakdown|sealdelta|uiderrors|alarmrelay.*\)|healthprobe@\1@'
   mutate "ro lane closed to vpnstate (every in-session report says vpn_state=unavailable: ERR-LANE)" \

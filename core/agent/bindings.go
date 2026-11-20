@@ -522,50 +522,74 @@ func bindingRefsByTelPubLocked(pub string) []string {
 	return refs
 }
 
+// telCarry is what a credential change's telephony carry did (NWP-20261208-05): counts and two error flags,
+// never logged as refs. Matched is -1 for a rotation (the old ref is known), else how many bound owners held
+// the vault's telephony key. OldRef is the first of them; the record names it only when Matched == 1.
+type telCarry struct {
+	Bind     int
+	BindErr  bool
+	Inbox    int
+	InboxErr bool
+	Matched  int
+	OldRef   string
+}
+
 // carryTelephonyRef moves a profile's SIM bindings and its sealed inbox (pending copies included) from oldRef to
 // newRef, under telMu so no seal lands between the two. Called only after the credential change has committed. Logs
-// counts, never refs.
-func carryTelephonyRef(oldRef, newRef string) {
+// counts, never refs. Returns what it carried (telCarry, NWP-20261208-05).
+func carryTelephonyRef(oldRef, newRef string) telCarry {
+	tc := telCarry{Matched: -1}
 	if oldRef == "" || newRef == "" || oldRef == newRef {
-		return
+		return tc
 	}
 	telMu.Lock()
 	defer telMu.Unlock()
 	n, err := renameBindingOwnerEverywhereLocked(oldRef, newRef)
+	tc.Bind, tc.BindErr = n, err != nil
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[logind] credential change: could NOT carry %d SIM binding line(s) to the new passphrase (NWP-20261013-21)\n", n)
 	} else if n > 0 {
 		fmt.Fprintf(os.Stderr, "[logind] credential change: carried %d SIM binding line(s) to the new passphrase (NWP-20261013-21)\n", n)
 	}
 	moved, err := moveTelInboxLocked(oldRef, newRef)
+	tc.Inbox, tc.InboxErr = moved, err != nil
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[logind] credential change: carried %d sealed item(s), then the inbox move failed (NWP-20261013-21)\n", moved)
 	} else if moved > 0 {
 		fmt.Fprintf(os.Stderr, "[logind] credential change: carried %d sealed item(s) to the new passphrase (NWP-20261013-21)\n", moved)
 	}
+	return tc
 }
 
 // carryTelephonyByTelPub is the recovery form: oldRef is the one owner whose TelPub is the vault's. No match, or
-// more than one, changes nothing -- a guess could hand a SIM to the wrong profile.
-func carryTelephonyByTelPub(telPub, newRef string) {
+// more than one, changes nothing -- a guess could hand a SIM to the wrong profile. Returns what it carried
+// (telCarry, NWP-20261208-05).
+func carryTelephonyByTelPub(telPub, newRef string) telCarry {
 	telMu.Lock()
 	defer telMu.Unlock()
 	refs := bindingRefsByTelPubLocked(telPub)
+	tc := telCarry{Matched: len(refs)}
+	if len(refs) > 0 {
+		tc.OldRef = refs[0]
+	}
 	if len(refs) != 1 {
 		fmt.Fprintf(os.Stderr, "[logind] recover: telephony key matched %d bound owner ref(s) -- binding(s) left as they were (NWP-20261013-21)\n", len(refs))
-		return
+		return tc
 	}
 	oldRef := refs[0]
 	n, err := renameBindingOwnerEverywhereLocked(oldRef, newRef)
+	tc.Bind, tc.BindErr = n, err != nil
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[logind] recover: could NOT carry %d SIM binding line(s) to the new passphrase (NWP-20261013-21)\n", n)
 	} else if n > 0 {
 		fmt.Fprintf(os.Stderr, "[logind] recover: carried %d SIM binding line(s) to the new passphrase (NWP-20261013-21)\n", n)
 	}
 	moved, err := moveTelInboxLocked(oldRef, newRef)
+	tc.Inbox, tc.InboxErr = moved, err != nil
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[logind] recover: carried %d sealed item(s), then the inbox move failed (NWP-20261013-21)\n", moved)
 	} else if moved > 0 {
 		fmt.Fprintf(os.Stderr, "[logind] recover: carried %d sealed item(s) to the new passphrase (NWP-20261013-21)\n", moved)
 	}
+	return tc
 }

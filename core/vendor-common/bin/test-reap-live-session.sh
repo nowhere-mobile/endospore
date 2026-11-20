@@ -9,7 +9,8 @@
 # next bt_seal_capture removes its bt-bond-* artifacts, so every later sign-in of that profile starts with none.
 # Nothing fails and nothing logs an error, so only the executed cases below can see it.
 #
-# stop_mediad, bt_reset, reap_live_other and reap_media_mounted are extracted from nowhere_roamd.sh BY NAME, never copied.
+# stop_mediad, the _ms clock it reads, bt_reset, reap_live_other and reap_media_mounted are extracted from
+# nowhere_roamd.sh BY NAME, never copied.
 # $STATE and /data point into the suite's root, and /proc/mounts points at a case file. setprop, getprop, sleep, cmd,
 # settings and find are stubs that record their argv in $T/argv; find still runs, so the wipe is real.
 #
@@ -66,11 +67,14 @@ restorecon(){ :; }
 EOS
 )
 
-FN_REQUIRED="stop_mediad bt_reset reap_live_other reap_media_mounted bt_default_name _bt_state_ok _bt_wait_off qn"
+FN_REQUIRED="stop_mediad _ms bt_reset reap_live_other reap_media_mounted bt_default_name _bt_state_ok _bt_wait_off qn"
 # extract <script> <names> -> the variables and functions, re-rooted, or failure. A function cut short has no closing `}`.
+# A one-line function (`_ms() { ...; }`, the clock stop_mediad's waits read since NWP-20261210-26) is taken as its line.
 extract() {
   local f="$1" names="$2" out n prog="/^BT_FILES=/p; /^BT_NAME_KEYS=/p;" one
   for n in $names; do
+    one=$(sed -n "/^$n() { .*; }\$/p" "$f")
+    if [ -n "$one" ]; then prog="$prog /^$n() { .*; }\$/p;"; continue; fi
     one=$(sed -n "/^$n() {\$/,/^}\$/p" "$f")
     case "$one" in "$n() {"*) ;; *) return 1 ;; esac
     [ "$(tail -n 1 <<<"$one")" = "}" ] || return 1

@@ -14,10 +14,14 @@ package main
 //     reboot with no network, and the floor names a hash, not a key.
 //   - A failed durable write is an error and the object is not used: a rollover the phone did not keep would be lost
 //     at the next reboot. The next fetch retries.
-//   - A damaged or unreadable floor refuses every object. This keeps the fail-closed rule for this channel. It is an
-//     inference by analogy, not a decision (h54 #4 relaxed the rule only for build warnings, "a warning never
-//     blocks"); it is safe here because the phone always keeps the baked /system index, which rides verified boot, so
-//     a refused /data refresh costs freshness only.
+//   - A damaged floor is rebuilt from the held envelope (h57 #7, docs/product-decisions.md 2026-11-04, "nine answers to
+//     harvest 57"; NWP-20261210-18): when the held copy verifies, its seq and hash become the floor, which
+//     acceptIndexKey rewrites with one log line, so an object at or below that seq is still refused. currentIndexKey
+//     answers from the held object and writes nothing. Only when the held copy is damaged too (absent, unreadable or
+//     not verifying) does the phone fail closed: every object is refused and currentIndexKey answers "". A damaged
+//     floor is NEVER read as absent: floor 0 would let a replayed older rollover restore a revoked key. An unreadable
+//     floor (an I/O error, not bad content) refuses every object, as before. Failing closed is safe because the phone
+//     always keeps the baked /system index, which rides verified boot, so a refused /data refresh costs freshness only.
 //
 // NWP-20261129-18 built the calls: refreshOtaCache calls fetchIndexKey beside the build-warning refresh, and index.go
 // calls currentIndexKey. The operator's put command is a later slice. No goroutine.
@@ -116,6 +120,22 @@ func readIndexKeyFloor(path string) (int64, string, error) {
 	return seq, string(m[2]), nil
 }
 
+// heldIndexKeyFloor is the floor a damaged one is rebuilt from (h57 #7): the held envelope at heldPath, verified as a
+// fresh object (floor 0: any seq >= 1, no expiry by design), and the envelope's hash. An absent, unreadable or
+// unverifiable held copy means both files are damaged: errIndexKeyFloorDamaged. It writes nothing and logs nothing.
+func heldIndexKeyFloor(heldPath string, now int64) (*indexKeyObject, string, error) {
+	held, err := os.ReadFile(heldPath)
+	if err != nil {
+		return nil, "", errIndexKeyFloorDamaged
+	}
+	obj, err := verifyIndexKeyObject(indexKeyObjectKey, held, now, 0)
+	if err != nil {
+		return nil, "", errIndexKeyFloorDamaged
+	}
+	sum := sha256.Sum256(held)
+	return obj, hex.EncodeToString(sum[:]), nil
+}
+
 // indexKeyFileSync syncs a temp file before its rename; a var so tests can fail or count it.
 var indexKeyFileSync = func(f *os.File) error { return f.Sync() }
 
@@ -152,8 +172,25 @@ func writeIndexKeyFile(path string, data []byte) error {
 // heldPath FIRST, then the floor. A crash between the two leaves a new held copy and the old floor, which
 // currentIndexKey reads as a mismatch (no /data refresh) until the next fetch writes both; the reverse order would
 // leave a floor naming an envelope the phone does not hold. A failed write returns an error and no object.
+//
+// A damaged floor (h57 #7) is rewritten FIRST from a held copy that verifies, and env is then judged against the
+// rebuilt floor. acceptIndexKey stays the only writer of the floor. Both damaged, or the floor unreadable: refused, and
+// nothing is written.
 func acceptIndexKey(seqPath, heldPath string, env []byte, now int64) (*indexKeyObject, error) {
 	seq, stored, err := readIndexKeyFloor(seqPath)
+	if err == errIndexKeyFloorDamaged {
+		hobj, hh, herr := heldIndexKeyFloor(heldPath, now)
+		if herr != nil {
+			fmt.Fprintln(os.Stderr, "[index-key] refused: the floor and the held copy are both damaged")
+			return nil, herr
+		}
+		if werr := writeIndexKeyFile(seqPath, []byte(fmt.Sprintf("%d %s\n", hobj.Seq, hh))); werr != nil {
+			fmt.Fprintf(os.Stderr, "[index-key] damaged floor not rebuilt at seq %d: the object is not used\n", hobj.Seq)
+			return nil, werr
+		}
+		fmt.Fprintf(os.Stderr, "[index-key] damaged floor rebuilt at seq %d from the held copy\n", hobj.Seq)
+		seq, stored, err = hobj.Seq, hh, nil
+	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[index-key] refused: %v\n", err)
 		return nil, err
@@ -193,13 +230,27 @@ func acceptIndexKey(seqPath, heldPath string, env []byte, now int64) (*indexKeyO
 // currentIndexKey returns the key the /data index refresh is to be checked against, from the durable pair: the baked
 // indexPubKey when the phone holds no object; activeIndexKey(indexPubKey, obj) when the floor and the held envelope
 // agree (same hash) and the held object re-verifies at floor-1 with the floor's seq; else "" with one log line (one
-// file without the other, a hash mismatch, a damaged or unreadable floor, a held object that no longer verifies).
+// file without the other, a hash mismatch, an unreadable floor, a held object that no longer verifies).
+//
+// A damaged floor (h57 #7): the held object, when it verifies, selects the key; when it does not, "". This path WRITES
+// NOTHING: it runs from getIndex, concurrently with refreshOtaCache's acceptIndexKey, and a second writer could roll
+// the floor back below a seq the accept just wrote (writeIndexKeyFile uses one fixed temp name). The next fetch's
+// acceptIndexKey rewrites the floor.
 //
 // "" means "no /data refresh is accepted", NEVER "unsigned": the baked /system copy still serves. In index.go the
 // selected key replaces indexPubKey ONLY for loadIndexBytesWith's /data branch and refreshIndex's checks; the
 // `indexPubKey == ""` branches trust the baked copy unsigned, so an "" from here must never reach them.
 func currentIndexKey(now int64) string {
 	seq, stored, err := readIndexKeyFloor(indexKeySeqPath)
+	if errors.Is(err, errIndexKeyFloorDamaged) {
+		hobj, _, herr := heldIndexKeyFloor(indexKeyHeldPath, now)
+		if herr != nil {
+			fmt.Fprintln(os.Stderr, "[index-key] no /data refresh key: the floor and the held copy are both damaged")
+			return ""
+		}
+		fmt.Fprintf(os.Stderr, "[index-key] floor damaged: the held object (seq %d) selects the key until the next fetch rewrites the floor\n", hobj.Seq)
+		return activeIndexKey(indexPubKey, hobj)
+	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[index-key] no /data refresh key: %v\n", err)
 		return ""

@@ -51,7 +51,7 @@ func TestEssSpan_IsASelfContainedTarFragment(t *testing.T) {
 			t.Errorf("%s is not in the Ess index at all; index=%v", rel, keysOfEss(m.Ess))
 			continue
 		}
-		frag, err := fetchEssSpan(a.base, key, m, r)
+		frag, err := fetchEssSpan(a.base, key, m, r, nil)
 		if err != nil {
 			t.Errorf("fetch the span for %s: %v", rel, err)
 			continue

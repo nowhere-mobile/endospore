@@ -11,8 +11,9 @@ import android.widget.TextView;
 
 /**
  * The topic tiles of the gate's Help combo screen (NWP-20261130-11): two rows of three equal tiles, in
- * GateHelpHome.TILES order. A tile holds the TalkBack description; its icon and its label are hidden from TalkBack, so
- * TalkBack reads each tile once.
+ * GateHelpHome.TILES order, each row followed by the body its tiles' topics open into, in place (NWP-20261208-26). A
+ * tile holds the TalkBack description; its icon, its label and its chevron are hidden from TalkBack, so TalkBack reads
+ * each tile once.
  */
 final class GateHelpTileGrid extends LinearLayout {
     private static final int COLUMNS = 3;
@@ -20,28 +21,38 @@ final class GateHelpTileGrid extends LinearLayout {
     private static final int[] ICONS = { R.drawable.ic_help_signin, R.drawable.ic_help_apps, R.drawable.ic_help_saving,
         R.drawable.ic_help_lock, R.drawable.ic_help_calls, R.drawable.ic_help_owner };
 
-    GateHelpTileGrid(Context c, GateHelpArt.Roles r, GateHelpScreen.Nav nav) {
+    GateHelpTileGrid(Context c, GateHelpArt.Roles r, GateHelpScreen.Topics topics) {
         super(c);
         setOrientation(VERTICAL);
         int gap = GateHelpScreen.dp(c, 4);
         LinearLayout row = null;
+        LinearLayout body = null;
         for (int i = 0; i < GateHelpHome.TILES.length; i++) {
             if (i % COLUMNS == 0) {
                 row = new LinearLayout(c);
                 row.setOrientation(HORIZONTAL);
                 row.setBaselineAligned(false);
                 addView(row, new LinearLayout.LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT));
+                // The row's body, full width, under its three tiles.
+                body = GateHelpScreen.body(c);
+                LinearLayout.LayoutParams blp = new LinearLayout.LayoutParams(LayoutParams.MATCH_PARENT,
+                        LayoutParams.WRAP_CONTENT);
+                blp.leftMargin = gap;
+                blp.rightMargin = gap;
+                addView(body, blp);
             }
             LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, LayoutParams.MATCH_PARENT, 1f);
             lp.leftMargin = gap;
             lp.rightMargin = gap;
             lp.topMargin = gap;
             lp.bottomMargin = gap;
-            row.addView(tile(c, r, nav, i), lp);
+            TextView chevron = GateHelpScreen.chevron(c, r, 14);
+            row.addView(tile(c, r, topics, i, chevron), lp);
+            topics.add(i, body, chevron);
         }
     }
 
-    private static View tile(Context c, GateHelpArt.Roles r, GateHelpScreen.Nav nav, int index) {
+    private static View tile(Context c, GateHelpArt.Roles r, GateHelpScreen.Topics topics, int index, TextView chevron) {
         LinearLayout tile = new LinearLayout(c);
         tile.setOrientation(VERTICAL);
         tile.setGravity(Gravity.CENTER);
@@ -51,7 +62,7 @@ final class GateHelpTileGrid extends LinearLayout {
         tile.setBackground(GateHelpScreen.card(c, r.cardFill, r.cardEdge, 1));
         tile.setContentDescription(GateHelpHome.tileDescription(index));
         tile.setFocusable(true);
-        tile.setOnClickListener(v -> nav.openTile(index));
+        tile.setOnClickListener(v -> topics.tap(index));
 
         ImageView icon = new ImageView(c);
         icon.setImageResource(ICONS[index]);
@@ -69,6 +80,7 @@ final class GateHelpTileGrid extends LinearLayout {
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT);
         lp.topMargin = GateHelpScreen.dp(c, 6);
         tile.addView(label, lp);
+        tile.addView(chevron, new LinearLayout.LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT));
         return tile;
     }
 }

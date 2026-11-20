@@ -7,9 +7,9 @@
 # reads HelpPages (the six session topics). Both classes hold only words (pure, java.lang only) and are compiled here
 # with their cases; they pin both page lists exactly and apart, 3 to 6 steps and at most 650 characters a page, and no
 # B4 word in a body, for both sets. A source check (comment lines stripped) pins the two doors: showGateHelp opens the
-# combo screen (NWP-20261130-11; test-gate-help-combo-java.sh runs that screen's own cases), its page dialog
-# (showGateHelpPage) shows moreLine with no words of its own, and these methods read no HelpPages. "Got it" left the page
-# dialog with that slice: on top of the combo screen it did the same as Back. Both Profile home arrays end with a
+# combo screen (NWP-20261130-11; test-gate-help-combo-java.sh runs that screen's own cases), whose topics open in place
+# (GateHelpTopic, NWP-20261208-26; the page dialog showGateHelpPage is gone) and show moreLine with no words of their
+# own, and none of these reads HelpPages. Both Profile home arrays end with a
 # "Help" row that runs showHelp; showHelp lists
 # HelpPages.TITLES and opens a topic in place through showHelpPage, which builds its step cards from HelpPages.steps
 # through HelpCards.cards, shows moreLine and runs close on Back from the first card (NWP-20261122-08,
@@ -44,6 +44,7 @@ SRC="$root/core/chooser/src/com/nowhere/chooser"
 SUT="${HELP_PAGES_SRC:-$SRC/HelpPages.java}"
 GATE="${HELP_GATE_PAGES_SRC:-$SRC/GateHelpPages.java}"
 CHOOSER="${HELP_CHOOSER_SRC:-$SRC/ChooserActivity.java}"
+TOPIC="${HELP_GATE_TOPIC_SRC:-$SRC/GateHelpTopic.java}"
 PROFILE="${HELP_PROFILE_SRC:-$SRC/ProfileActivity.java}"
 CASES="$root/core/chooser/tests/help-pages/HelpPagesCases.java"
 HOST_JDK=/mnt/build/lineage/prebuilts/jdk/jdk21/linux-x86/bin
@@ -88,21 +89,22 @@ method() {
 # The card screen's private helpers beside showHelpPage (NWP-20261122-08). S4 reads them with showHelpPage.
 HELP_PAGE_HELPERS='helpCardPicture helpCardDrop helpCardFling helpCardChips helpCardPanel helpTopicIcon'
 
-# source_check <ChooserActivity.java> <ProfileActivity.java> <HelpPages.java> <GateHelpPages.java> -> 0 when the
-# wiring holds, 1 otherwise.
+# source_check <ChooserActivity.java> <ProfileActivity.java> <HelpPages.java> <GateHelpPages.java> <GateHelpTopic.java>
+# -> 0 when the wiring holds, 1 otherwise.
 source_check() {
-  local chooser="$1" profile="$2" pages="$3" gatepages="$4" gate gatenav gatepage home help page cardsrc h body k n lits rest arrays f bad=0
+  local chooser="$1" profile="$2" pages="$3" gatepages="$4" topic="$5" gate gatenav topicsrc home help page cardsrc h body k n lits rest arrays f bad=0
   gate=$(method "$chooser" 'private void showGateHelp\\(\\)')
   gatenav=$(method "$chooser" 'private GateHelpScreen\\.Nav gateHelpNav\\(\\)')
-  gatepage=$(method "$chooser" 'private void showGateHelpPage\\(')
   home=$(method "$profile" 'private void showConfirm\\(\\)')
   help=$(method "$profile" 'private void showHelp\\(\\)')
   page=$(method "$profile" 'private void showHelpPage\\(')
   [ -n "$gate" ] || { echo "  FAIL  showGateHelp not found in $chooser" >&2; return 1; }
   [ -n "$gatenav" ] || { echo "  FAIL  gateHelpNav not found in $chooser" >&2; bad=1; }
-  [ -n "$gatepage" ] || { echo "  FAIL  showGateHelpPage not found in $chooser" >&2; bad=1; }
-  # The gate's three Help methods, read together by S1 and S4.
-  gate=$(printf '%s\n%s\n%s\n' "$gate" "$gatenav" "$gatepage")
+  # The gate's two Help methods, read together by S1 and S4.
+  gate=$(printf '%s\n%s\n' "$gate" "$gatenav")
+  # topicsrc: the in-place topic (NWP-20261208-26), comment lines and "//" tails stripped, for S1 and S4.
+  [ -f "$topic" ] || { echo "  FAIL  $topic does not exist (the gate's topics do not open in place)" >&2; return 1; }
+  topicsrc=$(sed -e '/^[[:space:]]*\(\*\|\/\*\)/d' -e 's#//.*$##' "$topic")
   [ -n "$home" ] || { echo "  FAIL  showConfirm not found in $profile" >&2; return 1; }
   [ -n "$help" ] || { echo "  FAIL  showHelp not found in $profile" >&2; bad=1; }
   [ -n "$page" ] || { echo "  FAIL  showHelpPage not found in $profile" >&2; bad=1; }
@@ -114,18 +116,21 @@ source_check() {
     cardsrc=$(printf '%s\n%s\n' "$cardsrc" "$body")
   done
 
-  # S1 the gate's "?": the combo screen, then a page dialog that shows GateHelpPages' last line; never a HelpPages
-  # (Profile's set), and no words of its own: every word is GateHelpHome's or GateHelpPages'.
-  for k in 'GateHelpScreen.home(' '.setTitle(' '.setMessage(' 'GateHelpPages.moreLine()'; do
-    n=$(printf '%s\n' "$gate" | grep -cF "$k")
-    [ "$n" -ge 1 ] || { echo "  FAIL  showGateHelp and its methods have no <$k>" >&2; bad=1; }
-  done
-  n=$(printf '%s\n' "$gate" | grep -cE '(^|[^A-Za-z])HelpPages\.')
-  [ "$n" -eq 0 ] || { echo "  FAIL  showGateHelp reads HelpPages (Profile › Help's set), not only GateHelpPages" >&2; bad=1; }
-  lits=$(printf '%s\n' "$gate" | grep -o '"[^"]*"' | sort -u | grep -vxF -e '"\n\n"')
+  # S1 the gate's "?": the combo screen, whose topics open in place (GateHelpTopic) and show GateHelpPages' last line;
+  # never a HelpPages (Profile's set), and no words of their own: every word is GateHelpHome's, GateHelpPages' or
+  # HelpCards' (Back, Next).
+  n=$(printf '%s\n' "$gate" | grep -cF 'GateHelpScreen.home(')
+  [ "$n" -ge 1 ] || { echo "  FAIL  showGateHelp and its methods have no <GateHelpScreen.home(>" >&2; bad=1; }
+  n=$(printf '%s\n' "$topicsrc" | grep -cF 'GateHelpPages.moreLine()')
+  [ "$n" -ge 1 ] || { echo "  FAIL  GateHelpTopic has no <GateHelpPages.moreLine()>" >&2; bad=1; }
+  n=$(printf '%s\n%s\n' "$gate" "$topicsrc" | grep -cE '(^|[^A-Za-z])HelpPages\.')
+  [ "$n" -eq 0 ] || { echo "  FAIL  the gate's Help reads HelpPages (Profile › Help's set), not only GateHelpPages" >&2; bad=1; }
+  lits=$(printf '%s\n' "$gate" | grep -o '"[^"]*"' | sort -u)
   [ -z "$lits" ] || { echo "  FAIL  showGateHelp shows its own words: $(printf '%s' "$lits" | tr '\n' ' ')" >&2; bad=1; }
-  n=$(printf '%s\n' "$gate" | grep -cE 'startActivity|Intent|WebView|Uri\.')
-  [ "$n" -eq 0 ] || { echo "  FAIL  showGateHelp leaves the gate (an activity, a link)" >&2; bad=1; }
+  lits=$(printf '%s\n' "$topicsrc" | grep -o '"[^"]*"' | sort -u | grep -vxF -e '"\n"' -e '", "')
+  [ -z "$lits" ] || { echo "  FAIL  GateHelpTopic shows its own words: $(printf '%s' "$lits" | tr '\n' ' ')" >&2; bad=1; }
+  n=$(printf '%s\n%s\n' "$gate" "$topicsrc" | grep -cE 'startActivity|Intent|WebView|Uri\.|AlertDialog')
+  [ "$n" -eq 0 ] || { echo "  FAIL  the gate's Help leaves the gate (an activity, a link, a dialog)" >&2; bad=1; }
 
   # S2 both home arrays: "Help" last, and the runnable at the same index is showHelp.
   arrays=$(printf '%s\n' "$home" | perl -0ne '
@@ -164,11 +169,10 @@ source_check() {
   [ "$n" -eq 0 ] || { echo "  FAIL  showHelpPage opens a screen of its own, not the topic in place" >&2; bad=1; }
 
   # S4 static text only: no Help method reads a profile name or a daemon reply, or joins one into a Help string.
-  n=$(printf '%s\n%s\n%s\n' "$gate" "$help" "$cardsrc" \
+  n=$(printf '%s\n%s\n%s\n%s\n' "$gate" "$topicsrc" "$help" "$cardsrc" \
         | grep -cE 'profileName|\bname\b|sendDaemon|daemonCmd|daemonLenReply|DaemonSocket|\breply\b|sessionType|getUserName')
   [ "$n" -eq 0 ] || { echo "  FAIL  a Help method reads a profile name or a daemon reply" >&2; bad=1; }
-  rest=$(printf '%s\n' "$gate" | sed 's/body + "\\n\\n" + GateHelpPages\.moreLine()//')
-  n=$(printf '%s\n%s\n%s\n' "$rest" "$help" "$cardsrc" | grep -cE '[^+]\+[^+=]')
+  n=$(printf '%s\n%s\n%s\n' "$gate" "$help" "$cardsrc" | grep -cE '[^+]\+[^+=]')
   [ "$n" -eq 0 ] || { echo "  FAIL  a Help method joins something into a Help string" >&2; bad=1; }
 
   # S5 HelpPages, GateHelpPages and GateHelpHome are pure: java.* only.
@@ -181,55 +185,39 @@ source_check() {
   [ "$bad" -eq 0 ]
 }
 
-# run_all <HelpPages.java> <GateHelpPages.java> <ChooserActivity.java> <ProfileActivity.java> -> 0 pass, 1 a check
-# failed, 3 no compile.
+# run_all <HelpPages.java> <GateHelpPages.java> <ChooserActivity.java> <ProfileActivity.java> <GateHelpTopic.java>
+# -> 0 pass, 1 a check failed, 3 no compile.
 run_all() {
   local rc
   echo "== $1 $2"
   suite "$1" "$2"; rc=$?
   [ "$rc" -eq 3 ] && return 3
-  if source_check "$3" "$4" "$1" "$2"; then echo "source: ok"; else echo "FAILED (source)"; rc=1; fi
+  if source_check "$3" "$4" "$1" "$2" "$5"; then echo "source: ok"; else echo "FAILED (source)"; rc=1; fi
   return "$rc"
 }
 
-run_all "$SUT" "$GATE" "$CHOOSER" "$PROFILE"; rc=$?
+run_all "$SUT" "$GATE" "$CHOOSER" "$PROFILE" "$TOPIC"; rc=$?
 [ "$rc" -eq 0 ] || { echo "FAILED (rc=$rc)"; exit 1; }
 [ "$MUTATE" = yes ] || exit 0
 
 command -v perl >/dev/null 2>&1 || { echo "FAIL: --mutate needs perl, and there is none -- refusing to report" >&2; exit 1; }
 echo "== mutations (each must be CONVICTED -- a mutant that does not apply or does not compile proves nothing)"
 
-# The gate sheet as it stood before this slice, for M7.
-cat > "$W/old-gate-help.txt" <<'OLD'
-    private void showGateHelp() {
-        runOnUiThread(() -> new android.app.AlertDialog.Builder(this)
-                .setTitle("Signing in")
-                .setMessage("Enter your profile name and passphrase, then tap Unlock. Nothing is kept on this "
-                        + "phone — your apps and data come down from your store as you sign in.\n\n"
-                        + "Using a security key?\n"
-                        + "• USB-C key: plug it in, enter your passphrase, then touch the key when it blinks.\n"
-                        + "• NFC key: enter your passphrase, then hold the key to the back of the phone.\n"
-                        + "No security key? Ignore this — just sign in with your passphrase.\n\n"
-                        + "Forgot your passphrase? Use the link below the Unlock button to recover with your "
-                        + "12-word recovery code.")
-                .setPositiveButton("Got it", (d, w) -> d.dismiss())
-                .show());
-    }
-OLD
-
-# mut <label> <pages|gate|chooser|profile> <perl-expr> -> 0 when the mutant is convicted.
+# mut <label> <pages|gate|chooser|profile|topic> <perl-expr> -> 0 when the mutant is convicted.
 mut() {
-  local label="$1" which="$2" expr="$3" d orig c rc pg="$SUT" gp="$GATE" ch="$CHOOSER" pr="$PROFILE"
-  case "$which" in pages) orig="$SUT" ;; gate) orig="$GATE" ;; chooser) orig="$CHOOSER" ;; profile) orig="$PROFILE" ;; esac
+  local label="$1" which="$2" expr="$3" d orig c rc pg="$SUT" gp="$GATE" ch="$CHOOSER" pr="$PROFILE" tp="$TOPIC"
+  case "$which" in
+    pages) orig="$SUT" ;; gate) orig="$GATE" ;; chooser) orig="$CHOOSER" ;; profile) orig="$PROFILE" ;; topic) orig="$TOPIC" ;;
+  esac
   d=$(mktemp -d -p "$W") || return 1
   c="$d/$(basename "$orig")"
   cp "$orig" "$c"
-  if ! OLD_GATE="$W/old-gate-help.txt" perl -0pi -e "$expr" "$c"; then
+  if ! perl -0pi -e "$expr" "$c"; then
     echo "  ERROR     $label -- perl failed on the mutation"; rm -rf "$d"; return 1
   fi
   if cmp -s "$orig" "$c"; then echo "  INERT     $label -- the mutation changed nothing"; rm -rf "$d"; return 1; fi
-  case "$which" in pages) pg="$c" ;; gate) gp="$c" ;; chooser) ch="$c" ;; profile) pr="$c" ;; esac
-  run_all "$pg" "$gp" "$ch" "$pr" >/dev/null 2>&1; rc=$?
+  case "$which" in pages) pg="$c" ;; gate) gp="$c" ;; chooser) ch="$c" ;; profile) pr="$c" ;; topic) tp="$c" ;; esac
+  run_all "$pg" "$gp" "$ch" "$pr" "$tp" >/dev/null 2>&1; rc=$?
   rm -rf "$d"
   case "$rc" in
     0) echo "  SURVIVED  $label"; return 1 ;;
@@ -253,15 +241,15 @@ mut "M5 a page with 2 steps" pages \
 mut "M6 the throwaway array's Help row removed" profile \
   's/(new String\[\]\{"Security", "Preferences"), "Help"\}(,\s*new Runnable\[\]\{\(\) -> showSecurity\(\), \(\) -> showPreferences\(\)), \(\) -> showHelp\(\)\}/$1}$2}/' \
   || fails=$((fails+1))
-mut "M7 showGateHelp reverted to its old literal sheet" chooser \
-  'BEGIN { local $/; open my $f, "<", $ENV{OLD_GATE} or die; $old = <$f> } s/    private void showGateHelp\(\) \{\n.*?\n    \}\n/$old/s or die "M7: showGateHelp not found"' \
+mut "M7 GateHelpTopic shows its own support line, not GateHelpPages.moreLine()" topic \
+  's/GateHelpPages\.moreLine\(\)/"More help is on the support pages."/ or die "M7"' \
   || fails=$((fails+1))
 mut "M8 \"Your apps\" added to the gate set" gate \
   's/^(\s+)"Signing in and creating a profile",$/$1"Signing in and creating a profile",\n$1"Your apps",/m or die "M8: title";
    s/^(\s+)\{ \/\/ page 1: Gate settings$/$1\{ \/\/ page 0b: Your apps\n$1    "Tap Your apps.",\n$1    "Tap an app.",\n$1    "Tap Back.",\n$1\},\n$1\{ \/\/ page 1: Gate settings/m or die "M8: page"' \
   || fails=$((fails+1))
-mut "M9 showGateHelpPage pointed back at HelpPages" chooser \
-  's/(    private void showGateHelpPage\(.*?\n    \}\n)/$1 =~ s#GateHelpPages\.#HelpPages.#gr/se or die "M9: showGateHelpPage not found"' \
+mut "M9 GateHelpTopic pointed back at HelpPages" topic \
+  's/GateHelpPages\./HelpPages./g or die "M9"' \
   || fails=$((fails+1))
 mut "M10 a Gate settings step given the word secure" gate 's/join a network/join a secure network/ or die "M10"' \
   || fails=$((fails+1))

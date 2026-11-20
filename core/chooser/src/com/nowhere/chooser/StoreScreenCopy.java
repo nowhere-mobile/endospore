@@ -17,7 +17,7 @@ final class StoreScreenCopy {
     /** The message for one GET-STORE state. {@code configured} does not change it today: a managed device is always
      *  configured, and the key / no-store split reads keyset= only, as it always did. */
     static String message(boolean configured, boolean managed, boolean keyset) {
-        if (managed) return "This phone saves to the managed Nowhere store.";
+        if (managed) return "This phone saves to the managed nowhere store.";
         if (keyset) return "a key is already set — re-enter both keys to change it";
         return "no store yet — set one up to create or unlock a profile";
     }

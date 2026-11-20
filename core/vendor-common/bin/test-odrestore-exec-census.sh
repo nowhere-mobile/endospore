@@ -30,6 +30,13 @@
 #   bash test-odrestore-exec-census.sh              # the cases and the census tables, under each shell found
 #   bash test-odrestore-exec-census.sh --mutate     # ... plus mutants of roamd that must each CONVICT under each shell
 #
+# Since NWP-20261208-13 the arm's last step is `od_extdata_watched "$pkg"`: the census runs the REAL function (extracted
+# by anchor, re-rooted, renamed od_extdata_watched_real) with STATE empty, its no-count-file form, so B's and C's
+# `reown_ext_appdata` and the -D relabel walk keep their meaning. Its counted walks are test-odrestore-extdata-progress.sh's.
+# Since NWP-20261209-04 that relabel is `od_walk prune 2 restorecon -D <dir> -xdev` (was `restorecon -R -D <dir>`), run
+# only when <dir> exists. od_walk is a recorder here, like the other helpers (so its find, xargs and restorecon execs
+# are not in the census tables; its bounded walk is test-od-relabel.sh's), and C plants <dir> so its walk still runs.
+#
 # Pure logic -- no device. Every other helper the arm calls is a recorder; cp/rm/mkdir/mv are real against a temp
 # tree; the /data paths of the arm and both functions are re-rooted into it.
 set -uo pipefail
@@ -117,7 +124,7 @@ reroot() { printf '%s\n' "$1" | sed -E 's#([" |])/data/#\1$ROOT/data/#g'; }
 nleft() { printf '%s\n' "$1" | sed -E 's/(^|[[:space:]])#.*$//' | sed 's#\$ROOT/data/##g' | grep -cE '(^|[^[:alnum:]_])/data/'; }
 
 suite() {  # suite <roamd.sh> <sh> [quiet] -> 0 all ok, 1 a case failed, 2 the harness could not run
-  local f="$1" sh="$2" quiet="${3:-}" p=0 x=0 ARM GPF KSR RA RG RK ODH PKGOK n R d k
+  local f="$1" sh="$2" quiet="${3:-}" p=0 x=0 ARM GPF GWA KSR RA RG RK ODH PKGOK n R d k EXW
   say() { [ -n "$quiet" ] || printf '%s\n' "$1"; }
   chk() {
     local l="$1"; shift
@@ -132,6 +139,7 @@ suite() {  # suite <roamd.sh> <sh> [quiet] -> 0 all ok, 1 a case failed, 2 the h
 
   ARM=$(arm_of "$f" odrestore)
   GPF=$(fn_of "$f" grant_perms_for)
+  GWA=$(fn_of "$f" gwin_add)   # NWP-20261210-09: the window helper grant_perms_for calls (absent before it)
   KSR=$(fn_of "$f" keystore_register)
   PKGOK=$(fn_of "$f" pkgname_ok)
   ODH=$(grep -m1 -E '^ODHOLD=' "$f")
@@ -143,8 +151,11 @@ suite() {  # suite <roamd.sh> <sh> [quiet] -> 0 all ok, 1 a case failed, 2 the h
   done
   [ -n "$ODH" ] || { echo "EXTRACTION FAILED: ODHOLD= not found in $f" >&2; return 2; }
   case "$PKGOK" in *'return 1'*'return 0'*) ;; *) echo "EXTRACTION FAILED: pkgname_ok in $f" >&2; return 2 ;; esac
+  EXW=$(fn_of "$f" od_extdata_watched)
+  case "$EXW" in *'if [ -z "$cnt" ]; then'*'reown_ext_appdata "$pkg"; r=$?'*'od_walk '*'"$d"'*'exit "$r" )'*'return $?'*) ;; *) echo "EXTRACTION FAILED: od_extdata_watched in $f" >&2; return 2 ;; esac
+  EXW=$(reroot "$EXW" | sed '1s/^od_extdata_watched() {$/od_extdata_watched_real() {/')
   RA=$(reroot "$ARM"); RG=$(reroot "$GPF"); RK=$(reroot "$KSR")
-  for k in "$RA" "$RG" "$RK"; do
+  for k in "$RA" "$RG" "$RK" "$EXW"; do
     n=$(nleft "$k")
     [ "$n" = 0 ] || { echo "RE-ROOT INCOMPLETE: $n absolute /data path(s) left in live code" >&2; return 2; }
   done
@@ -159,15 +170,16 @@ suite() {  # suite <roamd.sh> <sh> [quiet] -> 0 all ok, 1 a case failed, 2 the h
         SIM "$1/sim" KS_MAP "$1/ks/map" KS_IMPORT "$1/ks/import" KS_IN "$1/ks/in" PATH "$BIN:$PATH"
       printf '%s\n' 'export CENSUS SIM PATH' "$EXP" 'USERDIR="$ROOT/data/user/$uid"' "$ODH" "$PKGOK"
       for t in a11y_apply autofill_apply pkg_live_pids reown_restored od_relabel cutoff_prog reown_ext_appdata \
-               wait_acct_authenticator acct_reload sync_apply keystore_unit; do
+               wait_acct_authenticator acct_reload sync_apply keystore_unit od_walk; do
         printf '%s() { echo "%s $*" >> "$C"; }\n' "$t" "$t"
       done
       printf '%s\n' 'vpn_preconsent_off() { :; }'
       printf '%s\n' 'od_watched() { shift; "$@" 2>&1; }'
       printf '%s\n' 'od_label_watched() { reown_restored "$2"; od_relabel "$1" "$2"; }'
+      printf '%s\n' 'od_extdata_watched() { ( STATE=; od_extdata_watched_real "$@" ); }   # NWP-20261208-13' "$EXW"
       printf '%s\n' 'od_fetch_data() { return 0; }; od_listed() { return 1; }; od_block_app() { return 0; }; od_unblock_app() { :; }; od_pending_clear() { :; }; od_block_installed() { :; }; od_shipped_prep() { return 0; }; od_park_var() { :; }; od_unf_path() { echo "$STATE/odfetch.$1/unfetched.$2"; }   # NWP-20261130-03'
       printf '%s\n' 'ks_in_dir() { echo "ks_in_dir" >> "$C"; printf "%s\n" "$KS_IN/$uid"; }'
-      printf '%s\n%s\n' "$RG" "$RK"
+      printf '%s\n%s\n%s\n' "$GWA" "$RG" "$RK"
       printf 'case "$op" in\n%s\nesac\n' "$RA"
     } > "$1/run.sh"
   }
@@ -282,7 +294,7 @@ suite() {  # suite <roamd.sh> <sh> [quiet] -> 0 all ok, 1 a case failed, 2 the h
   chk "B reown_ext_appdata ran" has "$R/sim/calls" "reown_ext_appdata $PKG"
 
   say "== [$sh] C: an archived placeholder, CE hold onto a root-owned dest, no code =="
-  mkroot; placeholder "$R"; plant_hold "$R"
+  mkroot; placeholder "$R"; plant_hold "$R"; mkdir -p "$R/data/media/$UID_/Android/data/$PKG"
   run_od "$R"; table C "$R/sim/census"
   chk "C the reply is ERR-NOTREADY (as before)" eqv "$(cat "$R/res" 2>/dev/null)" ERR-NOTREADY
   chk "C no 'pm grant'" nopre "$R/sim/census" '^pm grant '
@@ -294,7 +306,7 @@ suite() {  # suite <roamd.sh> <sh> [quiet] -> 0 all ok, 1 a case failed, 2 the h
   chk "C grant_perms_for did not run" grant_not "$R"
   chk "C the one 'no code' log line" eqv "$(nocode_n "$R")" 1
   chk "C reown_ext_appdata still ran" has "$R/sim/calls" "reown_ext_appdata $PKG"
-  chk "C restorecon of the external data dir still ran" has "$R/sim/census" "restorecon -R -D $R/data/media/$UID_/Android/data/$PKG"
+  chk "C the -D relabel walk of the external data dir still ran" has "$R/sim/calls" "od_walk prune 2 restorecon -D $R/data/media/$UID_/Android/data/$PKG -xdev"
   chk "C \$STATE/.declined.$UID_ does not hold $PKG" undeclined "$R"
 
   say "== [$sh] CA: the placeholder's op, then its real install's op, on the same STATE =="
@@ -360,7 +372,10 @@ suite() {  # suite <roamd.sh> <sh> [quiet] -> 0 all ok, 1 a case failed, 2 the h
   say "== [$sh] BB5: shape B with no token =="
   mkroot; code "$R"
   run_od "$R"
-  chk "BB5 shape B with no token still runs 6 execs" eqv "$(grep -c . "$R/sim/census")" 6
+  # 5 execs: the two pm lists, cmd appops and the two grants. Until NWP-20261209-04 a sixth, `restorecon -R -D`, ran on
+  # the Android/data dir this case does not plant; the relabel walk now runs only on a dir that exists.
+  chk "BB5 shape B with no token still runs 5 execs, and no relabel walk of the absent ext data dir" \
+    eqv "$(grep -c . "$R/sim/census"):$(grep -c '^od_walk ' "$R/sim/calls")" 5:0
 
   for k in "$TOKB.1.x:$TOKB.2.x" "b0123ABCD.1.2:b0123ABCD.2.2" "$TOKB.01.2:$TOKB.02.2" "$TOKB.1.2.3:$TOKB.2.2.3" \
            "x0123abcd.1.2:x0123abcd.2.2" "b0123abc.1.2:b0123abc.2.2"; do
@@ -406,7 +421,7 @@ for sh in "${SHELLS[@]}"; do suite "$SUT" "$sh"; r=$?; [ "$r" -gt "$rc" ] && rc=
 L_SKIP='    if [ "$_odcode" = no ]; then'
 L_KS='      keystore_register "$pkg" "$_odns"'
 L_II='          if _odpu=$(pm list packages -U -a --user "$uid" "$pkg" </dev/null 2>/dev/null); then'
-L_RE='    reown_ext_appdata "$pkg"; restorecon -R -D "/data/media/$uid/Android/data/$pkg" 2>>"$LOG"'
+L_RE='    od_extdata_watched "$pkg"'
 N_EXACT='package:$pkg uid:"'
 # NWP-20261125-08's lines, passed to awk through ENVIRON (one ends in a backslash, which -v would read as an escape).
 export M_CR='    if [ -n "$_gbf" ] && [ -f "$_gbf" ] && [ -r "$_gbf" ] \'

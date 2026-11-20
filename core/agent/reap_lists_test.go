@@ -21,17 +21,18 @@ var reapListsGone = []string{
 
 var reapListsStay = []string{
 	"blobcache.x", "signin-summary.11", "xscancache.1", "xheal-handled-1", "xcontentcache.1", "xsealcount.1",
-	"xapps-not-restored-1",
+	"xapps-not-restored-1", "xfreemedia.keys",
 }
 
 var reapCachesGone = []string{
 	"contentcache.ab12", "groupcache.ab12", "groupcache.ab12.tmp", "sealcount.ab12", "mnochange.ab12", "mnochange.ab12.tmp",
+	"freemedia.keys", "freemedia.keys.tmp",
 }
 
 const (
 	reapListsKeptLine  = "[logind] reap: kept the session file lists and caches -- a session is live or parked (h59 #11, h60 #8)"
 	reapListsDoneLine  = "[logind] reap: removed 11 session file list(s) from the state tmpfs (h59 #11)"
-	reapCachesDoneLine = "[logind] reap: removed 6 session cache file(s) from the state tmpfs (h60 #8)"
+	reapCachesDoneLine = "[logind] reap: removed 8 session cache file(s) from the state tmpfs (h60 #8)"
 )
 
 // reapListsPlant writes every listed name into dest, plus the two shapes that must never be removed: an EMPTY

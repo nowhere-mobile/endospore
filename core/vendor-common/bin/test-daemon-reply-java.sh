@@ -54,7 +54,7 @@ suite() {
   perl -0ne 'exit(/private String sendDaemon\(String msg\) \{.*?String line = br\.readLine\(\);\n\s*if \(DaemonSocket\.moreBuffered\(br\)\)[^\n]*\n\s*android\.util\.Log\.e\("NowhereChooser", "sendDaemon\(" \+ DaemonSocket\.verbOf\(msg\) \+ "\): the reply has more "\n\s*\+ "than one line and only the first was read -- use DaemonSocket\.roundTripLines"\);\n\s*s\.close\(\);/s ? 0 : 1)' "$pa" || {
     echo "  PIN   ProfileActivity.sendDaemon no longer logs a multi-line reply by verb after its readLine" >&2; return 1; }
   # PIN 3: ChooserActivity.sendDaemon still delegates to roundTrip, so PIN 1 covers it.
-  grep -qF 'return DaemonSocket.roundTrip(msg, 90000);' "$root/core/chooser/src/com/nowhere/chooser/ChooserActivity.java" || {
+  grep -qF 'return DaemonSocket.roundTrip(msg, DaemonReadCap.forRequest(msg));' "$root/core/chooser/src/com/nowhere/chooser/ChooserActivity.java" || {
     echo "  PIN   ChooserActivity.sendDaemon no longer delegates to DaemonSocket.roundTrip" >&2; return 1; }
   bash "$RUN" "$ds"
 }

@@ -15,7 +15,8 @@
 #       joins, the rerun reads an empty list, and each app is processed once.
 #   J8  a by-hand join after a pass whose apps waited for Wi-Fi reruns with BY_HAND, so the waiting apps are fetched.
 #   P1  onStartCommand calls sweepAutoJoined(false) in the netRekick branch and sweepAutoJoined(byHand) after the
-#       presence snapshot and wakeRestored, and calls no sweepAuto( itself.
+#       presence snapshot and wakeRestored, and calls no sweepAuto( itself. Each call's finally runs workerDone(); the
+#       landing call's finally may first free the landing queue (LandingQueue.decided(0), NWP-20261208-24).
 #   P2  sweepAuto( is called only inside sweepAutoJoined: once there, and nowhere else in the file.
 #   P3  sweepAutoJoined reads and removes LANDING, then calls SweepJoin.enter (its false branch returns) before any
 #       sweepAuto call, then the SweepWake lock lines and `try {` (NWP-20261128-07), and in its loop catches Throwable
@@ -93,7 +94,7 @@ sources() {
       $nb =~ /try \{ sweepAutoJoined\(false\); \}\s*catch \(Throwable \w+\) \{[^}]*\}\s*finally \{ workerDone\(\); \}/ or exit 1;
       my $snap = index($c, "StoreInstaller.snapshotAppSeen(");
       my $wake = index($c, "wakeRestored(restoredOk)");
-      $c =~ /try \{ sweepAutoJoined\(byHand\); \}\s*catch \(Throwable \w+\) \{[^}]*\}\s*finally \{ workerDone\(\); \}/g or exit 1;
+      $c =~ /try \{ sweepAutoJoined\(byHand\); \}\s*catch \(Throwable \w+\) \{[^}]*\}\s*finally \{(?:(?!sweepAuto|finally).)*?\bworkerDone\(\);\s*\}/gs or exit 1;
       my $call = pos($c);
       exit 1 unless $snap >= 0 && $wake > $snap && $call > $wake;
       exit 0;' <<<"$start" || bad=1

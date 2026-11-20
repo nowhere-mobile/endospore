@@ -99,7 +99,7 @@ final class OsAgreement {
     static final String DRAFT_MARK = "DRAFT -- not yet reviewed by counsel. This text will change.";
 
     static final String BODY_FROM =
-            "These terms are from Nowhere Mobile LLC, which makes the Nowhere operating system on this phone.";
+            "These terms are from Nowhere Mobile LLC, which makes the nowhere operating system on this phone.";
     // BODY_KEEPS and BODY_WE_SEE carry their qualifiers (docs/privacy-claims.md §3 and §4 rule 2); the cases pin them.
     static final String BODY_KEEPS = "What this phone keeps. Your profiles are not kept on this phone. At sign-in, "
             + "your profile comes back from your store. At sign-out or power-off, the phone wipes it. Some phone "
@@ -122,7 +122,7 @@ final class OsAgreement {
 
     /** The second confirmation, on its own control: a lost passphrase cannot be recovered by anyone. */
     static final String ACK = "I understand that if I lose my passphrase and my 12-word recovery code, no one can "
-            + "recover my data. Not Nowhere, and not anyone else.";
+            + "recover my data. Not nowhere, and not anyone else.";
 
     static final String ACCEPT = "Agree and continue";
 

@@ -188,6 +188,17 @@ type Wallet struct {
 	// (pendingClaimMissesFor). A build older than this field decodes the wallet non-strictly and drops it on its next
 	// write; that costs at most one extra retry (one more /issue round trip at a later session), never a token.
 	PendingClaimMisses []string `json:"pending_claim_misses,omitempty"`
+
+	// UnusableClaims holds unusableClaimKey hashes, never a code (NWP-20261208-03; decided 2026-11-03, h55 #1 in
+	// docs/product-decisions.md: when the deferred drain finds the code unknown or spent, it clears the pending entry in
+	// the same wallet publish, and Profile says that the code could not be used and that the profile is on the free
+	// plan). drainPendingClaims adds one in the save that clears a code on its second empty answer with nothing landed,
+	// when the profile is then on the free plan (claimNoticeFree). GET-CLAIM-NOTICE counts them and CLAIM-NOTICE-SHOWN
+	// drops the first n. walletForPublish and mergeLateRestore carry them, and the seen-set holds each, so an
+	// acknowledged one is never brought back from a stored copy. Oldest first, deduplicated. A build older than this
+	// field decodes the wallet non-strictly and drops it on its next write; that loses the notice, never a token or a
+	// code.
+	UnusableClaims []string `json:"unusable_claims,omitempty"`
 }
 
 func loadWallet(path string) (*Wallet, error) {
@@ -2862,7 +2873,7 @@ func walletHeadKey(base, name, pass string) string { return headKey(base, name+"
 // under this same key, so it's reachable by exactly whoever can open the data.
 // ⚠ se IS THE SECURE-ELEMENT SECRET, AND PASSING nil IS A REAL ANSWER, not a placeholder: it means "this
 // caller has none", which is correct for the su:s0 worker and the CLI, where openVaultDKSE's env rung
-// still fires because nowhere_roamd.sh exports NOWHERE_SE_SECRET there. It is NOT correct in the login
+// still fires because nowhere_roamd.sh hands NOWHERE_SE_SECRET to each agent call there. It is NOT correct in the login
 // daemon, whose environment never carries that variable -- see NWP-20260915-12.
 func resolveDK(base, name, pass string, se []byte) []byte {
 	dk, _ := resolveDKVault(base, name, pass, se)
@@ -3214,6 +3225,9 @@ func sealWalletValuePublish(strict bool, base, name, pass string, dk []byte, wal
 // cost is the same shape: a code the OTHER phone cleared but this one still holds is published again, and lasts until
 // this phone's next drain, where the gateway's 402 proves it empty and clears it (one /issue round trip). The miss hashes
 // (Wallet.PendingClaimMisses, NWP-20261202-01) are both sides' union, kept only for a code the published list holds.
+// The unusable-claim notices (Wallet.UnusableClaims, NWP-20261208-03) follow the token rule too, with the same residual:
+// a notice this phone acknowledged that the other phone still holds is published again by that phone, so Profile shows
+// it once more. It never costs a token or a code.
 //
 // ⚠ AN IDLE PHONE PUBLISHES THE OTHER PHONE'S PURCHASE WHOLE (NWP-20261129-10; decided 2026-10-20, "a bigger plan
 // starts at once ...": a smaller purchase "is never stranded: the wallet activates each purchase at its own size and
@@ -3311,6 +3325,16 @@ func walletForPublish(stored, local *Wallet, seen map[string]bool) *Wallet {
 			}
 		}
 		out.PendingClaimMisses = pendingClaimMissesFor(out.PendingClaims, local.PendingClaimMisses, stored.PendingClaimMisses)
+		// The unusable-claim notices (NWP-20261208-03) by the same rule: this phone's, plus each stored one neither held
+		// here nor in seen. A notice this session acknowledged stays out; one the other phone left is kept; both phones
+		// clearing the same code give one, because the key is the code's hash.
+		out.UnusableClaims = append([]string(nil), local.UnusableClaims...)
+		for _, k := range stored.UnusableClaims {
+			if !have[k] && !seen[k] {
+				have[k] = true
+				out.UnusableClaims = append(out.UnusableClaims, k)
+			}
+		}
 		// Every waiting purchase of the stored copy that this session never held (h60 #14). have holds this phone's plan
 		// id and queue ids (walletSeenKeys), and seen holds every id this session held, so a purchase that activated here
 		// stays out. taken is appended after this phone's, and the first becomes the head when this phone has none waiting.

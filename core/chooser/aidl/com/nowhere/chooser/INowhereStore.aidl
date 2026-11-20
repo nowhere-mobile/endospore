@@ -74,4 +74,14 @@ interface INowhereStore {
      *  queue applies; returns at once. Appended LAST so every existing transaction code is unchanged.
      *  Replies: "OK" | "ERR-CALLER" | "ERR-NOTARCHIVED" | "ERR". */
     String materializeOwn(String pkg);
+
+    /** NWP-20261209-05 (decision 2026-11-17, in-app progress reopens h51 #3): the progress of nApps' add of pkg, as
+     *  getApp's notification shows it. Replies: "<got> <total>" in bytes (total 0 while unknown) | "" (no add of pkg
+     *  is in flight, an empty pkg, or a caller that is not the storefront). Reads the chooser's AddProgress only; no
+     *  daemon call. Appended LAST so every existing transaction code is unchanged. */
+    String getAddProgress(String pkg);
+
+    /** NWP-20261209-05: the packages with an nApps add in flight, space-separated, in start order. Replies: the list |
+     *  "" (none, or a caller that is not the storefront). Reads AddProgress only; no daemon call. Appended LAST. */
+    String getAddsInFlight();
 }

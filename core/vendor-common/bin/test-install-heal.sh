@@ -315,7 +315,7 @@ if [ "$MUTATE" = yes ]; then
   mutate "sweep: the re-check under the lock reads constants, not the state" UNARCH \
          's@if (autoAction(hasInstalledCode(pkg), odRestored(pkg), false)@if (autoAction(true, false, false)@'
   mutate "sweep: restore-only apps queued as downloads" UNARCH \
-         's@^        qEnqueue(work);@        qEnqueue(work); qEnqueue(retry);@'
+         's@^        qEnqueue(queued);@        qEnqueue(queued); qEnqueue(retry);@'
   mutate "materializeAndInstall: the restore-only guard removed" UNARCH \
          's@if (action == AUTO_RESTORE_ONLY) {@if (false) {@'
   mutate "materializeAndInstall: the restored marker is not consulted" UNARCH \

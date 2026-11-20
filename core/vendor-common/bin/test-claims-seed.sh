@@ -85,6 +85,7 @@ umask 022
 ROOT="$ROOT"; STATE="\$ROOT/state"; USERDIR="\$ROOT/user"; LOG="\$ROOT/log"; uid=11; name=prof; pass=pw
 SIM_SEED=$2; FAILCHOWN=$3; AGENT=agent_sim
 pw() { printf '%s\n' x; }
+pwv() { [ -z "\$1" ] || pw "\$1"; }
 agent_sim() {
   echo "env-seed=\${NOWHERE_CLAIMS_SEED:-}" >> "\$ROOT/calls"
   if [ -n "\${NOWHERE_CLAIMS_SEED:-}" ] && [ "\$SIM_SEED" = 1 ]; then
@@ -141,7 +142,7 @@ CASE
   # R5: text checks over the whole script, comments dropped
   local ALL
   ALL=$(codeonly < "$f")
-  n=$(printf '%s\n' "$ALL" | grep -F -- "$RESTORE_PAT" | grep -cF "NOWHERE_CLAIMS_SEED=\"\$STATE/claims.seed\" \"\$AGENT\" restore s3")
+  n=$(printf '%s\n' "$ALL" | grep -F -- "$RESTORE_PAT" | grep -cF "NOWHERE_CLAIMS_SEED=\"\$STATE/claims.seed\" NOWHERE_SE_SECRET=\"\$(pwv \"\$_se_v\")\" NOWHERE_FIDO2_HMAC=\"\$(pwv \"\$_fh_v\")\" \"\$AGENT\" restore s3")
   chk "R5 the seed is inline on the bare restore line" [ "$n" = 1 ]
   n=$(printf '%s\n' "$ALL" | grep -cE 'export[^#]*NOWHERE_CLAIMS_SEED')
   chk "R5 it is never exported" [ "$n" = 0 ]

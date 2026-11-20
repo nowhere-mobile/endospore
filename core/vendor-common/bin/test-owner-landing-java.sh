@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 # test-owner-landing-java.sh [--mutate] -- NWP-20261129-12: an owner action answered after owner mode ended opens no
-# owner screen, and a confirm dialog left open after it ended does nothing.
+# owner screen, and a confirm sheet left open after it ended does nothing.
 # Runs core/chooser/tests/owner-landing: OwnerLanding compiled and EXECUTED, its eight sites read from ChooserActivity's
 # source (tests/owner-landing/run.sh says how).
 #
 # WHY THIS IS COMMITTED. Slice D's onPause rule ends owner mode on a screen-off. Six completions opened an owner screen
 # whenever their answer arrived, and every one of those screens leads back to the owner menu, which asks no passphrase.
-# Repair's and Unbind's confirm dialogs stay over the gate after a screen-off, and their buttons still acted. Each guard
+# Repair's and Unbind's confirm sheets stay over the gate after a screen-off, and their buttons still acted. Each guard
 # is one line a later edit can drop without breaking a build, and the start read works only on the UI thread at the tap.
 #   P1  each of the six landing lambdas starts with the guard
-#   P2  Repair's and Unbind's positive buttons start with the guard
-#   P3  each owned is read once, before its worker, and before its dialog for Repair and Unbind
+#   P2  the Repair and Unbind sheets' slot-0 actions start with the guard
+#   P3  each owned is read once, before its worker, and before its sheet for Repair and Unbind
 #   P4  OwnerLanding.lands( occurs exactly eight times in ChooserActivity
 #   P5  (control) buildReportScreen and its answer, renderGateReportResult, keep their isAttachedToWindow guards
 #
@@ -84,14 +84,14 @@ if [ "$MUTATE" = yes ] && [ "$rc" = 0 ]; then
     's/\n[ ]*'"$G"'(\n[ ]*if \(BindingMarks\.mineBack\(r\)\))/$1/ or die'
   mutate "L7 Save's landing guard removed" "P1 Save" $A \
     's/\n[ ]*'"$G"'(\n[ ]*if \(r\.startsWith\("OK"\)\) \{\n[ ]*\/\/ #27)/$1/ or die'
-  mutate "L8 Unbind's owned read moved into the dialog's button" "P3 Unbind" $A \
-    's/(ICCID first"\); return; \}\n)[ ]*final boolean owned[^\n]*\n([ ]*new android\.app\.AlertDialog\.Builder\(this\)\n[ ]*\.setTitle\("Unbind this line\?"\))/$1$2/ or die; s/(\.setPositiveButton\("Unbind", \(d, w\) -> \{\n)/$1'"$O"'\n/ or die'
+  mutate "L8 Unbind's owned read moved into the sheet's slot 0" "P3 Unbind" $A \
+    's/(ICCID first"\); return; \}\n)[ ]*final boolean owned[^\n]*\n((?:[ ]*\/\/[^\n]*\n)*[ ]*SheetDialog\.confirm\(this, LineReportPresetSheets\.unbindLine\(\))/$1$2/ or die; s/(LineReportPresetSheets\.unbindLine\(\), new Runnable\[\] \{ \(\) -> \{\n)/$1'"$O"'\n/ or die'
   mutate "L9 Repair's owned read moved into the worker" "P3 Repair" $A \
     's/(private void confirmRepairBindings\(TextView status\) \{\n)[ ]*final boolean owned[^\n]*\n/$1/ or die; s/(GateNoticeSheets\.repairBindings\(\), new Runnable\[\] \{ \(\) -> \{.*?new Thread\(\(\) -> \{\n)/$1'"$O"'\n/s or die'
   mutate "L10 Repair's dialog guard removed" "P2 Repair" $A \
     's/(GateNoticeSheets\.repairBindings\(\), new Runnable\[\] \{ \(\) -> \{)\n[ ]*'"$G"'/$1/ or die'
-  mutate "L11 Unbind's dialog guard removed" "P2 Unbind" $A \
-    's/(\.setPositiveButton\("Unbind", \(d, w\) -> \{)\n[ ]*'"$G"'/$1/ or die'
+  mutate "L11 Unbind's sheet guard removed" "P2 Unbind" $A \
+    's/(LineReportPresetSheets\.unbindLine\(\), new Runnable\[\] \{ \(\) -> \{)\n[ ]*'"$G"'/$1/ or die'
   mutate "L12 Save's landing guard moved after the toast" "P1 Save" $A \
     's/\n([ ]*'"$G"')(\n[ ]*if \(r\.startsWith\("OK"\)\) \{\n[ ]*\/\/ #27.*?"Store saved",\s*android\.widget\.Toast\.LENGTH_SHORT\)\.show\(\);)/$2\n$1/s or die'
 fi

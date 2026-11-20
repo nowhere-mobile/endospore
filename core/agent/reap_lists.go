@@ -24,9 +24,10 @@ func isSessionFileList(name string) bool {
 }
 
 // isSessionCache says a top-level name in the state tmpfs is one of a session's content and group caches, its seal
-// counter or its #media no-change record, their .tmp forms included (h60 #8).
+// counter or its #media no-change record, their .tmp forms included (h60 #8), and FREE-MEDIA-FOLDER's key list a crash
+// left (NWP-20261207-14).
 func isSessionCache(name string) bool {
-	for _, prefix := range []string{"contentcache.", "groupcache.", "sealcount.", "mnochange."} {
+	for _, prefix := range []string{"contentcache.", "groupcache.", "sealcount.", "mnochange.", "freemedia.keys"} {
 		if strings.HasPrefix(name, prefix) {
 			return true
 		}

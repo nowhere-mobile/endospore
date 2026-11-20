@@ -34,7 +34,7 @@ func rlwWindow() time.Time {
 func TestResumeLoginWindowClosesToTheTailAtTheReply(t *testing.T) {
 	rlwSaveWindow(t)
 	l := crLock(t, crKinds[0])
-	rec := locSetup(t, "OK APPLIED network_location=2 geocoder=0")
+	rec := scSetup(t, "OK APPLIED network_location=2 geocoder=0;OK;OK") // NWP-20261210-05: the claims are one sessclaim run
 	crStartFake(t, l.dest, &crFake{mode: "keyguard", keyguard: l.keyguard, hmacHex: l.h1})
 	if got := crResume(t, l.dest, l.unlock); got != "OK 10" {
 		t.Fatalf("the resume was refused (%q)", got)
@@ -55,7 +55,7 @@ func TestResumeLoginWindowClosesToTheTailAtTheReply(t *testing.T) {
 func TestResumeLoginWindowARefusedResumeLeavesItAsItWas(t *testing.T) {
 	rlwSaveWindow(t)
 	l := crLock(t, crKinds[0])
-	rec := locSetup(t, "OK APPLIED network_location=2 geocoder=0")
+	rec := scSetup(t, "OK APPLIED network_location=2 geocoder=0;OK;OK") // NWP-20261210-05: the claims are one sessclaim run
 	crStartFake(t, l.dest, &crFake{mode: "keyguard", keyguard: l.keyguard, hmacHex: l.h1})
 	before := time.Now().Add(loginWindowCap)
 	pendingReapMu.Lock()

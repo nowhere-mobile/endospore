@@ -111,6 +111,7 @@ keystore_register() { :; }
 # pm: an app with code -- `list packages -U ... <pkg>` lists the package's own line (the arm's NWP-20261122-03 read)
 pm() { case "$*" in "list packages -U "*) echo "package:$srcunit uid:1110234" ;; esac; return 0; }
 reown_ext_appdata() { :; }
+od_extdata_watched() { reown_ext_appdata "$1"; restorecon -R -D "$ROOT/data/media/$uid/Android/data/$1" 2>>"$LOG"; }   # NWP-20261208-13: the no-count-file pair
 wait_acct_authenticator() { :; }
 acct_reload() { :; }
 sync_apply() { :; }
@@ -227,7 +228,8 @@ L_PROG='      cutoff_prog od '
 L_LOOP='    odn=0; odsrc=0; odkept=0'
 # xform <order> <prog>: the arm with its success branch's label step (R: od_label_watched, reown then relabel), rm (D)
 # and WARN (N) lines put back in <order> after the branch's comment lines; prog=keep|drop|hoist moves the cutoff_prog
-# line. Outside the arm, nothing.
+# line. Outside the arm, nothing. R carries every line between od_label_watched and the rm with it: NWP-20261209-04's
+# failed-walk check reads the label step's status, so it moves with the step it tests.
 xform() {
   awk -v ORD="$1" -v PM="$2" -v CP="$L_CP" -v RM="$L_RM" -v WN="$L_WARN" -v RO="$L_LABEL" \
       -v PG="$L_PROG" -v LP="$L_LOOP" '
@@ -242,8 +244,9 @@ xform() {
     }
     arm && blk {
       if ($0 ~ /^ *#/ && nt == 0 && !(("R") in ln)) { com[++nc] = $0; next }
-      if ($0 == RO) { ln["R"] = $0; next }
-      if ($0 == RM) { ln["D"] = $0; next }
+      if ($0 == RO) { ln["R"] = $0; inr = 1; next }
+      if ($0 == RM) { ln["D"] = $0; inr = 0; next }
+      if (inr && index($0, WN) != 1) { ln["R"] = ln["R"] "\n" $0; next }
       if (index($0, WN) == 1) { ln["N"] = $0; next }
       tl[++nt] = $0; next
     }

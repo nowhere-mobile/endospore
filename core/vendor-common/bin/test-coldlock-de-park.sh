@@ -15,6 +15,13 @@
 # suite's bash. mksh is the device's /system/bin/sh and evaluates some tests differently (a non-number in
 # `[ x -lt N ]` reads as 0, silently), and an unpark that reports success without the file signs the session out.
 #
+# NWP-20261206-14 (backlog: "During a cold lock, AccountManagerService's own handler thread re-creates an EMPTY
+# `accounts_de.db` for the stopped user"): before de_unpark drops what DE re-created during the lock,
+# de_recreated_note logs it and writes one line to $STATE/coldde-unpark (the contract the in-session report reads):
+#   v=1 found=<0|1> after_park_s= db_bytes= wal_bytes= emails= ss_fds= pkgs_delta_s= pkgr_delta_s=  (<n|na> each)
+# E1-E7 pin that line, that no email reaches roam.log, that a new park drops the old line and that the note never
+# fails the unpark (E7: a clock set back during the lock gives after_park_s=na); M11-M18 break each of those.
+#
 #   bash test-coldlock-de-park.sh            # the cases
 #   bash test-coldlock-de-park.sh --mutate   # ... plus mutations that must each CONVICT the suite
 set -uo pipefail
@@ -40,14 +47,15 @@ done
 fn() { sed -n "/^$2() {\$/,/^}\$/p" "$1"; }
 
 suite() {  # suite <roamd.sh> <quiet> <shell> -> 0 all ok, 1 a case failed, 2 the harness could not run
-  local f="$1" quiet="${2:-}" sh="$3" label p=0 x=0 code cf rc pre="" lg av
+  local f="$1" quiet="${2:-}" sh="$3" label p=0 x=0 code cf rc pre="" lg av evid="" ln
   label=$(basename "$sh")
   ok(){ p=$((p+1)); [ -n "$quiet" ] || printf '  ok    [%s] %s\n' "$label" "$1"; }
   no(){ x=$((x+1)); [ -n "$quiet" ] || printf '  FAIL  [%s] %s\n' "$label" "$1"; }
   code="$(fn "$f" _de_park_ok)
 $(fn "$f" de_park)
+$(fn "$f" de_recreated_note)
 $(fn "$f" de_unpark)"
-  case "$code" in *'_de_park_ok() {'*'de_park() {'*'de_unpark() {'*'restorecon'*) ;; *) echo "EXTRACTION FAILED -- the park functions moved in $f" >&2; return 2 ;; esac
+  case "$code" in *'_de_park_ok() {'*'de_park() {'*'de_recreated_note() {'*'de_unpark() {'*'restorecon'*) ;; *) echo "EXTRACTION FAILED -- the park functions moved in $f" >&2; return 2 ;; esac
   cf=$(mktemp -p "$W"); printf '%s\n' "$code" > "$cf"
   "$sh" -n "$cf" || { echo "EXTRACTION FAILED -- the park functions do not parse under $label" >&2; command rm -f "$cf"; return 2; }
   command rm -f "$cf"
@@ -62,9 +70,11 @@ $(fn "$f" de_unpark)"
       blind)   : > "$T/jar" ;;
     esac
   }
+  # evid: DE_EVID for the run (E6 points it into a directory that does not exist).
   run() { local a
     { printf "DE_SYS_ROOT='%s/de' DE_PARK_ROOT='%s/st/coldde' DE_JAR='%s/jar' LOG='%s/log'\n" "$T" "$T" "$T" "$T"
-      printf 'chown(){ :; }\nrestorecon(){ :; }\n'; printf '%s\n' "$pre" "$code"
+      printf "DE_EVID='%s' DE_PKG_ROOT='%s/sys' DE_PROC_ROOT='%s/proc'\n" "${evid:-$T/st/coldde-unpark}" "$T" "$T"
+      printf 'chown(){ :; }\nrestorecon(){ :; }\npidof(){ echo 4242; }\n'; printf '%s\n' "$pre" "$code"
       for a in "$@"; do printf "'%s' " "$a"; done; echo; } > "$T/run.sh"
     "$sh" "$T/run.sh" >/dev/null 2>&1; }
   # refuse <path> -> pre = an rm that records its argv and removes every argument but exactly <path>. Whole-argument
@@ -134,6 +144,76 @@ $(fn "$f" de_unpark)"
     ok "P6c unpark restores both byte-for-byte"; else no "P6c unpark rc=$rc did not restore both (the park was lost)"; fi
   command rm -rf "$T"
 
+  # ---- NWP-20261206-14: the re-created accounts_de.db is recorded before the unpark drops it ----
+  # recreate [pkg] -> after a park: a fresh db (two email-shaped strings) and -wal in DE, two system_server fds (one on
+  # the db, one elsewhere), optionally the package files; mtimes last: park @1000, db @1039, packages.xml @1030,
+  # package-restrictions.xml @1050.
+  recreate() {
+    printf 'a@b.example x@y.example meta' > "$T/de/12/accounts_de.db"; printf 'walwal' > "$T/de/12/accounts_de.db-wal"
+    mkdir -p "$T/proc/4242/fd" "$T/sys/users/12"
+    ln -s "$T/de/12/accounts_de.db" "$T/proc/4242/fd/3"; ln -s "$T/sys/packages.xml" "$T/proc/4242/fd/4"
+    if [ "${1:-}" = pkg ]; then
+      : > "$T/sys/packages.xml"; : > "$T/sys/users/12/package-restrictions.xml"
+      touch -d @1030 "$T/sys/packages.xml"; touch -d @1050 "$T/sys/users/12/package-restrictions.xml"
+    fi
+    touch -d @1000 "$T/st/coldde/12"; touch -d @1039 "$T/de/12/accounts_de.db"
+  }
+  E1L='found=1 after_park_s=39 db_bytes=28 wal_bytes=6 emails=2 ss_fds=1 pkgs_delta_s=9 pkgr_delta_s=-11'
+  mk patched; run de_park 12; recreate pkg; run de_unpark 12; rc=$?
+  ln=$(cat "$T/st/coldde-unpark" 2>/dev/null); lg=$(cat "$T/log" 2>/dev/null)
+  [ "$ln" = "v=1 $E1L" ] && ok "E1 the evidence line is exact: v=1 $E1L" || no "E1 the evidence line is '$ln', want 'v=1 $E1L'"
+  [ ! -e "$T/st/coldde-unpark.tmp" ] && ok "E1b no coldde-unpark.tmp left" || no "E1b coldde-unpark.tmp left behind"
+  case "$lg" in *"[roamd] coldlock-de-unpark: user 12 re-created accounts_de.db: $E1L "*) ok "E1c roam.log has the re-created line" ;;
+    *) no "E1c roam.log has no 're-created accounts_de.db: $E1L' line" ;; esac
+  case "$lg" in *'a@b.example'*|*'x@y.example'*) no "E1d an email-shaped string reached roam.log" ;; *) ok "E1d no email-shaped string in roam.log" ;; esac
+  if [ "$rc" = 0 ] && grep -q email-shaped-row "$T/de/12/accounts_de.db" 2>/dev/null && [ "$(cat "$T/de/12/accounts_de.db-wal" 2>/dev/null)" = wal ] && [ ! -e "$T/st/coldde/12" ]; then
+    ok "E1e the unpark still restores the parked files byte-for-byte, rc=0"; else no "E1e unpark rc=$rc did not restore the parked files"; fi
+  command rm -rf "$T"
+
+  mk patched; run de_park 12; run de_unpark 12
+  ln=$(cat "$T/st/coldde-unpark" 2>/dev/null); lg=$(cat "$T/log" 2>/dev/null)
+  E2L='v=1 found=0 after_park_s=na db_bytes=na wal_bytes=na emails=na ss_fds=na pkgs_delta_s=na pkgr_delta_s=na'
+  [ "$ln" = "$E2L" ] && ok "E2 nothing re-created: $E2L" || no "E2 the evidence line is '$ln', want '$E2L'"
+  case "$lg" in *'coldlock-de-unpark: user 12 no re-created accounts_de.db '*) ok "E2b roam.log says no re-created accounts_de.db" ;;
+    *) no "E2b roam.log has no 'no re-created accounts_de.db' line" ;; esac
+  command rm -rf "$T"
+
+  mk patched; run de_park 12; recreate; run de_unpark 12
+  ln=$(cat "$T/st/coldde-unpark" 2>/dev/null)
+  E3L='v=1 found=1 after_park_s=39 db_bytes=28 wal_bytes=6 emails=2 ss_fds=1 pkgs_delta_s=na pkgr_delta_s=na'
+  [ "$ln" = "$E3L" ] && ok "E3 package files absent: both deltas na" || no "E3 the evidence line is '$ln', want '$E3L'"
+  command rm -rf "$T"
+
+  # The clock went back during the lock (db @900 < park @1000): the age is na, never negative; the deltas stay signed.
+  mk patched; run de_park 12; recreate pkg; touch -d @900 "$T/de/12/accounts_de.db"; run de_unpark 12; rc=$?
+  ln=$(cat "$T/st/coldde-unpark" 2>/dev/null); lg=$(cat "$T/log" 2>/dev/null)
+  E7L='found=1 after_park_s=na db_bytes=28 wal_bytes=6 emails=2 ss_fds=1 pkgs_delta_s=-130 pkgr_delta_s=-150'
+  [ "$ln" = "v=1 $E7L" ] && ok "E7 a clock rollback: after_park_s=na, deltas signed" || no "E7 the evidence line is '$ln', want 'v=1 $E7L'"
+  case "$lg" in *"[roamd] coldlock-de-unpark: user 12 re-created accounts_de.db: $E7L "*) ok "E7b roam.log has the rollback line" ;;
+    *) no "E7b roam.log has no 're-created accounts_de.db: $E7L' line" ;; esac
+  if [ "$rc" = 0 ] && grep -q email-shaped-row "$T/de/12/accounts_de.db" 2>/dev/null && [ ! -e "$T/st/coldde/12" ]; then
+    ok "E7c ... and the unpark still restores, rc=0"; else no "E7c unpark rc=$rc did not restore after a clock rollback"; fi
+  command rm -rf "$T"
+
+  mk patched; run de_unpark 12
+  [ ! -e "$T/st/coldde-unpark" ] && ok "E4 nothing parked: no evidence file" || no "E4 an evidence file was written with nothing parked"
+  command rm -rf "$T"
+
+  mk patched; printf 'v=1 found=1\n' > "$T/st/coldde-unpark"; run de_park 12
+  [ ! -e "$T/st/coldde-unpark" ] && ok "E5 a new park drops the last resume's evidence" || no "E5 the last resume's evidence survived a new park"
+  command rm -rf "$T"
+  mk patched; command rm -f "$T/de/12/accounts_de.db"; printf 'v=1 found=1\n' > "$T/st/coldde-unpark"; run de_park 12
+  [ ! -e "$T/st/coldde-unpark" ] && ok "E5b a park with no db also drops it (the rm is before the early return)" || no "E5b the evidence survived a park with no db"
+  command rm -rf "$T"
+
+  mk patched; run de_park 12; recreate pkg; evid="$T/nodir/x"
+  run de_recreated_note 12; rc=$?
+  [ "$rc" = 0 ] && ok "E6 an unwritable evidence path: de_recreated_note returns 0" || no "E6 de_recreated_note rc=$rc on an unwritable evidence path"
+  run de_unpark 12; rc=$?
+  if [ "$rc" = 0 ] && grep -q email-shaped-row "$T/de/12/accounts_de.db" 2>/dev/null; then
+    ok "E6b ... and de_unpark still returns 0 and restores"; else no "E6b de_unpark rc=$rc on an unwritable evidence path"; fi
+  evid=""; command rm -rf "$T"
+
   # Wiring: the lock parks, the reap clears, the resume op exists, and no sign-in deletes a park.
   grep -qxF '      de_park "$uid"   # NWP-20261005-23: the account names, out of DE for the lock (gated on the AMS patch)' "$f" \
     && ok "W1 dropcaches (the lock) parks" || no "W1 dropcaches no longer parks"
@@ -155,10 +235,12 @@ for sh in $SHELLS; do suite "$SUT" "" "$sh" || rc=1; done
 [ "$MUTATE" = yes ] || exit 0
 
 echo "== mutations (each must be CONVICTED)"
-mut() { # mut <label> <sed-expr>; convicted under EACH shell's own line
-  local m r sh bad=0
+mut() { # mut <label> <sed-expr> [<sed-expr>...]; convicted under EACH shell's own line
+  local m r sh bad=0 lbl="$1" e
+  local -a ex=()
+  shift; for e in "$@"; do ex+=(-e "$e"); done; set -- "$lbl"
   m=$(mktemp -p "$W")
-  sed -e "$2" "$SUT" > "$m" || { echo "  ERROR     $1 -- the sed program failed"; command rm -f "$m"; return 1; }
+  sed "${ex[@]}" "$SUT" > "$m" || { echo "  ERROR     $1 -- the sed program failed"; command rm -f "$m"; return 1; }
   [ -s "$m" ] || { echo "  ERROR     $1 -- the mutant is empty"; command rm -f "$m"; return 1; }
   if cmp -s "$SUT" "$m"; then echo "  INERT     $1 -- the mutation changed nothing"; command rm -f "$m"; return 1; fi
   for sh in $SHELLS; do
@@ -182,4 +264,13 @@ mut "M7 the removal is not read back"       's/then _k=$((_k + 1)); fi/then :; f
 mut "M8 a failed removal returns 0"         's/(a copy is parked in RAM) $(date)" >> "$LOG"; return 1; }/(a copy is parked in RAM) $(date)" >> "$LOG"; return 0; }/' || fails=$((fails+1))
 mut "M9 success logged before the read-back" '/^  rm -f "\$_src\/accounts_de.db" "\$_src\/accounts_de.db-wal"/a\  echo "[roamd] coldlock-de-park: user $_u accounts_de parked in RAM ($_n file(s)) $(date)" >> "$LOG"' || fails=$((fails+1))
 mut "M10 the park is deleted on a failure"  's/(a copy is parked in RAM) $(date)" >> "$LOG"; return 1; }/(a copy is parked in RAM) $(date)" >> "$LOG"; rm -rf "$_dst"; return 1; }/' || fails=$((fails+1))
+mut "M11 the note is not called (E1)"       '/^  de_recreated_note "\$_u"   # NWP-20261206-14/d' || fails=$((fails+1))
+mut "M12 the note runs after the rm (E1)"   '/^  de_recreated_note "\$_u"   # NWP-20261206-14/d' \
+  '/# anything recreated meanwhile$/a\  de_recreated_note "$_u"' || fails=$((fails+1))
+mut "M13 the email count forced to 0 (E1)"  's/^    _em=\$(grep -a -o -E .*/    _em=0/' || fails=$((fails+1))
+mut "M14 every fd counted (E1: ss_fds=2)"   's/case "\$_l" in \*" -> \$_d\/accounts_de.db"\*)/case "$_l" in *" -> "*)/' || fails=$((fails+1))
+mut "M15 found=0 writes no file (E2)"       's/^  if \[ -n "\$DE_EVID" \]; then$/  if [ -n "$DE_EVID" ] \&\& [ "$_fd" = 1 ]; then/' || fails=$((fails+1))
+mut "M16 a new park keeps old evidence (E5)" '/^  rm -f "\$DE_EVID" 2>\/dev\/null   # NWP-20261206-14/d' || fails=$((fails+1))
+mut "M17 the note returns 1 (E6)"           '/^de_recreated_note() {$/,/^}$/s/^  return 0$/  return 1/' || fails=$((fails+1))
+mut "M18 a negative age is kept (E7)"      's/^    case "\$_ap" in /    case "${_ap#-}" in /' || fails=$((fails+1))
 [ "$fails" -eq 0 ] && echo "== all mutations convicted" || { echo "== $fails mutation(s) not convicted"; exit 1; }

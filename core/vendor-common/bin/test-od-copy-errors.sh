@@ -123,6 +123,7 @@ keystore_register() { :; }
 pm() { case "$*" in "list packages -U "*) echo "package:$srcunit uid:1110234" ;; "list packages -s -u") echo package:android ;; esac; return 0; }
 timeout() { while [ "${1:-}" = -k ]; do shift 2; done; shift; "$@"; }
 reown_ext_appdata() { :; }
+od_extdata_watched() { reown_ext_appdata "$1"; restorecon -R -D "$ROOT/data/media/$uid/Android/data/$1" 2>>"$LOG"; }   # NWP-20261208-13: the no-count-file pair
 wait_acct_authenticator() { :; }
 acct_reload() { :; }
 sync_apply() { :; }

@@ -95,4 +95,28 @@ final class MediaStatus {
         String now = landed(reply);
         return now != null && !now.equals("0") && !now.equals(seen);
     }
+
+    /** NWP-20261208-09: the cap on how long the gate holds a landed-media rescan behind the Auto sweep. */
+    static final long RESCAN_SWEEP_CAP_MS = 60L * 60 * 1000;
+
+    /** NWP-20261208-09: whether the gate holds the session's landed-media rescan for one more tick, given the daemon's
+     *  GET-SWEEP reply and how long the rescan has waited. The scan MediaProvider runs opens every file it indexes,
+     *  and through mediad's overlay each open of a deferred file fetches from the store: on frankel 0.5.58 it made
+     *  1,510 stub reads of 250 ms or more in 937 s beside a 50-app Auto sweep. True only for "LIVE <seconds>" (1-9
+     *  digits) and 0 <= heldMs < capMs; NONE, an empty read (a timeout), a malformed reply, a negative held time and
+     *  the cap all run the scan, as before. The lease expires by itself 10 minutes after the sweep's last app
+     *  (autoSweepLease); the cap is the backstop, so a stuck lease cannot keep the Gallery partial for a whole session
+     *  (a 49-app sweep ran 3,079 s, NW-e39d98931a8f). */
+    static boolean holdRescanForSweep(String sweepReply, long heldMs, long capMs) {
+        if (sweepReply == null || heldMs < 0 || heldMs >= capMs) return false;
+        String v = sweepReply.trim();
+        if (!v.startsWith("LIVE ")) return false;
+        String n = v.substring(5);
+        if (n.isEmpty() || n.length() > 9) return false;
+        for (int i = 0; i < n.length(); i++) {
+            char c = n.charAt(i);
+            if (c < '0' || c > '9') return false;
+        }
+        return true;
+    }
 }

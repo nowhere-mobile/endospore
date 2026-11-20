@@ -29,8 +29,8 @@ PY
   else echo "  SURVIVED/NOT-COMPILED $1"; fails=$((fails+1)); fi
   cp "$MAIN.orig" "$MAIN"
 }
-mut "M1 success-path call removed" '(\t// The rotation committed: carry[^\n]*\n\tcarryTelephonyRef[^\n]*\n)\trekeyKsLogoffCreds\(dest, name, oldpass, newpass\)\n' '\1'
-mut "M2 RetireBegun call removed" '(\t\t\tcarryTelephonyRef[^\n]*\n)\t\t\trekeyKsLogoffCreds\(dest, name, oldpass, newpass\)\n' '\1'
+mut "M1 success-path call removed" '(\t// The rotation committed: carry[^\n]*\n\t(?:tc := )?carryTelephonyRef[^\n]*\n)\trekeyKsLogoffCreds\(dest, name, oldpass, newpass\)\n' '\1'
+mut "M2 RetireBegun call removed" '(\t\t\t(?:tc := )?carryTelephonyRef[^\n]*\n)\t\t\trekeyKsLogoffCreds\(dest, name, oldpass, newpass\)\n' '\1'
 mut "M3 match on name only" 'lines\[0\] != name \|\| lines\[1\] != oldpass' 'lines[0] != name'
 mut "M4 call at the top of the err block" '(\tif err != nil \{\n)(\t\t// NWP-20260915-14: DID IT PARTLY)' '\1\t\trekeyKsLogoffCreds(dest, name, oldpass, newpass)\n\2'
 mut "M5 lines 3-4 dropped" 'rewriteKsStash\(path, \[\]byte\(strings\.Join\(lines, "\\n"\)\)\)' 'rewriteKsStash(path, []byte(strings.Join(lines[:2], "\\n")+"\\n"))'

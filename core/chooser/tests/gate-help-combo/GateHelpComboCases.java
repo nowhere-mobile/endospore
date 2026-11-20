@@ -27,7 +27,8 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /** NWP-20261130-11: the gate's Help combo screen, run by test-gate-help-combo-java.sh. The screen is built against the
- *  stubs beside this file, which record text, descriptions, clicks and colours. Every failure prints "FAIL T<n>: ...". */
+ *  stubs beside this file, which record text, descriptions, clicks, visibility, rotation and colours. Every failure
+ *  prints "FAIL T<n>: ...". NWP-20261208-26: each topic opens in place as step cards (T3, T18, T19). */
 public final class GateHelpComboCases {
     private static int fails = 0;
     private static final Context C = new Context();
@@ -62,8 +63,6 @@ public final class GateHelpComboCases {
         View shown;
         @Override public void show(View v) { shown = v; events.add("show"); }
         @Override public void close() { events.add("close"); }
-        @Override public void openTile(int i) { events.add("tile:" + i); }
-        @Override public void openForgot() { events.add("forgot"); }
     }
 
     private static List<View> walk(View root) {
@@ -116,6 +115,82 @@ public final class GateHelpComboCases {
         return out;
     }
 
+    // --- the in-place topics (NWP-20261208-26). Topic k is tile k for k < 6, the Forgot card for k == 6.
+
+    private static final int TOPICS = GateHelpHome.TILES.length + 1;
+
+    private static GateHelpTileGrid grid(View home) {
+        return grids(walk(home)).get(0);
+    }
+
+    /** Row r of the grid: the rows are its children 0 and 2, each followed by its body. */
+    private static ViewGroup row(GateHelpTileGrid g, int r) {
+        return (ViewGroup) g.getChildAt(2 * r);
+    }
+
+    private static View tile(View home, int i) {
+        return row(grid(home), i / 3).getChildAt(i % 3);
+    }
+
+    /** The view right after v among its parent's children, or null. */
+    private static View after(View root, View v) {
+        for (View p : walk(root)) {
+            if (!(p instanceof ViewGroup)) continue;
+            ViewGroup g = (ViewGroup) p;
+            for (int k = 0; k + 1 < g.getChildCount(); k++) if (g.getChildAt(k) == v) return g.getChildAt(k + 1);
+        }
+        return null;
+    }
+
+    private static View control(View home, int k) {
+        return k < GateHelpHome.TILES.length ? tile(home, k) : byDescription(home, GateHelpHome.forgotDescription());
+    }
+
+    /** The body topic k opens into: directly after its tile's row, or directly after the Forgot card. */
+    private static ViewGroup body(View home, int k) {
+        return (ViewGroup) (k < GateHelpHome.TILES.length ? grid(home).getChildAt(2 * (k / 3) + 1)
+                : after(home, control(home, k)));
+    }
+
+    private static String[] steps(int k) {
+        return k < GateHelpHome.TILES.length ? GateHelpHome.tileSteps(k) : GateHelpHome.forgotSteps();
+    }
+
+    /** The text of the shown card of the topic in b, or null when b holds no topic. */
+    private static String cardText(ViewGroup b) {
+        if (b == null || b.getChildCount() != 1 || !(b.getChildAt(0) instanceof ViewGroup)) return null;
+        ViewGroup topic = (ViewGroup) b.getChildAt(0);
+        View t = topic.getChildCount() == 0 ? null : topic.getChildAt(0);
+        return t instanceof TextView ? ((TextView) t).getText().toString() : null;
+    }
+
+    private static boolean open(ViewGroup b) {
+        return b != null && b.getVisibility() == View.VISIBLE && b.getChildCount() == 1;
+    }
+
+    private static boolean shut(ViewGroup b) {
+        return b != null && b.getVisibility() == View.GONE && b.getChildCount() == 0;
+    }
+
+    /** The chevrons in tree order: tiles 0-5, then the Forgot card. */
+    private static List<TextView> chevrons(View home) {
+        List<TextView> out = new ArrayList<>();
+        for (View v : walk(home)) {
+            if (v instanceof TextView && GateHelpHome.CHEVRON.contentEquals(((TextView) v).getText())) out.add((TextView) v);
+        }
+        return out;
+    }
+
+    /** The TextView in root whose text is s and that is shown, or null. */
+    private static View shownText(View root, String s) {
+        for (View v : walk(root)) {
+            if (v instanceof TextView && v.getVisibility() == View.VISIBLE && s.contentEquals(((TextView) v).getText())) {
+                return v;
+            }
+        }
+        return null;
+    }
+
     private static Canvas drawn(GateHelpArtView a) {
         Canvas cv = new Canvas();
         a.layout(0, 0, 600, 300);
@@ -127,6 +202,17 @@ public final class GateHelpComboCases {
         List<View> roots = new ArrayList<>();
         roots.add(GateHelpScreen.home(C, p, new RecNav()));
         for (int i = 0; i < GateHelpHome.INTRO.length; i++) roots.add(GateHelpScreen.intro(C, p, i, new RecNav()));
+        // Each topic open, and tile 0's related page open through its Also-see link.
+        for (int k = 0; k < TOPICS; k++) {
+            View home = GateHelpScreen.home(C, p, new RecNav());
+            control(home, k).performClick();
+            roots.add(home);
+        }
+        View also = GateHelpScreen.home(C, p, new RecNav());
+        tile(also, 0).performClick();
+        View link = byText(also, GateHelpHome.alsoLine(0));
+        if (link != null) link.performClick();
+        roots.add(also);
         return roots;
     }
 
@@ -144,7 +230,7 @@ public final class GateHelpComboCases {
                     "hero art " + a + ", title " + title + ", body " + body + ", watch " + watch + ", grid " + grid
                             + ": want that order, all present");
             check("T1", art(t) != null && art(t).kind == GateHelpHome.ART_HERO, "the first art is not the hero");
-            check("T1", "How Nowhere works".equals(GateHelpHome.HERO_TITLE), "hero title " + GateHelpHome.HERO_TITLE);
+            check("T1", "How nowhere works".equals(GateHelpHome.HERO_TITLE), "hero title " + GateHelpHome.HERO_TITLE);
             check("T1", "Watch the 3 steps".equals(GateHelpHome.WATCH), "watch label " + GateHelpHome.WATCH);
             check("T1", watch >= 0 && t.get(watch) instanceof Button, "Watch the 3 steps is not a button");
         });
@@ -152,14 +238,17 @@ public final class GateHelpComboCases {
             List<GateHelpTileGrid> g = grids(walk(GateHelpScreen.home(C, GatePalette.DARK, new RecNav())));
             check("T2", g.size() == 1, g.size() + " grids, want 1");
             GateHelpTileGrid grid = g.get(0);
-            check("T2", grid.getChildCount() == 2, grid.getChildCount() + " rows, want 2");
+            check("T2", grid.getChildCount() == 4, grid.getChildCount() + " children, want 2 rows and their 2 bodies");
             List<String> labels = new ArrayList<>();
-            for (int r = 0; r < grid.getChildCount(); r++) {
-                ViewGroup row = (ViewGroup) grid.getChildAt(r);
+            for (int r = 0; r < 2; r++) {
+                ViewGroup row = row(grid, r);
                 check("T2", row.getChildCount() == 3, "row " + r + " has " + row.getChildCount() + " tiles, want 3");
+                check("T2", shut((ViewGroup) grid.getChildAt(2 * r + 1)), "the body under row " + r + " is not empty and GONE");
                 for (int c = 0; c < row.getChildCount(); c++) {
                     for (View v : walk(row.getChildAt(c))) {
-                        if (v instanceof TextView) labels.add(((TextView) v).getText().toString());
+                        if (v instanceof TextView && !GateHelpHome.CHEVRON.contentEquals(((TextView) v).getText())) {
+                            labels.add(((TextView) v).getText().toString());
+                        }
                     }
                 }
             }
@@ -170,20 +259,40 @@ public final class GateHelpComboCases {
         run("T3", () -> {
             RecNav nav = new RecNav();
             View home = GateHelpScreen.home(C, GatePalette.DARK, nav);
-            GateHelpTileGrid grid = grids(walk(home)).get(0);
-            int i = 0;
-            for (int r = 0; r < grid.getChildCount(); r++) {
-                ViewGroup row = (ViewGroup) grid.getChildAt(r);
-                for (int c = 0; c < row.getChildCount(); c++, i++) {
-                    nav.events.clear();
-                    check("T3", row.getChildAt(c).performClick(), "tile " + i + " has no click");
-                    check("T3", nav.events.equals(Arrays.asList("tile:" + i)), "tile " + i + " gives " + nav.events);
+            // Each topic, alone: a tap opens it in place, directly after its row or card, and a second tap closes it.
+            for (int k = 0; k < TOPICS; k++) {
+                String name = k < GateHelpHome.TILES.length ? "tile " + k : "the Forgot card";
+                View ctl = control(home, k);
+                check("T3", ctl != null && ctl.performClick(), name + " has no click");
+                check("T3", nav.events.isEmpty(), name + " records Nav events " + nav.events + ", want none (in place)");
+                ViewGroup b = body(home, k);
+                check("T3", open(b), name + " shows no VISIBLE body holding one topic after its row");
+                check("T3", steps(k)[0].equals(cardText(b)), name + "'s first card is \"" + cardText(b) + "\", want \""
+                        + steps(k)[0] + "\"");
+                String whole = k < GateHelpHome.TILES.length ? GateHelpHome.tileBody(k) : GateHelpHome.forgotBody();
+                check("T3", whole.split("\n\n")[0].equals(cardText(b)), name + "'s first card is not its page's first step");
+                for (int j = 0; j < TOPICS; j++) {
+                    if (body(home, j) != b) check("T3", shut(body(home, j)), name + " leaves topic " + j + "'s body open");
+                }
+                ctl.performClick();
+                check("T3", shut(b), name + "'s second tap leaves its body open or not empty");
+                check("T3", nav.events.isEmpty(), name + " records Nav events " + nav.events);
+            }
+            // One open at a time: tile j after topic i leaves only j open, in the same row, another row and the card.
+            int[][] pairs = { { 0, 1 }, { 1, 4 }, { 5, 3 }, { 2, 6 }, { 6, 0 }, { 6, 5 } };
+            for (int[] pr : pairs) {
+                View h = GateHelpScreen.home(C, GatePalette.DARK, new RecNav());
+                control(h, pr[0]).performClick();
+                control(h, pr[1]).performClick();
+                ViewGroup bj = body(h, pr[1]);
+                check("T3", open(bj) && steps(pr[1])[0].equals(cardText(bj)),
+                        "topic " + pr[1] + " after topic " + pr[0] + " shows \"" + cardText(bj) + "\"");
+                for (int j = 0; j < TOPICS; j++) {
+                    if (body(h, j) != bj) {
+                        check("T3", shut(body(h, j)), "topic " + pr[1] + " after topic " + pr[0] + " leaves body " + j + " open");
+                    }
                 }
             }
-            nav.events.clear();
-            View forgot = byDescription(home, GateHelpHome.forgotDescription());
-            check("T3", forgot != null && forgot.performClick() && nav.events.equals(Arrays.asList("forgot")),
-                    "the Forgot card does not call openForgot: " + nav.events);
             nav.events.clear();
             View back = byText(home, GateHelpHome.BACK);
             check("T3", back != null && back.performClick() && nav.events.equals(Arrays.asList("close")),
@@ -328,7 +437,10 @@ public final class GateHelpComboCases {
         for (int i = 0; i < GateHelpHome.TILES.length; i++) {
             out.add(GateHelpHome.tileDescription(i));
             out.add(GateHelpHome.tileBody(i));
+            out.addAll(Arrays.asList(GateHelpHome.tileSteps(i)));
+            if (GateHelpHome.alsoLine(i) != null) out.add(GateHelpHome.alsoLine(i));
         }
+        out.addAll(Arrays.asList(GateHelpHome.forgotSteps()));
         for (int i = 0; i < GateHelpHome.INTRO.length; i++) {
             out.add(GateHelpHome.nextLabel(i));
             out.add(GateHelpHome.nextDescription(i));
@@ -356,7 +468,7 @@ public final class GateHelpComboCases {
                 String low = s.toLowerCase(Locale.ROOT);
                 for (String w : B4) check("T11", !low.contains(w), "\"" + s + "\" holds the B4 word \"" + w + "\"");
             }
-            for (String name : new String[] { "GateHelpScreen", "GateHelpTileGrid", "GateHelpArtView" }) {
+            for (String name : new String[] { "GateHelpScreen", "GateHelpTileGrid", "GateHelpArtView", "GateHelpTopic" }) {
                 Matcher m = Pattern.compile("\"([^\"]*)\"").matcher(source(name));
                 while (m.find()) {
                     String low = m.group(1).toLowerCase(Locale.ROOT);
@@ -447,7 +559,7 @@ public final class GateHelpComboCases {
                 }
             }
             Pattern literal = Pattern.compile("0[xX][0-9a-fA-F]{6,8}|Color\\.|\"#[0-9a-fA-F]{3,8}\"");
-            for (String name : new String[] { "GateHelpScreen", "GateHelpTileGrid", "GateHelpArtView" }) {
+            for (String name : new String[] { "GateHelpScreen", "GateHelpTileGrid", "GateHelpArtView", "GateHelpTopic" }) {
                 check("T13", !literal.matcher(source(name)).find(), name + " holds a colour literal");
             }
         });
@@ -476,8 +588,13 @@ public final class GateHelpComboCases {
             }
             View home = GateHelpScreen.home(C, GatePalette.DARK, new RecNav());
             GateHelpTileGrid grid = grids(walk(home)).get(0);
-            for (int r = 0; r < grid.getChildCount(); r++) {
-                ViewGroup row = (ViewGroup) grid.getChildAt(r);
+            ViewGroup card = (ViewGroup) byDescription(home, GateHelpHome.forgotDescription());
+            for (int k = 0; card != null && k < card.getChildCount(); k++) {
+                check("T14", card.getChildAt(k).getImportantForAccessibility() == View.IMPORTANT_FOR_ACCESSIBILITY_NO,
+                        "TalkBack reads a part of the Forgot card twice");
+            }
+            for (int r = 0; r < 2; r++) {
+                ViewGroup row = row(grid, r);
                 for (int c = 0; c < row.getChildCount(); c++) {
                     ViewGroup tile = (ViewGroup) row.getChildAt(c);
                     String want = GateHelpHome.tileDescription(r * 3 + c);
@@ -524,9 +641,9 @@ public final class GateHelpComboCases {
     private static void sourceChecks() {
         run("T15", () -> {
             String[] refused = { "startActivity", "Intent", "WebView", "Uri.", "getSharedPreferences", "DaemonSocket",
-                "sendDaemon", "profileName", "Bitmap", "R.raw" };
+                "sendDaemon", "profileName", "Bitmap", "R.raw", "AlertDialog", "Dialog" };
             for (String name : new String[] { "GateHelpScreen", "GateHelpTileGrid", "GateHelpArtView", "GateHelpHome",
-                "GateHelpArt" }) {
+                "GateHelpArt", "GateHelpTopic" }) {
                 String s = source(name);
                 for (String r : refused) check("T15", !s.contains(r), name + " holds " + r);
             }
@@ -558,7 +675,7 @@ public final class GateHelpComboCases {
                 for (int c = 0; c < 3; c++) {
                     int want = R.drawable.class.getDeclaredField(GateHelpHome.TILE_ICONS[r * 3 + c]).getInt(null);
                     int got = 0;
-                    for (View v : walk(((ViewGroup) g.getChildAt(r)).getChildAt(c))) {
+                    for (View v : walk(row(g, r).getChildAt(c))) {
                         if (v instanceof ImageView) got = ((ImageView) v).imageResource();
                     }
                     check("T16", got == want, "tile " + (r * 3 + c) + " shows icon id " + got + ", want " + want);
@@ -573,19 +690,108 @@ public final class GateHelpComboCases {
             String all = stripComments(read(new File(System.getProperty("gatehelp.chooser"))));
             String show = method(all, "private void showGateHelp()");
             String nav = method(all, "private GateHelpScreen.Nav gateHelpNav()");
-            String page = method(all, "private void showGateHelpPage(");
             for (String k : new String[] { "GateHelpScreen.home(", "GatePalette.active()", "gateHelpNav()" }) {
                 check("T17", show.contains(k), "showGateHelp has no " + k);
             }
-            check("T17", !show.contains("AlertDialog"), "showGateHelp still opens a dialog");
-            for (String k : new String[] { "setContentView(v)", "setContentView(gateView)", "GateHelpHome.tileTitle(",
-                "GateHelpHome.tileBody(", "GateHelpHome.tileAlso(", "GateHelpHome.forgotBody()" }) {
+            for (String k : new String[] { "setContentView(v)", "setContentView(gateView)" }) {
                 check("T17", nav.contains(k), "gateHelpNav has no " + k);
             }
-            for (String k : new String[] { "GateHelpPages.moreLine()", "GateHelpHome.BACK", ".setNeutralButton(" }) {
-                check("T17", page.contains(k), "showGateHelpPage has no " + k);
-            }
+            // NWP-20261208-26: the topics open in place, so the gate's Help has no dialog and no page method left.
+            check("T17", !all.contains("showGateHelpPage"), "showGateHelpPage is still in ChooserActivity");
+            check("T17", !nav.contains("openTile") && !nav.contains("openForgot"), "gateHelpNav still opens a tile or the card");
+            check("T17", !show.contains("AlertDialog") && !nav.contains("AlertDialog"), "the gate's Help methods open a dialog");
             check("T17", all.contains("helpIcon.setOnClickListener(v -> showGateHelp());"), "the ? does not open showGateHelp");
+        });
+    }
+
+    // --- T18, T19: the step cards and the chevrons (NWP-20261208-26)
+
+    private static void topics() {
+        run("T18", () -> {
+            for (int k = 0; k < TOPICS; k++) {
+                String name = k < GateHelpHome.TILES.length ? "tile " + k : "the Forgot card";
+                String[] want = (k < GateHelpHome.TILES.length ? GateHelpHome.tileBody(k) : GateHelpHome.forgotBody())
+                        .split("\n\n");
+                check("T18", Arrays.equals(want, steps(k)), name + "'s steps are not its page's words");
+                View home = GateHelpScreen.home(C, GatePalette.DARK, new RecNav());
+                control(home, k).performClick();
+                ViewGroup b = body(home, k);
+                if (!open(b)) {
+                    check("T18", false, name + " does not open");
+                    continue;
+                }
+                View next = byText(b, HelpCards.NEXT), back = byText(b, HelpCards.BACK);
+                View more = byText(b, GateHelpPages.moreLine());
+                check("T18", next != null && back != null && more != null, name + " has no Next, Back or support line");
+                if (next == null || back == null || more == null) continue;
+                for (int i = 0; i < want.length; i++) {
+                    boolean last = i == want.length - 1;
+                    check("T18", want[i].equals(cardText(b)), name + " card " + i + " is \"" + cardText(b) + "\", want \""
+                            + want[i] + "\"");
+                    check("T18", shownText(b, HelpCards.position(i, want.length)) != null, name + " card " + i + " has no position");
+                    check("T18", shownText(b, HelpCards.dots(i, want.length)) != null, name + " card " + i + " has no dots");
+                    check("T18", (next.getVisibility() == View.VISIBLE) == !last, name + " card " + i + ": Next shown is wrong");
+                    check("T18", (more.getVisibility() == View.VISIBLE) == last, name + " card " + i + ": the support line");
+                    if (!last) next.performClick();
+                }
+                String also = k < GateHelpHome.TILES.length ? GateHelpHome.alsoLine(k) : null;
+                for (View v : walk(b)) {
+                    if (v instanceof TextView && ((TextView) v).getText().toString().startsWith(GateHelpHome.ALSO_SEE)) {
+                        check("T18", k == 0, name + " has an Also-see line \"" + ((TextView) v).getText() + "\"");
+                    }
+                }
+                if (k == 0) {
+                    check("T18", "Also see: Gate settings".equals(also) && also.equals(GateHelpHome.ALSO_SEE
+                            + GateHelpPages.TITLES[1]), "tile 0's Also-see line is \"" + also + "\"");
+                    View link = also == null ? null : shownText(b, also);
+                    check("T18", link != null && link.isClickable(), "tile 0's last card shows no \"Also see: Gate settings\"");
+                    if (link != null) {
+                        link.performClick();
+                        check("T18", open(b) && GateHelpPages.steps(1)[0].equals(cardText(b)),
+                                "Also see: Gate settings shows \"" + cardText(b) + "\", want Gate settings' first step");
+                        tile(home, 0).performClick();
+                        control(home, 0).performClick();
+                        next = byText(b, HelpCards.NEXT);
+                        back = byText(b, HelpCards.BACK);
+                        for (int i = 0; i < want.length - 1; i++) next.performClick();
+                    }
+                }
+                for (int i = want.length - 1; i > 0; i--) back.performClick();
+                check("T18", open(b) && want[0].equals(cardText(b)), name + ": Back does not return to the first card");
+                back.performClick();
+                check("T18", shut(b), name + ": Back on the first card does not close the topic");
+                check("T18", chevrons(home).size() == TOPICS && chevrons(home).get(k).getRotation() == 0f,
+                        name + ": Back on the first card leaves the chevron turned");
+            }
+            // Page 3's first step keeps its "Profile › " prefix: the gate's cards never run HelpCards.text.
+            String lock = "Profile › Lock — keep on this device: lock the phone and keep your session on it.";
+            View home = GateHelpScreen.home(C, GatePalette.DARK, new RecNav());
+            control(home, 3).performClick();
+            check("T18", lock.equals(cardText(body(home, 3))), "tile 3's first card is \"" + cardText(body(home, 3)) + "\"");
+        });
+        run("T19", () -> {
+            View home = GateHelpScreen.home(C, GatePalette.DARK, new RecNav());
+            List<TextView> ch = chevrons(home);
+            check("T19", ch.size() == TOPICS, ch.size() + " chevrons, want " + TOPICS);
+            if (ch.size() != TOPICS) return;
+            for (TextView t : ch) check("T19", t.getCurrentTextColor() == GatePalette.DARK.accent, "a chevron is not the accent");
+            for (int k = 0; k < TOPICS; k++) {
+                check("T19", ch.get(k).getRotation() == 0f, "chevron " + k + " is turned with nothing open");
+            }
+            // Each topic once (each closes the one before), the last again (it closes), then a tile after the card.
+            int[] taps = { 0, 1, 2, 3, 4, 5, 6, 6, 3, 0, 0 };
+            int open = -1;
+            for (int t : taps) {
+                control(home, t).performClick();
+                open = t == open ? -1 : t;
+                for (int k = 0; k < TOPICS; k++) {
+                    float want = k == open ? 90f : 0f;
+                    check("T19", ch.get(k).getRotation() == want, "after a tap on topic " + t + ", chevron " + k + " is "
+                            + ch.get(k).getRotation() + ", want " + want);
+                }
+            }
+            check("T19", GateHelpHome.chevronRotation(true) == 90f && GateHelpHome.chevronRotation(false) == 0f,
+                    "chevronRotation is not 90 open, 0 closed");
         });
     }
 
@@ -608,6 +814,7 @@ public final class GateHelpComboCases {
         palettes();
         labels();
         sourceChecks();
+        topics();
         if (fails > 0) {
             System.out.println(fails + " case(s) failed");
             System.exit(1);

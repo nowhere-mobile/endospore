@@ -59,16 +59,6 @@ func claimLocGlobals(dest, uid, why string) string {
 	return out
 }
 
-// claimLocGlobalsAsync is claimLocGlobals off the caller's path: a sign-in or resume does not wait on the worker
-// slot for it. Correct in any order, because roamd reads the choice from the session's own prefs when it runs, and
-// runWorkerHeld drops it if the session has ended by then.
-func claimLocGlobalsAsync(dest, uid, why string) {
-	if !locGlobalsSupported() {
-		return
-	}
-	goSafe("locglobals-claim", func() { claimLocGlobals(dest, uid, why) })
-}
-
 // releaseLocGlobalsAsync restores the baseline for a session that is no longer in front, off the caller's path (the
 // ACK-REAP verb must answer at once). roamd leaves the globals alone if another session owns them by the time it
 // runs, so a late release can never switch off the session that replaced this one.

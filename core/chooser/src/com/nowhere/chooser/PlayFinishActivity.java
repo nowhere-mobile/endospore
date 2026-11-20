@@ -20,7 +20,9 @@ import android.widget.TextView;
  * the user at the GrapheneOS App Store. The rule and the words are {@link PlayFinishPrompt}'s.
  *
  * {@link #check} runs on its own daemon thread from {@link UnarchiveService}'s switch-landing start, beside the skip
- * notice. It reads the play.finish marker and shows the card, settles the marker, or does nothing.
+ * notice. It reads the play.finish marker and shows the card, settles the marker, or does nothing. NWP-20261208-24:
+ * before it shows the card it waits for the Auto sweep's card decision and, when that card is up, for it to close
+ * ({@link LandingQueue}), so the two never stack.
  *
  * The card records the marker DONE at its FIRST onResume, when the words are on screen, on a background thread. A
  * saved-state flag keeps a rotation or a recreation from writing it twice. Dismissible, not pinned: Open App Store,
@@ -44,6 +46,9 @@ public class PlayFinishActivity extends Activity {
                 ProfileActivity.cfgPutStatic(app, PlayFinishPrompt.CFG_KEY, PlayFinishPrompt.DONE);
                 android.util.Log.i("NowhereChooser", "play finish: settled");
             } else if (v == PlayFinishPrompt.Verdict.SHOW) {
+                // NWP-20261208-24: never over the Auto sweep's card. Wait for its decision, then for it to close.
+                LandingQueue.awaitDecided(LandingQueue.DECIDE_MS);
+                LandingQueue.awaitGone(LandingQueue.SHOW_MS);
                 try {
                     app.startActivity(new Intent(app, PlayFinishActivity.class).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
                     android.util.Log.i("NowhereChooser", "play finish: showing");

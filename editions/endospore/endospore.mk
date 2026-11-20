@@ -190,6 +190,11 @@ PRODUCT_PACKAGE_OVERLAYS += vendor/endospore/overlay
 # gate rings it instead (docs/product-decisions.md, 2026-10-04). Source: editions/endospore/vendor/rro/.
 PRODUCT_PACKAGES += NowhereFrameworkOverlay
 
+# NWP-20261208-27: the USB-debugging refusal's message for a profile session (it names owner mode, not an admin user
+# to switch to), as a NAMED runtime overlay of SystemUI for the same reason as NowhereFrameworkOverlay. The title
+# stays stock. Lands in /product/overlay -> a product reflash. Source: editions/endospore/vendor/rro/.
+PRODUCT_PACKAGES += NowhereSystemUIOverlay
+
 # Endospore boot animation (DIA-20260622): a branded boot for the OS-boot phase. GrapheneOS ships its boot
 # logo in the com.android.bootanimation APEX (search order: APEX, /product/media, /oem, /system) -- but on
 # lynx that APEX is absent, so /product/media wins. CRITICAL: BootAnimation picks bootanimation-DARK.zip

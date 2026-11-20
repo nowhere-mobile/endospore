@@ -115,7 +115,7 @@ sources() {
   if perl -0e '
       my $c = do { local $/; <STDIN> };
       my $n = () = $c =~ /DaemonSocket\.roundTrip\("AUTO-SWEEP\\n0\\n", 30000\);/g; exit 1 unless $n == 1;
-      exit 1 unless $c =~ /\}\s*finally\s*\{\s*DaemonSocket\.roundTrip\("AUTO-SWEEP\\n0\\n", 30000\);\s*\}/;
+      exit 1 unless $c =~ /\}\s*finally\s*\{\s*qDrop\(queued\);\s*DaemonSocket\.roundTrip\("AUTO-SWEEP\\n0\\n", 30000\);\s*\}/;
       exit 0;' <<<"$sweep"; then
     echo "ok S5 AUTO-SWEEP 0 is still sent from sweepAuto's finally"
   else

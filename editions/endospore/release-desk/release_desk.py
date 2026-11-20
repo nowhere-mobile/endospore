@@ -14,7 +14,8 @@ zip's size and sha256 against the manifest, and the manifest on disk against the
 
 The Desk listens in one of two ways (NWP-20261205-06). A Unix socket (the shipped unit's
 %t/nowhere-release-desk.sock, or --socket PATH) marks the server `private`: only the signing user and root can connect,
-and the Host must be the tailnet name. A loopback TCP port (--port, or a TCP socket from systemd) is not private: it
+and the Host must be the tailnet name (or `localhost` with the tailnet name in X-Forwarded-Host, which is what
+`tailscale serve` sends to a unix: target). A loopback TCP port (--port, or a TCP socket from systemd) is not private: it
 serves the read-only Desk of stage 4, and stage 5's Sign is refused there.
 
 Stage 5 (§4.3 item 3): a release page that is ready to sign shows one passphrase field and a Sign button. Sign starts
@@ -1150,6 +1151,12 @@ class Handler(BaseHTTPRequestHandler):
         if not LOGIN_RE.fullmatch(self.login()):
             return self.deny("no Tailscale login")
         host = (self.headers.get("Host") or "").strip().lower()
+        if self.server.private and host == "localhost":
+            # `tailscale serve` to a unix: target sends `Host: localhost` and the name the browser used in
+            # X-Forwarded-Host (Tailscale 1.104.5 on the build host, 2026-11-17, NWP-20261116-60). Only the signing
+            # user and root can reach the private socket, the same trust the login header already rests on; a TCP
+            # Desk never reads this header.
+            host = (self.headers.get("X-Forwarded-Host") or "").strip().lower()
         loopback = not self.server.private and host == "127.0.0.1:%d" % self.server.port
         if host != self.server.name and not loopback:
             return self.deny("wrong host")

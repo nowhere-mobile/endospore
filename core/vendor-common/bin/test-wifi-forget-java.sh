@@ -100,5 +100,5 @@ mut "M2 disconnect before the remove check"  copy 's/if \(!ops\.remove\(netId\)\
 mut "M3 the -1 check removed"                copy 's/if \(netId == -1\) return "ERR not connected";//' || fails=$((fails+1))
 mut "M4 disconnect's own try removed"        copy 's/try \{\s*ops\.disconnect\(\);\s*\} catch \(RuntimeException e\) \{[^}]*\}/ops.disconnect();/' || fails=$((fails+1))
 mut "M5 the catch answers OK"                copy 's/return "ERR " \+ \(e\.getMessage\(\) == null \? "failed" : e\.getMessage\(\)\);/return "OK";/' || fails=$((fails+1))
-mut "M6 saveConfiguration re-added"          act  's/(return WifiForget\.run\(new WifiForget\.Ops\(\) \{)/wm.saveConfiguration();\n            $1/' || fails=$((fails+1))
+mut "M6 saveConfiguration re-added"          act  's/(final String r = WifiForget\.run\(new WifiForget\.Ops\(\) \{)/wm.saveConfiguration();\n            $1/' || fails=$((fails+1))
 [ "$fails" -eq 0 ] && echo "== all mutations convicted" || { echo "== $fails mutation(s) not convicted"; exit 1; }

@@ -217,6 +217,7 @@ suite() {  # suite <roamd.sh> [quiet] -> 0 all ok, 1 a case failed, 2 the harnes
       dt_release() { :; }    # NWP-20261027-05: the device toggles are test-devtoggles's, not this suite's
       dr_release() { :; }    # NWP-20261028-07: data roaming is test-dataroaming's, not this suite's
       hs_release() { :; }    # NWP-20261028-10: the hotspot is test-hotspot-release's, not this suite's
+      np_release() { :; }; reap_live_other() { return 1; }   # NWP-20261210-19: the netpolicy reset and its guard are test-netpolicy-release's
       ks_reap_clear() { :; } # NWP-20261114-18: the keystore staging clear is test-reap-ks-staging's, not this suite's
       reap_pm_census() { RPC_LINE=unread; }   # NWP-20261203-01: test-reap-pm-census.sh runs the real one
       base_retry_add() { :; }; base_retry_run() { BASE_CLEARED=0; BASE_LEFT=0; }   # NWP-20261203-02: test-reap-baseline-retry.sh's
@@ -237,6 +238,7 @@ suite() {  # suite <roamd.sh> [quiet] -> 0 all ok, 1 a case failed, 2 the harnes
       dt_boot() { DT_BOOT=stub; }     # NWP-20261027-05: the device-toggles suite runs the real one
       dr_boot() { DR_BOOT=stub; }     # NWP-20261028-07: the data-roaming suite runs the real one
       hs_release() { HS_VERDICT="OK RELEASED"; }   # NWP-20261028-10: the hotspot suite runs the real one
+      np_release() { :; }   # NWP-20261210-19: test-netpolicy-release.sh runs the real one
       bootsweep_plog_line() { BS_PLOG=" stub"; }   # NWP-20261201-36: test-bootsweep-plog.sh runs the real one
       reap_pm_census() { RPC_LINE=unread; }   # NWP-20261203-01: test-reap-pm-census.sh runs the real one
       base_retry_add() { :; }; base_retry_run() { BASE_CLEARED=0; BASE_LEFT=0; }   # NWP-20261203-02: test-reap-baseline-retry.sh runs the real ones
@@ -274,7 +276,7 @@ suite() {  # suite <roamd.sh> [quiet] -> 0 all ok, 1 a case failed, 2 the harnes
   run_seed() {  # run_seed <root> <uid>
     ( ROOT="$1"; uid="$2"; op=seedssaid; name=x; pass=""; sesec="$KEY64"
       LOG="$ROOT/roam.log"; RES="$ROOT/res"; STATE="$ROOT/state"
-      chown() { :; }; restorecon() { :; }; _ms() { echo 0; }
+      chown() { :; }; restorecon() { :; }; _ms() { echo 0; }; ssaid_census() { :; }
       print() {  # mksh's builtin, as this arm uses it: print -r -- / print -rn --
         local nl=1
         while [ $# -gt 0 ]; do case "$1" in -rn|-nr) nl=0; shift ;; -r) shift ;; --) shift; break ;; *) break ;; esac; done
@@ -311,10 +313,12 @@ suite() {  # suite <roamd.sh> [quiet] -> 0 all ok, 1 a case failed, 2 the harnes
         esac
       }
       pw() { printf '%s\n' "$ROOT/sim/pw"; }
+      pwv() { [ -z "$1" ] || pw "$1"; }
+      _se_v=""; _fh_v=""   # set at the top level in the script (NWP-20261205-18)
       od_fetch_data() { return 0; }; od_listed() { return 1; }; od_block_app() { return 0; }; od_unblock_app() { :; }; od_pending_clear() { :; }; od_block_installed() { :; }; od_shipped_prep() { return 0; }; od_park_var() { :; }; od_unf_path() { echo "$STATE/odfetch.$1/unfetched.$2"; }   # NWP-20261130-03
       _ms() { echo 0; }
       _sum0=0; _sumt=0   # set above the `in` arm in the script (NWP-20261130-08); this harness runs the arm alone under set -u
-      for t in stop_mediad usb_host relabel_launcher remap_media_db insert_deferred_media remap_per_pkg _tlog _ssum acct_restore remap_tree reown_ext_appdata \
+      for t in stop_mediad usb_host relabel_launcher remap_per_pkg _tlog _ssum acct_restore remap_tree reown_ext_appdata \
                keystore_push keystore_fetch keystore_restore ks_signin_reset hold_ondemand od_parked_report reap_stale_ondemand reap_orphan_provisioned restorecon \n               uiderrors_floor_take uiderrors_floor_commit tz_surface sroam_surface; do  # NWP-20261010-06: the report's sign-in floor
         eval "$t() { :; }"
       done

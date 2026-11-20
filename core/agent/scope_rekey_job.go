@@ -451,6 +451,21 @@ var (
 // than one.
 var rekeyTick = 20 * time.Second
 
+// rekeyHoldsSlot is true only while rekeyOnce holds laneRW's slot for a background re-key batch. Guarded by
+// pendingReapMu; handleBackup reads it in the same hold as backupBusyReason, so a Back up now tapped during a batch
+// can say what it waits for (NWP-20261206-13).
+var rekeyHoldsSlot bool
+
+// setRekeyHoldsSlot sets rekeyHoldsSlot under pendingReapMu.
+func setRekeyHoldsSlot(v bool) {
+	pendingReapMu.Lock()
+	rekeyHoldsSlot = v
+	pendingReapMu.Unlock()
+}
+
+// rekeyScopeStep is the step rekeyOnce runs for each large scope: largeScopeRekeyStep, replaced only by tests.
+var rekeyScopeStep = largeScopeRekeyStep
+
 // sessionVerbsInFlight counts the session verbs pending in the daemon that publish under a reply deadline -- see
 // rekeyHoldingVerb -- from before they wait for sessionMu until they have answered (NWP-20261009-07). A re-key batch
 // holds capBracketMu for a 16 MiB fetch, re-seal and upload, and every one of those verbs opens a bracket, so one
@@ -465,9 +480,10 @@ var sessionVerbsInFlight atomic.Int32
 // a bracket of its own before it ends the session, and it too answers BUSY rather than wait. RESTART-UNSAVED likewise. DELETE-SNAPSHOT (NWP-20261027-04) reseals the
 // vault in a bracket of its own, as ROLLBACK does. ROTATE, SET-PIN and FIDO2-NFC-ENROLL-FINISH now answer BUSY
 // rather than wait (NWP-20261124-10), so the dispatcher counts them once it holds the lock, as DELETE.
+// REMOVE-FIDO2-KEY-NFC (NWP-20261208-16) reseals the vault as REMOVE-FIDO2-KEY does and answers BUSY rather than wait.
 func rekeyHoldingVerb(name string) bool {
 	switch name {
-	case "ROTATE", "SET-PIN", "REMOVE-FIDO2-KEY", "FIDO2-NFC-ENROLL-FINISH", "ROLLBACK", "DELETE-SNAPSHOT", "EXPORT", "EXPORT-MEDIA", "DELETE", "END-UNSAVED", "RESTART-UNSAVED":
+	case "ROTATE", "SET-PIN", "REMOVE-FIDO2-KEY", "REMOVE-FIDO2-KEY-NFC", "FIDO2-NFC-ENROLL-FINISH", "ROLLBACK", "DELETE-SNAPSHOT", "EXPORT", "EXPORT-MEDIA", "DELETE", "END-UNSAVED", "RESTART-UNSAVED":
 		return true
 	}
 	return false
@@ -511,8 +527,10 @@ func rekeyOnce(dest string) {
 		rekeyStateUID, rekeyState, rekeyLastErr = uid, map[string]rekeyStep{}, nil
 	}
 	rekeyStateMu.Unlock()
+	setRekeyHoldsSlot(true)
+	defer setRekeyHoldsSlot(false) // runs before the slot's release: defers run last-first
 	for _, suf := range largeScopes {
-		st, err := largeScopeRekeyStep("s3", name, pass, se, suf)
+		st, err := rekeyScopeStep("s3", name, pass, se, suf)
 		rekeyStateMu.Lock()
 		if err == nil {
 			rekeyState[suf] = st

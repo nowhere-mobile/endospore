@@ -177,7 +177,9 @@ type landerCounts struct {
 // logged here.
 func landBackground(in landerInput, m chunkManifest) landerCounts {
 	if in.fetch == nil {
-		in.fetch = fetchEssSpan
+		in.fetch = func(base string, key []byte, m chunkManifest, r essRegion) ([]byte, error) {
+			return fetchEssSpan(base, key, m, r, nil) // the background lander runs outside any seal: no frame
+		}
 	}
 	if in.stop == nil {
 		in.stop = func() bool { return false }

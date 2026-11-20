@@ -50,14 +50,6 @@ func claimMobileData(dest, uid, why string) string {
 	return out
 }
 
-// claimMobileDataAsync is claimMobileData off the caller's path, correct in any order for claimLocGlobalsAsync's reason.
-func claimMobileDataAsync(dest, uid, why string) {
-	if !mobileDataSupported() {
-		return
-	}
-	goSafe("mobiledata-claim", func() { claimMobileData(dest, uid, why) })
-}
-
 // releaseMobileDataAsync puts the gate's value back for a session that is no longer in front, off the caller's path.
 // roamd leaves the value alone if another session owns it by the time it runs.
 func releaseMobileDataAsync(dest, uid, why string) {

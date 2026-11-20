@@ -343,40 +343,36 @@ func TestOfflineSignInClaimsLocGlobalsAfterTheMarker(t *testing.T) {
 	dest := t.TempDir()
 	stop := ropWorker(t, dest) // answers the btwipe at once
 	defer stop()
-	rec := locSetup(t, "OK APPLIED network_location=0 geocoder=0")
-	cli, srv := net.Pipe()
-	go func() { handleRoamInOffline(srv, dest, "alice", "correct horse battery", "12"); srv.Close() }()
-	buf := make([]byte, 64)
-	nr, _ := cli.Read(buf)
-	cli.Close()
-	if got := strings.TrimSpace(string(buf[:nr])); got != "OK 12" {
+	// NWP-20261210-05: the claim is one part of the session's sessclaim run (session_claims.go).
+	rec := scSetup(t, "OK APPLIED network_location=0 geocoder=0;OK;OK")
+	if got := scOffline(t, dest, "alice"); got != "OK 12" {
 		t.Fatalf("offline sign-in replied %q", got)
 	}
 	c := rec.wait(t, "an offline sign-in")
-	if c.op != "locapply" || c.why != "offline" || c.uid != "12" || c.live != "12" {
-		t.Errorf("worker asked %+v, want locapply/offline for user 12 with .roamsession naming it", c)
+	if !strings.Contains(","+c.parts+",", ",loc,") || c.why != "offline" || c.uid != "12" || c.live != "12" {
+		t.Errorf("worker asked %+v, want sessclaim/offline with loc for user 12 with .roamsession naming it", c)
 	}
 }
 
 // A resumed session claims again, after its marker is written and the cold-lock marker is gone.
 func TestResumeClaimsLocGlobalsAgain(t *testing.T) {
 	l := crLock(t, crKinds[0])
-	rec := locSetup(t, "OK APPLIED network_location=2 geocoder=0")
+	rec := scSetup(t, "OK APPLIED network_location=2 geocoder=0;OK;OK") // NWP-20261210-05: one sessclaim run
 	f := &crFake{mode: "keyguard", keyguard: l.keyguard, hmacHex: l.h1}
 	crStartFake(t, l.dest, f)
 	if got := crResume(t, l.dest, l.unlock); got != "OK 10" {
 		t.Fatalf("the resume was refused (%q)", got)
 	}
 	c := rec.wait(t, "a resume")
-	if c.op != "locapply" || c.why != "resume" || c.uid != "10" || c.live != "10" || c.coldlock {
-		t.Errorf("worker asked %+v, want locapply/resume for user 10, recorded and no longer cold-locked", c)
+	if !strings.Contains(","+c.parts+",", ",loc,") || c.why != "resume" || c.uid != "10" || c.live != "10" || c.coldlock {
+		t.Errorf("worker asked %+v, want sessclaim/resume with loc for user 10, recorded and no longer cold-locked", c)
 	}
 }
 
 // A refused resume claims nothing.
 func TestRefusedResumeClaimsNothing(t *testing.T) {
 	l := crLock(t, crKinds[0])
-	rec := locSetup(t, "OK APPLIED network_location=2 geocoder=0")
+	rec := scSetup(t, "OK;OK;OK") // NWP-20261210-05: the claim is the session's one sessclaim run
 	f := &crFake{mode: "keyguard", keyguard: l.keyguard, hmacHex: l.h1}
 	crStartFake(t, l.dest, f)
 	if got := crResume(t, l.dest, "not-the-passphrase"); got == "OK 10" {
@@ -413,7 +409,7 @@ func TestEverySignInClaimsLocGlobalsAfterTheMarker(t *testing.T) {
 	in := fn("func handleRoamIn(", "func handleRoamInOffline(")
 	mark := at(in, "handleRoamIn", "if err := markRoamSession(dest, name, pass, uid, seSecret); err != nil {")
 	refused := at(in, "handleRoamIn", `fmt.Fprint(conn, "ERR-UNRECORDED\n")`)
-	claim := at(in, "handleRoamIn", `claimLocGlobalsAsync(dest, uid, "signin")`)
+	claim := at(in, "handleRoamIn", `claimSessionGlobalsAsync(dest, uid, "signin")`)
 	throwaway := at(in, "handleRoamIn", `if head == "" {`+"\n\t\t\tmarkLocalSession(dest)")
 	if !(mark < refused && refused < claim && claim < throwaway) {
 		t.Errorf("sign-in order: marker %d, refusal %d, claim %d, throwaway branch %d -- want the claim after the "+
@@ -422,7 +418,7 @@ func TestEverySignInClaimsLocGlobalsAfterTheMarker(t *testing.T) {
 	off := fn("func handleRoamInOffline(", "func handleRelogin(")
 	mark = at(off, "handleRoamInOffline", `if err := markRoamSession(dest, name, pass, uid, ""); err != nil {`)
 	refused = at(off, "handleRoamInOffline", `fmt.Fprint(conn, "ERR-UNRECORDED\n")`)
-	claim = at(off, "handleRoamInOffline", `claimLocGlobalsAsync(dest, uid, "offline")`)
+	claim = at(off, "handleRoamInOffline", `claimSessionGlobalsAsync(dest, uid, "offline")`)
 	if !(mark < refused && refused < claim) {
 		t.Errorf("offline order: marker %d, refusal %d, claim %d -- want the claim after the refusal returned",
 			mark, refused, claim)
@@ -430,7 +426,7 @@ func TestEverySignInClaimsLocGlobalsAfterTheMarker(t *testing.T) {
 	res := fn("func handleResume(", "func purgeLocalProfileState(")
 	mark = at(res, "handleResume", "if err := markRoamSession(dest, name, pass, uid, se); err != nil {")
 	gone := at(res, "handleResume", `os.Remove(filepath.Join(dest, ".coldlock"))`)
-	claim = at(res, "handleResume", `claimLocGlobalsAsync(dest, uid, "resume")`)
+	claim = at(res, "handleResume", `claimSessionGlobalsAsync(dest, uid, "resume")`)
 	if !(mark < gone && gone < claim) {
 		t.Errorf("resume order: marker %d, cold-lock marker removed %d, claim %d -- want the claim after both",
 			mark, gone, claim)
@@ -439,12 +435,17 @@ func TestEverySignInClaimsLocGlobalsAfterTheMarker(t *testing.T) {
 
 // Without the provider nothing reaches roamd from any of the helpers -- the Diaspore guarantee on the daemon side.
 func TestLocGlobalsHelpersAreInertWithoutTheProvider(t *testing.T) {
+	sc := scSetup(t, "OK;OK;OK")
 	rec := locSetup(t, "OK")
 	locGlobalsSupported = func() bool { return false }
+	// NWP-20261210-05: a session start makes one sessclaim run, and without support it asks for no loc part.
+	claimSessionGlobalsAsync(t.TempDir(), "10", "signin")
+	if c := sc.wait(t, "a session start"); strings.Contains(","+c.parts+",", ",loc,") {
+		t.Errorf("without support the sessclaim asked for parts %q", c.parts)
+	}
 	if got := claimLocGlobals(t.TempDir(), "10", "live"); got != "OK UNAVAILABLE" {
 		t.Errorf("claimLocGlobals = %q", got)
 	}
-	claimLocGlobalsAsync(t.TempDir(), "10", "signin")
 	releaseLocGlobalsAsync(t.TempDir(), "10", "signout")
 	prevW := coldLockWorker
 	asked := 0

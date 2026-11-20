@@ -10,7 +10,6 @@ import java.nio.file.Paths;
 public final class OwnerLandingCases {
     private static final String OWN = "final boolean owned = ownerSessionPass != null;";
     private static final String GUARD = "if (!OwnerLanding.lands(owned, ownerSessionPass != null)) return;";
-    private static final String BUILDER = "new android.app.AlertDialog.Builder(";
     private static final String THREAD = "new Thread(";
     private static final String LAMBDA = "runOnUiThread(() -> {";
 
@@ -151,16 +150,17 @@ public final class OwnerLandingCases {
         pin("P1 Mark-mine", () -> landingGuarded(blockAt(c, BIND), "sendDaemon(\"SET-SIM-MINE\\n\""));
         pin("P1 Save", () -> landingGuarded(blockAt(c, STORE), "sendDaemon(\"SET-STORE\\n\""));
 
-        System.out.println("== P2: each dialog's positive button (the Repair sheet's slot-0 action) starts with the guard ==");
+        System.out.println("== P2: the Repair and Unbind sheets' slot-0 actions start with the guard ==");
         pin("P2 Repair", () -> first(blockAt(c, REPAIR), "new Runnable[] { () -> {").startsWith(GUARD));
-        pin("P2 Unbind", () -> first(blockAt(c, BIND), ".setPositiveButton(\"Unbind\", (d, w) -> {").startsWith(GUARD));
+        pin("P2 Unbind", () -> first(blockAt(c, BIND), "LineReportPresetSheets.unbindLine(), new Runnable[] { () -> {").startsWith(GUARD));
 
-        System.out.println("== P3: owned is read once, on the UI thread, before the worker and the dialog ==");
+        System.out.println("== P3: owned is read once, on the UI thread, before the worker and the sheet ==");
         pin("P3 Clear all", () -> ownBefore(blockAt(blockAt(c, INBOX), "clear.setOnClickListener(v -> {"), THREAD));
         pin("P3 Delete", () -> ownBefore(blockAt(blockAt(c, ITEM), "del.setOnClickListener(v -> {"), THREAD));
         pin("P3 Repair", () -> ownBefore(blockAt(c, REPAIR), "SheetDialog.confirm(", THREAD));
         pin("P3 Unbind", () -> ownBefore(blockAt(blockAt(c, BIND),
-                "settingsRow(\"Unbind all\", \"Remove every profile from this line\", v -> {"), BUILDER, THREAD));
+                "settingsRow(\"Unbind all\", \"Remove every profile from this line\", v -> {"),
+                "SheetDialog.confirm(this, LineReportPresetSheets.unbindLine()", THREAD));
         pin("P3 Mark-mine", () -> ownBefore(blockAt(blockAt(c, BIND), "BindingMarks.MARK_SUMMARY, v -> {"), THREAD));
         pin("P3 Save", () -> ownBefore(blockAt(blockAt(c, STORE), "save.setOnClickListener(v -> {"), THREAD));
         check("P3 the file holds six reads", count(c, OWN) == 6);

@@ -76,6 +76,15 @@
 # the code before NWP-20261125-13 by design. U4 and U5 pass there: they pin unchanged behaviour. What must fail is
 # every mutant.
 #
+# NWP-20261210-29 (S20): the sweep logs one "sweep phases:" line after its summary: list, detach over <k> entries
+# and classify, in ms, from four _ms stamps (the helper is extracted by anchor like the others, never redefined
+# here). The date stub keeps a millisecond clock file for `date +%s%3N`: each umount call adds 200 ms and each
+# case_cat table read adds 50 ms, so a phase's ms are exact. It also counts every `date` call (DATEALL). PH1 pins
+# the split over six entries (two layers at three paths), PH2 a sweep with no failure (classify 0ms), PH3 a clock
+# that prints nothing (unclocked), PH4 a line with no path that the shipped scrub leaves alone, and PH5 the cost:
+# a 60-folder sweep makes exactly 7 date calls (main made 3), so no stamp runs per entry. Mutants P1-P6 must
+# convict and the control PC must survive. PH1-PH5 fail on main by design (it has no phase line and no _ms).
+#
 #   bash test-mediad-sweep.sh            # the cases
 #   bash test-mediad-sweep.sh --mutate   # ... plus mutations that must each CONVICT the suite
 set -uo pipefail
@@ -102,6 +111,8 @@ done
 UNESC=$(awk 'index($0,"unesc_mount() {")==1{on=1} on{print} on&&$0=="}"{exit}' "$SUT")
 QN=$(awk 'index($0,"qn() {")==1{on=1} on{print} on&&$0=="}"{exit}' "$SUT")
 UERR=$(awk 'index($0,"umount_err() {")==1{on=1} on{print} on&&$0=="}"{exit}' "$SUT")
+# NWP-20261210-29: _ms is one line, the same as roamd's (checked below).
+MS=$(grep -m1 '^_ms() { ' "$SUT")
 SWEEPBLK=$(awk '$0=="if [ -f \"$SWEEP\" ]; then"{on=1} on{print} on&&$0=="fi"{exit}' "$SUT")
 STALEBLK=$(awk 'index($0,"_smt=$(cat /proc/mounts")==1{on=1} on{print} on&&$0=="unset _smt _smtrc"{exit}' "$SUT")
 
@@ -112,7 +123,7 @@ needs() { # needs <name> <text> <marker>...
   for mk in "$@"; do
     case "$text" in *"$mk"*) ;; *) extract_fail "$what (no '$mk')" ;; esac
   done
-  printf '%s\n%s\n%s\n%s\n' "$UNESC" "$QN" "$UERR" "$text" | sh -n 2>/dev/null || extract_fail "$what (does not parse)"
+  printf '%s\n%s\n%s\n%s\n%s\n' "$UNESC" "$QN" "$UERR" "$MS" "$text" | sh -n 2>/dev/null || extract_fail "$what (does not parse)"
 }
 [ -n "$UNESC" ] || extract_fail "unesc_mount"
 case "$UNESC" in *sed*) ;; *) extract_fail "unesc_mount (no sed)" ;; esac
@@ -120,7 +131,10 @@ printf '%s\n' "$UNESC" | sh -n 2>/dev/null || extract_fail "unesc_mount (does no
 [ -n "$QN" ] || extract_fail "qn"
 case "$QN" in *sed*) ;; *) extract_fail "qn (no sed)" ;; esac
 case "$SWEEPBLK$STALEBLK" in *umount_err*) [ -n "$UERR" ] || extract_fail "umount_err" ;; esac
-needs "the sweep block" "$SWEEPBLK" 'mediad.sweep.list' 'sweep done:'
+[ -n "$MS" ] || extract_fail "_ms"
+case "$MS" in *'date +%s%3N'*) ;; *) extract_fail "_ms (no date +%s%3N)" ;; esac
+printf '%s\n' "$MS" | sh -n 2>/dev/null || extract_fail "_ms (does not parse)"
+needs "the sweep block" "$SWEEPBLK" 'mediad.sweep.list' 'sweep done:' 'sweep phases:'
 needs "the stale sweep" "$STALEBLK" 'stale overlay detached' 'stale bind detached' 'STALE-SWEEP-UNREADABLE'
 case "$STALEBLK" in *"unset _smt _smtrc") ;; *) extract_fail "the stale sweep (no end)" ;; esac
 
@@ -128,6 +142,7 @@ case "$STALEBLK" in *"unset _smt _smtrc") ;; *) extract_fail "the stale sweep (n
 ROAMD="$(dirname "$0")/nowhere_roamd.sh"
 eval "$(grep -m1 '^LOG_SCRUB_SED=' "$ROAMD")"
 [ -n "${LOG_SCRUB_SED:-}" ] || { echo "EXTRACTION FAILED: LOG_SCRUB_SED in $ROAMD" >&2; exit 2; }
+[ "$MS" = "$(grep -m1 '^_ms() { ' "$ROAMD")" ] || extract_fail "_ms (not the same line as roamd's)"
 [ "$(printf '%s\n' 'x "a b"' | sed -E "$LOG_SCRUB_SED")" = 'x "<name>"' ] \
   || { echo "EXTRACTION FAILED: LOG_SCRUB_SED does not redact a quoted token" >&2; exit 2; }
 # test-log-name-scrub.sh's PRINT_SHIM, with one difference: each printf is `command printf` (NWP-20261115-05). bash
@@ -152,6 +167,8 @@ fail_out() {
   esac
 }
 printf '%s\n' "$P" >> "$CALLS"
+# NWP-20261210-29: every umount call, failed or not, costs 200 ms on the case's clock.
+if [ -n "${CLOCKF:-}" ] && [ -f "$CLOCKF" ]; then read -r c < "$CLOCKF"; echo $((c + 200)) > "$CLOCKF"; fi
 if [ -e "$LISTF" ]; then stat -c %a "$LISTF" >> "$MODEF"; fi
 if [ -e "$PENDF" ]; then stat -c %a "$PENDF" >> "$PMODEF"; fi
 E=$(printf '%s' "$P" | sed -e 's/\\/\\134/g' -e 's/ /\\040/g' -e 's/	/\\011/g')
@@ -176,9 +193,18 @@ awk -v dev="$hit" '$1 != dev' "$FIXTURE" > "$FIXTURE.new" && mv "$FIXTURE.new" "
 exit 0
 EOF
 # Stub date: `date +%s` prints 1000 on its first call in a run and 1007 after (the counter is read with `read`, never
-# with a cat: case_cat counts every cat); any other call prints DATE.
+# with a cat: case_cat counts every cat); any other call prints DATE. NWP-20261210-29: `date +%s%3N` prints the case's
+# clock file (CLOCKF), or nothing when it is missing; every call, of any kind, adds one to DATEALL.
 cat > "$W/stubbin/date" <<'EOF'
 #!/bin/sh
+if [ -n "${DATEALL:-}" ]; then
+  a=0; [ -f "$DATEALL" ] && read -r a < "$DATEALL"
+  echo $((a + 1)) > "$DATEALL"
+fi
+if [ "${1:-}" = "+%s%3N" ]; then
+  [ -n "${CLOCKF:-}" ] && [ -f "$CLOCKF" ] && { read -r c < "$CLOCKF"; echo "$c"; }
+  exit 0
+fi
 if [ "${1:-}" = "+%s" ]; then
   n=0; [ -f "$DATECNT" ] && read -r n < "$DATECNT"
   n=$((n + 1)); echo "$n" > "$DATECNT"
@@ -200,6 +226,7 @@ new_case() {
   mkdir -p "$CD/state"
   : > "$CD/mounts"; : > "$CD/calls"; : > "$CD/fail"; : > "$CD/modes"; : > "$CD/pmodes"
   : > "$CD/state/mediad.sweep"
+  echo 1763500000000 > "$CD/clock"              # NWP-20261210-29: a 13-digit start, as on a device (mksh wraps it)
   CASEBIN=""; AFTERFAIL=""; CATFROM=""; CATALT=""; UMOUNT_ERR=""; XT=""; SHOPT=""
 }
 
@@ -213,6 +240,7 @@ case_cat() {
 #!/bin/sh
 n=0; read -r n < "$CATCNT"
 n=$((n + 1)); echo "$n" > "$CATCNT"
+if [ -f "$CLOCKF" ]; then read -r c < "$CLOCKF"; echo $((c + 50)) > "$CLOCKF"; fi
 src="$FIXTURE"; [ "$n" -ge "$CATFROM" ] && src="$CATALT"
 while IFS= read -r l || [ -n "$l" ]; do printf '%s\n' "$l"; done < "$src"
 [ "$n" -ge "$CATFROM" ] && exit 1
@@ -286,9 +314,10 @@ command -v print >/dev/null 2>&1 || eval "$PSHIM"
 eval "$UNESC"
 eval "$QN"
 eval "$UERR"
+eval "$MS"
 if [ -n "${XT:-}" ]; then exec 2>>"$XT"; set -x; fi
 eval "$BLK"'
-  env PATH="${CASEBIN:+$CASEBIN:}$W/stubbin:$PATH" XT="$XT" AFTERFAIL="$AFTERFAIL" UMOUNT_ERR="$UMOUNT_ERR" PSHIM="$PRINT_SHIM" QN="$QN" UERR="$UERR" CATFROM="$CATFROM" CATALT="$CATALT" \
+  env PATH="${CASEBIN:+$CASEBIN:}$W/stubbin:$PATH" XT="$XT" AFTERFAIL="$AFTERFAIL" UMOUNT_ERR="$UMOUNT_ERR" PSHIM="$PRINT_SHIM" QN="$QN" UERR="$UERR" MS="$MS" CLOCKF="$CD/clock" DATEALL="$CD/dateall" CATFROM="$CATFROM" CATALT="$CATALT" \
       CATCNT="$CD/catcnt" FIXTURE="$CD/mounts" CALLS="$CD/calls" FAILF="$CD/fail" \
       LISTF="$CD/state/mediad.sweep.list" MODEF="$CD/modes" PENDF="$CD/state/mediad.sweep.pending" PMODEF="$CD/pmodes" \
       DATECNT="$CD/datecnt" ROOT="$CD" UNESC="$UNESC" BLK="$text" \
@@ -340,6 +369,10 @@ c4x() {
   if [ -e "$CD/state/$3" ] && [ ! -x "$CD/state/$3" ]; then no "C4 $1: planted $3 lost its search bit ($2)"; fi
 }
 
+# phaseline: the log's "sweep phases:" lines (NWP-20261210-29), newline-joined; dates: every `date` call of the case.
+phaseline() { grep -F '[mediad] sweep phases:' "$CD/log" 2>/dev/null; }
+dates() { local n=; read -r n < "$CD/dateall" 2>/dev/null; printf '%s' "${n:-0}"; }
+
 # readcount: how many times this case's counting cat (case_cat) ran.
 readcount() { local n=; read -r n < "$CD/catcnt" 2>/dev/null; printf '%s' "${n:-0}"; }
 
@@ -372,13 +405,14 @@ stage_script() {
   printf '%s\n' 'm1 /data/user/10/com.x/files/DCIM fuse.nowheremedia rw 0 0' > "$R/proc/mounts"
   : > "$R/calls"; : > "$R/modes"
   : > "$R/data/nowhere/state/mediad.sweep"
+  echo 1763500000000 > "$R/clock"
 }
 
 run_script() { # run_script <shell> <R>
   ( cd "$2" && env -i PATH="$W/stubbin:/usr/bin:/bin" FIXTURE="$2/proc/mounts" CALLS="$2/calls" FAILF=/dev/null \
       LISTF="$2/data/nowhere/state/mediad.sweep.list" MODEF="$2/modes" \
       PENDF="$2/data/nowhere/state/mediad.sweep.pending" PMODEF="$2/pmodes" DATECNT="$2/datecnt" \
-      timeout 60 "$1" "$2/run/mediad.sh" ) >/dev/null 2>&1
+      CLOCKF="$2/clock" DATEALL="$2/dateall" timeout 60 "$1" "$2/run/mediad.sh" ) >/dev/null 2>&1
 }
 
 suite() {
@@ -727,6 +761,87 @@ suite() {
       c4x "${e% *}" "$label" "${e#* }"
     done
 
+    # PH1 (NWP-20261210-29): C1's mount at three paths plus a second layer at three paths: six entries, two detached,
+    # four queued. The clock moves 50 ms per table read (case_cat) and 200 ms per umount call, so the split is exact.
+    new_case; case_cat 100000
+    mounts 'm1 /data/user/10/com.x/files/DCIM fuse.nowheremedia rw 0 0' \
+           'm1 /data_mirror/data_ce/null/10/com.x/files/DCIM fuse.nowheremedia rw 0 0' \
+           'm1 /mnt/pass_through/0/emulated/10/com.x/files/DCIM fuse.nowheremedia rw 0 0' \
+           'm2 /data/user/10/com.x/files/Music fuse.nowheremedia rw 0 0' \
+           'm2 /data_mirror/data_ce/null/10/com.x/files/Music fuse.nowheremedia rw 0 0' \
+           'm2 /mnt/pass_through/0/emulated/10/com.x/files/Music fuse.nowheremedia rw 0 0' \
+           '/dev/fuse /storage/emulated fuse rw 0 0'
+    run_block "$sh" "$SWEEPBLK"
+    n=$(grep -c . "$CD/calls")
+    want="[mediad] sweep phases: list 50ms, detach $((200 * n))ms over 6 entries (2 detached, 4 queued), classify 50ms (NWP-20261210-29) DATE"
+    if [ "$n" = 6 ] && [ "$(grep -cxF "$want" "$CD/log")" = 1 ] && [ "$(phaseline | grep -c .)" = 1 ]; then
+      ok "PH1 list 50ms, detach 1200ms over 6 entries (2 detached, 4 queued), classify 50ms ($label)"
+    else no "PH1 the phase line is not '${want#\[mediad\] }' ($n umount calls) ($label)"; fi
+    got=$(awk -v s='[mediad] sweep done: 2 detached, 4 already gone, 0 FAILED, 0 unverified in 7s DATE' -v p="$want" \
+          'prev == s && $0 == p {hit = 1} {prev = $0} END {print hit + 0}' "$CD/log")
+    if [ "$got" = 1 ]; then ok "PH1 summary unchanged, and the phase line is the line right after it ($label)"
+    else no "PH1 summary is not '2 detached, 4 already gone, 0 FAILED, 0 unverified in 7s DATE' with the phase line next ($label)"; fi
+    # PH4: the line holds counts and ms only (no path, no fixture fragment), and the shipped scrub leaves it alone.
+    L=$(phaseline)
+    case "$L" in
+      ''|*/*|*data*|*DCIM*|*Music*|*com.x*|*fuse*|*user*|*mirror*|*emulated*) no "PH4 the phase line holds a path or a fixture fragment: $L ($label)" ;;
+      *) ok "PH4 the phase line holds no path and no fixture fragment ($label)" ;;
+    esac
+    S=$(printf '%s\n' "$L" | sed -E "$LOG_SCRUB_SED")
+    if [ -n "$L" ] && [ "$S" = "$L" ]; then ok "PH4 LOG_SCRUB_SED leaves the phase line unchanged ($label)"
+    else no "PH4 LOG_SCRUB_SED changed the phase line to: $S ($label)"; fi
+    c4 PH1 "$label"
+
+    # PH2: W5's fixture, no umount fails: nothing queued, no re-read, classify 0ms.
+    new_case; case_cat 100000
+    mounts 'm1 /data/user/10/com.x/files/A fuse.nowheremedia rw 0 0' \
+           'm2 /data/user/10/com.x/files/B fuse.nowheremedia rw 0 0' \
+           'b1 /data/user/10/com.nowhere.chooser/files/.nowhere-media/.under/A ext4 rw 0 0'
+    run_block "$sh" "$SWEEPBLK"
+    want='[mediad] sweep phases: list 50ms, detach 600ms over 3 entries (3 detached, 0 queued), classify 0ms (NWP-20261210-29) DATE'
+    if [ "$(grep -cxF "$want" "$CD/log")" = 1 ]; then ok "PH2 no failure: 0 queued, classify 0ms ($label)"
+    else no "PH2 the phase line is not '${want#\[mediad\] }' ($label)"; fi
+
+    # PH3: `date +%s%3N` prints nothing (no clock file): one unclocked line, no numbers, and the summary as before.
+    new_case; case_cat 100000; rm -f "$CD/clock"
+    mounts 'm1 /data/user/10/com.x/files/DCIM fuse.nowheremedia rw 0 0' \
+           'm1 /data_mirror/data_ce/null/10/com.x/files/DCIM fuse.nowheremedia rw 0 0' \
+           '/dev/fuse /storage/emulated fuse rw 0 0'
+    run_block "$sh" "$SWEEPBLK"
+    if [ "$(phaseline)" = '[mediad] sweep phases: unclocked (NWP-20261210-29) DATE' ]; then ok "PH3 an unreadable clock: sweep phases: unclocked ($label)"
+    else no "PH3 the phase line is not 'sweep phases: unclocked': $(phaseline) ($label)"; fi
+    if grep -qxF '[mediad] sweep done: 1 detached, 1 already gone, 0 FAILED, 0 unverified in 7s DATE' "$CD/log"; then ok "PH3 summary unchanged ($label)"
+    else no "PH3 summary is not '1 detached, 1 already gone, 0 FAILED, 0 unverified in 7s DATE' ($label)"; fi
+
+    # PH5 (cost guard): W1's 60-folder table (240 entries). The sweep calls date exactly 7 times: _t0, _t1, the one
+    # formatted date both lines share, and the four stamps. main called it 3 times; a stamp per entry adds 240.
+    new_case
+    for n in $(seq 1 60); do
+      printf 'm%s /data/user/10/com.x/files/F%s fuse.nowheremedia rw 0 0\n' "$n" "$n"
+      printf 'm%s /data_mirror/data_ce/null/10/com.x/files/F%s fuse.nowheremedia rw 0 0\n' "$n" "$n"
+      printf 'm%s /mnt/pass_through/0/emulated/10/com.x/files/F%s fuse.nowheremedia rw 0 0\n' "$n" "$n"
+      printf 'b%s /data/user/10/com.nowhere.chooser/files/.nowhere-media/.under/F%s ext4 rw 0 0\n' "$n" "$n"
+    done > "$CD/mounts"
+    run_block "$sh" "$SWEEPBLK"; got=$(dates)
+    if [ "$got" = 7 ]; then ok "PH5 60 folders: exactly 7 date calls, 4 more than main's 3 ($label)"
+    else no "PH5 60 folders: $got date calls, not 7 ($label)"; fi
+    if [ "$(phaseline | grep -c 'over 240 entries (120 detached, 120 queued)')" = 1 ]; then ok "PH5 the phase line counts 240 entries ($label)"
+    else no "PH5 the phase line does not count 240 entries: $(phaseline) ($label)"; fi
+
+    # PH6: W4's fixture (the final re-read is a directory): classification adds the 3 queued entries to unverified
+    # AFTER the loop; the entry count is taken before that, so it stays 4.
+    new_case
+    mounts 'm2 /data/user/10/com.x/files/DCIM fuse.nowheremedia rw 0 0' \
+           'm2 /data_mirror/data_ce/null/10/com.x/files/DCIM fuse.nowheremedia rw 0 0' \
+           'm2 /mnt/pass_through/0/emulated/10/com.x/files/DCIM fuse.nowheremedia rw 0 0' \
+           'm1 /data/user/10/com.y/files/Movies fuse.nowheremedia rw 0 0'
+    printf '%s\n' '/data/user/10/com.y/files/Movies' > "$CD/fail"; AFTERFAIL=dir
+    run_block "$sh" "$SWEEPBLK"
+    want='[mediad] sweep phases: list 0ms, detach 800ms over 4 entries (1 detached, 3 queued), classify 0ms (NWP-20261210-29) DATE'
+    if [ "$(grep -cxF "$want" "$CD/log")" = 1 ] && grep -qF '3 unverified in 7s' "$CD/log"; then
+      ok "PH6 the entry count is taken before classification: 4 entries, 3 unverified after ($label)"
+    else no "PH6 the phase line is not '${want#\[mediad\] }' ($label)"; fi
+
     # C6: the start path detaches ONLY user 10's leftovers.
     new_case
     mounts 'm1 /data/user/10/com.x/files/DCIM fuse.nowheremedia rw 0 0' \
@@ -840,6 +955,9 @@ suite() {
     if [ -e "$R/data/nowhere/state/mediad.sweep" ]; then no "C5 the marker survived ($label)"; else ok "C5 marker gone ($label)"; fi
     if has "$L" 'sweep done: 1 detached' && ! has "$L" '[mediad] start'; then ok "C5 only the sweep ran ($label)"
     else no "C5 the log is wrong: $L ($label)"; fi
+    if has "$L" 'sweep phases: list 0ms, detach 200ms over 1 entries (1 detached, 0 queued), classify 0ms'; then
+      ok "C5 the whole script logs the phase line ($label)"
+    else no "C5 the whole script logged no phase line: $L ($label)"; fi
 
     # C5b: marker and NO req -- the real sign-out shape (stop_mediad removed the req first).
     R=$(mktemp -d -p "$W"); stage_script "$sh" "$R"
@@ -1084,6 +1202,77 @@ if [ "$_smtrc" -ne 0 ] || [ -z "$_smt" ]; then
   :
 else
 ' 'C6 STALE-SWEEP-UNREADABLE'
+
+# NWP-20261210-29: pymutn_each <label> <old> <new> [<old> <new>]... -- <case>...: like pymut_each, with several exact
+# edits, each of which must match ONCE.
+pymutn_each() {
+  local label="$1" copy; shift
+  local -a pairs=()
+  while [ $# -gt 0 ] && [ "$1" != -- ]; do pairs+=("$1"); shift; done
+  [ "${1:-}" = -- ] && shift
+  copy=$(mktemp -p "$W")
+  if python3 -I -c '
+import sys
+src, dst = sys.argv[1:3]
+p = sys.argv[3:]
+t = open(src).read()
+if len(p) % 2:
+    sys.exit(1)
+for i in range(0, len(p), 2):
+    if t.count(p[i]) != 1:
+        sys.exit(1)
+    t = t.replace(p[i], p[i + 1])
+open(dst, "w").write(t)
+' "$SUT" "$copy" "${pairs[@]}"; then convict_each "$label" "$copy" "$@"
+  else echo "  BROKEN    $label -- a text to mutate is not in the script exactly once"; MFAILS=$((MFAILS + 1)); fi
+}
+pymutn_each 'P1 the after-loop stamp taken before the loop' \
+'  done < "$SWEPT"
+  _p2=$(_ms); _pk=' '  done < "$SWEPT"
+  _pk=' \
+'  while read -r _dev mnt _rest; do
+' '  _p2=$(_ms)
+  while read -r _dev mnt _rest; do
+' -- 'PH1 the phase line'
+pymutn_each 'P2 the list stamp taken after the loop' \
+'  _p1=$(_ms)
+' '' '_p2=$(_ms); ' '_p1=$(_ms); _p2=$(_ms); ' -- 'PH1 the phase line'
+pymut_each 'P3 a stamp added inside the loop' \
+'    m=$(unesc_mount "$mnt")
+' '    _px=$(_ms)
+    m=$(unesc_mount "$mnt")
+' 'PH5 60 folders:'
+pymut_each 'P4 n_pend dropped from the line' \
+'($n_ok detached, $n_pend queued)' '($n_ok detached)' 'PH1 the phase line'
+pymut_each 'P4b n_pend dropped from the entry count' \
+'_pk=$((n_ok + n_pend + n_unk))' '_pk=$((n_ok + n_unk))' 'PH1 the phase line'
+pymut_each 'P5 the unclocked guard removed' \
+'    *" 0 "*)
+      echo "[mediad] sweep phases: unclocked (NWP-20261210-29) $_pdate" >> "$LOG" ;;
+' '' 'PH3 the phase line'
+pymut_each 'P6 the phase line written into the summary line' \
+'  echo "[mediad] sweep done: $n_ok detached, $n_gone already gone, $n_fail FAILED, $n_unk unverified in ${_dt}s $_pdate" >> "$LOG"
+' '  printf "%s " "[mediad] sweep done: $n_ok detached, $n_gone already gone, $n_fail FAILED, $n_unk unverified in ${_dt}s $_pdate" >> "$LOG"
+' 'PH1 summary is not' 'W1 summary is not' 'Q1 summary is not'
+pymutn_each 'P7 the entry count taken after classification' \
+'_p2=$(_ms); _pk=$((n_ok + n_pend + n_unk)); _prr=0' '_p2=$(_ms); _prr=0' \
+'  _p3=$(_ms)
+' '  _p3=$(_ms); _pk=$((n_ok + n_pend + n_unk))
+' -- 'PH6 the phase line'
+# The control: a comment-only edit in the phase block must SURVIVE (the cases pin behaviour, not comment text).
+copy=$(mktemp -p "$W")
+if python3 -I -c '
+import sys
+t = open(sys.argv[1]).read()
+old = "Four stamps per sweep, never one per entry."
+if t.count(old) != 1:
+    sys.exit(1)
+open(sys.argv[2], "w").write(t.replace(old, "Four stamps a sweep, and none for an entry."))
+' "$SUT" "$copy"; then
+  if cmp -s "$SUT" "$copy"; then echo "  INERT     PC the control changed nothing"; MFAILS=$((MFAILS + 1))
+  elif TMPDIR="$W" bash "$0" "$copy" >/dev/null 2>&1; then echo "  survived  PC the control (a comment edit), as it must"
+  else echo "  KILLED    PC the control (a comment edit) failed the suite: a case pins comment text"; MFAILS=$((MFAILS + 1)); fi
+else echo "  BROKEN    PC the control -- the comment text is not in the script exactly once"; MFAILS=$((MFAILS + 1)); fi
 
 copy=$(mktemp -p "$W")
 if python3 -I - "$SUT" "$copy" <<'PY'

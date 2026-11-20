@@ -32,7 +32,7 @@ final class AboutFacts {
                 return "Verified — checked at boot against the phone maker's key";
             case "yellow":
                 return "Verified with a custom key — checked at boot against a key installed on this phone, "
-                        + "not the phone maker's. A locked Nowhere phone boots this way.";
+                        + "not the phone maker's. A locked nowhere phone boots this way.";
             case "orange":
                 return "Not verified — the bootloader is unlocked, so the software was not checked at boot";
             default:

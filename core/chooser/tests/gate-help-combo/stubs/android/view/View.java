@@ -6,6 +6,8 @@ import android.graphics.drawable.Drawable;
 /** Records what the cases read. A listener makes a view clickable, as the framework's does. */
 public class View {
     public static final int IMPORTANT_FOR_ACCESSIBILITY_NO = 2;
+    public static final int VISIBLE = 0;
+    public static final int GONE = 8;
     public interface OnClickListener { void onClick(View v); }
     private final Context context;
     private CharSequence description;
@@ -15,6 +17,8 @@ public class View {
     private Drawable background;
     private ViewGroup.LayoutParams params;
     private int w, h;
+    private int visibility = VISIBLE;
+    private float rotation;
     public View(Context c) { context = c; }
     public Context getContext() { return context; }
     public Resources getResources() { return context.getResources(); }
@@ -28,6 +32,10 @@ public class View {
     public void setImportantForAccessibility(int m) { important = m; }
     public int getImportantForAccessibility() { return important; }
     public void setPadding(int l, int t, int r, int b) {}
+    public void setVisibility(int v) { visibility = v; }
+    public int getVisibility() { return visibility; }
+    public void setRotation(float r) { rotation = r; }
+    public float getRotation() { return rotation; }
     public void setBackground(Drawable d) { background = d; }
     public Drawable getBackground() { return background; }
     public void setBackgroundColor(int c) { background = new android.graphics.drawable.GradientDrawable(); ((android.graphics.drawable.GradientDrawable) background).setColor(c); }

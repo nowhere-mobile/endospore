@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -82,6 +83,16 @@ func restoreAppCode(base, scope, pass, pkg, destDir string) (int, error) {
 	if len(rels) == 0 {
 		return 0, fmt.Errorf("no on-demand APK bytes for %q in scope %q", pkg, scope)
 	}
+	resumeDir := chunkCacheDir == appFetchResumeDir(destDir)
+	if resumeDir {
+		keep := make(map[string]bool)
+		for _, d := range m.Deferred {
+			for _, h := range d.Chunks {
+				keep[h] = true
+			}
+		}
+		_, _ = pruneChunkCache(chunkCacheDir, keep)
+	}
 	sort.Strings(rels)
 	// DIA-20260803-03: sum this package's bytes up front so the fetch below can report MOVEMENT. The worker
 	// wait is deliberately adaptive -- waitWorker gives up only after stallTicks (150s) with no NEW progress,
@@ -119,15 +130,40 @@ func restoreAppCode(base, scope, pass, pkg, destDir string) (int, error) {
 		writeProg(int(doneB), int(totalB))
 	}}
 	defer w.abort()
+	priorHits := atomic.LoadInt64(&chunkHits)
 	err := healFetchOrdered(base, key, m.Version, chunks, w.write)
 	if err == nil {
 		err = w.finish()
 	}
+	if resumeDir {
+		hits := atomic.LoadInt64(&chunkHits) - priorHits
+		if hits > 0 {
+			fmt.Printf("restore-app: %d of %d chunk(s) were already here from an earlier try (NWP-20261210-10)\n", hits, len(chunks))
+		}
+	}
 	if err != nil {
 		return w.done, fmt.Errorf("materialise %s: %w", pkg, err)
 	}
+	if resumeDir {
+		for _, h := range chunks {
+			_ = os.Remove(filepath.Join(chunkCacheDir, h))
+		}
+		_ = os.Remove(chunkCacheDir)
+	}
 	return w.done, nil
 }
+
+// appFetchResumeDirName (NWP-20261210-10, the backlog row "A large app's fetch fails on a slow link: one chunk with
+// no data for 30 s ends the whole fetch, and each retry starts again from chunk 1"): the restore-app verb points
+// chunkCacheDir here, so a failed try keeps the chunks it landed and the next try fetches only the missing ones.
+// It holds SEALED chunks only, by content hash, exactly as the store holds them. It sits under .appcode, so the seal
+// walk skips it (isAppCodeStagePath) and no package dir can collide with it (a package name never starts with a
+// dot). It is in the roamed user's CE and leaves with that user at sign-out. roamd's materializeapp and the
+// chooser's rmTree remove .appcode/<pkg> only, so a failed try's chunks survive to the next. restoreAppCode prunes
+// it to the scope's on-demand chunks before a fetch and removes this package's chunks once the set lands.
+const appFetchResumeDirName = ".odchunks"
+
+func appFetchResumeDir(destDir string) string { return filepath.Join(destDir, appFetchResumeDirName) }
 
 // isPkgApkRel reports whether rel is one of pkg's own APK files in an #apps manifest: a direct child of <pkg>/
 // (base.apk, split_*.apk). restoreAppCode fetches exactly these rels and appFetchBytes sizes exactly these, so the

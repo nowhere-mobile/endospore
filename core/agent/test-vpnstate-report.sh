@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # test-vpnstate-report.sh [--mutate] -- runs vpn_state_report_test.go (NWP-20261202-43: an in-session issue report
 # carries the always-on VPN's live state as vpn_state and a sent one appends a codes-only ev=vpnstate day-summary
-# line) and TestDaySummarySourcePins; --mutate re-runs them against a COPY of the package with each part broken in
+# line; NWP-20261208-10: and the last refused always-on apply as vpn_refused) and TestDaySummarySourcePins; --mutate re-runs them against a COPY of the package with each part broken in
 # turn. Each mutant must be CONVICTED by a `--- FAIL` from the test its label names; one that fails to apply, or fails
 # to compile, counts as a failure.
 set -uo pipefail
@@ -44,13 +44,13 @@ PY
   cp "$W/orig.go" "$P/$f"
 }
 mut "R1 gate scope gets the key" TestVpnStateReportGateScopeAbsent report_issue.go \
-  'delete\(rep\.Status, "vpn_state"\)\n\tif deviceScope \{' 'delete(rep.Status, "vpn_state")\n\tif false {'
+  'delete\(rep\.Status, "vpn_refused"\)\n\tif deviceScope \{' 'delete(rep.Status, "vpn_refused")\n\tif false {'
 mut "R2 a preview appends the day-summary line" TestVpnStateReportPreviewAppendsNothing report_issue.go \
   'v != "" && !req\.Preview \{' 'v != "" {'
 mut "R3 the caller-sent key survives" TestVpnStateReportCallerKeyRemoved report_issue.go \
   '\tdelete\(rep\.Status, "vpn_state"\)\n' ''
 mut "R4 the reply regex loosened" TestVpnStateReportJunkIsUnavailable report_issue.go \
-  'net=\(1\|0\|-\)\$`\)\n\n// mergeVpnState' 'net=(1|0|-)`)\n\n// mergeVpnState'
+  '\\.lock\(0\|1\)\)\$`\)\n\n// mergeVpnState' '\\.lock(0|1))`)\n\n// mergeVpnState'
 mut "R5 laneFor drops vpnstate" TestVpnStateReportLane main.go \
   '\tcase "vpnstate":\n\t\t// NWP-20261202-43: three secure-settings reads and one package dump for an issue report\. Its own' \
   '\tcase "vpnstate-x":\n\t\t// NWP-20261202-43: three secure-settings reads and one package dump for an issue report. Its own'
@@ -60,4 +60,11 @@ mut "R7 the append moved between mergeSigninSummary and mergeDaySummary" TestDay
   '(\tif v := mergeVpnState.*?\n\t\}\n)(.*?mergeSigninSummary\(rep\.Status, uid, deviceScope\)[^\n]*\n)' '\2\1'
 mut "R8 the vpnstate worker sends the passphrase" TestVpnStateReportWorkerSendsNoPass report_issue.go \
   'triggerRoamWorker\(dest, "vpnstate", name, "", uid' 'triggerRoamWorker(dest, "vpnstate", name, name, uid'
+# NWP-20261208-10: the refused token.
+mut "R9 the refused regex takes any usr word" TestVpnStateReportRefusedJunk report_issue.go \
+  '\\.usr\(unlocked\|locked\|unlocking\|booting\|stopping\|shutdown\|notstarted\|-\)' '\\.usr([a-z-]+)'
+mut "R10 vpn_refused copies the reply's token" TestVpnStateReportRefusedValid report_issue.go \
+  'rep\.Status\["vpn_refused"\] = fmt\.Sprintf\(.*?m\[14\]\)' 'rep.Status["vpn_refused"] = m[5]'
+mut "R11 the caller-sent vpn_refused survives" TestVpnStateReportRefusedCallerKeyRemoved report_issue.go \
+  '\tdelete\(rep\.Status, "vpn_refused"\)\n' ''
 [ "$fails" -eq 0 ] && echo "== all mutations convicted" || { echo "== $fails mutation(s) not convicted"; exit 1; }

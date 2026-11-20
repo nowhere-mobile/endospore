@@ -17,6 +17,8 @@ public class ViewGroup extends View {
     public ViewGroup(Context c) { super(c); }
     public void addView(View v) { kids.add(v); }
     public void addView(View v, LayoutParams p) { v.setLayoutParams(p); kids.add(v); }
+    public void removeAllViews() { kids.clear(); }
+    public void removeView(View v) { kids.remove(v); }
     public int getChildCount() { return kids.size(); }
     public View getChildAt(int i) { return kids.get(i); }
 }

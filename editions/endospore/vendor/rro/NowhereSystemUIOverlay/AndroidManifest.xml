@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- NWP-20261208-27: static, always-on overlay of SystemUI (com.android.systemui) for every Endospore device. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.nowhere.overlay.systemui">
+    <overlay android:targetPackage="com.android.systemui" android:isStatic="true" />
+    <application android:hasCode="false" />
+</manifest>

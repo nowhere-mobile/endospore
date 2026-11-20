@@ -74,13 +74,13 @@ ROOT="$root"; LOG="\$ROOT/log"; uid=11; name=prof; pass=pw; AGENT=agent_sim; SIM
 DEDIR="\$ROOT/user_de/11"; MEDIADIR="\$ROOT/media/11"   # the segment starts after the arm's own two assignments
 : > "\$ROOT/calls"
 pw() { printf '%s\n' x; }
+pwv() { [ -z "\$1" ] || pw "\$1"; }
+_se_v=""; _fh_v=""   # set at the top level in the script (NWP-20261205-18)
 agent_sim() { echo "agent \$1 \$3" >> "\$ROOT/calls"; return "\$SIM_RC"; }
 _ms() { echo 0; }
 _tlog() { :; }
 _ssum() { :; }
 remap_per_pkg() { echo tail >> "\$ROOT/calls"; }
-remap_media_db() { :; }   # NWP-20261124-01: the #de tail calls it before remap_per_pkg
-insert_deferred_media() { :; }   # NWP-20261130-02: the #media tail calls it after restore_media_tail
 rescan_media() { :; }   # NWP-20261113-45: the #media tail calls it after the reown
 restorecon() { :; }
 restore_media_tail() { echo tail >> "\$ROOT/calls"; }

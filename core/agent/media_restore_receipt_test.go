@@ -129,7 +129,7 @@ func TestRoamdClearsMediaReceiptBeforeMediaRestore(t *testing.T) {
 	}, "\n") + "\n"
 	clr := strings.Index(src, `for _pn in media.restore-ok .btlogoff .had_account; do [ -e "$STATE/$_pn" ] && mv "$STATE/$_pn" "$PARK/"`)
 	del := strings.Index(src, noPark)
-	rs := strings.Index(src, `NOWHERE_PHASE=media "$AGENT" restore`)
+	rs := strings.Index(src, `NOWHERE_PHASE=media NOWHERE_SE_SECRET="$(pwv "$_se_v")" NOWHERE_FIDO2_HMAC="$(pwv "$_fh_v")" "$AGENT" restore`)
 	if clr < 0 || rs < 0 {
 		t.Fatalf("anchors missing (clear=%d restore=%d)", clr, rs)
 	}

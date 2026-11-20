@@ -24,9 +24,16 @@ import java.util.function.Predicate;
  * if nothing was installing. {@link #cardPkgs} gives them rows ahead of the work list, and {@link Sweep#depLanded} ticks
  * them. The stack still installs in keep-set order; only the card's order differs.
  *
- * ⚠ The words are the mockup's and stay DRAFTS for Chester to correct (the 2026-11-03 entry's inference). So is
- * {@link #INSTALLING} (h62 #3): its mockup goes to Chester in the slice's plan.
+ * ⚠ The words are the mockup's and stay DRAFTS for Chester to correct (the 2026-11-03 entry's inference),
+ * {@link #INSTALLING} (h62 #3) among them: its mockup goes to Chester in the slice's plan. {@link #TITLE} is the
+ * exception: Chester approved it verbatim on 2026-11-17 (NWP-20261116-48), so it is no longer a draft.
  * {@link #CLOSE_AFTER_MS} = 4000 is this slice's inference for the decision's "a few seconds".
+ *
+ * NWP-20261208-23 (Chester, 2026-11-17, NWP-20261116-48, approved verbatim, so not drafts): the card appears when the
+ * home screen lands, about 15 s before the sweep starts, in a waiting state ({@link Sweep#beginWaiting}): from
+ * {@code ROWS_MAX + 1} the headline {@link #waitingHeadline} and an empty bar, and each row {@link #CLOCK} + " " +
+ * {@link #WAITING}. The sweep adopts it ({@link Sweep#go}) when its rows are the same ({@link #sameRows}); else it drops
+ * it ({@link Sweep#drop}), the card finishes at once, and the running card starts as before.
  *
  * Once per sign-in: {@link UnarchiveService} keys it on the Android user's serial, which is new at every sign-in and
  * unchanged across a cold-lock resume, and stamps the serial it showed the card for. Pure (java.* only), so
@@ -35,11 +42,17 @@ import java.util.function.Predicate;
 final class LandingLine {
     private LandingLine() {}
 
-    static final String TITLE = "Welcome back";
+    // NWP-20261208-31: approved by Chester 2026-11-17 (NWP-20261116-48); "Welcome back" belongs to the switch
+    // overlay alone (ChooserActivity's D6 rule).
+    static final String TITLE = "Your apps are coming back";
     static final String READY = "ready";
     static final String COMING = "coming back";
     /** The bare word, with no glyph (h62 #3). */
     static final String INSTALLING = "installing";
+    /** NWP-20261208-23: the waiting card's row word, beside CLOCK, and the start of its from-5 headline. Approved
+     *  verbatim (Chester, 2026-11-17). */
+    static final String WAITING = "waiting";
+    static final String WAITING_HEAD = "Starting in a moment";
     static final String KEEP = "You can keep using the phone.";
     static final String GOT_IT = "Got it";
     /** NWP-20261201-13: the card's Pause and Stop, and Your apps' row while paused. Drafts for Chester to correct. */
@@ -67,6 +80,8 @@ final class LandingLine {
     /** ProfileActivity opens Your apps when its intent carries EXTRA_OPEN = OPEN_YOUR_APPS ("+<n> more"). */
     static final String EXTRA_OPEN = "nowhere.profile.open";
     static final String OPEN_YOUR_APPS = "your-apps";
+    /** NWP-20261209-05: nApps' "Learn more" sends EXTRA_OPEN = OPEN_HELP_YOUR_APPS; Profile opens Help on "Your apps". */
+    static final String OPEN_HELP_YOUR_APPS = "help-your-apps";
 
     /** The launcher-less providers: ProfileActivity.GMS_PKG and GSF_PKG. */
     static final String GMS = "com.google.android.gms";
@@ -103,7 +118,13 @@ final class LandingLine {
 
     /** A row's state words: landed wins over installing. */
     static String state(boolean landed, boolean installing) {
+        return state(landed, installing, false);
+    }
+
+    /** NWP-20261208-23: as above; a row of a waiting card that has not landed reads CLOCK + " " + WAITING. */
+    static String state(boolean landed, boolean installing, boolean waiting) {
         if (landed) return TICK + " " + READY;
+        if (waiting) return CLOCK + " " + WAITING;
         if (installing) return INSTALLING;
         return CLOCK + " " + COMING;
     }
@@ -112,6 +133,11 @@ final class LandingLine {
     static String headline(int landed, int total) {
         if (landed == total) return "All " + total + " apps are back";
         return landed + " of " + total + " apps back";
+    }
+
+    /** NWP-20261208-23: the waiting card's headline from ROWS_MAX + 1 apps. The middle dot is U+00B7. */
+    static String waitingHeadline(int total) {
+        return WAITING_HEAD + " · 0 of " + total;
     }
 
     /** NWP-20261201-13: the line a paused or stopped card shows; null when it is neither or every app landed, so the card
@@ -192,7 +218,13 @@ final class LandingLine {
         private static long seq, id;
         private static String[] pkgs = new String[0];
         private static boolean[] landed = new boolean[0], settled = new boolean[0];
-        private static boolean done, paused, stopped;
+        private static boolean done, paused, stopped, waiting;
+        /** NWP-20261208-23: the last waiting card the sweep dropped; it outlives a later begin. */
+        private static long dropped;
+        /** NWP-20261208-23: landing starts so far, and those not ended. A waiting card is shown only while no landing
+         *  start came after its own start and none runs (beginWaiting(long, String[])). */
+        private static long landings;
+        private static int landingsOpen;
         private static String[] labels = new String[0];
         /** Rows, -1 for none: the one the sweep works on now, the app to go back to after a dep, the last to land. */
         private static int installing = -1, resume = -1, lastLanded = -1;
@@ -205,10 +237,87 @@ final class LandingLine {
             settled = new boolean[pkgs.length];
             labels = new String[pkgs.length];
             done = false;
+            waiting = false;
             paused = false;
             stopped = false;
             installing = resume = lastLanded = -1;
             return id;
+        }
+
+        /** NWP-20261208-23: a card shown before the sweep starts. As {@link #begin}, and it reads as waiting until
+         *  {@link #go}. */
+        static synchronized long beginWaiting(String[] rows) {
+            long w = begin(rows);
+            waiting = true;
+            return w;
+        }
+
+        /** NWP-20261208-23: the ticket a waiting start takes when it starts, before any landing start that follows it. */
+        static synchronized long landingTicket() {
+            return landings;
+        }
+
+        /** NWP-20261208-23: a landing start begins. From now on, a waiting card with an older ticket is not shown. */
+        static synchronized void landingStarts() {
+            landings++;
+            landingsOpen++;
+        }
+
+        /** NWP-20261208-23: a landing start ended (after it took the waiting card). */
+        static synchronized void landingEnds() {
+            if (landingsOpen > 0) landingsOpen--;
+        }
+
+        /** NWP-20261208-23: the waiting card of a start that took {@code ticket}, as {@link #beginWaiting(String[])}.
+         *  Returns 0 and changes nothing when a landing start came after the ticket, when one runs, or when a card
+         *  sweep is open (begun and not ended, a paused one included): a late waiting card never replaces the running
+         *  card's record. One lock with {@link #begin}, so no begin falls between the check and the record. */
+        static synchronized long beginWaiting(long ticket, String[] rows) {
+            if (ticket != landings || landingsOpen > 0 || (id != 0 && !done)) return 0;
+            return beginWaiting(rows);
+        }
+
+        /** NWP-20261208-23 (RF-002): as {@link #beginWaiting(long, String[])}, and a recorded card goes to
+         *  {@code publish} under the same lock. A landing start (landingStarts) cannot fall between the record and the
+         *  publish: it comes before, and the record is refused, or after, and its take finds the published card. */
+        static synchronized long beginWaiting(long ticket, String[] rows, java.util.function.LongConsumer publish) {
+            long w = beginWaiting(ticket, rows);
+            if (w != 0) publish.accept(w);
+            return w;
+        }
+
+        /** NWP-20261208-23: the sweep adopts the waiting card. True once, and only for the recorded waiting sweep. */
+        static synchronized boolean go(long sweep) {
+            if (sweep == 0 || sweep != id || !waiting) return false;
+            waiting = false;
+            return true;
+        }
+
+        static synchronized boolean waiting(long sweep) {
+            return sweep == id && sweep != 0 && waiting;
+        }
+
+        /** NWP-20261208-23: a copy of the recorded sweep's rows; null for another sweep. */
+        static synchronized String[] pkgs(long sweep) {
+            return sweep == id && sweep != 0 ? pkgs.clone() : null;
+        }
+
+        /** NWP-20261208-23: the sweep did not adopt the waiting card. It ends, and its card finishes at once. */
+        static synchronized void drop(long sweep) {
+            if (sweep == 0 || sweep != id) return;
+            done = true;
+            dropped = sweep;
+        }
+
+        /** NWP-20261208-23: a later begin replaced the waiting card's record, or the sweep dropped it. An adopted card
+         *  ({@link #go}) is not gone. */
+        static synchronized boolean gone(long sweep) {
+            return sweep == 0 || sweep != id || sweep == dropped;
+        }
+
+        /** NWP-20261208-23: true for the dropped card, also after a later begin replaced the record. */
+        static synchronized boolean dropped(long sweep) {
+            return sweep != 0 && sweep == dropped;
         }
 
         /** The sweep starts an app: its first row with no outcome is the installing row, or none when it has no such
@@ -220,6 +329,28 @@ final class LandingLine {
             resume = -1;
             for (int i = 0; i < pkgs.length; i++) {
                 if (settled[i] || !pkg.equals(pkgs[i])) continue;
+                installing = i;
+                break;
+            }
+            return installing != was;
+        }
+
+        /** NWP-20261210-25, the backlog row "For the first seconds after a tap, the landing card names the sweep's
+         *  first app while the notification downloads the tapped app": the sweep starts {@code pkg} while a tap holds
+         *  the materialise lock, and the notification names {@code named}. The card and the notification then name one
+         *  app: the installing row is the first row of {@code named} with no outcome, or none when it has no such row.
+         *  The sweep's own app reads its existing coming-back state until the sweep holds the lock and calls
+         *  {@link #started}. A null {@code named}, or {@code named} equal to {@code pkg}, is exactly {@link #started}.
+         *  Another sweep's id, an ended sweep or a null {@code pkg} changes nothing and returns false. Returns true when
+         *  the installing row changed. */
+        static synchronized boolean startedBehind(long sweep, String pkg, String named) {
+            if (named == null || named.equals(pkg)) return started(sweep, pkg);
+            if (sweep != id || done || pkg == null) return false;
+            int was = installing;
+            installing = -1;
+            resume = -1;
+            for (int i = 0; i < pkgs.length; i++) {
+                if (settled[i] || landed[i] || !named.equals(pkgs[i])) continue;
                 installing = i;
                 break;
             }
@@ -351,6 +482,13 @@ final class LandingLine {
         static synchronized boolean done(long sweep) {
             return sweep == 0 || sweep != id || done;
         }
+
+        /** NWP-20261207-12: a card sweep was begun and has not ended, so its card may still be up. A paused sweep is
+         *  open; a stopped or ended one is not. MediaLandingNoticeActivity.check asks it to put the media sentence in
+         *  the card rather than in a card of its own. */
+        static synchronized boolean open() {
+            return id != 0 && !done;
+        }
     }
 
     /** Show the card? Only on the switch-landing sweep ({@code landing}), with apps to fetch, for a known sign-in
@@ -358,5 +496,10 @@ final class LandingLine {
      *  stamp). */
     static boolean show(boolean landing, int toFetch, String shownFor, String thisSignIn) {
         return landing && toFetch > 0 && thisSignIn != null && !thisSignIn.equals(shownFor);
+    }
+
+    /** NWP-20261208-23: the waiting card's rows equal the running card's, in order. A null or empty side is never equal. */
+    static boolean sameRows(String[] a, String[] b) {
+        return a != null && b != null && a.length > 0 && b.length > 0 && java.util.Arrays.equals(a, b);
     }
 }

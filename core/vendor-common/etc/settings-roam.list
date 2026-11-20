@@ -6,3 +6,39 @@
 #   kind   absent for a plain value, or tiles for a comma list of Quick Settings tiles. Only one row has kind tiles.
 # A later slice adds a row here and changes no code.
 secure sysui_qs_tiles tiles
+system screen_off_timeout
+# Public Secure rows (NWP-20261210-23): each a user choice with a plain number value, written with WRITE_SECURE_SETTINGS.
+# Display: colour inversion, colour correction and its mode, high contrast text.
+secure accessibility_display_inversion_enabled
+secure accessibility_display_daltonizer_enabled
+secure accessibility_display_daltonizer
+secure high_text_contrast_enabled
+# Captions: on or off, the style preset, the text size.
+secure accessibility_captioning_enabled
+secure accessibility_captioning_preset
+secure accessibility_captioning_font_scale
+# Night Light schedule: the mode and the custom start and end times.
+secure night_display_auto_mode
+secure night_display_custom_start_time
+secure night_display_custom_end_time
+# Input: the touch-and-hold delay, the on-screen keyboard with a hardware keyboard, spell check.
+secure long_press_timeout
+secure show_ime_with_hard_keyboard
+secure spell_checker_enabled
+# Speech: the text-to-speech rate and pitch.
+secure tts_default_rate
+secure tts_default_pitch
+# Gesture: the camera on a double press of the power button.
+secure camera_double_tap_power_gesture_disabled
+#
+# Left out on purpose. test-settings-roam.sh's pin-deny refuses each of these.
+#   Identifiers and setup state: android_id, user_setup_complete. They name the device or the user's setup, not a choice.
+#   Package-keyed values: selected_spell_checker, tts_default_synth, tts_default_locale, the enabled_* service lists,
+#     the *_component and *_components rows, accessibility_shortcut_target_service, accessibility_button_targets.
+#     They name an app, which may not be installed at the next sign-in.
+#   Panel-bound values: night_display_color_temperature. Its range is the panel's own, so it does not move between devices.
+#   Keys with their own path: ui_night_mode, doze_always_on, accessibility_enabled, navigation_mode, the location_*
+#     rows, the always_on_vpn_* rows. Two writers of one key would race. Always-on display moves here in a later slice.
+#   Lock, biometric, doze and emergency rows: they belong to the device and its security, not to a session's choice.
+#   The Global table, never: it is device-wide, not per-user (Q012).
+#   The non-public System rows wait on the privileged chooser writer (#70, docs/product-decisions.md 2026-10-22).

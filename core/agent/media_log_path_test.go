@@ -29,7 +29,7 @@ var mlpPathIdents = map[string]bool{"rel": true, "target": true, "hidden": true,
 var mlpPathSels = map[string]bool{"f.rel": true, "f.path": true, "mt.target": true, "hdr.Name": true}
 
 // mlpKnownGood is a line that already quoted before this slice: the scan must have seen it, or it saw nothing.
-const mlpKnownGood = "mediad: profile %q empty/absent -> nothing to serve"
+const mlpKnownGood = "mediad: profile %s empty/absent -> nothing to serve"
 
 // mlpExempt is keyed "<file> <func> <quoted format>". A stale entry fails.
 var mlpExempt = map[string]string{
@@ -202,7 +202,7 @@ func TestMediaSyncSkippedLineIsScrubbed(t *testing.T) {
 	m := chunkManifest{Ess: map[string]essRegion{mlpRel: {S: 0, E: 1}}} // Chunks empty: fetchEssSpan refuses it
 	var wrote []string
 	out := captureStdout(t, func() {
-		wrote, _ = materializeCarried("", nil, m, []string{mlpRel}, t.TempDir(), deferredSyncBudget())
+		wrote, _ = materializeCarried("", nil, m, []string{mlpRel}, t.TempDir(), deferredSyncBudget(), nil)
 	})
 	if len(wrote) != 0 {
 		t.Fatalf("wrote %v", wrote)

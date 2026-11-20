@@ -192,18 +192,20 @@ func TestSealPruneReleaseEligible(t *testing.T) {
 	if !sealPruneReleaseEligible("sprel-elig") {
 		t.Error("a bare profile in cap mode is not eligible")
 	}
+	// NWP-20261116-56: the flag ships on, so the off case is set here, not assumed from package init.
+	old := scopeReleaseOn
+	t.Cleanup(func() { scopeReleaseOn = old })
+	scopeReleaseOn = false
 	if sealPruneReleaseEligible("sprel-elig#de") {
 		t.Error("a scope head is eligible while scopeReleaseOn is off")
 	}
-	// NWP-20261207-03: with the scope release on, a #de vault is eligible and #media is not (a later slice).
-	old := scopeReleaseOn
+	// NWP-20261207-03: with the scope release on, a #de vault is eligible; NWP-20261208-14: so is a #media one.
 	scopeReleaseOn = true
-	t.Cleanup(func() { scopeReleaseOn = old })
 	if !sealPruneReleaseEligible("sprel-elig#de") {
 		t.Error("a #de scope is not eligible with scopeReleaseOn")
 	}
-	if sealPruneReleaseEligible("sprel-elig#media") {
-		t.Error("a #media scope is eligible: its export pin and kept-manifest bound are a later slice")
+	if !sealPruneReleaseEligible("sprel-elig#media") {
+		t.Error("a #media scope is not eligible with scopeReleaseOn")
 	}
 	scopeReleaseOn = old
 	t.Setenv("NOWHERE_MULTIDEVICE", "1")

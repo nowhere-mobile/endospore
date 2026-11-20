@@ -107,6 +107,7 @@ cur_agent_lines() {
   q=$(goq "$1")
   printf '%s\n' \
     "push: profile $q p:1a2b #media" "[logind] roam-in $q -> user 12" \
+    "mediad: profile $q p:1a2b #media manifest v2: 0 deferred file(s), 56 essential chunk(s), userDir=/data/media/13" \
     "[logind] roam-in $q: open \"/data/x y\": permission denied" \
     "[logind] export $q: sealed 2048 bytes (7-day expiry applied)" \
     "[logind] export $q: Put \"https://s3.example/b/ref/<ref>\": EOF" \
@@ -133,6 +134,8 @@ KEEP=('[restore] skip "net.thunderbird.android/databases/global.db": denied'
   '[roamd] GRANT "zqkeep" #sys accounts placed ce=NO de=yes + reloaded -> user 11'
   '[roamd] GRANT "zqkeep" #sys placed a ROW-EMPTY accounts db -- NOT marking .had_account, so this account-less profile can still seal #sys (NWP-20260903-14)'
   '[roamd] seedssaid staged 0123ABCDEF.. user 11 (#210)'
+  'mediad: profile "zqkeep" p:1a2b #media manifest v2: 0 deferred file(s), 56 essential chunk(s), userDir=/data/media/13'
+  'push: profile "zqkeep" p:1a2b #media'
   '[logind] export "zqkeep": sealed 2048 bytes (7-day expiry applied)'
   '[logind] export "zqkeep": Put "https://s3.example/b/ref/<ref>": EOF'
   '[logind] pay-rent "zqkeep": pay-rent: cannot measure "zqkeep" p:1a2b -- refusing to renew a footprint it cannot see'
@@ -150,7 +153,7 @@ MUST=('net.thunderbird.android/databases/global.db' '#apps staged 3 pkg(s)' '(co
   'p:1a2b -- refusing to renew' ': open "<name>": permission denied' '(2/5): Put "<name>": EOF'
   '(3/5): Put "<name>": EOF'
   'cutoff [PARTIAL 189 2] in 12620ms' 'answered [OK] -- the reap' 'egress iface=wlan0 resolvers=[<net4>:53 1.1.1.1:53]'
-  'egress iface="<name>" resolvers=[<net4>:53]')
+  'egress iface="<name>" resolvers=[<net4>:53]' 'p:1a2b #media manifest v2: 0 deferred' 'push: profile "<name>" p:1a2b #media')
 
 # --- extraction ---------------------------------------------------------------------------------------------
 fn_of() { awk -v n="$2" '$0 == n "() {" {f=1} f{print} f&&/^\}$/{exit}' "$1"; }
@@ -421,6 +424,9 @@ if [ "$MUTATE" = yes ]; then
   mutate 'rule 2: it eats [restore] paths' roamd '/^\[restore\]/! s/"([^"\\]|\\.)*"' 's/"([^"\\]|\\.)*"'
   mutate 'rule 2: the split export/pay-rent heal is gone' roamd "$R2SPLIT; " ''
   mutate 'rule 2: that heal cuts the lines written today too' roamd '"<name>"([^:]|:[^ ]).*/' '"<name>".*/'
+  # NWP-20261203-27: a scope logProfile prints outside the quotes (`"x" p:<tag> #media`) must survive the scrub.
+  mutate 'rule 2 eats an agent scope printed outside the quotes' roamd "$R2" \
+    '/^\[restore\]/! s/"([^"\\]|\\.)*"( p:[0-9a-f]+ #[a-z]+)?/"<name>"/g'
   mutate 'rule 3: the backslash-remainder chain is gone' roamd "$R3CHAIN; " ''
   mutate 'rule 3: it takes one remainder, not a chain' roamd '"<name>"([^"]*\\"<name>")+/' '"<name>"[^"]*\\"<name>"/'
   mutate 'rule 3: the odd-quote heal is gone' roamd "$R3ODD; " ''

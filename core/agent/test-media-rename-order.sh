@@ -53,14 +53,14 @@ HELPER_M1='	if live {
 	}
 	return op()'
 CALL_OK='	live := nr.deferSet[newName] && !nr.srv.isDeleted(rel)
-	return supersedeAfter(nr.srv, rel, live, func() syscall.Errno {
+	errno := supersedeAfter(nr.srv, rel, live, func() syscall.Errno {
 		return r.LoopbackNode.Rename(ctx, name, newParent, newName, flags)
 	})'
 CALL_M3='	if nr.deferSet[newName] && !nr.srv.isDeleted(rel) {
 		nr.srv.markDeleted(rel)
 		dlog("mediad: RENAME over deferred %q (stub superseded by write-back)", rel)
 	}
-	return r.LoopbackNode.Rename(ctx, name, newParent, newName, flags)'
+	errno := r.LoopbackNode.Rename(ctx, name, newParent, newName, flags)'
 mutate "M1 the helper tombstones before op" "TestSupersedeAfter" 0 "$HELPER_OK" "$HELPER_M1"
 mutate "M2 the helper tombstones whatever op returns" "TestSupersedeAfter" 0 'if errno == 0 && live {' 'if live {'
 mutate "M3 Rename keeps the inline pre-op tombstone" "TestOverlayRenameFailedOverStub" 1 "$CALL_OK" "$CALL_M3"

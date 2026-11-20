@@ -18,7 +18,7 @@ public class StoreScreenCopyCases {
     }
 
     public static void main(String[] a) {
-        final String managedMsg = "This phone saves to the managed Nowhere store.";
+        final String managedMsg = "This phone saves to the managed nowhere store.";
         final String keysetMsg = "a key is already set — re-enter both keys to change it";
         final String noneMsg = "no store yet — set one up to create or unlock a profile";
 

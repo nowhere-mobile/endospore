@@ -460,9 +460,9 @@ func TestCurrentIndexKeyInconsistent(t *testing.T) {
 			ikfWrite(t, s, ikfFloor(3, env))
 			ikfWrite(t, h, string(other))
 		},
-		"damaged floor": func(s, h string) {
+		"damaged floor, held does not verify": func(s, h string) {
 			ikfWrite(t, s, "garbage\n")
-			ikfWrite(t, h, string(env))
+			ikfWrite(t, h, string(ikfRollover(ikfOtherKey(), 3, iktIndexKey(1))))
 		},
 		"held no longer verifies": func(s, h string) {
 			ikfWrite(t, s, ikfFloor(4, env))
@@ -479,3 +479,226 @@ func TestCurrentIndexKeyInconsistent(t *testing.T) {
 		})
 	}
 }
+
+// ikfOtherKey is a release key the phone does not trust (seed 5; the trusted one, iktUseKey's, is seed 9).
+func ikfOtherKey() ed25519.PrivateKey {
+	return ed25519.NewKeyFromSeed(bytes.Repeat([]byte{5}, 32))
+}
+
+// ikfDamagedFloors is TestIndexKeyAcceptDamagedFloorRefuses's table of damaged floors, around env's hash.
+func ikfDamagedFloors(env []byte) map[string]string {
+	return map[string]string{
+		"garbage":    "garbage\n",
+		"seq 0":      "0 " + ikfHash(env) + "\n",
+		"two lines":  "1 " + ikfHash(env) + "\n1 " + ikfHash(env) + "\n",
+		"no newline": "1 " + ikfHash(env),
+		"empty":      "",
+	}
+}
+
+// TestIndexKeyAcceptDamagedFloorRebuilt (h57 #7): a damaged floor is rebuilt from a held copy that verifies, and the
+// rebuilt floor still refuses an object at or below the held seq.
+func TestIndexKeyAcceptDamagedFloorRebuilt(t *testing.T) {
+	k := iktUseKey(t)
+	held := ikfRollover(k, 3, iktIndexKey(1))
+	for name, floor := range ikfDamagedFloors(held) {
+		t.Run(name, func(t *testing.T) {
+			seqPath, heldPath := ikfPaths(t)
+			ikfWrite(t, seqPath, floor)
+			ikfWrite(t, heldPath, string(held))
+
+			// An older object: refused against the rebuilt floor, which now names the held copy.
+			obj, err := acceptIndexKey(seqPath, heldPath, ikfRollover(k, 2, iktIndexKey(3)), iktNow)
+			if obj != nil || err == nil {
+				t.Fatalf("an object below the held seq was accepted past a damaged floor: %+v, %v", obj, err)
+			}
+			if got, _ := ikfRead(t, seqPath); got != ikfFloor(3, held) {
+				t.Fatalf("floor %q, want it rebuilt at the held seq 3", got)
+			}
+			if got, _ := ikfRead(t, heldPath); got != string(held) {
+				t.Fatal("the rebuild changed the held copy")
+			}
+
+			// The held object itself: accepted, nothing written.
+			writes := ikfCountSync(t)
+			obj, err = acceptIndexKey(seqPath, heldPath, held, iktNow)
+			if err != nil || obj == nil || obj.Seq != 3 || obj.Key != iktIndexKey(1) {
+				t.Fatalf("the held object was refused against its rebuilt floor: %+v, %v", obj, err)
+			}
+			if *writes != 0 {
+				t.Fatalf("the held object wrote %d file(s) against its rebuilt floor, want none", *writes)
+			}
+
+			// A higher object replaces both.
+			next := ikfRollover(k, 4, iktIndexKey(3))
+			obj, err = acceptIndexKey(seqPath, heldPath, next, iktNow)
+			if err != nil || obj == nil || obj.Seq != 4 {
+				t.Fatalf("a higher object was refused against the rebuilt floor: %+v, %v", obj, err)
+			}
+			if got, _ := ikfRead(t, seqPath); got != ikfFloor(4, next) {
+				t.Fatalf("floor %q, want seq 4", got)
+			}
+			if got, _ := ikfRead(t, heldPath); got != string(next) {
+				t.Fatal("held copy not replaced by the higher object")
+			}
+		})
+	}
+}
+
+// TestIndexKeyAcceptBothDamagedRefuses: a damaged floor with no held copy that verifies refuses every object and
+// writes nothing.
+func TestIndexKeyAcceptBothDamagedRefuses(t *testing.T) {
+	k := iktUseKey(t)
+	incoming := ikfRollover(k, 4, iktIndexKey(3))
+	for name, held := range map[string]*string{
+		"held absent":            nil,
+		"held garbage":           ikfPtr("garbage\n"),
+		"held signed by another": ikfPtr(string(ikfRollover(ikfOtherKey(), 3, iktIndexKey(1)))),
+	} {
+		t.Run(name, func(t *testing.T) {
+			seqPath, heldPath := ikfPaths(t)
+			ikfWrite(t, seqPath, "garbage\n")
+			if held != nil {
+				ikfWrite(t, heldPath, *held)
+			}
+			obj, err := acceptIndexKey(seqPath, heldPath, incoming, iktNow)
+			if obj != nil || !errors.Is(err, errIndexKeyFloorDamaged) {
+				t.Fatalf("both damaged, an object was let in: %+v, %v", obj, err)
+			}
+			if got, _ := ikfRead(t, seqPath); got != "garbage\n" {
+				t.Fatalf("both damaged, the floor was rewritten: %q", got)
+			}
+			got, ok := ikfRead(t, heldPath)
+			if held == nil && ok {
+				t.Fatal("both damaged, a held copy was written")
+			}
+			if held != nil && got != *held {
+				t.Fatal("both damaged, the held copy was changed")
+			}
+			for _, p := range []string{seqPath + ".tmp", heldPath + ".tmp"} {
+				if _, ok := ikfRead(t, p); ok {
+					t.Fatalf("%s left behind", p)
+				}
+			}
+		})
+	}
+	// The control: the same damaged floor with a held copy that verifies lets the same object in.
+	t.Run("control: held verifies", func(t *testing.T) {
+		seqPath, heldPath := ikfPaths(t)
+		ikfWrite(t, seqPath, "garbage\n")
+		ikfWrite(t, heldPath, string(ikfRollover(k, 3, iktIndexKey(1))))
+		if obj, err := acceptIndexKey(seqPath, heldPath, incoming, iktNow); err != nil || obj == nil || obj.Seq != 4 {
+			t.Fatalf("a held copy that verifies did not rebuild the floor: %+v, %v", obj, err)
+		}
+	})
+}
+
+// TestIndexKeyAcceptRebuildWriteFails: a floor rebuild that does not land is an error and the object is not used.
+func TestIndexKeyAcceptRebuildWriteFails(t *testing.T) {
+	k := iktUseKey(t)
+	seqPath, heldPath := ikfPaths(t)
+	held := ikfRollover(k, 3, iktIndexKey(1))
+	ikfWrite(t, seqPath, "garbage\n")
+	ikfWrite(t, heldPath, string(held))
+	old := indexKeyFileSync
+	indexKeyFileSync = func(f *os.File) error { return errors.New("sync failed") }
+	t.Cleanup(func() { indexKeyFileSync = old })
+	obj, err := acceptIndexKey(seqPath, heldPath, held, iktNow)
+	if err == nil || obj != nil {
+		t.Fatalf("an object was used past a floor rebuild that failed: %+v, %v", obj, err)
+	}
+	if got, _ := ikfRead(t, seqPath); got != "garbage\n" {
+		t.Fatalf("the damaged floor changed after a failed rebuild: %q", got)
+	}
+	if got, _ := ikfRead(t, heldPath); got != string(held) {
+		t.Fatal("the held copy changed after a failed rebuild")
+	}
+	if _, ok := ikfRead(t, seqPath+".tmp"); ok {
+		t.Fatal("the floor's temp file was left behind")
+	}
+	// The next fetch, with the write working again, rebuilds the floor.
+	indexKeyFileSync = old
+	if obj, err := acceptIndexKey(seqPath, heldPath, held, iktNow); err != nil || obj == nil || obj.Seq != 3 {
+		t.Fatalf("the retry after a failed rebuild was refused: %+v, %v", obj, err)
+	}
+	if got, _ := ikfRead(t, seqPath); got != ikfFloor(3, held) {
+		t.Fatalf("floor %q after the retry, want it rebuilt at seq 3", got)
+	}
+}
+
+// TestIndexKeyAcceptUnreadableFloorNotRebuilt: only a DAMAGED floor is rebuilt; an unreadable one stays a refusal.
+func TestIndexKeyAcceptUnreadableFloorNotRebuilt(t *testing.T) {
+	k := iktUseKey(t)
+	seqPath, heldPath := ikfPaths(t)
+	held := ikfRollover(k, 3, iktIndexKey(1))
+	if err := os.Mkdir(seqPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	ikfWrite(t, heldPath, string(held))
+	writes := ikfCountSync(t)
+	obj, err := acceptIndexKey(seqPath, heldPath, held, iktNow)
+	if obj != nil || !errors.Is(err, errIndexKeyFloorRead) {
+		t.Fatalf("an unreadable floor: %+v, %v, want errIndexKeyFloorRead", obj, err)
+	}
+	if *writes != 0 {
+		t.Fatalf("an unreadable floor wrote %d file(s), want none", *writes)
+	}
+	if fi, err := os.Stat(seqPath); err != nil || !fi.IsDir() {
+		t.Fatalf("the unreadable floor was replaced (stat %v, err %v)", fi, err)
+	}
+	if got, _ := ikfRead(t, heldPath); got != string(held) {
+		t.Fatal("the held copy changed")
+	}
+	// The control: the same held copy rebuilds a floor that is readable but damaged.
+	if err := os.Remove(seqPath); err != nil {
+		t.Fatal(err)
+	}
+	ikfWrite(t, seqPath, "garbage\n")
+	if obj, err := acceptIndexKey(seqPath, heldPath, held, iktNow); err != nil || obj == nil || obj.Seq != 3 {
+		t.Fatalf("a damaged floor was not rebuilt from the same held copy: %+v, %v", obj, err)
+	}
+}
+
+// TestCurrentIndexKeyDamagedFloorUsesHeld: with a damaged floor the held object, when it verifies, selects the key,
+// and currentIndexKey writes nothing.
+func TestCurrentIndexKeyDamagedFloorUsesHeld(t *testing.T) {
+	k := iktUseKey(t)
+	baked := ikfUseBaked(t)
+	cases := []struct {
+		name string
+		held *string
+		want string
+	}{
+		{"held rollover", ikfPtr(string(ikfRollover(k, 3, iktIndexKey(1)))), iktIndexKey(1)},
+		{"held revokes the baked key", ikfPtr(string(ikfRevoke(k, 3, baked))), ""},
+		{"held revokes another key", ikfPtr(string(ikfRevoke(k, 3, iktIndexKey(2)))), baked},
+		{"held garbage", ikfPtr("garbage\n"), ""},
+		{"held signed by another", ikfPtr(string(ikfRollover(ikfOtherKey(), 3, iktIndexKey(1)))), ""},
+		{"held absent", nil, ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			seqPath, heldPath := ikfPaths(t)
+			ikfWrite(t, seqPath, "garbage\n")
+			if c.held != nil {
+				ikfWrite(t, heldPath, *c.held)
+			}
+			writes := ikfCountSync(t)
+			if got := currentIndexKey(iktNow); got != c.want {
+				t.Fatalf("currentIndexKey = %q, want %q", got, c.want)
+			}
+			if *writes != 0 {
+				t.Fatalf("currentIndexKey wrote %d file(s), want none", *writes)
+			}
+			if got, _ := ikfRead(t, seqPath); got != "garbage\n" {
+				t.Fatalf("currentIndexKey rewrote the damaged floor: %q", got)
+			}
+			if _, ok := ikfRead(t, seqPath+".tmp"); ok {
+				t.Fatal("currentIndexKey left a floor temp file")
+			}
+		})
+	}
+}
+
+// ikfPtr is a pointer to s: a case's held copy, nil when it is absent.
+func ikfPtr(s string) *string { return &s }

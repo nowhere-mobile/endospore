@@ -347,7 +347,7 @@ elif mid == 'S6':
             android.util.Log.w("NowhereChooser", "last save line: card not started", t);
         }
 '''
-    t = rep(s, w + st, st + w)
+    t = rep(rep(s, st, ''), w, st + w)
 elif mid == 'S7':
     t = rep(s, '<activity android:name=".LastSaveNoticeActivity" android:exported="false"',
             '<activity android:name=".LastSaveNoticeActivity" android:exported="true"')

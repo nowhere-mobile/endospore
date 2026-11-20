@@ -19,7 +19,7 @@ import (
 //
 // NWP-20261124-10: SET-PIN, ROTATE, ENROLL-FIDO2, FIDO2-NFC-ENROLL-FINISH, SE-TIE and SE-UNTIE joined them. Each
 // waited in the same blocking Lock, so a PIN, passphrase, key or tie change the screen reported failed could land
-// minutes later. The two BUSY tests below cover all nine.
+// minutes later. NWP-20261208-16: REMOVE-FIDO2-KEY-NFC joined them. The two BUSY tests below cover all ten.
 
 // storeBusyRequests are the requests, each with its reply when sessionMu is free and dest holds no session. The
 // ROTATE request carries a too-short new passphrase, so handleRotate answers WEAK before any marker or store read: a
@@ -28,6 +28,7 @@ var storeBusyRequests = []struct{ verb, req, control string }{
 	{"ROLLBACK", "ROLLBACK\n0\n", "NONE"},                                              // handleRollback: no .roamsession
 	{"DELETE-SNAPSHOT", "DELETE-SNAPSHOT\n1\n", "NONE"},                                // handleDeleteSnapshot: no .roamsession
 	{"REMOVE-FIDO2-KEY", "REMOVE-FIDO2-KEY\nAAAA\n", "ERR-NOSESSION"},                  // the arm's own session check
+	{"REMOVE-FIDO2-KEY-NFC", "REMOVE-FIDO2-KEY-NFC\nAAAA\n", "ERR-NOSESSION"},          // handleRemoveFido2KeyNFC's session check
 	{"SET-PIN", "SET-PIN\n1234\n", "ERR-NOSESSION"},                                    // the arm reads the PIN, then the session
 	{"ROTATE", "ROTATE\nn\no\nshort\n", "WEAK too short — use at least 12 characters"}, // handleRotate: the floor answers first
 	{"ENROLL-FIDO2", "ENROLL-FIDO2\n", "ERR-NOSESSION"},                                // the arm's own session check

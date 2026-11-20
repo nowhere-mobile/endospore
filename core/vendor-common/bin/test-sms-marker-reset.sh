@@ -38,7 +38,7 @@ RM='      rm -f "$USERDIR/com.nowhere.chooser/files/nowhere-sms-applied" 2>>"$LO
 RM2='      rm -f "$USERDIR/com.nowhere.chooser/files/nowhere-roles-applied" 2>>"$LOG"'
 OKL='      echo "OK $uid" > "$RES"; _inres=OK'
 # the CE vault restore: the rm must come AFTER it, or the restore untars the marker straight back
-RESTORE='    elif od_shipped_prep && NOWHERE_PARK_KEEP="$(od_park_var keep)" NOWHERE_PARK_SHIPPED="$(od_park_var shipped)" NOWHERE_UNFETCHED_LIST="$(od_park_var ce)" NOWHERE_PHASE=apps NOWHERE_CLAIMS_SEED="$STATE/claims.seed" "$AGENT" restore s3 "$name" "$(pw "$pass")" "$USERDIR" >> "$LOG" 2>&1; then'
+RESTORE='    elif od_shipped_prep && NOWHERE_PARK_KEEP="$(od_park_var keep)" NOWHERE_PARK_SHIPPED="$(od_park_var shipped)" NOWHERE_UNFETCHED_LIST="$(od_park_var ce)" NOWHERE_PHASE=apps NOWHERE_CLAIMS_SEED="$STATE/claims.seed" NOWHERE_SE_SECRET="$(pwv "$_se_v")" NOWHERE_FIDO2_HMAC="$(pwv "$_fh_v")" "$AGENT" restore s3 "$name" "$(pw "$pass")" "$USERDIR" >> "$LOG" 2>&1; then'
 # the `in` op, numbered, comment lines dropped (a line whose first non-blank character is #)
 IN=$(awk '/^  in\)$/{on=1} on{print NR": "$0} on && /^    ;;$/{exit}' "$SUT" | grep -vE '^[0-9]+: [[:space:]]*#')
 CODE=$(printf '%s\n' "$IN" | sed -E 's/^[0-9]+: //')

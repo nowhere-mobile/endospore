@@ -35,6 +35,17 @@
 # copy. P1 plants another app's external hold: with the old slash/space filter, `..` joined the chooser's own
 # Android/data dir to /data/media/<uid>/Android in the recursive copy, and the arm force-stopped `..` first.
 #
+# Since NWP-20261208-13 the arm's last step is `od_extdata_watched "$pkg"`. The runner holds the REAL od_extdata_watched
+# (extracted by anchor, re-rooted, renamed od_extdata_watched_real) behind a stub that runs it with STATE empty, so it
+# takes its no-count-file form: exactly `reown_ext_appdata "$pkg"` then the -D relabel walk of <dir>, through this
+# suite's recorders. E1-E17 keep their meaning; the counted walks are test-odrestore-extdata-progress.sh's.
+#
+# Since NWP-20261209-04 that relabel walk is `od_walk prune 2 restorecon -D <dir> -xdev` (was `restorecon -R -D <dir>`),
+# and it runs only when <dir> exists. od_walk is a recorder here (its bounded find | xargs is test-od-relabel.sh's);
+# E1-E3 and E16, whose point is that the relabel runs, plant <dir>, and E7 pins that a missing <dir> takes no walk.
+# E18 pins the new reply: a walk that fails (od_walk returns 2 when sim/walkfail exists) answers ERR-NOTREADY, never
+# OK NOSRC.
+#
 # Since NWP-20261112-33 the arm runs under EVERY shell found (bash, sh, dash, mksh -- an `sh` that is one of the
 # others is skipped), not inside a bash `eval`: each case writes a runner file holding its variables, the ODHOLD=
 # line, the recorder stubs and `case "$op" in <the arm> esac`, and runs it with `"$sh"`, after `"$sh" -n` has parsed
@@ -91,7 +102,7 @@ reroot() { printf '%s\n' "$1" | sed -E 's#([" |])/data/#\1$ROOT/data/#g'; }
 nleft() { printf '%s\n' "$1" | sed -E 's/(^|[[:space:]])#.*$//' | sed 's#\$ROOT/data/##g' | grep -cE '(^|[^[:alnum:]_])/data/'; }
 
 suite() {  # suite <roamd.sh> <sh> [quiet] -> 0 all ok, 1 a case failed, 2 the harness could not run
-  local f="$1" sh="$2" quiet="${3:-}" p=0 x=0 ARM RA n R ODH PKGOK d
+  local f="$1" sh="$2" quiet="${3:-}" p=0 x=0 ARM RA n R ODH PKGOK d EXW
   say() { [ -n "$quiet" ] || printf '%s\n' "$1"; }
   # a FAIL line prints even when quiet: it is the mutant runner's evidence, per shell
   chk() {
@@ -112,6 +123,11 @@ suite() {  # suite <roamd.sh> <sh> [quiet] -> 0 all ok, 1 a case failed, 2 the h
   [ -n "$ODH" ] || { echo "EXTRACTION FAILED: ODHOLD= not found in $f" >&2; return 2; }
   PKGOK=$(awk -v a='pkgname_ok() {' '$0 == a {f=1} f{print} f&&/^}$/{exit}' "$f")
   case "$PKGOK" in *'return 1'*'return 0'*) ;; *) echo "EXTRACTION FAILED: pkgname_ok in $f" >&2; return 2 ;; esac
+  # NWP-20261208-13: the arm's last step, run in its no-count-file form (the stub in the runner sets STATE empty)
+  EXW=$(awk -v a='od_extdata_watched() {' '$0 == a {f=1} f{print} f&&/^}$/{exit}' "$f")
+  case "$EXW" in *'if [ -z "$cnt" ]; then'*'reown_ext_appdata "$pkg"; r=$?'*'od_walk '*'"$d"'*'exit "$r" )'*'return $?'*) ;; *) echo "EXTRACTION FAILED: od_extdata_watched in $f" >&2; return 2 ;; esac
+  EXW=$(reroot "$EXW" | sed '1s/^od_extdata_watched() {$/od_extdata_watched_real() {/')
+  [ "$(nleft "$EXW")" = 0 ] || { echo "RE-ROOT INCOMPLETE: od_extdata_watched keeps an absolute /data path" >&2; return 2; }
   RA=$(reroot "$ARM")
   n=$(printf '%s\n' "$RA" | grep -o '\$ROOT/data/' | grep -c .)
   [ "$n" -ge 8 ] || { echo "RE-ROOT FAILED: the odrestore arm has $n rewritten paths, want >= 8" >&2; return 2; }
@@ -151,7 +167,10 @@ pm() {
   return 0
 }
 stat() { awk -v p="$3" '$1 == p {print $2; f=1} END{exit !f}' "$ROOT/sim/owners"; }
+od_extdata_watched() { ( STATE=; od_extdata_watched_real "$@" ); }
+od_walk() { echo "od_walk $*" >> "$C"; [ -e "$ROOT/sim/walkfail" ] && return 2; return 0; }
 STUBS
+      printf '%s\n' "$EXW"
       printf 'case "$op" in\n%s\nesac\n' "$RA"
     } > "$1/run.sh"
   }
@@ -185,18 +204,20 @@ STUBS
     echo payload > "$1/data/$2/com.nowhere.chooser/.nowhere-odhold/$PKG/f.txt"
   }
   A="reown_ext_appdata $PKG"
+  # XW <dir>: the -D relabel walk od_extdata_watched runs on an existing ext data dir, as the od_walk recorder writes it
+  XW() { printf '%s' "od_walk prune 2 restorecon -D $1 -xdev"; }
 
   say "== [$sh] E1: no hold on any volume -> OK NOSRC, external re-own still runs =="
-  mkroot; D="$R/data/media/$UID_/Android/data/$PKG"
+  mkroot; D="$R/data/media/$UID_/Android/data/$PKG"; mkdir -p "$D"
   run_od "$sh" "$R" "$PKG"
   chk "E1 the reply is OK NOSRC" eqv "$(cat "$R/res" 2>/dev/null)" "OK NOSRC"
   chk "E1 reown_ext_appdata <pkg> ran" has "$R/sim/calls" "$A"
-  chk "E1 restorecon -R -D <ext data dir> ran" has "$R/sim/calls" "restorecon -R -D $D"
-  chk "E1 re-own before relabel" before "$R/sim/calls" "$A" "restorecon -R -D $D"
+  chk "E1 the -D relabel walk of <ext data dir> ran" has "$R/sim/calls" "$(XW "$D")"
+  chk "E1 re-own before relabel" before "$R/sim/calls" "$A" "$(XW "$D")"
   chk "E1 no force-stop without a hold" eqv "$(grep -c '^am ' "$R/sim/calls")" 0
 
   say "== [$sh] E2: a CE hold onto an app-owned dest -> OK <pkg>, data copied =="
-  mkroot; D="$R/data/media/$UID_/Android/data/$PKG"
+  mkroot; D="$R/data/media/$UID_/Android/data/$PKG"; mkdir -p "$D"
   plant_hold "$R" "user/$UID_"; mkdir -p "$R/data/user/$UID_/$PKG"
   echo "$R/data/user/$UID_/$PKG $OWNED" > "$R/sim/owners"
   run_od "$sh" "$R" "$PKG"
@@ -204,11 +225,11 @@ STUBS
   chk "E2 the held file landed in the dest" eqv "$(cat "$R/data/user/$UID_/$PKG/f.txt" 2>/dev/null)" payload
   chk "E2 the hold was consumed" eqv "$([ -d "$R/data/user/$UID_/com.nowhere.chooser/.nowhere-odhold/$PKG" ] && echo kept || echo gone)" gone
   chk "E2 reown_ext_appdata <pkg> ran" has "$R/sim/calls" "$A"
-  chk "E2 restorecon -R -D <ext data dir> ran" has "$R/sim/calls" "restorecon -R -D $D"
-  chk "E2 re-own before relabel" before "$R/sim/calls" "$A" "restorecon -R -D $D"
+  chk "E2 the -D relabel walk of <ext data dir> ran" has "$R/sim/calls" "$(XW "$D")"
+  chk "E2 re-own before relabel" before "$R/sim/calls" "$A" "$(XW "$D")"
 
   say "== [$sh] E3: a CE hold onto a dest that is not app-owned -> ERR-NOTREADY, hold kept, re-own still runs =="
-  mkroot; D="$R/data/media/$UID_/Android/data/$PKG"
+  mkroot; D="$R/data/media/$UID_/Android/data/$PKG"; mkdir -p "$D"
   plant_hold "$R" "user/$UID_"; mkdir -p "$R/data/user/$UID_/$PKG"
   echo "$R/data/user/$UID_/$PKG 0" > "$R/sim/owners"
   run_od "$sh" "$R" "$PKG"
@@ -216,7 +237,7 @@ STUBS
   chk "E3 the hold is kept" eqv "$(cat "$R/data/user/$UID_/com.nowhere.chooser/.nowhere-odhold/$PKG/f.txt" 2>/dev/null)" payload
   chk "E3 nothing copied into the dest" eqv "$([ -e "$R/data/user/$UID_/$PKG/f.txt" ] && echo copied || echo empty)" empty
   chk "E3 reown_ext_appdata <pkg> ran" has "$R/sim/calls" "$A"
-  chk "E3 restorecon -R -D <ext data dir> ran" has "$R/sim/calls" "restorecon -R -D $D"
+  chk "E3 the -D relabel walk of <ext data dir> ran" has "$R/sim/calls" "$(XW "$D")"
 
   say "== [$sh] E4: a hold on Android/data only -> handed back BEFORE the external re-own =="
   mkroot; D="$R/data/media/$UID_/Android/data/$PKG"
@@ -226,7 +247,7 @@ STUBS
   chk "E4 the held file landed in the external dest" eqv "$(cat "$D/f.txt" 2>/dev/null)" payload
   chk "E4 the external hold was already handed back when the re-own ran" eqv "$(cat "$R/sim/ext-at-reown" 2>/dev/null)" gone
   chk "E4 od_relabel of the hand-back precedes the re-own" before "$R/sim/calls" "od_relabel $R/data/media/$UID_/Android/data $D" "$A"
-  chk "E4 re-own precedes the relabel" before "$R/sim/calls" "$A" "restorecon -R -D $D"
+  chk "E4 re-own precedes the relabel" before "$R/sim/calls" "$A" "$(XW "$D")"
   chk "E4 reown_ext_appdata <pkg> ran" has "$R/sim/calls" "$A"
 
   say "== [$sh] E5: a bad package -> ERR-PKG and neither call =="
@@ -283,6 +304,7 @@ STUBS
   run_od "$sh" "$R" "$PKG"
   chk "E7 grant_perms_for <uid> <pkg> 0" has "$R/sim/calls" "$GP 0"
   chk "E7 the reply is OK NOSRC" eqv "$(cat "$R/res" 2>/dev/null)" "OK NOSRC"
+  chk "E7 no ext data dir -> no relabel walk, and the re-own still ran" eqv "$(grep -c '^od_walk ' "$R/sim/calls"):$(grep -cxF -- "$A" "$R/sim/calls")" 0:1
 
   say "== [$sh] E8: no hold, the record lists only look-alike packages -> DECLINES 0 (whole-line match) =="
   mkroot; plant_marker "$R" "${PKG}2" "x$PKG" "$PKG.extra"
@@ -351,7 +373,7 @@ STUBS
   steps_n() { grep -cE '^(grant_perms_for|a11y_apply|autofill_apply|keystore_register) ' "$1/sim/calls"; }
 
   say "== [$sh] E16: an archived placeholder, a CE hold onto a root-owned dest -> no grant steps, ERR-NOTREADY as E3 =="
-  mkroot; : > "$R/sim/pm-U"; : > "$R/data/system/packages.list"; D="$R/data/media/$UID_/Android/data/$PKG"
+  mkroot; : > "$R/sim/pm-U"; : > "$R/data/system/packages.list"; D="$R/data/media/$UID_/Android/data/$PKG"; mkdir -p "$D"
   plant_hold "$R" "user/$UID_"; mkdir -p "$R/data/user/$UID_/$PKG"
   echo "$R/data/user/$UID_/$PKG 0" > "$R/sim/owners"
   run_od "$sh" "$R" "$PKG"
@@ -359,7 +381,7 @@ STUBS
   chk "E16 the reply is ERR-NOTREADY" eqv "$(cat "$R/res" 2>/dev/null)" ERR-NOTREADY
   chk "E16 the hold is kept" eqv "$(cat "$R/data/user/$UID_/com.nowhere.chooser/.nowhere-odhold/$PKG/f.txt" 2>/dev/null)" payload
   chk "E16 reown_ext_appdata <pkg> ran" has "$R/sim/calls" "$A"
-  chk "E16 restorecon -R -D <ext data dir> ran" has "$R/sim/calls" "restorecon -R -D $D"
+  chk "E16 the -D relabel walk of <ext data dir> ran" has "$R/sim/calls" "$(XW "$D")"
   chk "E16 roam.log has the one 'no code' line" eqv "$(grep -cF -- "$NOCODE" "$R/roam.log" 2>/dev/null)" 1
 
   say "== [$sh] E17: an archived placeholder, no hold -> no grant steps, OK NOSRC as E1 =="
@@ -368,6 +390,13 @@ STUBS
   chk "E17 no grant_perms_for, a11y_apply, autofill_apply or keystore_register call" eqv "$(steps_n "$R")" 0
   chk "E17 the reply is OK NOSRC" eqv "$(cat "$R/res" 2>/dev/null)" "OK NOSRC"
   chk "E17 reown_ext_appdata <pkg> ran" has "$R/sim/calls" "$A"
+
+  say "== [$sh] E18: no hold, the ext data dir's relabel walk fails -> ERR-NOTREADY, not OK NOSRC =="
+  mkroot; D="$R/data/media/$UID_/Android/data/$PKG"; mkdir -p "$D"; : > "$R/sim/walkfail"
+  run_od "$sh" "$R" "$PKG"
+  chk "E18 the -D relabel walk of <ext data dir> ran" has "$R/sim/calls" "$(XW "$D")"
+  chk "E18 the reply is ERR-NOTREADY" eqv "$(cat "$R/res" 2>/dev/null)" ERR-NOTREADY
+  chk "E18 roam.log has the one Android/data hand-back WARN" eqv "$(grep -cF "WARN odrestore $PKG Android/data hand-back FAILED" "$R/roam.log" 2>/dev/null)" 1
 
   [ -z "$HARN" ] || { echo "HARNESS ERROR:$HARN" >&2; return 2; }
   say "[$sh] $p passed, $x failed"
@@ -381,7 +410,11 @@ for sh in "${SHELLS[@]}"; do suite "$SUT" "$sh"; r=$?; [ "$r" -gt "$rc" ] && rc=
 
 # --- mutants ------------------------------------------------------------------------------------------------
 # Each is a transform of roamd's text, by exact line; a mutant that changes nothing is a failure of the suite.
-L_RE='    reown_ext_appdata "$pkg"; restorecon -R -D "/data/media/$uid/Android/data/$pkg" 2>>"$LOG"'
+L_RE='    od_extdata_watched "$pkg"'
+# L_FB is in od_extdata_watched twice (the no-count-file pair, then the counted one); the mutants take the FIRST, the
+# form this suite runs, and the check below wants exactly two.
+L_FB='      if [ -d "$d" ]; then od_walk prune 2 restorecon -D "$d" -xdev || r=2; fi'
+L_XF='    if [ "$_odxf" = 2 ]; then'
 L_LOOP='    odn=0; odsrc=0; odkept=0'
 L_PROBE='    [ "$_first" = 1 ] || { grep -qxF -- "$pkg" "$USERDIR/com.nowhere.chooser/files/nowhere-od-materialised" 2>/dev/null && _first=1; }'
 L_FIRST='    _first="$_hold"'
@@ -392,7 +425,8 @@ L_A11Y='      a11y_apply "$uid" "$pkg"  # NWP-20261108-18: Q024 -- this app'"'"'
 L_GUARD='    pkgname_ok "$pkg" || { echo "[roamd] odrestore bad pkg $(date)" >> "$LOG"; echo "ERR-PKG" > "$RES"; chmod 600 "$RES"; exit 0; }'
 L_GUARD_OLD='    case "$pkg" in ""|*/*|*" "*) echo "[roamd] odrestore bad pkg $(date)" >> "$LOG"; echo "ERR-PKG" > "$RES"; chmod 600 "$RES"; exit 0;; esac'
 L_AF='      autofill_apply "$uid" "$pkg"  # NWP-20261112-12: Q078 -- this app'"'"'s carried autofill service, once per session (.autofilldone)'
-for l in "$L_RE" "$L_LOOP" "$L_PROBE" "$L_FIRST" "$L_APPID" "$L_KEPT_OWN" "$L_A11Y" "$L_AF" "$L_GUARD" '  odrestore)'; do
+[ "$(grep -cxF -- "$L_FB" "$SUT")" = 2 ] || { echo "EXTRACTION FAILED: want the relabel walk line twice in $SUT: $L_FB" >&2; exit 2; }
+for l in "$L_RE" "$L_XF" "$L_LOOP" "$L_PROBE" "$L_FIRST" "$L_APPID" "$L_KEPT_OWN" "$L_A11Y" "$L_AF" "$L_GUARD" '  odrestore)'; do
   [ "$(grep -cxF -- "$l" "$SUT")" = 1 ] || { echo "EXTRACTION FAILED: anchor line not unique in $SUT: $l" >&2; exit 2; }
 done
 # A mutant convicts only with rc 1 AND a FAIL line under each shell's own tag; rc 0 is NOT CONVICTED, rc 1 without
@@ -400,7 +434,7 @@ done
 mut() {
   local name="$1" prog="$2" t out r sh ev
   t=$(mktemp -p "$W")
-  awk -v RE="$L_RE" -v LOOP="$L_LOOP" -v PROBE="$L_PROBE" -v FIRST="$L_FIRST" -v APPID_L="$L_APPID" -v APPID_OLD="$L_APPID_OLD" \
+  awk -v RE="$L_RE" -v FB="$L_FB" -v XF="$L_XF" -v LOOP="$L_LOOP" -v PROBE="$L_PROBE" -v FIRST="$L_FIRST" -v APPID_L="$L_APPID" -v APPID_OLD="$L_APPID_OLD" \
       -v KEPT_OWN="$L_KEPT_OWN" -v A11Y="$L_A11Y" -v AF="$L_AF" -v GUARD="$L_GUARD" -v GUARD_OLD="$L_GUARD_OLD" "$prog" "$SUT" > "$t"
   if cmp -s "$t" "$SUT"; then echo "  FAIL  mutant did not apply: $name"; MFAIL=1; command rm -f "$t"; return; fi
   for sh in "${SHELLS[@]}"; do
@@ -419,9 +453,19 @@ echo "== mutants =="
 mut "the re-own line deleted" \
   '$0==RE{next} {print}'
 mut "the re-own line guarded by odsrc = 1" \
-  '$0==RE{print "    [ \"$odsrc\" = 1 ] && { reown_ext_appdata \"$pkg\"; restorecon -R -D \"/data/media/$uid/Android/data/$pkg\" 2>>\"$LOG\"; }"; next} {print}'
-mut "restorecon -R -D reduced to -R" \
-  '$0==RE{sub(/-R -D /,"-R ")} {print}'
+  '$0==RE{print "    [ \"$odsrc\" = 1 ] && od_extdata_watched \"$pkg\""; next} {print}'
+mut "restorecon -D reduced to plain restorecon (od_extdata_watched's no-count-file pair)" \
+  '$0==FB&&!m{sub(/restorecon -D /,"restorecon "); m=1} {print}'
+mut "the relabel walk loses its mountpoint prune (no-count-file pair)" \
+  '$0==FB&&!m{sub(/od_walk prune /,"od_walk none "); m=1} {print}'
+mut "the relabel walk loses -xdev (no-count-file pair)" \
+  '$0==FB&&!m{sub(/ -xdev /," "); m=1} {print}'
+mut "the relabel walk runs on a missing dir (E7)" \
+  '$0==FB&&!m{sub(/if \[ -d "\$d" \]; then /,"if true; then "); m=1} {print}'
+mut "a failed relabel walk is not a failure (E18)" \
+  '$0==FB&&!m{sub(/ \|\| r=2;/,";"); m=1} {print}'
+mut "a failed Android/data walk does not answer ERR-NOTREADY (E18)" \
+  '$0==XF{print "    if false; then"; next} {print}'
 mut "the re-own line moved above the volume loop" \
   '$0==RE{next} {print} $0==LOOP{print RE}'
 mut "the materialised-record probe removed (E6)" \

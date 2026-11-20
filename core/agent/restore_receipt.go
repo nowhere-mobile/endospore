@@ -237,6 +237,28 @@ func loginRosterHead(ref string) string {
 	return strings.TrimSpace(string(b))
 }
 
+// rosterManifest returns the content hash of the manifest a login-roster head names (NWP-20261119-33). The roster
+// records the HEAD sign-in restored (finishRestore's restoredHead). A bare-shaped head IS its sealed manifest; a scope
+// VAULT head -- every scope a passphrase change or a recovery re-pointed (buildScopeVault) -- is an envelope whose
+// Manifest field names it, exactly as resolveKeyHeadSEWith reads it. Before this, the seal's carry and the
+// after-gate lander handed the vault's own hash to classifyManifestLoad, which cannot open an envelope as a
+// manifest: load=3 every time, so on a re-pointed #media scope the lander never started and every sign-out after an
+// after-gate split was refused (lynx 2026111901, 2026-11-19). The sentinel and "" pass through untouched, and a head
+// that cannot be fetched or is not a vault comes back as rh, so the manifest read that follows fails or succeeds
+// exactly as it did before: never a different manifest than the one the head names.
+func rosterManifest(base, rh string) string {
+	if rh == "" || rh == loginRosterNone {
+		return rh
+	}
+	mh := rh
+	_ = recovered(func() {
+		if v, isV := parseVault(headBlobGet(base, rh)); isV && v.Manifest != "" {
+			mh = v.Manifest
+		}
+	})
+	return mh
+}
+
 // publishReceiptFile writes b to f by temp + rename in f's directory, so f is always either the previous
 // content or the new one: a reader's open fd keeps the old inode, and a failed write (a full state tmpfs)
 // never leaves a truncated file behind. On any failure the temp is removed and f is left exactly as it was.

@@ -426,7 +426,7 @@ mut 'M8 shouldShow takes "draft" as a prefix' cls 's/"draft"\.equals\(daemonRepl
 mut 'M9 shouldShow does not trim the reply' cls 's/"draft"\.equals\(daemonReply\.trim\(\)\)/"draft".equals(daemonReply)/'
 mut 'M10 the first-run thread passes true' act 's/final boolean agreement = OsAgreement\.shouldShow\(sendDaemon\("GET-OS-AGREEMENT\\n"\)\) && !osAgreementAccepted\(\);/final boolean agreement = true;/'
 mut 'M11 the button always enabled' act 's/accept\.setEnabled\(ok\);/accept.setEnabled(true);/'
-mut 'M12 ACK does not name Nowhere' cls 's/ Not Nowhere, and not anyone else\./ Not anyone else./'
+mut 'M12 ACK does not name Nowhere' cls 's/ Not nowhere, and not anyone else\./ Not anyone else./'
 mut 'M13 accept does not write the marker' act 's/\n[ \t]*setOsAgreementAccepted\(\);//'
 mut 'M14 a Skip control goes past the screen' act 's/(\n([ \t]*)ll\.addView\(accept, new LinearLayout\.LayoutParams\(MATCH, WRAP\)\);)/$1\n$2TextView skip = new TextView(this);\n$2skip.setText("Skip");\n$2skip.setOnClickListener(v -> next.run());\n$2ll.addView(skip);/'
 mut 'M15 BODY says nothing of yours stays on the phone' cls 's/Your profiles are not kept on this phone\./Nothing of yours stays on this phone./'

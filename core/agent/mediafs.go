@@ -20,6 +20,7 @@ import (
 
 	"github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
+	"golang.org/x/sys/unix"
 )
 
 // #84 P3b -- the go-fuse adapter over mediaServer (P3a): a mountable, read-only overlay per deferred-media dir.
@@ -45,6 +46,7 @@ type mediaRoot struct {
 	names    []string        // deferred basenames in this dir (sorted)
 	deferSet map[string]bool // names, as a set, for O(1) lookup
 	uid, gid uint32          // the owning app uid/gid to present for the injected files (DAC)
+	newOwner *fuse.Owner     // NWP-20261209-01: owner of an entry this overlay makes; nil = go-fuse's (the FUSE caller)
 
 	// byDir is the WHOLE mount's deferred index, rel dir -> basenames, SHARED by every node of this mount.
 	// NWP-20260829-08: one overlay now serves a subtree, not a single dir. NWP-20260829-07 collapsed the
@@ -71,9 +73,12 @@ func (r *mediaRoot) realPath() string {
 var (
 	_ = (fs.NodeOpendirHandler)((*mediaRoot)(nil))
 	_ = (fs.NodeLookuper)((*mediaRoot)(nil))
-	_ = (fs.NodeUnlinker)((*mediaRoot)(nil)) // #84 deletion: unlink a deferred stub
-	_ = (fs.NodeCreater)((*mediaRoot)(nil))  // #84 write-back: create a new/updated file (real bytes -> .under)
-	_ = (fs.NodeRenamer)((*mediaRoot)(nil))  // #84 write-back: rename a temp over a stub (OM's atomic update)
+	_ = (fs.NodeUnlinker)((*mediaRoot)(nil))  // #84 deletion: unlink a deferred stub
+	_ = (fs.NodeCreater)((*mediaRoot)(nil))   // #84 write-back: create a new/updated file (real bytes -> .under)
+	_ = (fs.NodeRenamer)((*mediaRoot)(nil))   // #84 write-back: rename a temp over a stub (OM's atomic update)
+	_ = (fs.NodeMkdirer)((*mediaRoot)(nil))   // NWP-20261209-01: a new dir takes the tree's owner and its mode
+	_ = (fs.NodeMknoder)((*mediaRoot)(nil))   // NWP-20261209-01: a new node takes the tree's owner and its mode
+	_ = (fs.NodeSymlinker)((*mediaRoot)(nil)) // NWP-20261209-01: a new symlink takes the tree's owner
 	_ = (fs.NodeGetattrer)((*mediaFile)(nil))
 	_ = (fs.NodeSetattrer)((*mediaFile)(nil)) // #84 write-back: an O_TRUNC/ftruncate materializes the stub
 	_ = (fs.NodeOpener)((*mediaFile)(nil))
@@ -171,6 +176,9 @@ func (r *mediaRoot) Unlink(ctx context.Context, name string) syscall.Errno {
 // the kernel looks up first and Lookup serves a live stub, so an O_CREAT over a stub arrives as OPEN
 // (openForWrite). The live arm is therefore an ordering pinned at source level (test-media-writeopen-order.sh). It
 // does not use supersedeAfter, whose log line says RENAME.
+//
+// A create that landed then gets the tree's owner and the mode its caller asked for (fixNew, NWP-20261209-01). This
+// is the path of the copy an app's ActivityThread makes when its rename into an overlay crossed a mount.
 func (r *mediaRoot) Create(ctx context.Context, name string, flags uint32, mode uint32, out *fuse.EntryOut) (*fs.Inode, fs.FileHandle, uint32, syscall.Errno) {
 	rel := path.Join(r.dir, name)
 	live := r.deferSet[name] && !r.srv.isDeleted(rel)
@@ -179,7 +187,109 @@ func (r *mediaRoot) Create(ctx context.Context, name string, flags uint32, mode 
 		r.srv.markDeleted(rel)
 		dlog("mediad: CREATE over deferred %q (stub superseded by write-back)", rel)
 	}
+	if errno == 0 {
+		r.fixNew(name, out.Attr.Ino, mode, true, &out.Attr)
+	}
 	return inode, fh, fuseFlags, errno
+}
+
+// Mkdir and Mknod make the entry through the loopback, then give it the tree's owner and its requested mode
+// (fixNew). Symlink gives the link the tree's owner only: a symlink has no mode of its own. Each returns the
+// loopback's result unchanged (NWP-20261209-01).
+func (r *mediaRoot) Mkdir(ctx context.Context, name string, mode uint32, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	inode, errno := r.LoopbackNode.Mkdir(ctx, name, mode, out)
+	if errno == 0 {
+		r.fixNew(name, out.Attr.Ino, mode, true, &out.Attr)
+	}
+	return inode, errno
+}
+
+func (r *mediaRoot) Mknod(ctx context.Context, name string, mode, rdev uint32, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	inode, errno := r.LoopbackNode.Mknod(ctx, name, mode, rdev, out)
+	if errno == 0 {
+		r.fixNew(name, out.Attr.Ino, mode, true, &out.Attr)
+	}
+	return inode, errno
+}
+
+func (r *mediaRoot) Symlink(ctx context.Context, target, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	inode, errno := r.LoopbackNode.Symlink(ctx, target, name, out)
+	if errno == 0 {
+		r.fixNew(name, out.Attr.Ino, 0, false, &out.Attr)
+	}
+	return inode, errno
+}
+
+// fixNewChown re-owns the entry behind fixNew's O_PATH descriptor (the link itself for a symlink). It is a variable
+// only so a test can record the owner fixNew asks for where the test process cannot chown (no root, no mapped group).
+var fixNewChown = func(fd, uid, gid int) error {
+	return unix.Fchownat(fd, "", uid, gid, unix.AT_EMPTY_PATH)
+}
+
+// fixNew gives an entry this overlay just made the tree's owner and, when setMode, the mode its caller asked for
+// (NWP-20261209-01). Two defects made the copy a messaging app's move left behind: the rename into an overlay crossed a
+// mount (EXDEV), the app's ActivityThread logged `Recovering failed rename` and copied the file in through Files.move,
+// and MediaProvider's pf_create created the copy here. (1) go-fuse's loopback chowns a new entry to the FUSE CALLER
+// (preserveOwner), MediaProvider's FUSE thread, where remap_tree gives the rest of the tree one owner at sign-in;
+// r.newOwner is that owner (mediaTreeOwner), nil keeps go-fuse's. (2) The loopback's open, mkdir and mknod run
+// inside mediad, so mediad's own umask (init's 077) masks a mode the kernel already filtered by the caller's umask
+// (the mount does not negotiate CAP_DONT_MASK): MediaProvider's 0664 landed as 0600. An explicit chmod is not
+// umask-filtered, the same remedy as the restore chmod (NWP-20260910-09). The seal archives the on-disk mode, and
+// MediaProvider reads the tree by group media_rw only, so a 0600 file would stay unreadable after the next sign-in.
+//
+// CONFINED: the entry is opened once, as an O_PATH descriptor resolved beneath the overlay's own root with no
+// symlink in ANY component (openat2 RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS), and both changes go through that one
+// descriptor. A path-based chmod after the op followed whatever the app put at that name meanwhile: a symlink there,
+// or in place of a parent dir, sent the chmod outside the tree with mediad's root privileges. ino, when not 0, is the
+// inode the op made (out.Attr.Ino is the raw st_ino): a different inode at the name is left alone. A final symlink
+// is re-owned (the link itself, AT_EMPTY_PATH) but never chmodded. The chmod goes through /proc/self/fd, which names
+// the descriptor's own inode: fchmod refuses an O_PATH descriptor, and fchmodat2 is newer than the 6.1 kernels. The
+// chmod comes after the chown, because a chown by root clears the setuid and setgid bits. Nothing here fails the
+// op: the entry exists, and the creator's owner and mode are the fallback. No log line carries a path or a name.
+func (r *mediaRoot) fixNew(name string, ino uint64, mode uint32, setMode bool, a *fuse.Attr) {
+	if r.newOwner == nil && !setMode {
+		return
+	}
+	rootFd, err := unix.Open(r.RootData.Path, unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		dlog("mediad: new entry not fixed, overlay root: %v", errCode(err))
+		return
+	}
+	defer syscall.Close(rootFd)
+	rel := path.Join(r.Path(r.RootData.RootNode.EmbeddedInode()), name)
+	fd, err := unix.Openat2(rootFd, rel, &unix.OpenHow{
+		Flags:   unix.O_PATH | unix.O_NOFOLLOW | unix.O_CLOEXEC,
+		Resolve: unix.RESOLVE_BENEATH | unix.RESOLVE_NO_SYMLINKS,
+	})
+	if err != nil {
+		dlog("mediad: new entry not fixed, confined open: %v", errCode(err))
+		return
+	}
+	defer syscall.Close(fd)
+	var st syscall.Stat_t
+	if err := syscall.Fstat(fd, &st); err != nil {
+		dlog("mediad: new entry not fixed, fstat: %v", errCode(err))
+		return
+	}
+	if ino != 0 && st.Ino != ino {
+		dlog("mediad: new entry not fixed: a different inode is at its name")
+		return
+	}
+	if r.newOwner != nil {
+		if err := fixNewChown(fd, int(r.newOwner.Uid), int(r.newOwner.Gid)); err != nil {
+			dlog("mediad: new entry kept its creator's owner: %v", errCode(err))
+		} else {
+			a.Owner = *r.newOwner
+		}
+	}
+	if !setMode || st.Mode&syscall.S_IFMT == syscall.S_IFLNK {
+		return
+	}
+	if err := unix.Fchmodat(unix.AT_FDCWD, "/proc/self/fd/"+strconv.Itoa(fd), mode&0o7777, 0); err != nil {
+		dlog("mediad: new entry kept mediad's umask'd mode: %v", errCode(err))
+		return
+	}
+	a.Mode = (a.Mode &^ 0o7777) | (mode & 0o7777)
 }
 
 // supersedeAfter runs op and, only when op landed (returned 0) over a live deferred stub, tombstones rel so the stub
@@ -202,6 +312,9 @@ func supersedeAfter(srv *mediaServer, rel string, live bool, op func() syscall.E
 // not vanish for a rename the app was told failed. go-fuse's loopback Rename extracts the destination's embedded
 // LoopbackNode and refuses a cross-root (different overlay) rename with EXDEV, so this only fires for a rename WITHIN
 // one overlay dir -- OM's case.
+//
+// A rename that landed gives the entry the tree's owner (fixNew without setMode, NWP-20261209-01), never a new mode:
+// the inode keeps the mode its creator gave it.
 func (r *mediaRoot) Rename(ctx context.Context, name string, newParent fs.InodeEmbedder, newName string, flags uint32) syscall.Errno {
 	nr, ok := newParent.(*mediaRoot)
 	if !ok {
@@ -209,9 +322,13 @@ func (r *mediaRoot) Rename(ctx context.Context, name string, newParent fs.InodeE
 	}
 	rel := path.Join(nr.dir, newName)
 	live := nr.deferSet[newName] && !nr.srv.isDeleted(rel)
-	return supersedeAfter(nr.srv, rel, live, func() syscall.Errno {
+	errno := supersedeAfter(nr.srv, rel, live, func() syscall.Errno {
 		return r.LoopbackNode.Rename(ctx, name, newParent, newName, flags)
 	})
+	if errno == 0 {
+		nr.fixNew(newName, 0, 0, false, &fuse.Attr{})
+	}
+	return errno
 }
 
 // mediaFile is one deferred file. getattr answers from the manifest (cheap, no fetch); a READ open materializes
@@ -526,6 +643,9 @@ func newMediaOverlay(srv *mediaServer, rootDir string, byDir map[string][]string
 		return &mediaRoot{srv: srv, dir: dir, names: names, deferSet: set, uid: uid, gid: gid, byDir: byDir}
 	}
 	root := mk(rootDir)
+	// NWP-20261209-01: a new entry takes the overlay root's owner (uid, gid) by default; serveMediaScope sets the
+	// final owner (mediaTreeOwner, or nil for the CE scope) before the mount.
+	root.newOwner = &fuse.Owner{Uid: uid, Gid: gid}
 	root.LoopbackNode = fs.LoopbackNode{RootData: &fs.LoopbackRoot{Path: underPath, Dev: uint64(st.Dev)}}
 	// Every child DIRECTORY becomes a mediaRoot for its own rel dir, so stubs are injected at any depth.
 	// go-fuse routes all six child-construction paths (Lookup/Mkdir/Mknod/Create/Symlink/Link) through this
@@ -538,6 +658,7 @@ func newMediaOverlay(srv *mediaServer, rootDir string, byDir map[string][]string
 			}
 			child := mk(path.Join(pd, name))
 			child.LoopbackNode = fs.LoopbackNode{RootData: rd}
+			child.newOwner = root.newOwner // NWP-20261209-01: set before the mount, so this reads the final value
 			return child
 		}
 		return &fs.LoopbackNode{RootData: rd}
@@ -818,6 +939,59 @@ func stageUnders(dirs map[string][]string, dir, hidden string) (map[string][]str
 	return sub, unders
 }
 
+// mediaMountAnchors widens the shared-media scope's mount set to each app's media root (NWP-20261209-01). For every
+// deferred dir Android/media/<pkg>/<more>, it adds the key Android/media/<pkg> with no names, when that dir exists
+// under userDir; mediaMountRoots then folds the app's dirs under it, so all of one app's media folders are ONE
+// mount. Why: each overlay is its own mount, and a rename between two mounts fails in the VFS with EXDEV before
+// mediad sees it. A messaging app downloads into Android/media/<pkg>/<App>/.Shared and moves the file into its
+// media folders; on EXDEV its ActivityThread logs `Recovering failed rename` and copies the file in, and on kernel
+// 6.18 MediaProvider's FUSE then failed every open of the copy with EIO until a seal (frankel, 2026-11-17). In one
+// mount the move reaches mediaRoot.Rename as a plain rename(2). The anchor has no names, so its node is plain
+// passthrough, and stageUnders maps the nested dirs. Never for the CE scope, Android/data, Android/obb or a
+// top-level dir. Returns a new map and the number of anchors added; dirs is not changed.
+func mediaMountAnchors(dirs map[string][]string, userDir string, shared bool) (map[string][]string, int) {
+	if !shared {
+		return dirs, 0
+	}
+	out := make(map[string][]string, len(dirs))
+	for d, ns := range dirs {
+		out[d] = ns
+	}
+	added := 0
+	for d := range dirs {
+		parts := strings.Split(d, "/")
+		if len(parts) < 4 || parts[0] != "Android" || parts[1] != "media" || parts[2] == "" {
+			continue
+		}
+		anchor := path.Join(parts[0], parts[1], parts[2])
+		if _, ok := out[anchor]; ok {
+			continue
+		}
+		if fi, err := os.Stat(filepath.Join(userDir, filepath.FromSlash(anchor))); err != nil || !fi.IsDir() {
+			continue
+		}
+		out[anchor] = nil
+		added++
+	}
+	return out, added
+}
+
+// mediaTreeOwner is the owner a new entry in the shared-media overlay rooted at dir takes (NWP-20261209-01): the
+// owner remap_tree gives the whole tree at sign-in (`stat -c '%u:%g'` of /data/media/<u>, nowhere_roamd.sh), except
+// under Android/data/<pkg> and Android/obb/<pkg>, which reown_ext_appdata gives to the app; there it is the overlay
+// root's own owner. nil (go-fuse's owner, today's behaviour) when userDir cannot be read.
+func mediaTreeOwner(userDir, dir string, rootSt syscall.Stat_t) *fuse.Owner {
+	parts := strings.Split(dir, "/")
+	if len(parts) >= 3 && parts[0] == "Android" && (parts[1] == "data" || parts[1] == "obb") {
+		return &fuse.Owner{Uid: rootSt.Uid, Gid: rootSt.Gid}
+	}
+	var st syscall.Stat_t
+	if err := syscall.Stat(userDir, &st); err != nil {
+		return nil
+	}
+	return &fuse.Owner{Uid: st.Uid, Gid: st.Gid}
+}
+
 // serveMediaScope resolves ONE profile scope's manifest, mounts an on-demand overlay over each of its deferred
 // dirs under userDir, and starts that scope's pin-materialize + Tier-2 background-prefetch goroutines. Returns
 // the mounts for the caller to tear down at SIGTERM. A scope with no deferred media (or an absent/legacy
@@ -827,20 +1001,20 @@ func stageUnders(dirs map[string][]string, dir, hidden string) (map[string][]str
 func serveMediaScope(base, name, pass, userDir, cacheDir, stateDir string) []mediaMount {
 	key, manifestBlob, ok := resolveKey(base, name, pass)
 	if !ok {
-		dlog("mediad: profile %q empty/absent -> nothing to serve", name)
+		dlog("mediad: profile %s empty/absent -> nothing to serve", logProfile(name))
 		return nil
 	}
 	pt := unseal(key, manifestBlob)
 	if !bytes.HasPrefix(pt, cdcMagic) {
-		dlog("mediad: profile %q legacy (no deferred index) -> nothing to serve", name)
+		dlog("mediad: profile %s legacy (no deferred index) -> nothing to serve", logProfile(name))
 		return nil
 	}
 	var m chunkManifest
 	if err := json.Unmarshal(pt[len(cdcMagic):], &m); err != nil {
-		dlog("mediad: manifest parse %q: %v", name, errCode(err))
+		dlog("mediad: manifest parse %s: %v", logProfile(name), errCode(err))
 		return nil
 	}
-	dlog("mediad: profile %q manifest v%d: %d deferred file(s), %d essential chunk(s), userDir=%s", name, m.Version, len(m.Deferred), len(m.Chunks), userDir)
+	dlog("mediad: profile %s manifest v%d: %d deferred file(s), %d essential chunk(s), userDir=%s", logProfile(name), m.Version, len(m.Deferred), len(m.Chunks), userDir)
 	// NWP-20260923-02: the vault no longer defers, and this sign-in's restore already put every deferred file
 	// it could on the phone (media_heal.go). Do not serve those. An overlay over a dir whose files are already
 	// real is not harmless: roamd cannot chown through it, which is how an on-demand app's data hand-back
@@ -848,7 +1022,7 @@ func serveMediaScope(base, name, pass, userDir, cacheDir, stateDir string) []med
 	// serve everything, as before this build. (#media still defers: healListFile is "" for it.)
 	m.Deferred = mediadHealFilter(name, pass, stateDir, m.Deferred)
 	if len(m.Deferred) == 0 {
-		dlog("mediad: profile %q has no deferred media -> nothing to serve", name)
+		dlog("mediad: profile %s has no deferred media -> nothing to serve", logProfile(name))
 		return nil
 	}
 	srv := newMediaServer(base, key, m, cacheDir)
@@ -916,8 +1090,14 @@ func serveMediaScope(base, name, pass, userDir, cacheDir, stateDir string) []med
 		dlog("mediad: recreated missing deferred dir %q", target)
 		srv.markIncomplete(pinnedApp(dir))
 	}
+	// NWP-20261209-01: one overlay per app media root, so an app's move between its own media folders stays a rename
+	// (mediaMountAnchors). After the scar-heal, so the anchor's stat sees the recreated dirs; before the collapse,
+	// which then folds the app's dirs under the anchor.
+	dirs, widened := mediaMountAnchors(dirs, userDir, isSharedMediaScope(name))
+	if widened > 0 {
+		dlog("mediad: %d overlay root(s) widened to an app media root (NWP-20261209-01)", widened)
+	}
 	for _, dir := range mediaMountRoots(dirs) {
-		names := dirs[dir]
 		// The .appcode exclusion and the #92 scar-heal both moved ABOVE the collapse (NWP-20260829-04):
 		// the first must run before an ancestor can inherit the staging dir, the second must cover the
 		// nested dirs this root now serves as passthrough. All that is left here is the stat the mount needs.
@@ -960,13 +1140,21 @@ func serveMediaScope(base, name, pass, userDir, cacheDir, stateDir string) []med
 			syscall.Unmount(hidden, syscall.MNT_DETACH)
 			continue
 		}
+		root.newOwner = nil // NWP-20261209-01: before the mount, so every node reads the final value
+		if isSharedMediaScope(name) {
+			root.newOwner = mediaTreeOwner(userDir, dir, st)
+		}
 		server, err := mediaMountServe(target, root, mediaMountOptions()) // NWP-20261205-08: fs.Mount plus the read-latency map
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "mediad: mount %q failed: %v\n", target, errCode(err))
 			syscall.Unmount(hidden, syscall.MNT_DETACH)
 			continue
 		}
-		dlog("mediad: mounted %d deferred file(s) across %d dir(s) over %q", len(names), len(sub), target)
+		names := 0 // the whole mount's count: an app media root (NWP-20261209-01) holds no deferred file of its own
+		for _, ns := range sub {
+			names += len(ns)
+		}
+		dlog("mediad: mounted %d deferred file(s) across %d dir(s) over %q", names, len(sub), target)
 		mounts = append(mounts, mediaMount{server: server, target: target, hidden: hidden})
 		// PUBLISH ONLY NOW. materialize resolves a file's real location through
 		// undersByDir[path.Dir(rel)], fetches the bytes, writes them there, and then markDeleted()s
@@ -985,10 +1173,10 @@ func serveMediaScope(base, name, pass, userDir, cacheDir, stateDir string) []med
 		}
 	}
 	if len(mounts) == 0 {
-		dlog("mediad: profile %q nothing mounted", name)
+		dlog("mediad: profile %s nothing mounted", logProfile(name))
 		return nil
 	}
-	dlog("mediad: serving %d overlay(s) for %q", len(mounts), name)
+	dlog("mediad: serving %d overlay(s) for %s", len(mounts), logProfile(name))
 
 	// #108: a PINNED app's deferred media is fetched to local + written into the passthrough dir (background),
 	// so it stops being deferred and the next seal keeps it essential (restored at login). No-op when nothing is

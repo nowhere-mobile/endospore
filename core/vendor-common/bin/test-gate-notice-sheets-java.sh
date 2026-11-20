@@ -14,8 +14,9 @@
 #      notice only after it is seen) whose slot-0 action is the clear, and the file clears it from that one place;
 #   S5 SheetDialog.show holds the sheet only when held: setCancelable(false) and setCanceledOnTouchOutside(false), else
 #      today's setCanceledOnTouchOutside(true); confirmHeld passes held, confirm and picker do not. The file sets
-#      setCanceledOnTouchOutside three times: the two branches, and slot()'s own true (NWP-20261206-05's slot sheet is
-#      shown through window(), not show()).
+#      setCanceledOnTouchOutside five times: the two branches, slot()'s own true (NWP-20261206-05's slot sheet is
+#      shown through window(), not show()), and the live sheet's progress() false and confirm() true; it sets
+#      setCancelable three times: the held branch and the live sheet's two (NWP-20261208-28).
 # Mutant X4 changes creditLost alone: otaNotes and creditLost share one builder, so creditLost gets its own "OK" body.
 # Mutant X9 also runs core/chooser/test-popup-rules.sh on the mutated tree, which must report the breach as NEW.
 #
@@ -136,7 +137,7 @@ pins() {
   # S5: the held branch and the not-held branch, each once, and the three callers' flags.
   if ! perl -0e 'my $s = $ARGV[0]; exit($s =~ /if \(held\) \{\s*dlg\.setCancelable\(false\);\s*dlg\.setCanceledOnTouchOutside\(false\);\s*\} else \{\s*dlg\.setCanceledOnTouchOutside\(true\);\s*\}/ ? 0 : 1)' "$(meth "$df" show)" \
      || ! has "$(cat "$df")" "private static void show(Dialog dlg, LinearLayout panel, boolean held) {" \
-     || [ "$(cnt "$(cat "$df")" 'setCancelable(')" != 1 ] || [ "$(cnt "$(cat "$df")" 'setCanceledOnTouchOutside(')" != 3 ] \
+     || [ "$(cnt "$(cat "$df")" 'setCancelable(')" != 3 ] || [ "$(cnt "$(cat "$df")" 'setCanceledOnTouchOutside(')" != 5 ] \
      || [ "$(cnt "$(meth "$df" slot)" 'dlg.setCanceledOnTouchOutside(true);')" != 1 ] \
      || ! has "$(meth "$df" confirmHeld)" "return confirmSheet(ctx, m, actions, null, true);" \
      || ! has "$(meth "$df" confirm)" "return confirmSheet(ctx, m, actions, onLink, false);" \

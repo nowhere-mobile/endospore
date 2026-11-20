@@ -170,6 +170,7 @@ func forgetSessionKeys(why string) {
 	fmt.Fprintf(os.Stderr, "[logind] KDF cache forgotten (%s) (dn-1106 #1)\n", why)
 	resetStorageCount()    // NWP-20261118-06: the session's last storage count is RAM only
 	forgetBillingLatches() // h60 #18 (NWP-20261201-37): the billing latches are keyed by the holder key
+	removeCredChange()     // NWP-20261208-05: the passphrase-change record never outlives its session
 }
 
 // headKey resolves the ref a profile's head CURRENTLY lives at: v2 if present (migrated or new), else the
@@ -1134,7 +1135,8 @@ func resolveKeyHead(base, name, pass string) (key, manifestBlob []byte, head str
 
 // resolveKeySession is resolveKey for the login DAEMON, with the session's secure-element secret passed in
 // (seFromSession). The plain form reaches the `se` slot only through NOWHERE_SE_SECRET, which only the roamd
-// worker exports (see openVaultDKSE), so in the daemon it cannot open a tied vault that has no fido2 slot:
+// worker (staged per agent call) and mediad hand to an agent (see openVaultDKSE), so in the daemon it cannot open a
+// tied vault that has no fido2 slot:
 // LIST-MEDIA-APPS answered ERR for exactly that profile (NWP-20260916-01).
 func resolveKeySession(base, name, pass string, seSecret []byte) (key, manifestBlob []byte, ok bool) {
 	k, m, _, o := resolveKeyHeadSE(base, name, pass, seSecret)
@@ -1387,8 +1389,9 @@ func seSlotCount(v *vault) int {
 // environment.
 //
 // ⚠ THE ENVIRONMENT IS NOT AN OPTION HERE, and that is the root of NWP-20260915-10 rather than a detail of
-// it. seDK (main.go) reads NOWHERE_SE_SECRET, and the ONLY exporter of that variable in the whole tree
-// is nowhere_roamd.sh's `export NOWHERE_SE_SECRET="$sesec"`, from the request file -- inside the su:s0 WORKER. The login daemon is a different process: its
+// it. seDK (main.go) reads NOWHERE_SE_SECRET, and only the su:s0 WORKER (nowhere_roamd.sh, which stages it from the
+// request file per agent call through pwv since NWP-20261205-18) and mediad (pw) ever hand it to an agent. The login
+// daemon is a different process: its
 // environment is fixed by nowhere_login.sh, which exports a closed list not containing it and then execs
 // the agent. So every in-process vault open in the daemon returns nil on a hardened profile. For ROTATE
 // that surfaced as "pass slot won't unwrap" -> BLANK -> "check your current passphrase", a false
@@ -2253,7 +2256,8 @@ func recoverVault(base, name, mnemonic, newpass string) (err error) {
 	recoveryDone = true // committed: the re-tag stands (NWP-20261009-02)
 	// NWP-20261013-21: the SIM bindings and sealed inbox are keyed by the ref this recovery just replaced. The old
 	// passphrase is lost, so the old ref is named by the one bindings owner holding the vault's kept telephony key.
-	carryTelephonyByTelPub(v.TelPub, profileRefV2(name, newpass))
+	// NWP-20261208-05: recoverReply records it.
+	handOutRecoverCarry(carryTelephonyByTelPub(v.TelPub, profileRefV2(name, newpass)))
 	// NWP-20260917-04: the plan follows the recovery -- and THIS is the case the slice exists for. You
 	// recover precisely when somebody may hold your old passphrase, so losing the plan here punishes the
 	// one action we most want people to take.
@@ -2927,15 +2931,20 @@ func handlePinStatus(conn net.Conn, dest, base string) {
 // already does (floorCheckCLI). The check runs before the words are parsed and before any store read. It depends
 // only on the typed name and new passphrase, so it answers the same for any name and any words and says nothing
 // about which profiles exist: blind login holds.
+//
+// NWP-20261208-05: on OK it writes the recovery's session-scope outcome record (cred_change_status.go) from the
+// telephony carry recoverVault handed out; the reply is unchanged.
 func recoverReply(name, mnemonic, newpass string) string {
 	if floorEnforced() {
 		if ok, reason := passphraseStrong(name, newpass); !ok {
 			return "WEAK " + reason
 		}
 	}
+	takeRecoverCarry() // NWP-20261208-05: drop a carry an earlier recovery left
 	err := daemonVaultErr(func() error { return recoverVault("s3", name, mnemonic, newpass) })
 	switch {
 	case err == nil:
+		writeRecoverCredChange(name, newpass) // NWP-20261208-05
 		return "OK"
 	case errors.Is(err, errRecoverMoved): // before the unwrap case: a moved error carries both
 		return "ERR-MOVED"
@@ -3139,10 +3148,11 @@ var (
 // protects the seal -- it holds even if a future caller here gets it wrong.
 func laneFor(op string) workerLane {
 	switch op {
-	case "storagebreakdown", "sealdelta", "uiderrors", "alarmrelay", "gmsexits":
+	case "storagebreakdown", "sealdelta", "uiderrors", "alarmrelay", "gmsexits", "mediaexits":
 		// uiderrors: NWP-20261010-06, one framework file read. alarmrelay: NWP-20261108-02 (Q183), one
 		// `am startservice` of the session's own service; it rides here so a cold lock taken behind an abandoned RW
 		// op still relays the next alarm. gmsexits: NWP-20261201-02, one `dumpsys activity exit-info`, uid only.
+		// mediaexits: NWP-20261208-06, two `dumpsys activity exit-info` reads, one per media module name, uid only.
 		return laneRO
 	case "playrestart":
 		// NWP-20261201-10: a health notice's Fix, one `am force-stop` of Play services in the session's user.
@@ -3212,6 +3222,10 @@ func workerWaitCap(op string) time.Duration {
 	case "gmsexits":
 		// NWP-20261201-02: one dumpsys for an issue report, whose preview the user is waiting on. Inside gmsExitsWait,
 		// so a busy lane answers "not-collected-lane" before the report's own wait ends.
+		return 10 * time.Second
+	case "mediaexits":
+		// NWP-20261208-06: two dumpsys reads for an issue report, whose preview the user is waiting on. Inside
+		// mediaExitsWait, so a busy lane answers "not-collected-lane" before the report's own wait ends.
 		return 10 * time.Second
 	case "healthprobe":
 		// NWP-20261201-08: a periodic check nobody waits for. A busy answer is one unmeasured check, and the next
@@ -3341,6 +3355,12 @@ func retryStoreWithin(what string, window time.Duration, op func() error) error 
 	return retryStoreWithinGuarded(what, window, nil, op)
 }
 
+// storeStallRetries bounds the attempts one retryStoreWithinGuarded call may start PAST its window (NWP-20261210-02):
+// an attempt cut by storeXferStall while a body byte arrived on some connection since it began is the link being
+// shared, not the store being dead, so it is retried even when the window is spent -- at most this many times per
+// call, each bounded by storeXferStall and storeXferDeadline. A dead store moves no byte and never earns one.
+const storeStallRetries = 2
+
 // retryStoreWithinGuarded is retryStoreWithin with a late step's guard (h46 #1, late_work.go; nil = always) asked
 // before EVERY attempt, the first and each retry: once it says no, no new request begins and errLateWriteDenied is
 // returned. An attempt already running is left alone. A denial is not a store answer, so it is never noted.
@@ -3348,6 +3368,7 @@ func retryStoreWithinGuarded(what string, window time.Duration, mayWrite func() 
 	const attempts = storeRetryAttempts
 	start := time.Now()
 	var err error
+	stallRetries := 0 // NWP-20261210-02: attempts started past the window, at most storeStallRetries
 	for i := 0; ; i++ {
 		// NWP-20261028-02: armed (a sign-in's restore, a DELETE), a store silent for storeGiveUpWindow is not
 		// retried again in this process; unarmed, storeGivenUp is always false and nothing below changes.
@@ -3372,6 +3393,15 @@ func retryStoreWithinGuarded(what string, window time.Duration, mayWrite func() 
 			return err
 		}
 		if time.Since(start)+(s3RetryBase<<i) > window {
+			// NWP-20261210-02: a stall while the link carried bytes since this attempt began (its own early bytes
+			// included) is not a dead store; it is retried past the window, a bounded number of times.
+			if errors.Is(err, errStoreXferStall) && storeXferByteAt.Load() >= t0.UnixNano() && stallRetries < storeStallRetries {
+				stallRetries++
+				fmt.Fprintf(os.Stderr, "  retry %s (%d/%d): stalled while the link carried bytes -- retried past the %v window (NWP-20261210-02)\n",
+					logSafeWhat(what), i+2, attempts, window)
+				time.Sleep(s3RetryBase << i)
+				continue
+			}
 			fmt.Fprintf(os.Stderr, "  retry %s stopped at %d/%d: the %v retry window is spent: %s\n",
 				logSafeWhat(what), i+1, attempts, window, logSafeStoreErr(what, err))
 			return err
@@ -3756,7 +3786,12 @@ func capGet(key string) ([]byte, bool) { return capGetMax(key, 0) }
 // included), so with gwDefault 30 s one attempt costs up to 2 x 30 + 30 = 90 s (NWP-20261203-10). retryStoreWithin
 // starts the last attempt at most window after the first, the backoff before it included, so the worst case for
 // one hung chunk read is window + 90 s; the budget test also adds the largest backoff (s3RetryBase << 3 = 1.6 s)
-// to stay pessimistic: 15 + 90 + 1.6 = 106.6 s, under roamStallBudget (150 s) with 43.4 s to spare. A GET whose
+// to stay pessimistic: 15 + 90 + 1.6 = 106.6 s, under roamStallBudget (150 s) with 43.4 s to spare. That is the
+// DEAD-STORE worst case and NWP-20261210-02 leaves it unchanged. Superseded in part by NWP-20261210-02: a stall no
+// longer always ends the read. When a body byte arrived on any connection since the stalled attempt began, the link
+// carries bytes and retryStoreWithinGuarded may add up to storeStallRetries attempts past the window, each bounded
+// by storeXferStall or storeXferDeadline; a dead store moves no byte and gets none. materializeapp's worker stall
+// watchdog (roamStallBudget) still bounds an app fetch whose head chunk is retried. A GET whose
 // bytes FLOW is bounded by storeXferDeadline instead, at most storeXferCeil (10 min); a sign-in restore runs on
 // roamInStallTicks (900 s), longer than that ceiling. Fast failures (a reset, #70; the stale-cap 403, #139) still
 // get all five attempts: their backoffs total 3.0 s. TestCapGetFitsTheStallBudget holds these together.
@@ -7283,6 +7318,7 @@ func pushProfile(base, profile, pass, src string) {
 	// NWP-20261123-04: the #media no-change record is published HERE, registered before the flush so it runs after
 	// it: it names only a head the store holds. A capFlush that panics leaves mnoFlushed false and the record removed.
 	var mnoPending *mediaNoChangePending
+	var mnoDigest string // NWP-20261204-22: the walk digest folded with the tombstones key, taken once at the walk
 	mnoFlushed := !capMode()
 	defer func() {
 		if mnoPending == nil {
@@ -7291,7 +7327,9 @@ func pushProfile(base, profile, pass, src string) {
 		sealExpectMu.Lock()
 		refusedPtr := sealStaleHit || sealFenceHit // set by capFlush, which has run: this push's own bracket
 		sealExpectMu.Unlock()
-		mediaNoChangeCommit(mnoPending, mnoFlushed, refusedPtr)
+		if why := mediaNoChangeCommit(mnoPending, mnoFlushed, refusedPtr); why != "" {
+			fmt.Printf(mediaNoChangeNotKeptLine, logProfile(profile), why)
+		}
 	}()
 	// NWP-20261204-06: the chunks this seal's retention dropped are released AFTER the flush (registered before it, so
 	// LIFO runs it after): only a head that landed may stop naming them (seal_prune_release.go). It never changes the
@@ -7423,8 +7461,10 @@ func pushProfile(base, profile, pass, src string) {
 	// save and no reason to hold the session open. The bare guard below reached this same conclusion for
 	// the identical situation and returns clean -- which is exactly why the bare vault has never wedged a
 	// logoff. Match it. Loud in the log, invisible to the exit code.
+	bareHead := "" // the bare head the guard below reads; a bare-shaped scope push checks its release generation (NWP-20261208-15)
 	if i := strings.IndexByte(profile, '#'); i > 0 {
-		if bare := profileRefV2(profile[:i], pass); getRef(base, bare) == "" && refExists(base, bare) {
+		bare := profileRefV2(profile[:i], pass)
+		if bareHead = getRef(base, bare); bareHead == "" && refExists(base, bare) {
 			fmt.Printf("push: profile %s bare head is a TOMBSTONE (this profile was deleted, or its"+
 				" passphrase was changed on another device) -> skip: sealing this scope would store data no"+
 				" login can ever reach. Nothing was stored, and the sign-out is NOT blocked.\n",
@@ -7519,12 +7559,18 @@ func pushProfile(base, profile, pass, src string) {
 	// all dedup through blobCacheKnown, so a stale entry would publish a manifest naming a collected chunk. A bare
 	// seal whose head's release generation differs from the one recorded for this head drops the cache first.
 	// BARE ONLY: snapshots are the bare vault's History, and scope chunks are sealed under other keys so they can
-	// never equal a bare chunk. (Superseded by NWP-20261207-03: a #de, #sys, #keys or #apps head that is a VAULT is
+	// never equal a bare chunk. (Superseded by NWP-20261207-03 and NWP-20261208-14: a #de, #sys, #keys, #apps or
+	// #media head that is a VAULT is
 	// checked too, under its own head key, because its seal-time prune release bumps its generation; a bare-shaped
 	// scope head carries no generation and never reads or writes the record. The cache is shared, so a scope's drop
 	// leaves the bare record over an emptier cache: the safe direction. FLEET WINDOW: an image without this check
 	// keeps a scope cache across a sign-out and could re-publish a released chunk, so the scope release itself ships
-	// off, scopeReleaseOn.) Cost: one seal that re-chunks and re-leases the whole scope (the gateway's `present`
+	// off, scopeReleaseOn.) (Superseded in part by NWP-20261208-15: a bare-shaped #de, #sys, #keys, #apps or #media
+	// push also checks the BARE vault's generation, relGenAtBareShapedScope, because a bare seal releases the chunks
+	// the bare-shaped scope seals recorded and bumps only that generation. It ships on whatever scopeReleaseOn says, so
+	// a handset on this image distrusts before any handset releases. Residual: between another handset's bare push and
+	// its scope push in one round, its cache can still name a released chunk, the same accepted window as a vault
+	// head's CAS-less read.) Cost: one seal that re-chunks and re-leases the whole scope (the gateway's `present`
 	// keeps it to no upload). ref == relGenHeadKey(base, profile, pass).
 	relGen := uint64(0) // a legacy or absent head is generation 0
 	if v != nil {
@@ -7532,6 +7578,9 @@ func pushProfile(base, profile, pass, src string) {
 	}
 	if (!strings.Contains(profile, "#") || (v != nil && relGenScope(profile))) && distrustBlobCacheIfReleased(blobCachePath(), ref, relGen) {
 		fmt.Printf("push: profile %s: a snapshot was deleted since this phone's chunk cache was filled -- the cache is dropped for this seal (release generation %d)\n", logProfile(profile), relGen)
+	}
+	if v == nil && scopeDropChecksBare(profile) {
+		relGenAtBareShapedScope(base, profile, pass, bareHead)
 	}
 	if capMode() {
 		capSetSession(profile, pass, dk) // fold the post-spend wallet into this seal's flush (free)
@@ -7876,6 +7925,10 @@ func pushProfile(base, profile, pass, src string) {
 	// and the carry or the guard then forget it. walkExcl is the list minus the drop set: an Off app is a deletion,
 	// priced by the walk's drop branch, never excluded as unfetched.
 	unfList, unfListOK, walkExcl := sealUnfetchedList(profile)
+	var appsEv appsSealCounts // NWP-20261208-01: this #apps seal's carry counts, for the next sign-in's issue report
+	if strings.HasSuffix(profile, "#apps") {
+		removeAppsSeal(os.Getenv("NOWHERE_STATE"), profile, pass) // a seal refused before the carry leaves no older record
+	}
 	if incrementalSeal() {
 		// Incremental (#69): walk files, chunk file-aligned, and skip re-reading unchanged large files via the
 		// scan cache. A periodic full re-hash self-heals a content change that kept an identical mtime+size.
@@ -7894,10 +7947,14 @@ func pushProfile(base, profile, pass, src string) {
 			// NWP-20261128-01: roamd's dormant shape of each On-demand/Auto package it carried, adopted only when the
 			// stored app index has no line for it (a head sealed before 0.5.51). A count, never names: roam.log.
 			if dd := os.Getenv("NOWHERE_APPS_DORMANT"); dd != "" && strings.HasSuffix(profile, "#apps") {
+				appsEv.dormant = len(appManifestLines(dd)) // NWP-20261208-01: what roamd offered, read before the adoption moves it
 				if ad, aerr := adoptDormantApps(src, dd, oldM.Apps, effDrop); aerr != nil {
 					fmt.Printf("push: profile %s dormant adoption failed (%v) -- adopting nothing this seal\n", logProfile(profile), aerr)
-				} else if len(ad) > 0 {
-					fmt.Printf("push: profile %s adopted %d dormant package(s) the stored app index does not name\n", logProfile(profile), len(ad))
+				} else {
+					appsEv.adopted = len(ad)
+					if len(ad) > 0 {
+						fmt.Printf("push: profile %s adopted %d dormant package(s) the stored app index does not name\n", logProfile(profile), len(ad))
+					}
 				}
 			}
 			carryPkgs = carryablePackages(src, oldM.Apps, effDrop)
@@ -7908,6 +7965,7 @@ func pushProfile(base, profile, pass, src string) {
 				fmt.Printf("push: profile %s app-index union failed (%v) -- carrying nothing this seal\n", logProfile(profile), uerr)
 				carryPkgs = nil
 			} else {
+				appsEv.carried, appsEv.dropped = len(added), len(removed) // NWP-20261208-01
 				if len(added) > 0 {
 					// NWP-20261119-02: a count, never the names. This stdout reaches roam.log, which outlives every
 					// wipe, and a periodic seal now carries every on-demand/auto app whose list paths are stale.
@@ -7919,6 +7977,10 @@ func pushProfile(base, profile, pass, src string) {
 			}
 			if n := notRestoredCarried(profile, pass, carryPkgs); n > 0 { // h47 #2, NWP-20261207-08: a count, never names
 				fmt.Printf("push: profile %s %d carried package(s) were not restored at this sign-in: kept from the last save (h47 #2)\n", logProfile(profile), n)
+			}
+			if strings.HasSuffix(profile, "#apps") { // NWP-20261208-01: counts only, never names
+				appsEv.stored, appsEv.guard = len(oldM.Apps), "none"
+				writeAppsSeal(os.Getenv("NOWHERE_STATE"), profile, pass, appsEv)
 			}
 		}
 		// effThreshold is what the walk ACTUALLY used, which is not always what sealFileThreshold() says --
@@ -7961,18 +8023,28 @@ func pushProfile(base, profile, pass, src string) {
 		gRead, gReadD := sc.groupReadStats()
 		fmt.Printf("push: profile %s %s\n", logProfile(profile), walkCostLine(wcBefore, walkCostNow(), gRead, gReadD, time.Since(walkT0)))
 		fmt.Printf("push: profile %s changed since the last seal: %s\n", logProfile(profile), sealWriterLine(sc.sealWriterStats(), forceFull))
+		// NWP-20261203-29: how many local files sat in the unfetched package dirs the walk skipped. Counts only.
+		if sealStats.unfLocalPkgs > 0 {
+			fmt.Print(unfetchedLocalLine(profile, sealStats))
+		}
 		// NWP-20261123-04: a #media walk equal to the last landed seal's, over the same head, ends here -- no carry,
-		// no manifest, no lease, no head write (media_nochange.go has every condition).
+		// no manifest, no lease, no head write (media_nochange.go has every condition). NWP-20261204-22: the digest
+		// folds in the tombstones key, read here, before the full path reads the tombstones; a refused exit prints
+		// one line naming its guard.
 		if isSharedMediaScope(profile) {
 			walkD := time.Since(walkT0).Round(time.Millisecond)
 			pwg.Wait()
-			if mediaNoChange(mediaNoChangeIn{tag: cct, head: head, rcptHead: restoreReceiptHead(rcptRef), digest: sealStats.digest,
-				src: src, forceFull: forceFull, blind: sealBlind, dropped: sealDropped, discard: len(sealDiscard),
-				deferred: len(deferredR), perr: perr}) {
+			tk, tok := mediaTombstonesKey(src)
+			mnoDigest = mediaNoChangeDigest(sealStats.digest, tk, tok)
+			why := mediaNoChangeReason(mediaNoChangeIn{tag: cct, head: head, rcptHead: restoreReceiptHead(rcptRef), digest: mnoDigest,
+				forceFull: forceFull, blind: sealBlind, dropped: sealDropped, discard: len(sealDiscard),
+				deferred: len(deferredR), perr: perr})
+			if why == "" {
 				stopProg()
 				fmt.Printf(mediaNoChangeLine, logProfile(profile), short(head), walkD)
 				return
 			}
+			fmt.Printf(mediaNoChangeFullLine, logProfile(profile), why, mediaTombstonesCount(src))
 		}
 	} else {
 		pr, pw := io.Pipe()
@@ -8257,7 +8329,7 @@ func pushProfile(base, profile, pass, src string) {
 			if rh == loginRosterNone {
 				restoredM = chunkManifest{EssIdx: true}
 			} else {
-				restoredM, rl = classifyManifestLoad(base, dk, rh)
+				restoredM, rl = classifyManifestLoad(base, dk, rosterManifest(base, rh)) // NWP-20261119-33: a vault head names its manifest
 			}
 			switch {
 			case rl != mlOK:
@@ -8442,6 +8514,7 @@ func pushProfile(base, profile, pass, src string) {
 	var goneIdx map[string]int64
 	if carryEssential() {
 		appsIdx = appManifestLines(src)
+		appsEv.published = len(appsIdx) // NWP-20261208-01
 		// The tombstone set for the head about to be written. `present` is what this seal actually accounts
 		// for -- the walk's own attribution, its deferred entries, and anything carried -- so a package that
 		// came BACK (the keep-set rescued it out of the drop set) clears its tombstone simply by being here.
@@ -8968,6 +9041,11 @@ func pushProfile(base, profile, pass, src string) {
 					lineLost++
 				}
 			}
+			appsEv.lost, appsEv.vanished, appsEv.guard = lineLost, len(vanished), "passed" // NWP-20261208-01
+			if lineLost > 0 || len(vanished) > 0 {
+				appsEv.guard = "refused"
+			}
+			writeAppsSeal(os.Getenv("NOWHERE_STATE"), profile, pass, appsEv)
 			if len(vanished) > 0 || lineLost > 0 {
 				if len(vanished) > 0 {
 					sort.Strings(vanished) // deterministic, so the refusal reads the same in a log and in a test
@@ -9121,9 +9199,13 @@ func pushProfile(base, profile, pass, src string) {
 		}
 		// NWP-20261204-06: a seal that drops snapshots releases their unshared chunks after the flush. The generation
 		// moves in the head this seal signs, so another handset drops its chunk cache before it seals again.
-		if len(dropped) > 0 && sealPruneReleaseEligible(profile) {
+		// NWP-20261208-15: a bare seal at least scopeDropMinGap after the last such release also releases what the
+		// bare-shaped scope seals recorded, under the same one bump. scopeDropDue is nil for a scope vault.
+		sd := scopeDropDue(base, profile, pass, time.Now())
+		if (len(dropped) > 0 || len(sd) > 0) && sealPruneReleaseEligible(profile) {
 			v.ReleaseGen++
 			spr = &sealPrunePending{base: base, profile: profile, pass: pass, dk: append([]byte(nil), dk...), dropped: dropped}
+			spr.scopes = sd
 		}
 		signVault(v, dk)
 		vh := postBlob(base, serializeVault(v))
@@ -9160,6 +9242,18 @@ func pushProfile(base, profile, pass, src string) {
 		// (NWP-20261123-01): hk is the key putHead just wrote.
 		hk, _ := headWriteRef(profile, pass)
 		capAfterPublish(hk, func() { writeRestoreReceipt(rcptRef, manifestHash) })
+		if scopeDropEligible(profile) && head != "" && head != manifestHash {
+			// NWP-20261208-15: the chunks this seal stopped naming, recorded once the head landed; the next due bare
+			// seal releases them (seal_prune_release.go). A read error records nothing.
+			if freed, err := scopeDropFreed(base, dk, head, manifestHash, chunks, deferredMap); err == nil && len(freed) > 0 {
+				cache, rk := blobCachePath(), ref
+				capAfterPublish(hk, func() {
+					if err := scopeDropRecord(cache, rk, freed); err != nil {
+						fmt.Printf("push: profile %s: the chunks this seal stopped naming were not recorded -- they stay on the lease schedule\n", logProfile(profile))
+					}
+				})
+			}
+		}
 		if mediaEssentialCarryOn(profile) && incrementalSeal() {
 			// The rels THIS seal walked and published. Never a carried rel (another handset's: recording it would make
 			// the next seal call its absence a deletion) and never a present-but-unread one (seen is false for both).
@@ -9208,10 +9302,11 @@ func pushProfile(base, profile, pass, src string) {
 			fmt.Printf("push: profile %s media-sync: skipped at sign-out -- nothing is fetched onto a session that is ending (NWP-20261129-25)\n",
 				logProfile(profile))
 		} else if budget := deferredSyncBudget(); budget > 0 {
+			prog := &mediaSyncProg{} // NWP-20261204-19: one chunk count across both tiers, a frame per chunk
 			var landed []string
 			var landedB int64
 			if len(carryRels) > 0 {
-				w, nb := materializeCarried(base, dk, oldM, carriedToLand(landRels, seen), src, budget)
+				w, nb := materializeCarried(base, dk, oldM, carriedToLand(landRels, seen), src, budget, prog)
 				landed, landedB = append(landed, w...), landedB+nb
 			}
 			// NWP-20260908-22: and the DEFERRED tier -- the half a camera photo lands in. Budgeted, because
@@ -9220,7 +9315,7 @@ func pushProfile(base, profile, pass, src string) {
 			if len(oldM.Deferred) > 0 {
 				arrivals := newlyArrivedDeferred(oldM.Deferred, restoredDef, src, walkedHere)
 				if len(arrivals) > 0 {
-					w, nb := materializeDeferredArrivals(base, dk, oldM, arrivals, src, budget)
+					w, nb := materializeDeferredArrivals(base, dk, oldM, arrivals, src, budget, prog)
 					landed, landedB = append(landed, w...), landedB+nb
 					fmt.Printf("push: profile %s media-sync: %d deferred rel(s) arrived from another handset, landed %d\n",
 						logProfile(profile), len(arrivals), len(w))
@@ -9238,12 +9333,16 @@ func pushProfile(base, profile, pass, src string) {
 	// staged here: mediaNoChangeCommit writes it after the head commit (capFlush in cap mode).
 	// A failure before here panics past it; the record was removed at the walk.
 	if isSharedMediaScope(profile) && incrementalSeal() {
-		mnoPending = mediaNoChangeAfterSeal(cct, committedHead, sealStats.digest, src, carriedToLand(landRels, seen), mediaCarryRan,
+		var why string
+		mnoPending, why = mediaNoChangeAfterSeal(cct, committedHead, mnoDigest, src, carriedToLand(landRels, seen), mediaCarryRan,
 			oldM.Deferred, restoredDef, walkedHere, func() bool {
 				sealExpectMu.Lock()
 				defer sealExpectMu.Unlock()
 				return sealStaleHit || sealFenceHit // a direct-mode guard that refused the head pointer and returned
 			}())
+		if why != "" {
+			fmt.Printf(mediaNoChangeNotKeptLine, logProfile(profile), why)
+		}
 	}
 }
 
@@ -9297,6 +9396,7 @@ func tarDirToExcl(dir string, w io.Writer, excl map[string]bool) (int64, error) 
 			return filepath.SkipDir    // DIA-20260804-04: the user switched this app Off -> its data is not carried
 		}
 		if info.IsDir() && dropPkgForRel(rel, excl) {
+			// NWP-20261203-29: this legacy NOWHERE_SEAL_FULL arm does not count the skipped dir's local files; only walkChunksExcl does.
 			return filepath.SkipDir // NWP-20261130-03: unfetched in this scope -- not priced, same as walkChunksExcl
 		}
 		if info.IsDir() && isOdFetchStagePath(rel) {
@@ -10237,6 +10337,10 @@ func cdcRestoreProg(base string, key []byte, m chunkManifest, dest string, off, 
 	} else {
 		off = 0
 	}
+	if est := healBandEst.Load(); cumBytes != nil && est > 0 { // NWP-20261208-29: leave room for the heal's bar
+		healBandBase.Store(sumBytes)
+		sumBytes += est
+	}
 	if cumBytes != nil {
 		writeProg(int(off), int(sumBytes))
 	} else {
@@ -11083,7 +11187,8 @@ func concurrentSafeCmd(name string) bool {
 		// also when a materialise may be holding sessionMu for minutes -- serialising it would leave the
 		// "free up space" screen blank at the one moment it matters. A walk racing a seal yields a slightly
 		// stale estimate, which is what it is labelled as.
-		"GET-SESSION-TYPE", "GET-OFFLINE", "GET-BILLING", "GET-STORAGE-BREAKDOWN",
+		// GET-CLAIM-NOTICE (NWP-20261208-03): a pure local wallet read, as GET-BILLING.
+		"GET-SESSION-TYPE", "GET-OFFLINE", "GET-BILLING", "GET-CLAIM-NOTICE", "GET-STORAGE-BREAKDOWN",
 		// NWP-20261118-06: the kept storage count -- a RAM read under its own mutex, and a goSafe start that never waits.
 		"STORAGE-COUNT-START", "GET-STORAGE-BREAKDOWN-CACHED",
 		// GET-MEDIA-STATUS + GET-MEDIA-APP-PROGRESS + GET-PREFETCH-METERED (NWP-20261117-23): pure reads of one RAM-state
@@ -11225,7 +11330,7 @@ func handleLogin(conn net.Conn, dest string) {
 	// concurrentSafeCmd lists run free -- pure reads such as STATUS/GET-COLDLOCK/OTA-*/the Profile and Storage probes,
 	// and the bindings.conf reads (GET-BINDINGS, TEL-OWNER, TEL-OWNED-*) -- plus a few writers with their own lock, so a
 	// wedged writer can't stall the gate's probes. The verbs in the TryLock set below answer BUSY instead of waiting.
-	if name == "BACKUP" || name == "DELETE" || name == "EXPECT-SHRINK" || name == "EXPECT-SHRINK-INFERRED" || name == "EXPECT-SHRINK-ANDROID" || name == "SET-BINDING" || name == "REPAIR-BINDINGS" || name == "SET-SIM-MINE" || name == "DELETE-BINDING" || name == "ROLLBACK" || name == "DELETE-SNAPSHOT" || name == "REMOVE-FIDO2-KEY" || name == "SET-PIN" || name == "ROTATE" || name == "ENROLL-FIDO2" || name == "FIDO2-NFC-ENROLL-FINISH" || name == "SE-TIE" || name == "SE-UNTIE" ||
+	if name == "BACKUP" || name == "DELETE" || name == "EXPECT-SHRINK" || name == "EXPECT-SHRINK-INFERRED" || name == "EXPECT-SHRINK-ANDROID" || name == "SET-BINDING" || name == "REPAIR-BINDINGS" || name == "SET-SIM-MINE" || name == "DELETE-BINDING" || name == "ROLLBACK" || name == "DELETE-SNAPSHOT" || name == "REMOVE-FIDO2-KEY" || name == "REMOVE-FIDO2-KEY-NFC" || name == "SET-PIN" || name == "ROTATE" || name == "ENROLL-FIDO2" || name == "FIDO2-NFC-ENROLL-FINISH" || name == "SE-TIE" || name == "SE-UNTIE" ||
 		name == "END-UNSAVED" || name == "RESTART-UNSAVED" {
 		// SET-PIN, ROTATE, ENROLL-FIDO2, FIDO2-NFC-ENROLL-FINISH, SE-TIE and SE-UNTIE joined with NWP-20261124-10. Each
 		// is a user-tapped write: a session PIN, the passphrase, a security key, a tie to this phone. Queued behind a
@@ -11240,6 +11345,7 @@ func handleLogin(conn net.Conn, dest string) {
 		// unsaved, and a key removal or a snapshot delete the screen said failed landed unseen. BUSY is safe: the caller
 		// has not been told the change landed, and each screen already renders BUSY as "nothing changed, try again".
 		// They are on the first line for the reason the REPAIR-BINDINGS paragraph below gives.
+		// REMOVE-FIDO2-KEY-NFC joined with NWP-20261208-16: the NFC tap of the same removal.
 		// REPAIR-BINDINGS and SET-SIM-MINE joined with NWP-20261110-02: both write bindings.conf, the SET-BINDING case
 		// below -- an honest BUSY now, never a queued repair or mark the owner did not see land. They are on the first
 		// line because TestEndUnsaved_Wiring and TestRestartUnsaved_Wiring pin the second one and its line break.
@@ -11645,7 +11751,6 @@ func handleLogin(conn net.Conn, dest string) {
 		return
 	}
 	if name == "LOGOUT" {
-		captureWifiMirror(dest)  // #98: read the session's private Wi-Fi store BEFORE the user stops
 		handleLogout(conn, dest) // reboot-free: seal, then queue the in-place reap for the user-0 chooser to do
 		return
 	}
@@ -11862,7 +11967,6 @@ func handleLogin(conn net.Conn, dest string) {
 			ds, _ := r.ReadString('\n')
 			decidedAt, _ = strconv.ParseInt(strings.TrimSpace(ds), 10, 64)
 		}
-		captureWifiMirror(dest) // #98: the stop CE-locks the user's Wi-Fi store -- read it while it's open
 		// Only the IDLE-driven lock is abortable. An EXPLICIT "lock now" from Profile keeps the plain verb and runs
 		// to completion: the user asked for it, and a later unlock is them returning to a phone they chose to lock.
 		// An older chooser sending plain COLD-LOCK is therefore unchanged.
@@ -11979,6 +12083,10 @@ func handleLogin(conn net.Conn, dest string) {
 		}
 		out := triggerRoamWorker(dest, "freemedia", nm, "", uid, "", nil) // "OK <bytes>" | ERR-...
 		fmt.Fprintf(conn, "%s\n", strings.TrimSpace(out))
+		return
+	}
+	if name == "FREE-MEDIA-FOLDER" {
+		handleFreeMediaFolder(conn, r, dest) // NWP-20261207-14 (h51 #4): free one top-level folder's streamed copies
 		return
 	}
 	if name == "MEDIA-RESTART" {
@@ -12191,6 +12299,19 @@ func handleLogin(conn net.Conn, dest string) {
 		// Read from the LOCAL wallet only (no passphrase, no gateway) -> "OK credit=.. through=.. epochsec=.."
 		// or "NONE". Fast + local; GB-used (footprint) is the separate GET-USAGE below.
 		fmt.Fprint(conn, billingLine(capWalletPath()))
+		return
+	}
+	if name == "GET-CLAIM-NOTICE" {
+		// NWP-20261208-03 (h55 #1): how many unusable claim codes Profile has not told the profile about yet, from the
+		// LOCAL wallet only. "NOTICE <n>" | "NONE". Replies on handleGetClaimNotice.
+		handleGetClaimNotice(conn, dest)
+		return
+	}
+	if name == "CLAIM-NOTICE-SHOWN" {
+		// "CLAIM-NOTICE-SHOWN\n<n>\n" (NWP-20261208-03): Profile showed the notice; drop the first n. "OK" | "BUSY" |
+		// "NONE" | "ERR-ARGS" | "ERR". Serialized: it writes the wallet.
+		a, _ := r.ReadString('\n')
+		handleClaimNoticeShown(conn, dest, strings.TrimRight(a, "\r\n"))
 		return
 	}
 	if name == "CLAIM" {
@@ -12651,8 +12772,8 @@ func handleLogin(conn net.Conn, dest string) {
 			return
 		}
 		conn.SetDeadline(time.Now().Add(120 * time.Second)) // host mode + 2 touches + the paid vault write
-		// ⚠ THE SECRET, WHICH THIS LINE PASSED AS "" (NWP-20260915-13). roamd exports line 5 as
-		// NOWHERE_SE_SECRET only when it is non-empty, so the worker's agent ran blind and a hardened vault
+		// ⚠ THE SECRET, WHICH THIS LINE PASSED AS "" (NWP-20260915-13). roamd handed line 5 to the agent as
+		// NOWHERE_SE_SECRET only when it was non-empty, so the worker's agent ran blind and a hardened vault
 		// could not enrol a key by USB at all. The op does not overload line 5 -- only rekey and armcred do
 		// -- so the real value is safe to send, and roamd's own comment about opening a 2FA vault via the
 		// enrolled key's cached hmac is the same reasoning, never extended to the secure element.
@@ -12908,6 +13029,11 @@ func handleLogin(conn net.Conn, dest string) {
 			fmt.Fprintf(os.Stderr, "[logind] remove-fido2-key %q FAILED: %v\n", nm, rmErr)
 			fmt.Fprint(conn, "ERR\n")
 		}
+		return
+	}
+	if name == "REMOVE-FIDO2-KEY-NFC" {
+		// NWP-20261208-16 (h57 #6): the NFC tap of the removal above. See handleRemoveFido2KeyNFC.
+		handleRemoveFido2KeyNFC(conn, r, dest, "s3")
 		return
 	}
 	if name == "FIDO2-STATUS" {
@@ -14178,15 +14304,51 @@ func validOtaTime(s string) string {
 // just-seeded ota.res (mtime < 20s) is never "dead" even before init marks the oneshot service running, so a
 // fresh Install tap can't flicker to FAILED. During a legitimate long apply the service stays "running"
 // (otad blocks on update_engine_client --follow), so this never false-fires on a slow ~40min VABC write.
+//
+// NWP-20261206-12 (frankel 0.5.52, gate report NW-c865): an EMPTY read is UNKNOWN, not stopped. A property
+// the caller's domain may not read makes getprop print an empty line and exit 0, the same as main.go's other
+// init.svc reads ("Denied/empty reads as unknown"). Calling that dead answered FAILED ERR-STALE mid-apply, the
+// gate showed Install update again, and a second tap re-seeded ota.res over otad's APPLYING. So an empty read
+// is live while ota.res or ota.prog changed within otaLiveWindow (otad rewrites ota.prog on every phase and
+// percent change of the fetch and the apply), and dead after that: a ten-minute silence on both files is the
+// #23 frozen install. Any other non-empty state that is not running/stopping/restarting is dead, as before.
 func otaWorkerDead(dest string) bool {
 	if fi, err := os.Stat(filepath.Join(dest, "ota.res")); err == nil && time.Since(fi.ModTime()) < 20*time.Second {
 		return false
 	}
-	out, err := exec.Command("/system/bin/getprop", "init.svc.nowhere_otad").Output()
+	s, err := otadSvcState()
 	if err != nil {
 		return false // can't tell -> assume live; never false-fail a real install
 	}
-	return strings.TrimSpace(string(out)) != "running"
+	if otadSvcLive(s) {
+		return false
+	}
+	if s != "" {
+		return true // stopped (or any other known state): the worker is gone (#23)
+	}
+	for _, n := range []string{"ota.res", "ota.prog"} {
+		if fi, err := os.Stat(filepath.Join(dest, n)); err == nil && time.Since(fi.ModTime()) < otaLiveWindow {
+			return false // unknown state, but otad wrote a phase file recently
+		}
+	}
+	return true
+}
+
+// otaLiveWindow is how recently otad must have written ota.res or ota.prog for an UNKNOWN (empty) service read
+// to count as a live install (NWP-20261206-12).
+const otaLiveWindow = 10 * time.Minute
+
+// otadSvcState reads init.svc.nowhere_otad: the trimmed getprop output and its exec error. A var so tests stub
+// it; every OTA liveness read goes through it (NWP-20261206-12). An empty string with a nil error is a read the
+// domain may not make, not a stopped service.
+var otadSvcState = func() (string, error) {
+	out, err := exec.Command("/system/bin/getprop", "init.svc.nowhere_otad").Output()
+	return strings.TrimSpace(string(out)), err
+}
+
+// otadSvcLive reports an init service state in which otad is still at work.
+func otadSvcLive(s string) bool {
+	return s == "running" || s == "stopping" || s == "restarting"
 }
 
 // otaProgLine reads otad's $STATE/ota.prog -- one line "<phase> <done> <total>", the same shape the login
@@ -14230,13 +14392,22 @@ func otaProgLine(dest string) string {
 }
 
 func otaResState(dest string) string {
+	// NWP-20261206-12: no usable ota.res while nowhere_otad runs is an install the daemon kicked and otad has
+	// not yet written (or wrote torn). Without this OTA-STATUS serves the cached AVAIL and the gate offers
+	// Install update again.
+	absent := func() string {
+		if s, err := otadSvcState(); err == nil && s == "running" {
+			return "DOWNLOADING"
+		}
+		return ""
+	}
 	b, err := os.ReadFile(filepath.Join(dest, "ota.res"))
 	if err != nil {
-		return ""
+		return absent()
 	}
 	f := strings.Fields(strings.TrimSpace(string(b)))
 	if len(f) == 0 {
-		return ""
+		return absent()
 	}
 	ver := ""
 	if len(f) > 1 && f[1] != "?" {
@@ -14257,8 +14428,10 @@ func otaResState(dest string) string {
 		return "APPLYING" + ver
 	case "ERR-RESTORE", "ERR-PAYLOAD", "ERR-APPLY", "ERR-CHECK":
 		return "FAILED " + f[0]
-	default: // UPTODATE / NONE / unknown -> let the live check answer AVAIL/NONE
+	case "UPTODATE", "NONE": // otad writes these as it exits -> let the live check answer AVAIL/NONE
 		return ""
+	default: // unknown token -> the live check answers, unless otad runs
+		return absent()
 	}
 }
 
@@ -14286,7 +14459,14 @@ func refuseSignInDuringOta(conn net.Conn, dest string) bool {
 // tmpfs + `ctl.start nowhere_otad` (the confined daemon's only way to spawn an su:s0 service; mirrors the
 // roamd trigger). The updater re-checks, downloads (delta via the chunk cache), update_engine-applies, and
 // reboots into the new slot -- so there is no result to wait for; the daemon just acks.
+// NWP-20261206-12: while nowhere_otad runs it answers BUSY and writes nothing, whatever ota.res says: a
+// misread ota.res must never let a second tap re-seed STAGING over otad's own phase.
 func handleOtaApply(conn net.Conn, dest string) {
+	if s, err := otadSvcState(); err == nil && otadSvcLive(s) {
+		fmt.Fprint(os.Stderr, "[ota] OTA-APPLY while nowhere_otad runs: BUSY (NWP-20261206-12)\n")
+		fmt.Fprint(conn, "BUSY\n")
+		return
+	}
 	// #21: don't stack a second updater on a running one; and SEED ota.res=STAGING before kicking otad so
 	// OTA-STATUS reflects "in flight" in the gap before otad writes its first phase (a quick screen re-entry
 	// would otherwise re-offer "Update available"). otad overwrites this with its own STAGING/APPLYING.
@@ -14299,6 +14479,11 @@ func handleOtaApply(conn net.Conn, dest string) {
 	exec.Command("/system/bin/setprop", "ctl.start", "nowhere_otad").Run()
 	fmt.Fprint(conn, "OK\n")
 }
+
+// logoffRefusalKickMediad gives a sign-out's kept session its media back when the media sweep did not verify
+// (NWP-20261210-13, backlog row "After a refused sign-out the session stays signed in, but its On-demand media stays
+// detached for the rest of the session"). A variable only so a test can count the kick; kickMediad is what runs.
+var logoffRefusalKickMediad = kickMediad
 
 // mediadReqMu serialises kickMediad's publish of mediad.req (write mediad.req.tmp, rename it over mediad.req).
 var mediadReqMu sync.Mutex
@@ -15132,15 +15317,20 @@ func handleRotate(conn net.Conn, dest, name, oldpass, newpass string) {
 			// still names the retired passphrase, so the periodic sync and the logoff capture publish to a ref
 			// that no longer resolves -- and ERR-SESSION tells the user to sign out, which is exactly when the
 			// capture runs. Best-effort: if it fails the reply is already the one that says so.
+			pmk := "untouched"
 			if live {
+				pmk = "rekeyed"
 				if merr := markRoamSession(dest, name, newpass, su, seHex); merr != nil {
+					pmk = "failed"
 					fmt.Fprintf(os.Stderr, "[logind] rotate: ...and the session marker could not follow it either: "+
 						"%v -- this session will not seal until the user signs out and in\n", merr)
 				}
 			}
 			// The rotation is committed, so the SIM bindings and sealed inbox follow it too (NWP-20261013-21).
-			carryTelephonyRef(profileRefV2(name, oldpass), profileRefV2(name, newpass))
+			tc := carryTelephonyRef(profileRefV2(name, oldpass), profileRefV2(name, newpass))
 			rekeyKsLogoffCreds(dest, name, oldpass, newpass)
+			// NWP-20261208-05: the change's outcome record, before the reply.
+			writeCredChange(dest, rotateCredChange(name, oldpass, newpass, "partial", pmk, credKeyguardWord(live, rekeyed, dest), tc))
 			say("ERR-SESSION")
 			return
 		}
@@ -15172,8 +15362,9 @@ func handleRotate(conn net.Conn, dest, name, oldpass, newpass string) {
 	}
 
 	// The rotation committed: carry the profile's SIM bindings and sealed inbox to the new ref (NWP-20261013-21).
-	carryTelephonyRef(profileRefV2(name, oldpass), profileRefV2(name, newpass))
+	tc := carryTelephonyRef(profileRefV2(name, oldpass), profileRefV2(name, newpass))
 	rekeyKsLogoffCreds(dest, name, oldpass, newpass)
+	kg := credKeyguardWord(live, rekeyed, dest) // NWP-20261208-05
 
 	if live || staleMarker {
 		// The marker feeds the periodic seal, the logoff capture and the cold-lock verify, so it has to carry
@@ -15230,6 +15421,7 @@ func handleRotate(conn net.Conn, dest, name, oldpass, newpass string) {
 			if !live {
 				follows = "and the keyguard was NOT re-keyed (the marker did not vouch for the old credential)"
 			}
+			writeCredChange(dest, rotateCredChange(name, oldpass, newpass, "committed", "failed", kg, tc))
 			fmt.Fprintf(os.Stderr, "[logind] .roamsession WRITE FAILED: %v -- passphrase rotated in the store "+
 				"%s, but the live session (user %s) still carries the OLD one; its seals "+
 				"will not follow the rotation\n", err, follows, su)
@@ -15237,6 +15429,7 @@ func handleRotate(conn net.Conn, dest, name, oldpass, newpass string) {
 			return
 		}
 	}
+	writeCredChange(dest, rotateCredChange(name, oldpass, newpass, "committed", credMarkerWord(live, staleMarker), kg, tc))
 	fmt.Fprintf(conn, "OK %d\n", retired) // n = handsets that must run ADD-DEVICE again
 }
 
@@ -15571,6 +15764,15 @@ func triggerRoamWorkerKind(dest, op, name, pass, uid, seSecret, kind, srcUnit, i
 	// adjacent lines of the same log. That is why "cold lock took way too long" never once appeared in a
 	// log as a long number. Same trap and same fix as the NWP-20260824-03 note above otaCacheTTL -- DO NOT tidy the Round(0) away.
 	tLock := time.Now().Round(0)
+	// NWP-20261204-21 (Q039): whether this sign-in queues behind a reap, read BEFORE it queues (the holder it meets, not
+	// the one after it) and before userOpWaiting rises, which a test reads as "the read has happened". A checked
+	// assertion: rwHolderOp is unset until the first RW holder.
+	behindReap := false
+	if op == "in" {
+		h, _ := rwHolderOp.Load().(string)
+		behindReap = h == "cleanstorage"
+	}
+	waitHolder, _ := rwHolderOp.Load().(string) // NWP-20261208-11: the RW holder this op meets, read BEFORE it queues and before userOpWaiting rises
 	// NWP-20260825-11: publish that a human is waiting, so syncLoop does not schedule a background seal
 	// in front of them. Decremented once we HOLD the slot, not when the op finishes.
 	hi := userInitiatedOp(op)
@@ -15592,6 +15794,9 @@ func triggerRoamWorkerKind(dest, op, name, pass, uid, seSecret, kind, srcUnit, i
 					userOpWaiting.Store(0)
 				}
 			}
+			if lane.svc == laneRW.svc {
+				rwSlotWaits.wait(op, waitHolder, capWait.Milliseconds()) // NWP-20261208-11: the whole cap was waited
+			}
 			dlog("worker op=%s uid=%s GAVE UP after %s waiting for the slot -- answering busy (NWP-20260826-04)",
 				op, uid, capWait)
 			return workerBusy
@@ -15607,6 +15812,12 @@ func triggerRoamWorkerKind(dest, op, name, pass, uid, seSecret, kind, srcUnit, i
 			userOpWaiting.Store(0) // a stray decrement must never wedge the counter negative
 		}
 	}
+	if lane.svc == laneRW.svc {
+		rwSlotWaits.wait(op, waitHolder, time.Since(tLock).Milliseconds()) // NWP-20261208-11: WALL (tLock), every RW wait
+	}
+	if behindReap {
+		signinWaitBehindReap.add(time.Since(tLock).Milliseconds()) // NWP-20261204-21: the wait the user felt, WALL (tLock)
+	}
 	// NWP-20260826-06: log the HOLDER, not just the waiter. Until now only the wait was recorded, so a
 	// "waited 284673ms" line named the victim and never the culprit -- you could see that something held the
 	// slot for five minutes and not which op it was. Logging both halves makes the queue attributable, which
@@ -15616,11 +15827,17 @@ func triggerRoamWorkerKind(dest, op, name, pass, uid, seSecret, kind, srcUnit, i
 		setRWHolder(op) // NWP-20261005-09: a queued lock's screen names it
 	}
 	defer func() {
-		if h := time.Since(tHold); h > 2*time.Second {
+		h := time.Since(tHold)
+		if op == "cleanstorage" {
+			reapHold.add(h.Milliseconds()) // NWP-20261204-21 (Q039): EVERY reap's hold, not only the >2 s ones logged below
+		}
+		if h > 2*time.Second {
 			fmt.Fprintf(os.Stderr, "[logind] worker op=%s uid=%s lane=%s HELD the slot %dms (NWP-20260826-06)\n",
 				op, uid, lane.svc, h.Milliseconds())
 		}
 		if lane.svc == laneRW.svc {
+			// NWP-20261208-11: every RW hold; hold() keeps those >= the floor
+			rwSlotWaits.hold(op, h.Milliseconds())
 			setRWHolder("") // before the release, so the next holder's own set is never overwritten
 		}
 		<-lane.slot
@@ -15771,7 +15988,8 @@ func runWorkerHeld(lane workerLane, dest, op, name, pass, uid, seSecret, kind, s
 	// NWP-20261026-06: and for a mobile-data claim (mdapply), which sets the one global the same way.
 	// NWP-20261027-08: and for a device-toggles claim (dtclaim): a late one would make an ended session the owner, and
 	// every later release would answer KEPT and leave the next session's toggles on.
-	if op == "locapply" || op == "mdapply" || op == "dtclaim" {
+	// NWP-20261210-05: and for sessclaim, which makes those three claims in one run (session_claims.go).
+	if op == "locapply" || op == "mdapply" || op == "dtclaim" || op == "sessclaim" {
 		if why := locClaimRefusal(dest, uid); why != "" {
 			what := "locglobals"
 			switch op {
@@ -15779,6 +15997,8 @@ func runWorkerHeld(lane workerLane, dest, op, name, pass, uid, seSecret, kind, s
 				what = "mobiledata"
 			case "dtclaim":
 				what = "devtoggles"
+			case "sessclaim":
+				what = "sessionclaims"
 			}
 			fmt.Fprintf(os.Stderr, "[logind] %s: claim for user %s dropped under the slot -- %s (NWP-20261016-45)\n", what, uid, why)
 			return "SKIP-ENDED"
@@ -15863,8 +16083,9 @@ func runWorkerHeld(lane workerLane, dest, op, name, pass, uid, seSecret, kind, s
 		// including one left by a sign-out that ended before its own seal.
 		dropSealStop(dest)
 	}
-	// roam.req line 5 = se_secret (hex) for a hardened identity; roamd exports it as NOWHERE_SE_SECRET so the
-	// agent opens/seals via the `se` keyslot. Empty for non-hardened (agent falls back to the pass slot).
+	// roam.req line 5 = se_secret (hex) for a hardened identity; roamd hands it to each agent call as
+	// NOWHERE_SE_SECRET, staged as @file: (NWP-20261205-18), so the agent opens/seals via the `se` keyslot. Empty
+	// for non-hardened (agent falls back to the pass slot).
 	// roam.req line 7 = srcUnit (#91 slice 4b): a "restore from <device>" login carries the SOURCE lineage's
 	// unit id; roamd exports it as NOWHERE_UNIT_SRC around the restore agent calls ONLY, so the restore reads
 	// that unit's head while this device's seal (a separate "out" run, no srcUnit) still writes its OWN head.
@@ -15889,10 +16110,15 @@ func runWorkerHeld(lane workerLane, dest, op, name, pass, uid, seSecret, kind, s
 	// (see #85 / the escalating bound in DIA-20260811-05), leaving the data seal to be cut off mid-flight and
 	// reported as ERR-TIMEOUT. Raise it to a genuine backstop for a progress-emitting livelock.
 	const hardCap = 7200 // 60 min absolute ceiling (×500 ms)
+	// NWP-20261204-16 (Q182): this op's lost-start re-fires; timedOut reads it, so it is declared before timedOut.
+	refired := 0
 	// NWP-20261022-02: both ERR-TIMEOUT exits leave roamd running, so both record the lane (see the check above).
 	// NWP-20261120-01: an odrestore's instance is then stopped (worker_stop.go); the record stays, so the next op
 	// still discards whatever the stopped instance left in $RES.
+	// NWP-20261204-16: both exits also count the expiry, and whether the request was still unread (worker_timeouts.go).
 	timedOut := func() string {
+		_, rerr := os.Stat(req) // still there: no worker read the request
+		noteWorkerTimeout(op, refired > 0, rerr == nil)
 		markLaneAbandoned(lane, op)
 		if stopOnGiveUp(op) {
 			stopAbandonedWorker(lane, op)
@@ -15963,6 +16189,7 @@ func runWorkerHeld(lane workerLane, dest, op, name, pass, uid, seSecret, kind, s
 					if workerState(lane.svc) == "stopped" {
 						workerStart(lane.svc)
 						noteLostStart(op)
+						refired++
 					}
 				}
 			}
@@ -16006,10 +16233,11 @@ func takeWorkerResult(res, prog string) (string, bool) {
 // needed -- and the count resets with the daemon, which the report's boot_id/uptime_s already date.
 var roamLostStarts atomic.Int64
 
-// noteLostStart records one lost-start recovery for op: it bumps the counter, logs the recovery numbered with the
-// new count, and returns that count.
+// noteLostStart records one lost-start recovery for op: it bumps the counter and the per-op count
+// (worker_timeouts.go, NWP-20261204-16), logs the recovery numbered with the new count, and returns that count.
 func noteLostStart(op string) int64 {
 	n := roamLostStarts.Add(1)
+	noteLostStartOp(op)
 	fmt.Fprintf(os.Stderr, "[logind] roam worker re-start (lost start #%d) op=%s\n", n, op)
 	return n
 }
@@ -16035,9 +16263,23 @@ func noteLostStart(op string) int64 {
 //
 // NWP-20261202-41: its start is the session's sign-in instant for the day summary, and an OK or a give-up ends with
 // daySummaryTakeVpn: one codes-only `ev=vpn at=signin` line (never when it stops because the session is gone).
+//
+// NWP-20261210-06: before its first try it waits for the grant's answer (awaitGrantVpn, grant_vpn.go): the sign-in's
+// first apply runs inside the grant op, so no vpnup run queues ahead of the grant. An OK answer ends here; any other
+// answer, or none, runs the loop below as before.
 func retryVpnup(dest, name, pass, uid string) {
 	defer func() { recover() }()
 	daySummaryVpnStart(uid)
+	if ans, ok, stop := awaitGrantVpn(dest, uid); stop {
+		fmt.Fprintf(os.Stderr, "[logind] vpnup: user %s is no longer this session's -- stopping\n", uid)
+		return
+	} else if ok && strings.HasPrefix(ans, "OK") {
+		if line := vpnupDoneLine(ans, uid); line != "" {
+			fmt.Fprintln(os.Stderr, line)
+		}
+		daySummaryTakeVpn(uid, daySummaryVpnRC(ans))
+		return
+	}
 	last := ""
 	for i := 0; i < vpnupTries; i++ { // ~90s: the vpn= pref + WG .conf can land well after the login reply (restore + provisionRoamedApps)
 		// NWP-20261113-20 (backlog "A `vpnup` worker op ran for a user after that user's reap"): this loop is the vpnup
@@ -16068,6 +16310,7 @@ func retryVpnup(dest, name, pass, uid string) {
 
 // The seams the tests replace; production drives roamd's vpnup op every two seconds.
 var (
+	grantWorker = triggerRoamWorkerKind // NWP-20261210-06: handleGrantPerms's grant op
 	vpnupTries  = 45
 	vpnupWorker = func(dest, name, pass, uid string) string {
 		return triggerRoamWorker(dest, "vpnup", name, pass, uid, "", nil)
@@ -16257,9 +16500,9 @@ func handleRoamIn(conn net.Conn, dest, name, pass, uid, seSecret, srcUnit string
 		// prefs the `in` op just restored (a throwaway's, which has none, is the baseline). Off this path: it runs
 		// beside the store round trips below, so a sign-in waits nothing for it. Before the head=="" return, so a
 		// throwaway claims too, and a cold-locked session this login supersedes is never left owning them.
-		claimLocGlobalsAsync(dest, uid, "signin")
-		claimMobileDataAsync(dest, uid, "signin") // and the session's mobile-data choice (docs/product-decisions.md, 2026-10-19)
-		claimDevTogglesAsync(dest, uid, "signin")
+		// NWP-20261210-05: one worker run claims them, the session's mobile-data choice (docs/product-decisions.md,
+		// 2026-10-19) and the device toggles (session_claims.go).
+		claimSessionGlobalsAsync(dest, uid, "signin")
 		// ⚠⚠ AND THE WALLET, which nothing in the tree has ever removed (NWP-20260915-12). wallet.json lives
 		// in the BOOT-lifetime state tmpfs, not a per-login one, and the login's restore could not repair that: it
 		// returned EARLY (restoreWallet, since removed; pullWalletStrict leaves the file too), leaving the file exactly
@@ -16305,7 +16548,9 @@ func handleRoamIn(conn net.Conn, dest, name, pass, uid, seSecret, srcUnit string
 		clearOfflineSession(dest)                  // #49: a real restore landed -> no longer an offline-deferred session
 		os.Remove(filepath.Join(dest, ".relogin")) // #97: a resolved login supersedes any queued auto-relogin
 		removeReloginTaken(dest)                   // NWP-20261011-05: and a half-taken copy of it
-		// #159: re-establish + raise this profile's always-on VPN once the restore + provisioning land
+		// #159: re-establish + raise this profile's always-on VPN once the restore + provisioning land.
+		// NWP-20261210-06: the first apply rides this sign-in's grant op; retryVpnup waits for its answer.
+		grantVpn.expect(uid)
 		goSafe("vpnup-retry", func() { retryVpnup(dest, name, pass, uid) })
 		// #81 item 3 (DIA-20260704-40): decrypt + stash the remembered session PIN. A failed read clears the stash
 		// and logs it; it no longer passes for "no PIN" in silence (NWP-20261011-25, stashRoamInPIN).
@@ -16503,10 +16748,9 @@ func handleRoamInOffline(conn net.Conn, dest, name, pass, uid string) {
 	os.Remove(filepath.Join(dest, nfcHmacStash(true))) // NWP-20260924-01: a resume assertion dies with its marker
 	// NWP-20261016-45: claim the location globals for this session. An offline sign-in restores nothing, so its prefs
 	// hold no choice and the claim is the baseline -- written, not assumed from whatever the last session left.
-	claimLocGlobalsAsync(dest, uid, "offline")
 	// Mobile data too (2026-10-19 decision): no choice in these prefs, so roamd keeps the gate's value; a release is owed.
-	claimMobileDataAsync(dest, uid, "offline")
-	claimDevTogglesAsync(dest, uid, "offline")
+	// NWP-20261210-05: one worker run claims both and the device toggles (session_claims.go).
+	claimSessionGlobalsAsync(dest, uid, "offline")
 	// ...and the wallet, for the reason the online path states: nothing else in the tree removes it, and an
 	// OFFLINE sign-in inherits a stale stash exactly the way this function's own stashSessionPIN("") note
 	// above describes. An offline session cannot reach the store, so it has no wallet of its own to keep.
@@ -16559,7 +16803,6 @@ func handleRelogin(conn net.Conn, dest string) {
 	}
 	writeQueuedRelogin(dest, name, pass) // NWP-20261011-05: atomic -- GET-RELOGIN takes it concurrently
 	clearOfflineSession(dest)
-	captureWifiMirror(dest) // #98: the network joined in THIS offline session is exactly what the relogin needs
 	fmt.Fprintf(os.Stderr, "[logind] relogin queued for %q (discard offline user %s, restore online)\n", name, uid)
 	handleLogout(conn, dest) // LOCAL branch: clears markers + queues switch+reap; replies OK
 }
@@ -17884,6 +18127,13 @@ func handleLogout(conn net.Conn, dest string) {
 			logoffSweepFailed(name, uid)
 			dropLogoffBTMarker(dest) // a sweep that timed out may still write it; this session stays
 			rearmRoamSession(dest, name, pass, uid, seSecret, "logout media sweep did not verify, re-arm")
+			// NWP-20261210-13: this logoff stopped mediad before its sweep, and the session is kept, so its overlays
+			// come back now, as after END-UNSAVED's undo, not at the next periodic seal's self-heal kick. After
+			// logoffSweepFailed (sealInFlight is false again) and after the re-arm (.roamsession is back): before
+			// either, kickMediad's own stand-downs swallow the kick. Not in the noKeep branch (that session is reaped)
+			// and not before the supersede check (a retry owns the session then). mediad's start-time stale sweep
+			// detaches this user's dead mounts before it serves. Before the inbox: that is a store round trip.
+			logoffRefusalKickMediad(dest)
 			// NWP-20261019-04: stage the inbox that filled while the marker was down (captured secret, marker is back).
 			logoffStageInbox("s3", name, pass, uid, seFromHex(seSecret))
 			fmt.Fprintf(os.Stderr, "[logind] logout %q user %s: media sweep did not verify [%s] -> NOT sealing over a "+
@@ -18966,7 +19216,6 @@ var coldLockSignOut = func(dest string) {
 	// data is never deferred past the bound. Waiting here also means handleLogout's own wait returns at once, so it
 	// never writes a WAIT line into the one-line pipe reader below. No worker lane held.
 	waitLateWork("cold-lock sign-out")
-	captureWifiMirror(dest)
 	server, client := net.Pipe()
 	reply := make(chan string, 1)
 	goSafe("coldlock-armfail-signout-reply", func() {
@@ -19958,9 +20207,9 @@ func handleResume(conn net.Conn, dest, entry string) {
 	triggerRoamWorker(dest, "btresume", name, pass, uid, "", nil)
 	// NWP-20261016-45: the cold lock gave the location globals back; the resumed session claims them again, read from
 	// its own prefs now that its CE is unlocked (so a switch flipped just before the lock counts). Off this path.
-	claimLocGlobalsAsync(dest, uid, "resume")
-	claimMobileDataAsync(dest, uid, "resume") // and the session's mobile-data choice (docs/product-decisions.md, 2026-10-19)
-	claimDevTogglesAsync(dest, uid, "resume")
+	// NWP-20261210-05: one worker run claims them, the session's mobile-data choice (docs/product-decisions.md,
+	// 2026-10-19) and the device toggles (session_claims.go).
+	claimSessionGlobalsAsync(dest, uid, "resume")
 	fmt.Fprintf(os.Stderr, "[logind] resume %q user %s: CE unlocked, session re-armed\n", name, uid)
 	// #195: decrypt any telephony SEALED while this session was cold-locked and stage it so the chooser's
 	// resume re-kick (#385) delivers it. stageTelInbox otherwise runs ONLY at login/roam-in, so
@@ -20408,8 +20657,19 @@ func grantNameArg(dest, uid string) string {
 // (DIA-20260625-06). The name slot carries the session's profile name (grantNameArg, NWP-20261116-24), which
 // roamd prints only in acct_reload's GRANT lines; it falls back to the uid when no complete marker names this
 // uid, so roamd's non-empty-name check still passes.
+//
+// NWP-20261210-06: the grant a sign-in expected (grantVpn.claim) carries "vpn" on roam.req line 7, so roamd runs the
+// sign-in's first always-on VPN apply at the end of this run; its answer goes to the waiting retryVpnup (an empty
+// answer too: it means NOTREADY). The reply to the chooser stays roamd's grant answer.
 func handleGrantPerms(conn net.Conn, dest, uid string) {
-	out := triggerRoamWorker(dest, "grant", grantNameArg(dest, uid), "", uid, "", nil)
+	unit := ""
+	if grantVpn.claim(uid) {
+		unit = "vpn"
+	}
+	out := grantWorker(dest, "grant", grantNameArg(dest, uid), "", uid, "", "", unit, "", nil)
+	if unit == "vpn" {
+		grantVpn.post(uid, readGrantVpn(loginStateDir(), uid))
+	}
 	fmt.Fprintf(conn, "%s\n", out)
 	// NWP-20260821-19: the login is done -- close the seal-suppression window, to a short TAIL rather than to
 	// zero (see loginWindowTail: seed-home is still 3s out below (NWP-20260822-27), and armcred follows from
@@ -21231,9 +21491,9 @@ func maybePayRent(dest, name, pass, wgen string) {
 	loadFido2HmacEnv(dest)
 	// ⚠⚠ AND THE SAME THING FOR THE SECURE ELEMENT, which is NWP-20260915-12. The comment above describes
 	// this defect exactly -- for FIDO2 -- and the SE twin was never written, so it stayed true of every
-	// hardened Endospore profile. There is no env to re-adopt: NOWHERE_SE_SECRET is exported only by
-	// nowhere_roamd.sh, in the su:s0 WORKER, and this is the login daemon. The secret is on the live
-	// session's own marker, so read it and hand it down.
+	// hardened Endospore profile. There is no env to re-adopt: NOWHERE_SE_SECRET reaches an agent only from
+	// nowhere_roamd.sh (the su:s0 WORKER, staged per call) or mediad, and this is the login daemon. The secret
+	// is on the live session's own marker, so read it and hand it down.
 	//
 	// ⚠ AND IT MUST REACH THE FOOTPRINT, not merely resolveDK. scopeFootprint opens the vault again on its
 	// own and, failing, returns having added ONLY the head refs -- so a half-fix would lease the heads,
@@ -22010,6 +22270,17 @@ func backupBusyReason(now time.Time, sealBusy bool, loginWin time.Time, userWait
 	return ""
 }
 
+// backupWaitLine is the optional second line of an OK reply to BACKUP (NWP-20261206-13): "WAIT rekey-batch" when a
+// background re-key batch holds the worker slot, so the save starts once that batch ends. A second line, because
+// every reader of the reply reads the first line only (BackupNowReply.first, startQueuedBackup, the chooser's
+// readLine), as SEAL-STATUS adds KIND. Pure.
+func backupWaitLine(waitBatch bool) string {
+	if waitBatch {
+		return "WAIT rekey-batch\n"
+	}
+	return ""
+}
+
 func handleBackup(conn net.Conn, dest string, stamp ...int64) {
 	// h46 #1 (late_work.go): no seal while the sign-in's late work runs; bounded by lateWorkBound, after which the seal
 	// goes ahead and the job is abandoned (removing data is never deferred past the bound). No worker lane held.
@@ -22048,6 +22319,11 @@ func handleBackup(conn net.Conn, dest string, stamp ...int64) {
 	why := backupBusyReason(time.Now(), sealInFlight, loginSettleUntil, userOpWaiting.Load(), sealRunKind, sealRunAt)
 	busy := why != ""
 	followUp, queueSave := backupJoinLocked(why, after) // NWP-20261201-07 (same lock, so six taps arm one waiter)
+	// NWP-20261206-13: a re-key batch holding the worker slot is NO refusal -- the row closes when the tap shows
+	// "Backing up…" and runs once the batch ends, and rekeyOnce stands down for the sealInFlight claimed below. It
+	// rides on the OK as a second line. Read in this hold, beside backupBusyReason; a user op queued behind the
+	// batch is still BUSY user-op-waiting.
+	waitBatch := !busy && rekeyHoldsSlot
 	var manualStart int64
 	if !busy {
 		sealInFlight = true                           // claim the progress channel BEFORE replying so the screen's first SEAL-STATUS poll
@@ -22081,7 +22357,10 @@ func handleBackup(conn net.Conn, dest string, stamp ...int64) {
 		return
 	}
 	seSecret := readRoamSessionSE(dest)
-	fmt.Fprint(conn, "OK\n")
+	if waitBatch {
+		fmt.Fprint(os.Stderr, "[logind] manual backup waits for the re-key batch already running (NWP-20261206-13)\n")
+	}
+	fmt.Fprint(conn, "OK\n"+backupWaitLine(waitBatch))
 	goSafe("manual-backup", func() {
 		// NWP-20260901-26: the clear lives in a defer WITH a recover, because this goroutine had neither --
 		// an unrecovered panic killed the daemon, and short of that there was no path that guaranteed the
@@ -22740,6 +23019,16 @@ func main() {
 		dump, _ := io.ReadAll(io.LimitReader(os.Stdin, 2<<20))
 		fmt.Print(parseGmsExits(string(dump), uid))
 		return
+	case "mediaexits": // mediaexits <uid> -- NWP-20261208-06, run by the roamd RO worker for REPORT-ISSUE
+		// stdin is roamd's clock line, the two media module dumps and the first non-zero exit status of the two. An
+		// over-long dump loses that status line, so it answers an honest ERR-DUMP. Exit 0 always.
+		uid := ""
+		if len(os.Args) > 2 {
+			uid = os.Args[2]
+		}
+		dump, _ := io.ReadAll(io.LimitReader(os.Stdin, 2<<20))
+		fmt.Print(parseExitInfo(string(dump), uid, mediaExitLabels))
+		return
 	case "uiderrorsfloor": // uiderrorsfloor -- NWP-20261010-06, run by roamd's `in` op: the file's size at sign-in
 		f, err := uiderrorsFloor(uiderrorsPath)
 		if err != nil {
@@ -22784,7 +23073,6 @@ func main() {
 		// and carry everything -- rather than a list from an earlier sign-in of the same profile this boot.
 		clearDeferredPending(os.Getenv("NOWHERE_STATE"), profile, pass) // h51 #2: the same rule for the deferred list
 		clearHealList(os.Getenv("NOWHERE_STATE"), profile, pass)
-		clearMediaRowsList()
 		resetUntarSkipNames()               // NWP-20261207-08: this restore's skipped entry names, for excuseAppsSkips
 		beginAppsNotRestored(profile, pass) // and no apps-not-restored list from an earlier sign-in of this profile
 		// NWP-20260820-27: open the head-resolution window HERE, not at rStart, because profileDeleted below is
@@ -22798,6 +23086,7 @@ func main() {
 		// handed to scopeOwnerLockedWith and resolveKeyHeadForLoginWith, so the bare head is read from the store once;
 		// misses are never recorded, and the memo dies with this process.
 		memo := refProbeMemo{}
+		joinScopeHead := scopeHeadOverlap(base, profile, pass, memo)
 		// #139 defense in depth: a DELETED profile (bare head tombstoned) must not have its scopes restored --
 		// pre-#139 deletes left every #scope ref live, and this restore resurrected the data into a "new"
 		// session. Absent-everywhere names (throwaways) pass through unchanged, so deniability is untouched.
@@ -22836,6 +23125,7 @@ func main() {
 			fmt.Printf("restore: profile %s does not open on this phone -> refusing scope restore (NWP-20261006-10)\n", logProfile(profile))
 			return
 		}
+		joinScopeHead()
 		// NWP-20260819-05: login-latency instrumentation. A "blank" profile login was measured at ~57s on
 		// lynx / ~126s on frankel, and the split between head/manifest fetch (network), chunk restore
 		// (network+untar), and roamd's per-app reown was never logged -- so the ~31s pre-IN window could only
@@ -22897,9 +23187,10 @@ func main() {
 				seedClaimsAtRestore(m.Claims)
 			}
 			// Fetch the chunks concurrently (bounded window) but write them in order into the untar
-			// (DIA-20260624-07). NOWHERE_PHASE (apps|accounts|appcode|secure|media -- D7 NWP-20260823-04 split
+			// (DIA-20260624-07). NOWHERE_PHASE (apps|accounts|appcode|secure|media|keys -- D7 NWP-20260823-04 split
 			// the old shared `apps` tag per scope), set per call by the roam worker, drives the
 			// gate's restore bar via writeProg inside cdcRestore; no-op when the env isn't set (CLI/host).
+			// `keys` is the #keys restore (keystore_fetch), its own word so the bar does not read as the vault (NWP-20261208-29).
 			// NWP-20261125-03 (Q106 S2): under NOWHERE_MEDIA_AFTER_GATE the #media restore streams only bgSplit's
 			// pre-gate chunks (mediaRestorePlan). Everything below keeps the FULL m: the receipt and the roster name the
 			// head, and the pre-gate pass's skipped is what earns them. S3 (the seal's carry under a split) is built: without
@@ -22907,6 +23198,7 @@ func main() {
 			// NWP-20261130-03: and the bare vault and #de skip the spans of packages the session parks, listing them
 			// in this scope's unfetched list (unfetched_fetch.go); off, restoreSkippingParked is cdcRestore. The two
 			// never both apply: mediaRestorePlan changes only #media.
+			setHealBand(healProgEstimate(profile, m)) // NWP-20261208-29: the heal continues this scope's bar
 			skipped = restoreSkippingParked(base, key, profile, mediaRestorePlan(profile, pass, restoredHead, m), dest)
 			// h51 #2 (NWP-20261207-02): list the FULL head's deferred chunks, not the after-gate plan's, as nobody has
 			// proved them present; the late sign-in step and the seal settle the list. A list not written is safe:
@@ -22918,6 +23210,7 @@ func main() {
 			// deferred, before roamd reowns the tree (media_heal.go). Never counted in `skipped`: a file the
 			// heal cannot write stays deferred in the head and is carried, so the receipt is still earned.
 			hr := restoreHeal(base, key, m, dest, profile, pass, os.Getenv("NOWHERE_STATE"))
+			clearHealBand()
 			restMs := time.Since(cStart).Milliseconds()
 			pruneAfterRestore(chunkCacheDir, skipped, m)
 			if chunkCacheDir != "" {
@@ -22928,10 +23221,8 @@ func main() {
 			if isSharedMediaScope(profile) {
 				fmt.Println(mediaUserShareLine(m))
 			}
-			if isSharedMediaScope(profile) {
-				writeMediaRowsList(m.Deferred, dest) // NWP-20261130-02: roamd reads this for media-insert
-			}
 			signinSummaryAppend(m, restMs, hr.ms) // NWP-20261122-09: the sign-in's summary as issue-report status keys
+			signinSummaryAppendApps(m, os.Getenv("NOWHERE_STATE"), profile, pass)
 		} else {
 			skipped = untarFrom(dest, bytes.NewReader(pt)) // pre-CDC ref: the blob IS the tar
 			fmt.Printf("restore: profile %s (legacy %d B) -> %s [key=%dms restore=%dms | %s]\n", logProfile(profile), len(pt), dest, keyMs, time.Since(cStart).Milliseconds(), headSplit)
@@ -23018,6 +23309,9 @@ func main() {
 		if locked { // NWP-20261006-10: never into a session the profile does not open in
 			fmt.Printf("restore-app: profile %s does not open on this phone -> refusing\n", logProfile(scope))
 			os.Exit(1)
+		}
+		if chunkCacheDir == "" {
+			chunkCacheDir = appFetchResumeDir(dest)
 		}
 		n, err := restoreAppCode(base, scope, pass, pkg, dest)
 		if err != nil {
@@ -23395,8 +23689,8 @@ func main() {
 	case "rotate": // rotate <store> <name> <oldpass> <newpass>   (change passphrase; no data re-encryption)
 		base, name, oldpass, newpass := os.Args[2], os.Args[3], os.Args[4], os.Args[5]
 		floorCheckCLI("rotate", name, newpass) // #79: the NEW passphrase must clear the floor
-		// The CLI runs in a shell where NOWHERE_SE_SECRET may genuinely be exported -- that is how the roamd
-		// worker supplies it -- so hand the same value through explicitly, rather than leaving the one caller
+		// The CLI runs in a shell where NOWHERE_SE_SECRET may genuinely be set -- roamd hands it to each agent
+		// call -- so hand the same value through explicitly, rather than leaving the one caller
 		// that CAN have it unable to rotate a hardened profile.
 		seCLI, _ := hex.DecodeString(strings.TrimSpace(os.Getenv("NOWHERE_SE_SECRET")))
 		// false: the CLI verb runs outside any login, so the state dir's wallet is not this profile's to
@@ -24051,8 +24345,13 @@ func resolveArgFiles(args []string) []string {
 // boundary (stagedPassFile), the file consumed at startup. mediad runs for the whole session, so the chip secret it
 // needs on a tied profile (NWP-20261007-16) and the security-key hmac it needs on a 2FA profile (NWP-20261112-29) are
 // handed to it this way rather than as values in its environment. os.Setenv changes only this process's copy;
-// /proc/<pid>/environ keeps the path, which discloses nothing. A value that is not one of our staged files is left
-// as it is, and a literal hex secret (how roamd passes it) is untouched.
+// /proc/<pid>/environ keeps the path, which discloses nothing. A value that is not one of our staged files, or a
+// literal hex secret, is left as it is. roamd stages both per agent call too, as a prefix assignment through pwv
+// (NWP-20261205-18): it makes many agent calls in one run and this function consumes the file, so one export would
+// serve only the first.
+// ⚠ Residual, NOT decided: os.Setenv puts the resolved value back in this process's environment, so a child started
+// with exec.Command and no Env of its own inherits it. Closing that is h57 #9 option 2 (the agent keeps both in
+// memory), a follow-up only if ever wanted.
 func adoptStagedSESecret() {
 	for _, k := range []string{"NOWHERE_SE_SECRET", "NOWHERE_FIDO2_HMAC"} {
 		if v := os.Getenv(k); strings.HasPrefix(v, argFilePrefix) {

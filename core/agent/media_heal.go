@@ -180,7 +180,8 @@ func healDeferredLate(base string, key []byte, m chunkManifest, dest string, lat
 		}
 	}
 	sort.Strings(rels) // deterministic, so a deadline makes the same progress every sign-in
-	writeProg(0, int(total))
+	// NWP-20261208-29: through the heal band, so the heal continues the restore's bar.
+	healProg(0, total)
 	// NWP-20261128-21: the read caps are requested a batch ahead of the files that use them, from one key list for
 	// the whole heal (plan, in rels order). A batch of restoreCapBatch keys is asked for only once the files before
 	// it are written, so each cap is fresh when its chunk is fetched and the first frame precedes every request.
@@ -258,7 +259,7 @@ func healDeferredLate(base string, key []byte, m chunkManifest, dest string, lat
 		}
 		if err := healFile(base, key, m.Version, d, dest, target, until, func(n int64) {
 			done += n
-			writeProg(int(done), int(total))
+			healProg(done, total)
 		}); err != nil {
 			if errors.Is(err, errHealDeadline) {
 				stay(rel, "deadline")
@@ -272,7 +273,7 @@ func healDeferredLate(base string, key []byte, m chunkManifest, dest string, lat
 		res.bytes += d.Size
 		res.handledRels = append(res.handledRels, rel)
 	}
-	writeProg(int(total), int(total))
+	healProg(total, total)
 	return res
 }
 
@@ -582,7 +583,7 @@ func mediadHealFilter(name, pass, stateDir string, def map[string]deferredFile) 
 		return def
 	}
 	out := healServeFilter(def, handled)
-	dlog("mediad: profile %q: the sign-in heal handled %d of %d deferred file(s); serving the other %d", name, len(def)-len(out), len(def), len(out))
+	dlog("mediad: profile %s: the sign-in heal handled %d of %d deferred file(s); serving the other %d", logProfile(name), len(def)-len(out), len(def), len(out))
 	return out
 }
 

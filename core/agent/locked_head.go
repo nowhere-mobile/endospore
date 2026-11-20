@@ -98,7 +98,7 @@ func (m refProbeMemo) probeStrict(base, ref string) (exists bool, val string, ha
 }
 
 // scopeOwnerLocked reports whether `profile` is a SCOPE ("name#suffix") whose profile's head does not open with what
-// this process holds (locked): the passphrase, NOWHERE_SE_SECRET (this phone's chip, exported by roamd),
+// this process holds (locked): the passphrase, NOWHERE_SE_SECRET (this phone's chip, handed per call by roamd),
 // NOWHERE_FIDO2_HMAC; or whose head could not be read (unreadable, NWP-20261124-07). The CLI `restore` refuses such a
 // scope, as it refuses a deleted profile's.
 func scopeOwnerLocked(base, profile, pass string) (locked, unreadable bool) {

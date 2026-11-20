@@ -3,8 +3,10 @@
 #
 # WHY THIS IS COMMITTED. NOWHERE_MEDIA_AFTER_GATE turns on user media restored after the gate (Q106). Two processes
 # read it: the `restore` roamd runs (mediaRestorePlan, S2) and mediad's background lander (startBgLander, S4b). A
-# conf flag that a daemon does not export is inert, and a daemon that exports it ON by default ships the feature
-# before S7's lynx run. So each daemon exports it exactly once, "0" unless the conf sets it (X1, X2). The in op also
+# conf flag that a daemon does not export is inert, and a daemon whose default differs from the other's restores
+# the head split while nothing lands it, or lands nothing that was split. S7's lynx run turned the default ON
+# (NWP-20261116-58), so each daemon exports it exactly once, "1" unless the conf sets it, and "0" in the conf
+# turns it off (X1, X2). The in op also
 # logs the pre-gate #media restore's wall time, `TIMING restore-media`, which is the number S7 compares: the line
 # sits right after the restore and before restore_media_tail, which overwrites _tt (T1-T3), and a user with no media
 # dir logs nothing (B1-B3).
@@ -15,7 +17,7 @@
 # it is CONVICTED under a shell only when every case it names fails there.
 #
 #   bash test-media-after-gate-roamd.sh            # X1, X2, T1-T3, B1-B3 under every shell found
-#   bash test-media-after-gate-roamd.sh --mutate   # ... plus N1-N4, each of which must be convicted under EACH shell
+#   bash test-media-after-gate-roamd.sh --mutate   # ... plus N1-N5, each of which must be convicted under EACH shell
 set -uo pipefail
 
 MUTATE=no
@@ -30,13 +32,16 @@ PASS=0; FAIL=0
 ok(){ PASS=$((PASS+1)); printf '  ok    %s\n' "$1"; }
 no(){ FAIL=$((FAIL+1)); printf '  FAIL  %s\n' "$1"; }
 
-RESTORE='        [ -d "$MEDIADIR" ] && { NOWHERE_PHASE=media "$AGENT" restore s3 "${name}#media"'
-SKIP='        _mdrc=skip'
-BLOCK='        if [ "$_mdrc" = 0 ]; then'
+RESTORE='          [ -d "$MEDIADIR" ] && { NOWHERE_DOWNLOAD_WORKERS="$_inshare" NOWHERE_PHASE=media NOWHERE_SE_SECRET="$(pwv "$_se_v")" NOWHERE_FIDO2_HMAC="$(pwv "$_fh_v")" "$AGENT" restore s3 "${name}#media"'
+SKIP='          _mdrc=skip'
+BLOCK='          if [ "$_mdrc" = 0 ]; then'
+# NWP-20261210-03: the #media segment is lane M's, a background group the in arm starts once the vault restore landed,
+# so it sits at ten spaces, and its restore takes the lane's share of the download budget. SEGEND closes it.
+SEGEND='          fi'
 
 # --- extraction ------------------------------------------------------------------------------------------
 # extract <roamd> <mediad> <dir>: writes dir/roamd.exp and dir/mediad.exp (each daemon's export lines of the flag),
-# dir/arm (the in arm, comment lines dropped) and dir/seg (from _mdrc=skip to the first line exactly `        fi`).
+# dir/arm (the in arm, comment lines dropped) and dir/seg (from _mdrc=skip to the first line exactly $SEGEND).
 # Prints why and returns 1 when an anchor is missing.
 extract(){
   local r="$1" m="$2" d="$3" n
@@ -50,8 +55,8 @@ extract(){
   [ "$n" = 1 ] || { echo "the #media restore line appears $n times in the in arm, want 1"; return 1; }
   RESTORE="$RESTORE" BLOCK="$BLOCK" awk 'index($0, ENVIRON["RESTORE"]) == 1 {f=1} f && $0 == ENVIRON["BLOCK"] {g=1} END {exit !g}' "$d/arm" \
     || { echo "[$BLOCK] does not follow the #media restore line"; return 1; }
-  SKIP="$SKIP" awk '$0 == ENVIRON["SKIP"] {f=1} f {print} f && $0 == "        fi" {exit}' "$d/arm" > "$d/seg"
-  [ "$(tail -n 1 "$d/seg")" = "        fi" ] || { echo "the #media segment ($SKIP ... fi) is missing"; return 1; }
+  SKIP="$SKIP" SEGEND="$SEGEND" awk '$0 == ENVIRON["SKIP"] {f=1} f {print} f && $0 == ENVIRON["SEGEND"] {exit}' "$d/arm" > "$d/seg"
+  [ "$(tail -n 1 "$d/seg")" = "$SEGEND" ] || { echo "the #media segment ($SKIP ... fi) is missing"; return 1; }
 }
 
 # The checks, run by each shell. $1 = the extraction dir, $2 = the shell itself (for X2's children).
@@ -62,7 +67,7 @@ say(){ if [ "$1" = 0 ]; then echo "ok $2"; else echo "FAIL $2"; fi; }
 nr=$(grep -c . "$d/roamd.exp"); nm=$(grep -c . "$d/mediad.exp")
 if [ "$nr" = 1 ] && [ "$nm" = 1 ]; then say 0 "X1: one export of the flag in roamd and one in mediad"
 else say 1 "X1: exports: roamd $nr, mediad $nm, want 1 each"; fi
-# X2: unset -> 0, empty -> 0, 1 -> 1, and exported (a child process sees it).
+# X2: unset -> 1, empty -> 1, 0 -> 0, 1 -> 1, and exported (a child process sees it).
 x2=0; why=""
 for f in roamd mediad; do
   line=$(cat "$d/$f.exp")
@@ -70,21 +75,24 @@ for f in roamd mediad; do
   a=$(env -i PATH="$PATH" "$sh_" -c "$line"'; printenv NOWHERE_MEDIA_AFTER_GATE')
   b=$(env -i PATH="$PATH" NOWHERE_MEDIA_AFTER_GATE= "$sh_" -c "$line"'; printenv NOWHERE_MEDIA_AFTER_GATE')
   c=$(env -i PATH="$PATH" NOWHERE_MEDIA_AFTER_GATE=1 "$sh_" -c "$line"'; printenv NOWHERE_MEDIA_AFTER_GATE')
-  [ "$a/$b/$c" = 0/0/1 ] || { x2=1; why="$why $f:unset=[$a],empty=[$b],1=[$c]"; }
+  z=$(env -i PATH="$PATH" NOWHERE_MEDIA_AFTER_GATE=0 "$sh_" -c "$line"'; printenv NOWHERE_MEDIA_AFTER_GATE')
+  [ "$a/$b/$c/$z" = 1/1/1/0 ] || { x2=1; why="$why $f:unset=[$a],empty=[$b],1=[$c],0=[$z]"; }
 done
-if [ "$x2" = 0 ]; then say 0 "X2: each export gives 0 unset, 0 empty, 1 for 1, and exports it"
+if [ "$x2" = 0 ]; then say 0 "X2: each export gives 1 unset, 1 empty, 1 for 1, 0 for 0, and exports it"
 else say 1 "X2:$why"; fi
 # T1-T3: the lines around the #media restore in the in arm (comments dropped).
-r=$(grep -nF -- '        [ -d "$MEDIADIR" ] && { NOWHERE_PHASE=media "$AGENT" restore s3 "${name}#media"' "$d/arm" | sed 's/:.*//')
+r=$(grep -nF -- '          [ -d "$MEDIADIR" ] && { NOWHERE_DOWNLOAD_WORKERS="$_inshare" NOWHERE_PHASE=media NOWHERE_SE_SECRET="$(pwv "$_se_v")" NOWHERE_FIDO2_HMAC="$(pwv "$_fh_v")" "$AGENT" restore s3 "${name}#media"' "$d/arm" | sed 's/:.*//')
 case "$r" in ''|*[!0-9]*) r=0 ;; esac
-before=$(sed -n "$((r-1))p" "$d/arm"); after=$(sed -n "$((r+1))p" "$d/arm"); next=$(sed -n "$((r+2))p" "$d/arm")
-if [ "$before" = '        _tt=$(_ms)' ]; then say 0 "T1: _tt=\$(_ms) directly precedes the #media restore"
+before=$(sed -n "$((r-1))p" "$d/arm"); after=$(sed -n "$((r+1))p" "$d/arm"); tprog=$(sed -n "$((r+2))p" "$d/arm"); next=$(sed -n "$((r+3))p" "$d/arm")
+if [ "$before" = '          _tt=$(_ms)' ]; then say 0 "T1: _tt=\$(_ms) directly precedes the #media restore"
 else say 1 "T1: the line before the restore is [$before]"; fi
-if [ "$after" = '        [ "$_mdrc" = skip ] || _tlog restore-media "$_tt"' ]; then
+if [ "$after" = '          [ "$_mdrc" = skip ] || _tlog restore-media "$_tt"' ]; then
   say 0 "T2: the guarded _tlog restore-media directly follows the #media restore"
 else say 1 "T2: the line after the restore is [$after]"; fi
-if [ "$next" = '        if [ "$_mdrc" = 0 ]; then' ]; then say 0 "T3: the _mdrc = 0 block follows the _tlog line"
-else say 1 "T3: the line after that is [$next]"; fi
+# NWP-20261210-03: lane M points NOWHERE_PROGRESS at the tail's own file (T) between the _tlog line and the block.
+if [ "$tprog" = '          NOWHERE_PROGRESS="${_inpb:+$_inpb.T}"   # the tail'"'"'s "finishing" lines: its own file, read by the join as T' ] &&
+   [ "$next" = '          if [ "$_mdrc" = 0 ]; then' ]; then say 0 "T3: the tail's progress switch, then the _mdrc = 0 block, follow the _tlog line"
+else say 1 "T3: the two lines after that are [$tprog] [$next]"; fi
 # B1-B3: the segment, run with stubs. restore_media_tail overwrites _tt, as the real one does.
 runseg(){
   # runseg <media dir present: yes|no> <agent rc> -> prints the calls, one per line
@@ -101,7 +109,6 @@ agentstub(){ echo "agent $1" >> "$CALLS"; return "$RC"; }
 pw(){ echo pw; }
 restore_media_tail(){ echo "tail" >> "$CALLS"; _tt=999; }
 _ssum(){ :; }
-insert_deferred_media(){ echo "idm" >> "$CALLS"; }
 EOS
     cat "$d/seg"
     printf ': > "%s/ran"\n' "$t"
@@ -182,7 +189,8 @@ PY
     done
   }
   mut 'N1 mediad export removed' mediad X1 '^export NOWHERE_MEDIA_AFTER_GATE=[^\n]*\n' ''
-  mut "N2 roamd's default 1" roamd X2 '^(export NOWHERE_MEDIA_AFTER_GATE="\$\{NOWHERE_MEDIA_AFTER_GATE:-)0\}"' '\g<1>1}"'
+  mut "N2 roamd's default back to 0" roamd X2 '^(export NOWHERE_MEDIA_AFTER_GATE="\$\{NOWHERE_MEDIA_AFTER_GATE:-)1\}"' '\g<1>0}"'
+  mut "N5 mediad's default back to 0" mediad X2 '^(export NOWHERE_MEDIA_AFTER_GATE="\$\{NOWHERE_MEDIA_AFTER_GATE:-)1\}"' '\g<1>0}"'
   mut 'N3 the skip guard dropped' roamd 'T2 B1' '^( *)\[ "\$_mdrc" = skip \] \|\| (_tlog restore-media)' '\1\2'
   mut 'N4 the _tlog moved after restore_media_tail' roamd 'T2 B2' '^( *\[ "\$_mdrc" = skip \] \|\| _tlog restore-media "\$_tt"\n)((?:[^\n]*\n)*?)( *restore_media_tail "\$MEDIADIR"\n)' '\2\3\1'
 fi

@@ -266,6 +266,9 @@ check() {
   if ! grep -Eq '(^|[^A-Za-z])Log\.|FileOutputStream|FileWriter' "$1"; then
     echo "PASS S3"; else echo "FAIL S3: CrashRecords logs or writes a file"; rc=1; fi
   m=$(method "$4" 'private String gateReportJson(')
+  # NWP-20261210-24: the one GateStrayCrashes.put call is exempt. It adds counts and fixed codes only, never a crash
+  # text (Q121), and test-gate-stray-crashes-java.sh pins that. Any other crash mention still fails S4.
+  [ -z "$m" ] || m=$(printf '%s\n' "$m" | grep -vF 'GateStrayCrashes.put(this, st); // NWP-20261210-24')
   if [ -z "$m" ]; then echo "FAIL S4: gateReportJson not found"; rc=1
   elif [[ "${m,,}" == *crash* ]]; then echo "FAIL S4: the gate's report JSON holds crash text"; rc=1
   else echo "PASS S4"; fi

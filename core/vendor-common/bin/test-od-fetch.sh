@@ -103,7 +103,10 @@ harness() {
 #!/bin/sh
 echo "$1" >> "$CALLS"
 case "$1" in
-  fetch-oddata) echo "hmac=${NOWHERE_FIDO2_HMAC:-}" > "$D/fetchenv"
+  fetch-oddata) h=${NOWHERE_FIDO2_HMAC:-}
+    # NWP-20261205-18: roamd hands the factor as a staged @file:; resolve and consume it as the agent does
+    case "$h" in @file:*) f=${h#@file:}; echo "$f" > "$D/fetchfile"; h=$(cat "$f"); rm -f "$f" ;; esac
+    echo "hmac=$h" > "$D/fetchenv"; env | grep -c deadbeef > "$D/rawenv"
     [ -e "$D/user/com.nowhere.chooser/files/.appcode/$5" ] && echo early > "$D/early"
     [ -e "$D/state/odfetch.12/pending.$5" ] && echo marked > "$D/premark"
     [ -n "${FETCH_UNLIST:-}" ] && : > "$D/state/odfetch.12/unfetched.ce"
@@ -114,7 +117,9 @@ EOF
   chmod +x "$d/agent"
   {
     echo 'LOG="$D/log"; RES="$D/res"; STATE="$D/state"; uid=12; name=prof; pass=x; AGENT="$D/agent"; USERDIR="$D/user"'
-    echo 'pw() { echo x; }; restorecon() { :; }; pkgname_ok() { return 0; }; chown() { :; }; stat() { echo 0; }'
+    # pw stages under $STATE as the real one does, so O7 sees the factor arrive as a file (NWP-20261205-18)
+    echo 'pw() { _f=$(mktemp -p "$STATE" .pw.roamd.XXXXXX) && printf "%s\n" "$1" > "$_f" && echo "@file:$_f"; }; pwv() { [ -z "$1" ] || pw "$1"; }'
+    echo 'restorecon() { :; }; pkgname_ok() { return 0; }; chown() { :; }; stat() { echo 0; }'
     anchor_of "$sut" '_ms() {' | head -1
     grep -m1 -E '^ODHOLD=' "$sut"
     anchor_of "$sut" 'od_unf_path() {'
@@ -140,8 +145,9 @@ EOF
     echo 'run_blockop() { srcunit="$1"; case odblock in'
     op_of "$sut" odblock
     echo 'esac; }'
-    echo 'run_reply() { odsrc="$1"; odkept="$2"; pkg="$3"'
-    awk '/^    if \[ "\$odsrc" = 0 \]; then$/{f=1} f{print} f&&/^    fi$/{exit}' "$sut"
+    # NWP-20261209-04: the reply block starts at the failed-Android/data branch; 0 here is a walk that did not fail.
+    echo 'run_reply() { odsrc="$1"; odkept="$2"; pkg="$3"; _odxf=0'
+    awk '/^    if \[ "\$_odxf" = 2 \]; then$/{f=1} f{print} f&&/^    fi$/{exit}' "$sut"
     echo '}'
     echo 'run_mat() { srcunit="$1"; case materializeapp in'
     op_of "$sut" materializeapp
@@ -180,8 +186,8 @@ O6='echo com.example.od > "$STATE/odfetch.12/unfetched.ce"; ( SUSPST=false DISST
 O4='( run_odr com.example.inst ); c=$(cat "$CALLS" 2>/dev/null); [ -z "$c" ] || { echo "calls: $c"; exit 1; }; [ -e "$D/reached" ] || { echo "stopped"; exit 1; }'
 B1='echo "s com.example.a" > "$STATE/odfetch.12/blocked.com.example.a"; echo "d com.example.b" > "$STATE/odfetch.12/blocked.com.example.b"; od_unblock_app com.example.a; od_unblock_app com.example.c; od_unblock_app com.example.b; c=$(tr "
 " " " < "$CALLS"); [ "$c" = "pm unsuspend pm enable " ] || { echo "calls: $c"; exit 1; }; [ ! -s "$STATE/odfetch.12/blocked.com.example.a" ] || { echo "left a: $(cat "$STATE/odfetch.12/blocked.com.example.a")"; exit 1; }; [ ! -s "$STATE/odfetch.12/blocked.com.example.b" ] || { echo "left b"; exit 1; }'
-O7='echo com.example.od > "$STATE/odfetch.12/unfetched.ce"; printf deadbeef > "$STATE/.fido2hmac"; ( run_odr com.example.od ); [ "$(cat "$D/fetchenv")" = hmac=deadbeef ] || { echo "env: $(cat "$D/fetchenv")"; exit 1; }; [ -e "$D/reached" ] || { echo "stopped"; exit 1; }'
-O8='echo com.example.od > "$STATE/odfetch.12/unfetched.ce"; ( run_odr com.example.od ); [ "$(cat "$D/fetchenv")" = hmac= ] || { echo "env: $(cat "$D/fetchenv")"; exit 1; }; [ -e "$D/reached" ] || { echo "stopped"; exit 1; }'
+O7='echo com.example.od > "$STATE/odfetch.12/unfetched.ce"; printf deadbeef > "$STATE/.fido2hmac"; ( run_odr com.example.od ); [ "$(cat "$D/fetchenv")" = hmac=deadbeef ] || { echo "env: $(cat "$D/fetchenv")"; exit 1; }; case "$(cat "$D/fetchfile" 2>/dev/null)" in "$STATE"/.pw.roamd.*) ;; *) echo "the factor was not staged as a file"; exit 1 ;; esac; [ "$(cat "$D/rawenv")" = 0 ] || { echo "the raw factor is in the agent environment"; exit 1; }; [ -e "$D/reached" ] || { echo "stopped"; exit 1; }'
+O8='echo com.example.od > "$STATE/odfetch.12/unfetched.ce"; ( run_odr com.example.od ); [ "$(cat "$D/fetchenv")" = hmac= ] || { echo "env: $(cat "$D/fetchenv")"; exit 1; }; [ ! -e "$D/fetchfile" ] || { echo "a factor file was staged with no factor"; exit 1; }; [ -e "$D/reached" ] || { echo "stopped"; exit 1; }'
 BR='B="$STATE/odfetch.12/blocked.com.example.a"; kept() { rc=$1; [ "$rc" = 1 ] || { echo "rc $rc"; exit 1; }; [ "$(cat "$B")" = "$2" ] || { echo "left: $(cat "$B")"; exit 1; }; }; '
 B2="$BR"'echo "s com.example.a" > "$B"; ( UNSUSPRC=1; export UNSUSPRC; od_unblock_app com.example.a ); kept $? "s com.example.a"; [ "$(cat "$CALLS")" = "pm unsuspend" ] || exit 1'
 B3="$BR"'echo "s com.example.a" > "$B"; ( TIMEOUTV=unsuspend; export TIMEOUTV; od_unblock_app com.example.a ); kept $? "s com.example.a"'
@@ -250,7 +256,7 @@ pin() {
   local sut="$1" label="$2" in_op commit cs ok=1
   case "$label" in
     P1)
-      grep -q 'NOWHERE_UNFETCHED_LIST="$(od_park_var ce)"' "$sut" && grep -q 'NOWHERE_UNFETCHED_LIST="$(od_park_var de)" "$AGENT" restore s3 "${name}#de"' "$sut" || ok=0
+      grep -q 'NOWHERE_UNFETCHED_LIST="$(od_park_var ce)"' "$sut" && grep -q 'NOWHERE_UNFETCHED_LIST="$(od_park_var de)" NOWHERE_SE_SECRET="$(pwv "$_se_v")" NOWHERE_FIDO2_HMAC="$(pwv "$_fh_v")" "$AGENT" restore s3 "${name}#de"' "$sut" || ok=0
       [ "$(grep -c 'NOWHERE_UNFETCHED_LIST="$(od_park_var' "$sut")" = 2 ] || ok=0
       grep -E 'restore s3 "\$\{name\}#(media|apps|sys|keys)"' "$sut" | grep -q UNFETCHED && ok=0 ;;
     P2)
@@ -321,7 +327,7 @@ mutant "R15 a zero-exit disable counts although its state line says it did not t
 mutant "R11 an unblockable app is fetched anyway" O3 's/^      od_block_app "\$pkg" || { echo "ERR-NOTREADY" > "\$RES"; chmod 600 "\$RES"; exit 0; }$/      od_block_app "$pkg" || :/'
 mutant "R12 the unblock lifts a block on ERR-NOTREADY too" P3 's/^      echo "ERR-NOTREADY" > "\$RES"$/      od_unblock_app "$pkg"; echo "ERR-NOTREADY" > "$RES"/'
 mutant "R13 the unblock keeps the line" B1 's/^    grep -vxF -- "\$_m \$pkg" "\$_b" > "\$_b.tmp"/    cat "$_b" > "$_b.tmp"/'
-mutant "R16 the fetch runs without the cached factor" O7 '/^od_fetch_data() {/,/^}/{/NOWHERE_FIDO2_HMAC/d}'
+mutant "R16 the cached factor is not loaded" O7 '/^od_fetch_data() {/,/^}/{s/_fh_v="\$(cat "\$STATE\/.fido2hmac")"/:/}'
 mutant "R17 a zero-exit unsuspend counts without a state line" B8 's/\*"new suspended state: "\*) _ok=1/*) _ok=1/'
 mutant "R58 another owner's hold counts as root's block still on (RF-012)" B4 's/\*"new suspended state: "\*) _ok=1/*"new suspended state: false"*) _ok=1/'
 mutant "R59 the other owner is not logged (RF-012)" B4 's/another owner still holds its suspension/unblocked/'

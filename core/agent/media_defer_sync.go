@@ -65,7 +65,9 @@ func signOutSeal() bool {
 // Simpler than the essential path, deliberately: a deferred file is chunked from RAW bytes with no tar
 // framing, so there is no header to parse and no neighbour to spill in from. fetchEssSpan only needs its tar
 // handling because essential files share one stream.
-func fetchDeferredBytes(base string, key []byte, version int, d deferredFile) (b []byte, err error) {
+//
+// NWP-20261204-19: prog gets one frame per chunk fetched (media_sync_prog.go); nil writes none.
+func fetchDeferredBytes(base string, key []byte, version int, d deferredFile, prog *mediaSyncProg) (b []byte, err error) {
 	defer func() {
 		if p := recover(); p != nil {
 			b, err = nil, fmt.Errorf("fetch deferred: %v", p)
@@ -79,6 +81,7 @@ func fetchDeferredBytes(base string, key []byte, version int, d deferredFile) (b
 			return nil, fmt.Errorf("unpack chunk %d/%d: %w", i+1, len(d.Chunks), ue)
 		}
 		buf.Write(raw)
+		prog.chunk()
 	}
 	if int64(buf.Len()) != d.Size {
 		// A short reassembly written to disk is a CORRUPT photo that the next walk then seals OVER the good
@@ -131,8 +134,11 @@ func newlyArrivedDeferred(stored, restored map[string]deferredFile, dest string,
 }
 
 // materializeDeferredArrivals fetches another handset's new large media, up to a byte budget.
+//
+// NWP-20261204-19: each fetch plans the file's chunks on prog, and every chunk it lands writes a frame, so the
+// stall watchdog sees the sync move. nil writes nothing.
 func materializeDeferredArrivals(base string, key []byte, m chunkManifest, rels []string, dest string,
-	budget int64) ([]string, int64) {
+	budget int64, prog *mediaSyncProg) ([]string, int64) {
 	var wrote []string
 	var total int64
 	waiting := 0
@@ -173,7 +179,8 @@ func materializeDeferredArrivals(base string, key []byte, m chunkManifest, rels 
 		if _, err := os.Lstat(target); err == nil {
 			continue // re-checked here as well: selection and write are not one atomic step
 		}
-		b, err := fetchDeferredBytes(base, key, m.Version, d)
+		prog.plan(len(d.Chunks))
+		b, err := fetchDeferredBytes(base, key, m.Version, d, prog)
 		if err != nil {
 			fmt.Printf("  media-sync: %q SKIPPED (%v)\n", rel, errCode(err))
 			continue

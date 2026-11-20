@@ -95,7 +95,7 @@ public class LandingLineCases {
         eq("C11 headline(4, 4) verbatim", LandingLine.headline(4, 4), "All 4 apps are back");
         eq("C12 more(47) verbatim", LandingLine.more(47), "+47 more");
 
-        eq("C13 TITLE", LandingLine.TITLE, "Welcome back");
+        eq("C13 TITLE", LandingLine.TITLE, "Your apps are coming back");
         eq("C13 READY", LandingLine.READY, "ready");
         eq("C13 COMING", LandingLine.COMING, "coming back");
         eq("C13 KEEP", LandingLine.KEEP, "You can keep using the phone.");

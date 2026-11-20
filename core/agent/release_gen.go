@@ -167,8 +167,8 @@ func relGenAtRestore(base, profile, pass, head string) {
 	}
 }
 
-// relGenAtScopeRestore is relGenAtRestore for a '#' scope (NWP-20261207-03). Only a #de, #sys, #keys or #apps head that
-// is a VAULT carries a release generation; any other scope, or a bare-shaped head, returns before the record or the
+// relGenAtScopeRestore is relGenAtRestore for a '#' scope (NWP-20261207-03). Only a #de, #sys, #keys, #apps or #media
+// (NWP-20261208-14) head that is a VAULT carries a release generation; any other scope, or a bare-shaped head, returns before the record or the
 // cache is read. The cache is shared with the bare vault, so a drop here leaves the bare record over an emptier
 // cache: the safe direction.
 func relGenAtScopeRestore(base, profile, pass, head string) {

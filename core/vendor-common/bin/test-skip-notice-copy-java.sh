@@ -17,7 +17,11 @@
 #      context, only on the switch-landing path: after the netRekick block (which returns) and inside if (!byHand).
 #   S2 SkipNoticeActivity sends SkipNoticeCopy.shownRequest only from markShown, and calls markShown only from
 #      onResume behind a once-flag (shownSent) that onCreate restores and onSaveInstanceState saves: never from
-#      onCreate or the OK button.
+#      onCreate or the OK button. markShown is package-private since NWP-20261208-24, for S3's one caller.
+#   S3 (NWP-20261208-24) outside SkipNoticeActivity, the one markShown( call in core/chooser/src is
+#      SkipNoticeActivity.markShown( in LandingNoticeActivity.sync(), on its own thread, in a loop over the long[] that
+#      sync() took from LandingQueue.takeSkipTimes(): a folded skip notice is recorded shown once, by the card that
+#      drew it.
 # The merger's full javac / `m NowhereChooser` covers SkipNoticeActivity and UnarchiveService themselves.
 #
 # What this does NOT prove: the two-phone run (a passphrase change on one phone, a skipped sign-out on the other, the
@@ -26,7 +30,7 @@
 # ⚠ IT FAILS WHEN THERE IS NO JAVAC, IT NEVER SKIPS. javac comes from PATH, else from the build host's JDK below.
 #
 #   bash test-skip-notice-copy-java.sh            # the cases and the pins
-#   bash test-skip-notice-copy-java.sh --mutate   # ... plus mutants M1-M7 that must each CONVICT the suite
+#   bash test-skip-notice-copy-java.sh --mutate   # ... plus mutants M1-M9 that must each CONVICT the suite
 set -uo pipefail
 
 MUTATE=no
@@ -107,12 +111,12 @@ cases() {
   return 1
 }
 
-# pin <S1|S2> <file>: 0 the pin holds, 1 it does not, 2 could not extract.
+# pin <S1|S2> <file> | pin S3 <src dir>: 0 the pin holds, 1 it does not, 2 could not extract.
 pin() {
   python3 -I - "$1" "$2" <<'PY'
-import io, re, sys
+import io, os, re, sys
 which, path = sys.argv[1], sys.argv[2]
-raw = io.open(path, encoding='utf-8').read()
+raw = io.open(path, encoding='utf-8').read() if os.path.isfile(path) else ''
 
 def strip(s):
     """Drop // and /* */ comments; keep string and char literals."""
@@ -213,7 +217,7 @@ elif which == 'S2':
         'onCreate': body(r'^    @Override protected void onCreate\('),
         'onResume': body(r'^    @Override protected void onResume\('),
         'onSaveInstanceState': body(r'^    @Override protected void onSaveInstanceState\('),
-        'markShown': body(r'^    private static void markShown\('),
+        'markShown': body(r'^    static void markShown\('),
     }
     def inside(pos):
         return [k for k, (o, e) in meth.items() if o < pos < e]
@@ -221,8 +225,8 @@ elif which == 'S2':
     if not sr: fail("no shownRequest( call")
     for p in sr:
         if inside(p) != ['markShown']: fail("shownRequest( is called outside markShown")
-    decl = re.search(r'^    private static void markShown\(', m, re.M).start()
-    ms = [x.start() for x in re.finditer(r'\bmarkShown\(', m) if x.start() != decl + len('    private static void ')]
+    decl = re.search(r'^    static void markShown\(', m, re.M).start()
+    ms = [x.start() for x in re.finditer(r'\bmarkShown\(', m) if x.start() != decl + len('    static void ')]
     if not ms: fail("markShown( is never called")
     for p in ms:
         if inside(p) != ['onResume']: fail("markShown( is called outside onResume (%s)" % (inside(p) or 'no method'))
@@ -239,6 +243,34 @@ elif which == 'S2':
     oo, oe = meth['onSaveInstanceState']
     if 'putBoolean(STATE_SHOWN_SENT' not in m[oo:oe]: fail("onSaveInstanceState does not save shownSent")
     print("PASS S2 the shown request is sent from onResume once, never from onCreate or the OK button")
+elif which == 'S3':
+    if not os.path.isdir(path):
+        print("EXTRACTION FAILED: S3 takes the chooser source dir"); sys.exit(2)
+    calls = []
+    for f in sorted(os.listdir(path)):
+        if not f.endswith('.java') or f == 'SkipNoticeActivity.java': continue
+        t = strip(io.open(os.path.join(path, f), encoding='utf-8').read())
+        tm = mask(t)
+        for x in re.finditer(r'\bmarkShown\(', tm):
+            calls.append((f, t, tm, x.start()))
+    if len(calls) != 1:
+        fail("outside SkipNoticeActivity markShown( is called %d times (%s), want 1" % (len(calls), sorted(set(c[0] for c in calls))))
+    f, src, m, c = calls[0]
+    if f != 'LandingNoticeActivity.java': fail("the one outside call is in %s, want LandingNoticeActivity.java" % f)
+    if not src.startswith('SkipNoticeActivity.markShown(', c - len('SkipNoticeActivity.')): fail("the call is not SkipNoticeActivity.markShown(")
+    yo, ye = body(r'^    private void sync\(\)')
+    if not yo < c < ye: fail("the call is not inside LandingNoticeActivity.sync()")
+    y = src[yo:ye]
+    tk = re.search(r'long\[\] (\w+) = LandingQueue\.takeSkipTimes\(\);', y)
+    if not tk or y.count('takeSkipTimes(') != 1: fail("sync() does not take the skip times once into a long[]")
+    lp = re.search(r'for \(long (\w+) : ' + re.escape(tk.group(1)) + r'\) \{', m[yo:ye])
+    if not lp: fail("sync() has no loop over the taken skip times")
+    lo = yo + lp.end() - 1
+    lc = close_of(lo)
+    if not lo < c < lc: fail("the call is not inside the loop over the taken skip times")
+    if not re.search(r'new Thread\(\(\) -> SkipNoticeActivity\.markShown\(' + lp.group(1) + r'\), "nowhere-skip-notice-shown"\);', src[lo:lc]):
+        fail("the loop does not mark the taken time shown on its own thread")
+    print("PASS S3 outside SkipNoticeActivity only LandingNoticeActivity.sync() records a skip notice shown, once per taken time")
 else:
     print("EXTRACTION FAILED: no pin %s" % which); sys.exit(2)
 PY
@@ -248,6 +280,7 @@ fails=0
 if cases "$COPY"; then echo "PASS cases"; else echo "FAIL cases"; fails=$((fails + 1)); fi
 pin S1 "$SVC" || fails=$((fails + 1))
 pin S2 "$ACT" || fails=$((fails + 1))
+pin S3 "$SRC" || fails=$((fails + 1))
 if [ "$fails" -ne 0 ]; then echo "test-skip-notice-copy-java: FAIL ($fails check(s))"; exit 1; fi
 echo "test-skip-notice-copy-java: PASS"
 [ "$MUTATE" = yes ] || exit 0
@@ -291,6 +324,12 @@ elif mid in ('M6', 'M7'):
         t = rep(t, '                if (netRekick) {\n', blk + '                if (netRekick) {\n')
     else:
         t = s[:a] + rep(blk, 'if (!byHand) {', '{') + s[e:]
+elif mid == 'M8':
+    t = rep(s, '        LandingQueue.cardShown(sweep);', '        LandingQueue.cardShown(sweep); SkipNoticeActivity.markShown(1L);')
+elif mid == 'M9':
+    t = rep(s, '        for (long time : skipShown) {\n',
+            '        for (long time : LandingQueue.takeSkipTimes()) SkipNoticeActivity.markShown(time);\n'
+            '        for (long time : skipShown) {\n')
 else:
     print("no mutant %s" % mid); sys.exit(2)
 if t == s:
@@ -299,14 +338,17 @@ io.open(dst, 'w', encoding='utf-8').write(t)
 PY
 }
 
-# convict <Mn> <cases|S1|S2> <file> <what>
+# convict <Mn> <cases|S1|S2|S3> <file> <what>. S3 runs on a copy of the source dir holding the mutated file.
 convict() {
   local id=$1 check=$2 file=$3 what=$4 d dst rc
   d=$(mktemp -d -p "$W") || { echo "FAIL $id: no temp"; MFAILS=$((MFAILS + 1)); return; }
   dst="$d/$(basename "$file")"
-  if ! mutate "$id" "$file" "$dst"; then echo "FAIL $id ($what): the mutant did not apply"; MFAILS=$((MFAILS + 1)); return; fi
+  if [ "$check" = S3 ]; then cp -r "$SRC" "$d/src"; dst="$d/src/$(basename "$file")"; fi
+  if ! mutate "$id" "$file" "$dst"; then echo "FAIL $id ($what): the mutant did not apply"; MFAILS=$((MFAILS + 1)); rm -rf "$d"; return; fi
   if [ "$check" = cases ]; then
     cases "$dst" quiet; rc=$?
+  elif [ "$check" = S3 ]; then
+    pin S3 "$d/src" >/dev/null; rc=$?
   else
     pin "$check" "$dst" >/dev/null; rc=$?
   fi
@@ -323,6 +365,8 @@ convict M4 cases "$COPY" "the empty-phone fallback removed"
 convict M5 S2 "$ACT" "the shown request moved to the OK button"
 convict M6 S1 "$SVC" "the check runs before the netRekick return"
 convict M7 S1 "$SVC" "the !byHand guard removed"
+convict M8 S3 "$SRC/LandingNoticeActivity.java" "the landing card also records a skip notice shown at onCreate"
+convict M9 S3 "$SRC/LandingNoticeActivity.java" "sync() takes the skip times a second time and marks them outside the loop"
 
 if [ "$MFAILS" -ne 0 ]; then echo "FAIL: $MFAILS mutant check(s) failed"; exit 1; fi
-echo "OK: all 7 mutants convicted"
+echo "OK: all 9 mutants convicted"

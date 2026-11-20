@@ -12,8 +12,7 @@
 # the chown leaves the gate unable to read or delete its own staging. Each is silent on a device. Other suites reach this
 # block only to get past it (test-signin-keystore-staging.sh), so nothing ran its branches.
 #
-# This suite runs the REAL block, extracted from its first line to its `_innet=apps` line, with /data/ re-rooted into a
-# case dir, in a child of each shell found among bash, sh, dash and mksh (the device's /system/bin/sh). $AGENT is a
+# This suite runs the REAL block (see NWP-20261210-03 below), with /data/ re-rooted into a case dir, in a child of each shell found among bash, sh, dash and mksh (the device's /system/bin/sh). $AGENT is a
 # script, so its real exit status reaches _aprc; the other helpers are shell functions. What the agent's restore does is the agent's own tests' job.
 #
 #   A1  a stale .appcode/old.app/base.apk is gone and the agent sees an empty .appcode. A1 runs inside A2, A3, A4, A6 and
@@ -24,8 +23,13 @@
 #   A5  CHOOSER0 is missing: no agent call, no .appcode
 #   A6  mkdir is refused: no agent call, no .appcode
 #   A7  the agent exits 5 (store unreachable) after a partial tree that holds manifest.tsv: as A2. The manifest is what
-#       makes this case pin the exit status. _aprc is 5 and _innet is apps after the block, so the arm's verdict ends the
-#       sign-in as BLANK NET (NWP-20261201-16; test-in-scope-net-blank.sh F runs that verdict).
+#       makes this case pin the exit status. _aprc is 5 after the block and the lane's status file holds 5, so the join's
+#       verdict ends the sign-in as BLANK NET (NWP-20261201-16; test-in-scope-net-blank.sh F runs that verdict).
+#
+# NWP-20261210-03: the block is lane A, a background group the `in` arm starts once the vault restore landed. The block
+# is now the arm's two CHOOSER0= and APPCODE= lines (set in the parent, before the lanes start) followed by lane A's
+# group, from its `{   # lane A` line to its closing `} &`, which the suite runs as `}` (in the foreground), so the
+# group's variables reach the checks. test-in-scope-lanes.sh runs the lanes as the arm starts them.
 #
 # The mutants edit the EXTRACTED block, not a copy of roamd, because M2 removes an extraction anchor: on a copy it would
 # only ever reach EXTRACTION FAILED. --mutate also proves the refusals: an anchor missing or doubled, a /data path the
@@ -51,28 +55,34 @@ SHELLS=""; for s in bash sh dash mksh; do command -v "$s" >/dev/null 2>&1 && SHE
 PRINT_SHIM='command -v print >/dev/null 2>&1 || print() { _pn=1; while [ $# -gt 0 ]; do case "$1" in -rn|-nr) _pn=0; shift ;; -r) shift ;; --) shift; break ;; *) break ;; esac; done; if [ "$_pn" = 1 ]; then printf "%s\n" "$*"; else printf "%s" "$*"; fi; }'
 sq() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
 
-ANCHOR_FIRST='          CHOOSER0="/data/user/0/com.nowhere.chooser/files"'
+ANCHOR_FIRST='      CHOOSER0="/data/user/0/com.nowhere.chooser/files"'
+ANCHOR_APPCODE='      APPCODE="$CHOOSER0/.appcode"'
+ANCHOR_LANE='        {   # lane A: #apps code -> user 0'"'"'s .appcode'
 ANCHOR_RM='            rm -rf "$APPCODE"'
-ANCHOR_END='          if [ "$_aprc" = 5 ]; then _innet=apps; fi'
+ANCHOR_END='        } &'
 FILES='data/user/0/com.nowhere.chooser/files'
 SUCCESS='[roamd] IN "zqprofile" #apps code restored → user0 chooser '
 
 # extract_block <roamd.sh> <out file> -> the re-rooted block; exit 2 when it cannot be read or re-rooted exactly.
 extract_block() {
   local f="$1" out="$2" a c raw live
-  for a in "$ANCHOR_FIRST" "$ANCHOR_RM"; do
+  for a in "$ANCHOR_FIRST" "$ANCHOR_APPCODE" "$ANCHOR_LANE" "$ANCHOR_RM"; do
     c=$(grep -cxF -- "$a" "$f")
     [ "$c" = 1 ] || { echo "EXTRACTION FAILED: '$a' appears $c times as a whole line in $f (want 1)" >&2; exit 2; }
   done
-  raw=$(awk -v first="$ANCHOR_FIRST" -v rm_line="$ANCHOR_RM" -v end="$ANCHOR_END" '
-    $0 == first { on = 1 }
-    on { print }
+  # The two parent lines, then lane A's group; the group's closing `} &` is printed as `}`.
+  raw=$(awk -v first="$ANCHOR_FIRST" -v ac="$ANCHOR_APPCODE" -v lane="$ANCHOR_LANE" -v rm_line="$ANCHOR_RM" -v end="$ANCHOR_END" '
+    $0 == first || $0 == ac { print; next }
+    $0 == lane { on = 1 }
     on && $0 == rm_line { seen = 1 }
-    on && seen && $0 == end { exit }' "$f")
-  [ "$(printf '%s\n' "$raw" | tail -n 1)" = "$ANCHOR_END" ] || { echo "EXTRACTION FAILED: no '$ANCHOR_END' after the failure arm's rm in $f" >&2; exit 2; }
+    on && seen && $0 == end { print "        }"; done = 1; exit }
+    on { print }
+    END { if (!done) print "NO-END" }' "$f")
+  [ "$(printf '%s\n' "$raw" | tail -n 1)" = "        }" ] || { echo "EXTRACTION FAILED: no '$ANCHOR_END' after the failure arm's rm in $f" >&2; exit 2; }
+  [ "$(printf '%s\n' "$raw" | head -n 2 | tail -n 1)" = "$ANCHOR_APPCODE" ] || { echo "EXTRACTION FAILED: '$ANCHOR_APPCODE' does not follow '$ANCHOR_FIRST' in $f" >&2; exit 2; }
   # Only the forms the block uses are rewritten, so the check below can still find any other /data path.
   printf '%s\n' "$raw" | sed -E 's#([" ])/data/#\1$ROOT/data/#g' > "$out"
-  c=$(grep -cxF -- '          CHOOSER0="$ROOT/'"$FILES"'"' "$out")
+  c=$(grep -cxF -- '      CHOOSER0="$ROOT/'"$FILES"'"' "$out")
   [ "$c" = 1 ] || { echo "RE-ROOT INCOMPLETE: the first line was not rewritten in $f" >&2; exit 2; }
   # The block runs a real rm -rf: this check comes before any child starts.
   live=$(sed -E -e 's/^[[:space:]]*#.*$//' -e 's/[[:space:]]#.*$//' -e 's#\$ROOT/data/##g' "$out")
@@ -92,6 +102,7 @@ run_case() {
     : > "$root/$FILES/.appcode/old.app/base.apk"
   fi
   : > "$root/log"
+  mkdir -p "$root/lanes"   # the arm's lane dir; lane A writes its status there as its last step
   printf '%s\n' "$mode" > "$root/agent.mode"
   cat > "$root/agent" <<'AGENT'
 #!/bin/sh
@@ -116,6 +127,7 @@ AGENT
     cat <<'STUB'
 name=zqprofile; pass=zqpass; uid=11; _innet=""
 LOG="$ROOT/log"; AGENT="$ROOT/agent"
+_inlanes="$ROOT/lanes"; _inshare=6; NOWHERE_PROGRESS=""   # set by the arm before the lanes start (NWP-20261210-03)
 stat() { for _a in "$@"; do :; done; if [ "$_a" = "$ROOT/data/user/0/com.nowhere.chooser/files" ]; then echo 10077; else echo 0; fi; }
 chown() { printf '%s\n' "$*" >> "$ROOT/chown.argv"; }
 restorecon() { printf '%s\n' "$*" >> "$ROOT/restorecon.argv"; }
@@ -124,6 +136,8 @@ _ms() { echo 0; }
 _tlog() { :; }
 qn() { printf '"%s"' "$1"; }
 pw() { printf 'pw-%s' "$1"; }
+pwv() { [ -z "$1" ] || pw "$1"; }
+_se_v=""; _fh_v=""   # set at the top level in the script (NWP-20261205-18)
 STUB
     cat "$block"
     printf 'printf "%%s\\n" "${_aprc-unset}" > "$ROOT/aprc"; printf "%%s\\n" "$_innet" > "$ROOT/innet"\n'
@@ -203,7 +217,7 @@ cases() {
   go A7 fail5 real yes || return 2
   stale_gone A7 saw; agent_ran_once A7; nothing_left A7
   chk "A7 [$sh] _aprc is 5 after the block (got '$(cat "$R/aprc")')" [ "$(cat "$R/aprc")" = 5 ]
-  chk "A7 [$sh] _innet is apps after the block (got '$(cat "$R/innet")')" [ "$(cat "$R/innet")" = apps ]
+  chk "A7 [$sh] the lane's status file holds 5 (got '$(cat "$R/lanes/A" 2>/dev/null)')" [ "$(cat "$R/lanes/A" 2>/dev/null)" = 5 ]
 
   printf '  -- [%s] %d passed, %d failed\n' "$sh" "$p" "$x"
   [ "$x" = 0 ]
@@ -215,9 +229,10 @@ edit() {
 import sys
 m, src, dst = sys.argv[1:]
 s = open(src, 'rb').read()
-FIRST = b'          CHOOSER0="/data/user/0/com.nowhere.chooser/files"\n'
+FIRST = b'      CHOOSER0="/data/user/0/com.nowhere.chooser/files"\n'
 FAIL_RM = b'            rm -rf "$APPCODE"\n'
-APPCODE_LINE = b'          APPCODE="$CHOOSER0/.appcode"\n'
+APPCODE_LINE = b'      APPCODE="$CHOOSER0/.appcode"\n'
+LANE_LINE = b"        {   # lane A: #apps code -> user 0's .appcode\n"
 R = {
   # Mutants of the block.
   'M1': (b'\n          rm -rf "$APPCODE"\n', b'\n'),
@@ -232,7 +247,7 @@ R = {
   'X2': (b'\n' + FAIL_RM, b'\n'),
   'X3': (b'\n' + FIRST, b'\n' + FIRST + FIRST),
   'X4': (b'\n' + FAIL_RM, b'\n' + FAIL_RM + FAIL_RM),
-  'X5': (b'\n' + APPCODE_LINE, b'\n' + APPCODE_LINE + b'          X=/data/leak\n'),
+  'X5': (b'\n' + LANE_LINE, b'\n' + LANE_LINE + b'          X=/data/leak\n'),
 }
 a, b = R[m]
 if s.count(a) != 1:

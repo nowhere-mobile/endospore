@@ -51,6 +51,7 @@ pm() {
   esac
 }
 cmd() { echo "cmd $*" >> "$D/calls"; return 0; }
+_ms() { echo 0; }; _tlog() { :; }   # NWP-20261210-09: the sign-in call times its phases
 '
 
 # prep_fn <roamd.sh> <out> -- extract grant_perms_for and point its nowhere-perms under $TROOT. 0 ok, 2 harness error.
@@ -62,6 +63,7 @@ prep_fn() {
     echo "EXTRACTION FAILED: grant_perms_for() { ... } not found in $sut" >&2; return 2
   fi
   sed 's#PF="/data/user/#PF="$TROOT/data/user/#' "$raw" > "$out"
+  sed -n '/^gwin_add() {$/,/^}$/p' "$sut" >> "$out"   # NWP-20261210-09: the window helper it calls
   if [ "$(grep -c 'PF="\$TROOT/data/user/' "$out")" != 1 ] || [ "$(grep -c '/data/user/' "$out")" != 1 ]; then
     echo "REWRITE FAILED: want exactly one PF=\"/data/user/ assignment in grant_perms_for of $sut" >&2; return 2
   fi
@@ -215,7 +217,7 @@ if [ "$MUTATE" = yes ]; then
   mutate 'M7 the record is written whether or not pm grant succeeded' \
     's/>\/dev\/null 2>&1 \&\& { echo x >> "\$_gn"; echo "\$gpkg" >> "\$_gok"; }$/>\/dev\/null 2>\&1; echo "$gpkg" >> "$_gok"/'
   mutate "M8 the INTERNET default's success is not recorded" \
-    's/{ dflt=\$((dflt+1)); echo "\$dpkg" >> "\$_gok"; }/dflt=$((dflt+1))/'
+    's/{ echo x >> "\$_gdf"; echo "\$dpkg" >> "\$_gok"; }/{ echo x >> "$_gdf"; }/'   # NWP-20261210-09: the default's line
   [ -z "${MFAIL:-}" ] || FAILED=1
 fi
 [ -z "${FAILED:-}" ] || exit 1

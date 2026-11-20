@@ -25,6 +25,10 @@ import java.io.File;
  * never shows it twice. Until the agent slice and the gate verb are on main the daemon answers anything but a
  * LASTSAVE line, and nothing shows.
  *
+ * NWP-20261208-24 (design approved 2026-11-17, NWP-20261116-48): after the stamp, check() asks {@link LandingQueue}.
+ * While the Auto sweep's card is up and its sweep runs, the line goes into that card as an amber line under its
+ * headline, and this card does not start. Otherwise this card starts once the landing card has closed.
+ *
  * The card sits at the top of the screen, so it never covers the Auto sweep's card, which is centred. Dismissible,
  * not pinned: Got it, Back, or a tap outside. Nothing is sent back to the daemon. No log line names the scopes, the
  * time, the serial or the profile.
@@ -43,6 +47,18 @@ public class LastSaveNoticeActivity extends Activity {
             StoreInstaller.writeAtomic(stamp, serial);
         } catch (Throwable t) {
             android.util.Log.w("NowhereChooser", "last save line: stamp not written", t);
+            return;
+        }
+        // NWP-20261208-24: while the Auto sweep's card is up, the line goes into it; else this card shows, after that
+        // card has closed when there is one.
+        if (LandingQueue.place(LandingQueue.DECIDE_MS, id -> !LandingLine.Sweep.done(id)) == LandingQueue.Place.CARD) {
+            LandingQueue.addLine(LastSaveCopy.LINE, 0);
+            try {
+                app.sendBroadcast(new Intent(LandingNoticeActivity.ACTION_NOTICE).setPackage(app.getPackageName()));
+                android.util.Log.i("NowhereChooser", "last save line: folded");
+            } catch (Throwable t) {
+                android.util.Log.w("NowhereChooser", "last save line: card not told", t);
+            }
             return;
         }
         try {

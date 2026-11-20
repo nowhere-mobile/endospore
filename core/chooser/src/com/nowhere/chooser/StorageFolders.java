@@ -36,4 +36,52 @@ final class StorageFolders {
     static boolean useFolderRows(int n) {
         return n > 0;
     }
+
+    // NWP-20261210-22 (h51 #4): "a folder row gets the same for its streamed copies". A named folder row offers
+    // Free on this phone (FreeOnPhone.LINK), which sends FREE-MEDIA-FOLDER and shows the reply in these words.
+
+    // Draft words, for Chester to correct.
+    static final String FREED_PREFIX = "Freed ";
+    static final String FREED_SUFFIX = " of streamed copies";
+    static final String NOTHING = "Nothing streamed from this folder is on the phone";
+    static final String NO_SESSION = "No active session";
+    static final String FAILED = "Couldn't free space — try again";
+
+    /**
+     * True when a folder row offers Free on this phone: a named folder (the daemon refuses "", so the files outside
+     * every folder are never offered) whose store figures are measured and hold something. The reply carries no
+     * per-folder streamed figure, so a folder with nothing fetched is offered too, and answers {@link #NOTHING}.
+     */
+    static boolean freeOffer(String name, long store, boolean measured) {
+        if (name == null || name.isEmpty()) return false;
+        return measured && store > 0;
+    }
+
+    /** The bytes an "OK <n>" reply freed (n digits only); -1 for any other reply. */
+    static long freedBytes(String reply) {
+        if (reply == null) return -1;
+        String r = reply.trim();
+        if (!r.startsWith("OK ")) return -1;
+        String d = r.substring(3);
+        if (d.isEmpty()) return -1;
+        for (int i = 0; i < d.length(); i++) {
+            char c = d.charAt(i);
+            if (c < '0' || c > '9') return -1;
+        }
+        try {
+            return Long.parseLong(d);
+        } catch (NumberFormatException e) {
+            return -1;
+        }
+    }
+
+    /** The toast for a FREE-MEDIA-FOLDER reply; {@code freed} is the formatted size, used only for "OK n" n > 0. */
+    static String freeMessage(String reply, String freed) {
+        long n = freedBytes(reply);
+        if (n > 0) return FREED_PREFIX + freed + FREED_SUFFIX;
+        if (n == 0) return NOTHING;
+        String r = reply == null ? "" : reply.trim();
+        if ("NONE".equals(r)) return NO_SESSION;
+        return FAILED;
+    }
 }

@@ -13,7 +13,8 @@
 #   B  uid='' and uid=1a: no export, and no file is removed;
 #   C  _ssum, extracted BY NAME: the exact line for an ordinary and a 13-digit start (both signs of mksh's 32-bit wrap),
 #      and no line and nothing on stderr for no variable, a bad start, a bad end or an end before the start;
-#   D  the whole arm and the script head: each bracket sits around its step (signin_in_ms, reap, acct and the three reown);
+#   D  the whole arm and the script head: each bracket sits around its step (signin_in_ms, reap, acct and the three reown;
+#      the CE reown's bracket is the barrier's wait, NWP-20261210-04);
 #   E  the real timer lines in file order behind a stub clock: 35 s of work before the arm and 1 s after it give
 #      phase=reap ms=35000 and phase=in ms=36000.
 # NWP-20261203-09 (backlog: A sign-in fetches every CE vault chunk fresh: ...): each scope line also carries the restore
@@ -147,13 +148,18 @@ shellsuite() {
   adj "the pre-arm reap line follows the file's export" '^      export NOWHERE_SIGNIN_SUMMARY=' '^    _ssum reap "\$_sumt"'
   adj "signin_in_ms ends right before the commit of the OK reply" '^      _ssum in "\$_sum0"$' '^      uiderrors_floor_commit "\$_uefloor"'
   adj "the OK reply is next" '^      uiderrors_floor_commit "\$_uefloor"' '^      echo "OK \$uid" > "\$RES"; _inres=OK$'
-  adj "the CE reown starts at the vault restore's success" '^      _ceok=1$' '^      _sumt=\$\(_ms\)$'
-  adj "the CE reown ends after its restorecon" '_tlog restorecon-ce ' '^      _ssum reown "\$_sumt"$'
+  # NWP-20261210-03: the #media, #apps and #keys lanes start at the vault restore's success
+  adj "the lanes start at the vault restore's success" '^      _ceok=1$' '^      # NWP-20261210-03 \(backlog'
+  adj "the lanes' setup ends with its no-lane-dir branch" '^        echo "\[roamd\] IN restore lanes NOT started' '^      fi$'
+  # NWP-20261210-04: the CE reown runs as a background job; its bracket is the barrier's wait, on the barrier's one line.
+  c=$(grep -cxF '      if [ -n "$_cerp" ]; then _sumt=$(_ms); _tt=$(_ms); wait "$_cerp" 2>/dev/null; _tlog reown-ce-wait "$_tt"; _ssum reown "$_sumt"; _cerp=""; fi' "$arm")
+  [ "$c" = 1 ] && ok "D the CE reown bracket is the barrier's wait" || no "D the barrier line with the CE reown bracket: $c, want 1"
   adj "the #de reown starts in its success branch" '^      if \[ "\$_derc" = 0 \]; then$' '^        _sumt=\$\(_ms\)$'
   adj "the #de reown ends after its restorecon" '_tlog restorecon-de ' '^        _ssum reown "\$_sumt"$'
-  adj "the #media reown starts before the tail" '^        if \[ "\$_mdrc" = 0 \]; then$' '^          _sumt=\$\(_ms\)$'
-  adj "the #media tail is next" '^          _sumt=\$\(_ms\)$' '^          restore_media_tail "\$MEDIADIR"$'
-  adj "the #media reown ends after the tail" '^          restore_media_tail "\$MEDIADIR"$' '^          _ssum reown "\$_sumt"$'
+  # NWP-20261210-03: the #media restore and its tail run in lane M, two spaces deeper
+  adj "the #media reown starts before the tail" '^          if \[ "\$_mdrc" = 0 \]; then$' '^            _sumt=\$\(_ms\)$'
+  adj "the #media tail is next" '^            _sumt=\$\(_ms\)$' '^            restore_media_tail "\$MEDIADIR"$'
+  adj "the #media reown ends after the tail" '^            restore_media_tail "\$MEDIADIR"$' '^            _ssum reown "\$_sumt"$'
   adj "acct starts right before acct_restore" '^        _sumt=\$\(_ms\)$' '^        acct_restore "\$uid"'
   adj "acct ends after acct_restore" '^        acct_restore "\$uid"' '^        _ssum acct "\$_sumt"$'
   adj "reap ends after reap_orphan_provisioned" '^      reap_orphan_provisioned "\$CHOOSER0' '^      _ssum reap "\$_sumt"$'
@@ -264,9 +270,9 @@ mut "m16 restoreHeal does not time the heal" media_heal.go 'hr\.ms = time\.Since
 smut "m17 _ssum in removed" -e '/^      _ssum in "\$_sum0"$/d'
 smut "m18 _ssum reap removed" -e '/^      _ssum reap "\$_sumt"$/d'
 smut "m19 _ssum acct removed" -e '/^        _ssum acct "\$_sumt"$/d'
-smut "m20 the CE _ssum reown removed" -e '/_tlog restorecon-ce /{n;/_ssum reown/d;}'
+smut "m20 the CE _ssum reown removed" -e 's/_tlog reown-ce-wait "\$_tt"; _ssum reown "\$_sumt"; /_tlog reown-ce-wait "$_tt"; /'
 smut "m21 the #de _ssum reown removed" -e '/_tlog restorecon-de /{n;/_ssum reown/d;}'
-smut "m22 the #media _ssum reown removed" -e '/^          restore_media_tail "\$MEDIADIR"$/{n;/_ssum reown/d;}'
+smut "m22 the #media _ssum reown removed" -e '/^            restore_media_tail "\$MEDIADIR"$/{n;/_ssum reown/d;}'
 smut "m23 _sum0 removed" -e '/^_sum0=\$(_ms)$/d'
 smut "m24 _ssum guards the raw start with a numeric test" -e 's/^  case "\${2:-}" in .*) return 0 ;; esac$/  [ "${2:-0}" -gt 0 ] || return 0/'
 # m25-m28: the start of signin_in_ms and the pre-arm reap line. Each names the case that convicts it.

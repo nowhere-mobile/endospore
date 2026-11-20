@@ -5,7 +5,8 @@
 # store-backed categories and evict them in-session"). Runs core/chooser/tests/storage-folders (StorageFolders' words,
 # compiled and EXECUTED) and source checks that parseStorageBreakdown reads the daemon's `folders` and
 # `folders_measured`, and that renderStorageList draws the folder rows through StorageFolders, keeps the one row when
-# the reply has no folders, and counts folders in its empty-screen test.
+# the reply has no folders, and counts folders in its empty-screen test. NWP-20261210-22 (h51 #4): each named folder
+# row with store figures offers Free on this phone, which sends FREE-MEDIA-FOLDER off the UI thread (F1-F3, s6-s9).
 #
 # It needs a JDK, and it FAILS when there is none. javac/java come from PATH, then the build VM's prebuilt JDK 21.
 #
@@ -54,7 +55,7 @@ has() { perl -0e 'exit(($ARGV[0] =~ /$ARGV[1]/s) ? 0 : 1)' -- "$1" "$2"; }
 
 # check <StorageFolders.java> <ProfileActivity.java>: the cases, then the source checks.
 check() {
-  local sf=$1 pa=$2 st pb rb pre_use pre_one
+  local sf=$1 pa=$2 st pb rb fb pre_use pre_one
   [ -f "$sf" ] || { echo "FAIL c0: no StorageFolders.java"; return 1; }
   JAVAC=$JAVAC JAVA=$JAVA bash "$ROOT/core/chooser/tests/storage-folders/run.sh" "$sf" || return 1
   st=$(mktemp -p "$W") || return 1
@@ -74,8 +75,12 @@ check() {
   # (s3) control: the extractor found the render and reached its remainder row
   case "$rb" in *'"Recent backups and shared data"'*) ;; *) echo "FAIL s3: renderStorageList was not found, or the body ends before the remainder row"; return 1 ;; esac
   # (s3) one row per folder through StorageFolders, with the folder's own figures
-  has "$rb" 'if \(StorageFolders\.useFolderRows\(si\.folders\.size\(\)\)\) \{\s*for \(StorageFolder (\w+) : si\.folders\) \{\s*list\.addView\(storageInfoRow\(StorageFolders\.title\(\1\.name\),\s*StorageFolders\.line\(humanBytes\(\1\.bytes\), humanBytes\(\1\.store\), si\.foldersMeasured\), null\)' \
-    || { echo "FAIL s3: renderStorageList does not draw one StorageFolders row per folder under StorageFolders.useFolderRows"; return 1; }
+  # (NWP-20261210-22: each row comes from storageFolderRow, which keeps today's title and line through storageInfoRow)
+  has "$rb" 'if \(StorageFolders\.useFolderRows\(si\.folders\.size\(\)\)\) \{\s*for \(StorageFolder (\w+) : si\.folders\) \{\s*list\.addView\(storageFolderRow\(\1, si, list, device\),\s*new LinearLayout\.LayoutParams\(MATCH, WRAP\)\);' \
+    || { echo "FAIL s3: renderStorageList does not draw one storageFolderRow per folder under StorageFolders.useFolderRows"; return 1; }
+  fb=$(body "$st" "private LinearLayout storageFolderRow(")
+  has "$fb" '^\s*private LinearLayout storageFolderRow\(final StorageFolder f, final StorageInfo si, final LinearLayout list,\s*final TextView device\) \{\s*LinearLayout row = storageInfoRow\(StorageFolders\.title\(f\.name\),\s*StorageFolders\.line\(humanBytes\(f\.bytes\), humanBytes\(f\.store\), si\.foldersMeasured\), null\);' \
+    || { echo "FAIL s3: storageFolderRow does not draw the folder's StorageFolders title and line through storageInfoRow"; return 1; }
   # (s4) the empty-screen test counts folders: a phone holding only store-side folders is not "Nothing much"
   has "$rb" 'if \(si\.apps\.isEmpty\(\) && si\.mediaBytes == 0 && si\.cacheBytes == 0 && si\.folders\.isEmpty\(\)\) \{\s*TextView empty' \
     || { echo "FAIL s4: renderStorageList's empty test does not count folders"; return 1; }
@@ -87,6 +92,26 @@ check() {
   [ "${#pre_use}" -lt "${#pre_one}" ] \
     || { echo "FAIL s5: the one row is not after the useFolderRows test"; return 1; }
   echo "  ok   source checks s3 s4 s5"
+  # (s7) NWP-20261210-22, checked before s6 so a Log call is convicted by its own pin: never the all-cache purge
+  # in storageFolderRow, and no Log call (the folder name is user data)
+  ! has "$fb" 'FREE-MEDIA-CACHE' || { echo "FAIL s7: storageFolderRow sends FREE-MEDIA-CACHE"; return 1; }
+  ! has "$fb" '\bLog\.\w+\(' || { echo "FAIL s7: storageFolderRow holds a Log call"; return 1; }
+  # (s6) the link is offered only under StorageFolders.freeOffer, sits under the line, and sends
+  # FREE-MEDIA-FOLDER with the folder on the SECOND line, from inside a new Thread, after disabling itself
+  has "$fb" 'if \(!StorageFolders\.freeOffer\(f\.name, f\.store, si\.foldersMeasured\)\) return row;\s*final TextView (\w+) = new TextView\(this\);\s*\1\.setText\(FreeOnPhone\.LINK\);.*?\1\.setOnClickListener\(v -> \{\s*\1\.setEnabled\(false\);\s*new Thread\(\(\) -> \{\s*final String (\w+) = sendDaemon\("FREE-MEDIA-FOLDER\\n" \+ f\.name \+ "\\n"\)\.trim\(\);\s*runOnUiThread\(.*?\}, "[\w-]+"\)\.start\(\);\s*\}\);\s*\(\(LinearLayout\) row\.getChildAt\(0\)\)\.addView\(\1\);\s*return row;\s*\}\s*$' \
+    || { echo "FAIL s6: storageFolderRow does not send FREE-MEDIA-FOLDER, folder on the second line, inside a new Thread under StorageFolders.freeOffer"; return 1; }
+  has "$fb" 'sendDaemon\(' && [ "$(perl -0e 'my $n = () = $ARGV[0] =~ /sendDaemon\(/g; print $n' -- "$fb")" = 1 ] \
+    || { echo "FAIL s6: storageFolderRow calls sendDaemon other than once, inside its thread"; return 1; }
+  # (s8) the toast first, then measure again only on freed bytes while the list is still the screen showing; otherwise
+  # re-enable the link and repaint the device line. Never zero a row.
+  has "$fb" 'if \(isFinishing\(\) \|\| isDestroyed\(\)\) return;\s*long (\w+) = StorageFolders\.freedBytes\((\w+)\);\s*android\.widget\.Toast\.makeText\(this, StorageFolders\.freeMessage\(\2, humanBytes\(Math\.max\(\1, 0\)\)\),\s*android\.widget\.Toast\.LENGTH_LONG\)\.show\(\);\s*if \(\1 > 0 && list\.isAttachedToWindow\(\)\) \{\s*showStorageBreakdown\(\);\s*return;\s*\}\s*(\w+)\.setEnabled\(true\);\s*paintDeviceLine\(device\);' \
+    || { echo "FAIL s8: storageFolderRow does not toast, then measure again only on freed bytes under list.isAttachedToWindow()"; return 1; }
+  [ "$(perl -0e 'my $n = () = $ARGV[0] =~ /showStorageBreakdown\(/g; print $n' -- "$fb")" = 1 ] \
+    || { echo "FAIL s8: storageFolderRow measures again outside the isAttachedToWindow test"; return 1; }
+  # (s9) control: the cache row still sends FREE-MEDIA-CACHE
+  has "$rb" 'sendDaemon\("FREE-MEDIA-CACHE\\n"\)' \
+    || { echo "FAIL s9: the Streamed maps and photos row no longer sends FREE-MEDIA-CACHE"; return 1; }
+  echo "  ok   source checks s7 s6 s8 s9"
 }
 check "$SF" "$PA" || { echo "FAILED"; exit 1; }
 [ "$MUTATE" = yes ] || exit 0
@@ -116,4 +141,14 @@ mut "m4 the parse ignores folders_measured" pa 's/si\.foldersMeasured = o\.optBo
 mut "m5 the empty test ignores folders" pa 's/ && si\.folders\.isEmpty\(\)\) \{/) {/' "FAIL s4" || fails=$((fails+1))
 mut "m6 the parse reads no folder list" pa 's/o\.optJSONArray\("folders"\)/null/' "FAIL s1" || fails=$((fails+1))
 mut "m7 the one row dropped for a reply with no folders" pa 's/\} else if \(si\.mediaBytes > 0\) \{\n(\s*)list\.addView\(storageInfoRow\("Your photos, videos and files"/} else if (false) {\n$1list.addView(storageInfoRow("Your photos, videos and files"/' "FAIL s5" || fails=$((fails+1))
+# NWP-20261210-22: Free on this phone on a folder row
+mut "m8 the outside row is offered" sf 's/if \(name == null \|\| name\.isEmpty\(\)\) return false;\n\s*//' "FAIL F1" || fails=$((fails+1))
+mut "m9 offered when not measured" sf 's/return measured && store > 0;/return store > 0;/' "FAIL F1" || fails=$((fails+1))
+mut "m10 OK 0 shown as FREED" sf 's/if \(n > 0\) return FREED_PREFIX/if (n >= 0) return FREED_PREFIX/' "FAIL F3" || fails=$((fails+1))
+mut "m11 LOCAL shown as NOTHING" sf 's/(\n(\s*)if \("NONE"\.equals\(r\)\) return NO_SESSION;)/$1\n$2if ("LOCAL".equals(r)) return NOTHING;/' "FAIL F3" || fails=$((fails+1))
+mut "m12 the verb changed to FREE-MEDIA-CACHE" pa 's/sendDaemon\("FREE-MEDIA-FOLDER\\n" \+ f\.name/sendDaemon("FREE-MEDIA-CACHE\\n" + f.name/' "FAIL s7" || fails=$((fails+1))
+mut "m13 the folder sent on the verb line" pa 's/sendDaemon\("FREE-MEDIA-FOLDER\\n" \+ f\.name \+ "\\n"\)/sendDaemon("FREE-MEDIA-FOLDER " + f.name + "\\n")/' "FAIL s6" || fails=$((fails+1))
+mut "m14 the send moved out of the thread" pa 's/(\n\s*)new Thread\(\(\) -> \{\n(\s*)final String r = (sendDaemon\("FREE-MEDIA-FOLDER[^\n]*\n)/$1final String r = $3$1new Thread(() -> {\n/' "FAIL s6" || fails=$((fails+1))
+mut "m15 a Log.i of the folder" pa 's/(\n(\s*)link\.setEnabled\(false\);)/$1\n$2Log.i(TAG, "free-media-folder " + f.name);/' "FAIL s7" || fails=$((fails+1))
+mut "m16 measured again without the attached check" pa 's/if \(freed > 0 && list\.isAttachedToWindow\(\)\) \{/if (freed > 0) {/' "FAIL s8" || fails=$((fails+1))
 [ "$fails" -eq 0 ] && echo "== all mutations convicted" || { echo "== $fails mutation(s) not convicted"; exit 1; }

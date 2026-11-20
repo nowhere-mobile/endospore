@@ -36,6 +36,11 @@
 #     `<n> removed, <n> failed` and `reap-stale-ondemand: <n> package(s) in <ms> ms` (B1-B5). B6 runs the REAL timeout
 #     with a 2 s bound over a pm that stalls: the entries the batch did not reach count as failed, and one WARN says how
 #     many. B7: 17 entries are two batches, in list order.
+#   - NWP-20261210-07: the reap reads `pm list packages -a` once, at the first row that reaches removal, and a row whose
+#     package that listing does not name makes no pm call and counts as absent (D1); a refused uninstall still counts
+#     failed, apart from it (D2). A listing that fails or is empty is UNREAD: every row goes to pm as before, with one
+#     WARN and no absent line (D3). It is read once for 17 rows and never when no row reaches removal (D4). The check
+#     runs before h60 #6's K/A classification (D5), and the new lines name no package and no other user (D6).
 #
 # reap_stale_ondemand, od_reap_batch, od_reap_batch_run, od_other_users, userdir_has_record, hold_ondemand, pkgname_ok and the ODHOLD= line are extracted from nowhere_roamd.sh BY ANCHOR,
 # never copied, so a stale copy cannot keep passing after the real code moves. Every `"/data/` path in the extracted
@@ -76,6 +81,9 @@ done
 # process finds it on PATH. An uninstall records `<PM_VIA or fn> <PPID>` in $T/pmpid: run by a batch, PPID is the batch
 # process. An uninstall of a package listed in $T/pmhang sleeps 30 s first. _ms answers 250 more than its last answer,
 # so a reap's timing line reads 250 ms.
+# NWP-20261210-07: `pm list packages -a` (no --user) records its argv in $T/pmknown only. It fails on $T/knownfail. It
+# prints $T/known when that file exists (also when it is empty), and otherwise every package of the case's manifest plus
+# package:android, so each older case sees every one of its packages as known.
 STUBS=$(cat <<'EOS'
 restorecon(){ printf '%s\n' "$*" >> "$T/restorecon"; [ ! -e "$T/rconfail" ]; }
 chown(){ printf '%s\n' "$*" >> "$T/chown"; [ ! -e "$T/chownfail" ]; }
@@ -88,6 +96,12 @@ stat(){
 pm(){
   local _u
   case "$*" in "list packages -s -u") echo package:android; return 0 ;; "list packages -3 -u") return 0 ;; esac
+  if [ "$*" = "list packages -a" ]; then
+    printf '%s\n' "$*" >> "$T/pmknown"
+    [ -e "$T/knownfail" ] && return 1
+    if [ -e "$T/known" ]; then cat "$T/known"; else { cut -f1 "$T/man" 2>/dev/null | sed 's/^/package:/'; echo package:android; }; fi
+    return 0
+  fi
   case "$*" in
     "list packages --user "*|"list packages -a --user "*)
       printf '%s\n' "$*" >> "$T/pmlist"
@@ -155,7 +169,7 @@ suite() {
   newcase() {
     T=$(mktemp -d -p "$W")
     mkdir -p "$T/state"
-    : > "$T/pm"; : > "$T/pmpid"; : > "$T/pmlist"; : > "$T/timeout"; : > "$T/log"; : > "$T/chown"; : > "$T/restorecon"
+    : > "$T/pm"; : > "$T/pmpid"; : > "$T/pmlist"; : > "$T/pmknown"; : > "$T/timeout"; : > "$T/log"; : > "$T/chown"; : > "$T/restorecon"
   }
   # reap_in <shell> [hold] -- the extracted pieces + stubs in a fresh shell over the case dir; with `hold`, hold_ondemand 10
   # runs first, as the `in` op runs it. The reap gets ${MANARG:-$T/man} and the uid ${UIDARG-10} (UIDARG= passes an empty uid).
@@ -224,6 +238,13 @@ reap_stale_ondemand '${MANARG:-$T/man}' '${UIDARG-10}'; echo \$? > '$T/rc'" >"$T
   timed() { grep -cxE "\[roamd\] reap-stale-ondemand: $1 package\(s\) in 250 ms \(NWP-20261130-06\) .*" "$T/log"; }
   counted() { grep -cF "reap-stale-ondemand: $1 removed, $2 failed (NWP-20261130-06)" "$T/log"; }
   warns() { grep -cF "WARN reap-stale-ondemand: could not read another user's packages -- no package removed for all users (h60 #6)" "$T/log"; }
+  # NWP-20261210-07. known <pkg> ... -- $T/known lists exactly those (none: an empty file). absent <n> -- the absent line
+  # of <n>. kwarns -- the package-list WARN lines. kreads -- the `pm list packages -a` calls.
+  known() { local q; : > "$T/known"; for q in "$@"; do printf 'package:%s\n' "$q" >> "$T/known"; done; }
+  absent() { grep -cxE "\[roamd\] reap-stale-ondemand: $1 absent -- no package record on the phone, no pm call \(NWP-20261210-07\) .*" "$T/log"; }
+  absents() { grep -cF ' absent -- no package record' "$T/log"; }
+  kwarns() { grep -cxE '\[roamd\] WARN reap-stale-ondemand: could not read the package list -- every package tried \(NWP-20261210-07\) .*' "$T/log"; }
+  kreads() { grep -c . "$T/pmknown"; }
 
   for sh in $SHELLS; do
     local tg="[$sh]" m n u
@@ -637,6 +658,92 @@ reap_stale_ondemand '${MANARG:-$T/man}' '${UIDARG-10}'; echo \$? > '$T/rc'" >"$T
       ok "$tg B7 17 packages are two batches of 16 and 1, in list order"
     else no "$tg B7 rc=$RC, pm: $(show pm) timeout: $(show timeout) pids: $(show pmpid)"; fi
     rm -rf "$T"
+
+    # --- NWP-20261210-07: a package the phone has no record of makes no pm call and counts as absent. ---
+    # D1. four parked rows, two auto and two ondemand; the phone knows com.k1 and com.k2. com.u1.x is a longer name that
+    #     holds com.u1, and xcom.u2 one that ends in com.u2, so only a whole-line match leaves com.u1 and com.u2 absent.
+    newcase; printf '%s\n%s\n%s\n%s\n' "$(row com.u1 auto)" "$(row com.k1 ondemand)" "$(row com.u2 ondemand)" "$(row com.k2 auto)" > "$T/man"
+    known android com.u1.x com.k1 xcom.u2 com.k2
+    reap_in "$sh"
+    if [ "$RC" = 0 ] && pm_is 'uninstall com.k1\nuninstall com.k2\n'; then ok "$tg D1 only the two known packages reach pm, in manifest order"
+    else no "$tg D1 rc=$RC, pm: $(show pm)"; fi
+    if [ "$(counted 2 0)" = 1 ] && [ "$(absent 2)" = 1 ] && [ "$(timed 2)" = 1 ] && [ "$(kwarns)" = 0 ]; then
+      ok "$tg D1 2 removed, 0 failed, 2 absent, 2 packages timed"
+    else no "$tg D1 log: $(show log)"; fi
+    rm -rf "$T"
+
+    # D2. a known package whose uninstall is refused, and an unknown one: counted apart (N02)
+    newcase; manifest com.ref com.gone; known android com.ref
+    PMFAIL=com.ref reap_in "$sh"
+    if [ "$RC" = 0 ] && pm_is 'uninstall com.ref\n' && [ "$(counted 0 1)" = 1 ] && [ "$(absent 1)" = 1 ]; then
+      ok "$tg D2 a refused uninstall counts failed (0 removed, 1 failed), the unknown package absent (1 absent)"
+    else no "$tg D2 rc=$RC, pm: $(show pm) log: $(show log)"; fi
+    rm -rf "$T"
+    # D2. the package list is read and every row is known: the absent line still says 0
+    newcase; manifest com.a com.b
+    reap_in "$sh"
+    if pm_is 'uninstall com.a\nuninstall com.b\n' && [ "$(counted 2 0)" = 1 ] && [ "$(absent 0)" = 1 ]; then
+      ok "$tg D2 a read list that knows every row logs 0 absent"
+    else no "$tg D2 0 absent: pm: $(show pm) log: $(show log)"; fi
+    rm -rf "$T"
+
+    # D3. a package list that fails, then one that is empty: UNREAD, so every row goes to pm as before, with one WARN
+    for m in failed empty; do
+      newcase; manifest com.a com.b com.c
+      if [ "$m" = failed ]; then : > "$T/knownfail"; else known; fi
+      reap_in "$sh"
+      if [ "$RC" = 0 ] && pm_is 'uninstall com.a\nuninstall com.b\nuninstall com.c\n' && [ "$(counted 3 0)" = 1 ] && [ "$(timed 3)" = 1 ]; then
+        ok "$tg D3 $m package list: every row goes to pm as today"
+      else no "$tg D3 $m package list: rc=$RC, pm: $(show pm) log: $(show log)"; fi
+      if [ "$(kwarns)" = 1 ] && [ "$(absents)" = 0 ]; then ok "$tg D3 $m package list: one WARN line, no absent line"
+      else no "$tg D3 $m package list: $(kwarns) WARN line(s), $(absents) absent line(s): $(show log)"; fi
+      rm -rf "$T"
+    done
+
+    # D4. 17 rows (two batches) read the package list once; no row that reaches removal, no read and no new line
+    newcase; : > "$T/want"
+    for n in 01 02 03 04 05 06 07 08 09 10 11 12 13 14 15 16 17; do row "com.p$n" ondemand >> "$T/man"; printf 'uninstall com.p%s\n' "$n" >> "$T/want"; done
+    reap_in "$sh"
+    if [ "$RC" = 0 ] && [ "$(kreads)" = 1 ] && cmp -s "$T/want" "$T/pm" && [ "$(batches)" = 2 ] && [ "$(absent 0)" = 1 ]; then
+      ok "$tg D4 17 rows in two batches read the package list once"
+    else no "$tg D4 rc=$RC, $(kreads) package-list read(s): $(show pmknown) pm: $(show pm)"; fi
+    rm -rf "$T"
+    for m in installed unparked; do
+      newcase
+      if [ "$m" = installed ]; then printf '%s\n%s\n' "$(row com.i1 installed)" "$(row com.i2 installed)" > "$T/man"
+      else manifest com.un1 com.un2; mk user/10/com.un1; mk user_de/10/com.un2; fi
+      reap_in "$sh"
+      if [ "$RC" = 0 ] && [ "$(kreads)" = 0 ] && [ "$(pm_calls)" = 0 ] && [ "$(absents)" = 0 ] && [ "$(kwarns)" = 0 ]; then
+        ok "$tg D4 $m rows only: the package list is never read, no new line"
+      else no "$tg D4 $m rows only: $(kreads) package-list read(s), pm: $(show pm) log: $(show log)"; fi
+      rm -rf "$T"
+    done
+
+    # D5. user 11 lists com.kn (known) and com.ghost (unknown here): com.kn stays a K entry, com.ghost is absent before
+    #     the classification, so h60 #6's kept line counts 1 package
+    newcase; manifest com.kn com.ghost com.solo; rec 11.xml; lists 11 com.kn com.ghost; known android com.kn com.solo
+    reap_in "$sh"
+    if [ "$RC" = 0 ] && pm_is 'uninstall --user 0 com.kn\nuninstall --user 10 com.kn\nuninstall com.solo\n'; then
+      ok "$tg D5 a known package another user has keeps its --user 0 and --user 10 calls; the unknown one makes none"
+    else no "$tg D5 rc=$RC, pm: $(show pm)"; fi
+    if [ "$(grep -cxE '\[roamd\] reap-stale-ondemand: 1 package\(s\) kept for another user, removed for user 0 and user 10 only \(2 ok, 0 failed\) \(h60 #6\) .*' "$T/log")" = 1 ] \
+       && [ "$(summaries)" = 1 ] && [ "$(counted 2 0)" = 1 ] && [ "$(absent 1)" = 1 ]; then
+      ok "$tg D5 h60 #6's kept line is unchanged and counts only the known package; 1 absent"
+    else no "$tg D5 log: $(show log)"; fi
+    rm -rf "$T"
+
+    # D6. the new lines name no package and no other user (117, as in C8, so $(date) cannot match it)
+    for m in read unread; do
+      newcase; manifest com.shared com.gone com.solo; rec 117.xml; lists 117 com.shared
+      if [ "$m" = read ]; then known android com.shared com.solo; else : > "$T/knownfail"; fi
+      reap_in "$sh"
+      grep -F 'NWP-20261210-07' "$T/log" > "$T/rest"
+      if [ "$(grep -c . "$T/rest")" = 1 ]; then ok "$tg D6 $m: the new line is there to read"
+      else no "$tg D6 $m: want one new line: $(show log)"; fi
+      if grep -qE 'com\.|117' "$T/rest"; then no "$tg D6 $m: a new line names a package or the other user: $(show rest)"
+      else ok "$tg D6 $m: the new lines name no package and no other user"; fi
+      rm -rf "$T"
+    done
   done
 
   [ -n "$quiet" ] || printf '%s passed, %s failed\n' "$p" "$x"
@@ -656,7 +763,7 @@ if [ "$MUTATE" = yes ]; then
   mutant() {
     local name="$1" expr="$2" m="$MD/m.sh" res rc bad="" t want=""
     # a name that ends with "(C<n>)" names the case that must convict it
-    case "$name" in *" (C"[0-9]")"|*" (B"[0-9]")") want=${name##*\(}; want="${want%\)} " ;; esac
+    case "$name" in *" (C"[0-9]")"|*" (B"[0-9]")"|*" (D"[0-9]")") want=${name##*\(}; want="${want%\)} " ;; esac
     sed "$expr" "$SUT" > "$m"
     if cmp -s "$SUT" "$m"; then echo "  MUTANT DID NOT APPLY  $name"; MISSED=$((MISSED+1)); return; fi
     # not quiet: a conviction needs rc 1 and a FAIL line under every shell's own tag, mksh's included
@@ -717,6 +824,18 @@ if [ "$MUTATE" = yes ]; then
   mutant "incomplete batch not warned (B6)"             '/WARN reap-stale-ondemand: a batch ended after/d'
   mutant "last partial batch dropped (B7)"              's/\[ "\$_n" = 0 \] || od_reap_batch_run/[ "$_n" = 0 ] || :/'
   mutant "batch of 16 never flushed (B7)"               's/\(od_reap_batch_run "\$uid" "\$_n" "\$_c"\); _c=""; _n=0; fi/:; fi/'
+  # NWP-20261210-07: the package-list check. Each name ends with the case that convicts it.
+  KR='        if _kn=$(timeout -k 2 20 pm list packages -a <\/dev\/null 2>\/dev\/null) \&\& [ -n "$_kn" ]; then _kn="$_nl$_kn$_nl"; _kr=1; fi'
+  mutant "absent check removed (D1)"                    '/# NWP-20261210-07: no record, no pm call$/d'
+  mutant "absent rows still sent to the batch (D1)"     's/\*) _na=\$((_na + 1)); continue ;; esac/*) _na=$((_na + 1)) ;; esac/'
+  mutant "absent counted as failed (D2)"                's/\*) _na=\$((_na + 1)); continue ;; esac/*) _bad=$((_bad + 1)); continue ;; esac/'
+  mutant "UNREAD taken as nothing known (D3)"           's/^      \[ "\$_kr" = 1 \] && case "\$_kn" in/      case "$_kn" in/'
+  mutant "empty listing not UNREAD (D3)"                's/ && \[ -n "\$_kn" \]; then/; then/'
+  mutant "WARN line dropped (D3)"                       '/could not read the package list -- every package tried/d'
+  mutant "known set read per row (D4)"                  '/^        if _kn=\$(timeout -k 2 20 pm list packages -a /d; s/^      \[ "\$_kr" = 1 \] && case "\$_kn" in/'"$KR"'\n&/'
+  mutant "known set read before any row reaches removal (D4)" '/^        if _kn=\$(timeout -k 2 20 pm list packages -a /d; s/^  _ol="\$_nl"$/&\n'"$KR"'/'
+  mutant "absent line dropped (D1)"                     '/absent -- no package record on the phone, no pm call/d'
+  mutant "absent check moved after the K classification (D5)" '/# NWP-20261210-07: no record, no pm call$/{h;d;}; /^      set -- "\$@" "A:\$rpkg"$/{x;G;}'
   [ "$MISSED" -eq 0 ] || { echo "RESULT: FAIL ($MISSED mutant(s) not convicted)"; exit 1; }
 fi
 echo "RESULT: PASS"

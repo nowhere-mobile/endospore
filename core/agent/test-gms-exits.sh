@@ -193,7 +193,7 @@ mut "M12 failed-parse check removed" TestGmsExitsFormatDriftIsNotCollected $G 'i
 mut "M13 header pattern narrowed" TestGmsExitsChangedHeaderOpensABlock $G 'regexp\.MustCompile\(`\^\\s\*ApplicationExitInfo\\b`\)' 'regexp.MustCompile(`^\\s*ApplicationExitInfo #\\d+:\\s*$`)'
 mut "M14 failed-parse check over-eager" TestGmsExitsHonestReplies $G 'if blocks > 0 && parsed == 0 \{' 'if blocks > 0 && (parsed == 0 || len(kept) == 0) {'
 mut "M15 handleReportIssue no longer merges the records" TestGmsExitsReportHandlerIsWired report_issue.go 'mergeGmsExits\(rep\.Status, func\(\) string \{ return fetchGmsExits\(dest, name, uid\) \}, dest, deviceScope\)\n' ''
-mut "M16 caller-sent keys kept" TestGmsExitsCallerKeysDeletedAtSessionScope $G 'if strings\.HasPrefix\(k, "gms_exit"\) \{' 'if false && strings.HasPrefix(k, "gms_exit") {'
+mut "M16 caller-sent keys kept" TestGmsExitsCallerKeysDeletedAtSessionScope $G 'if strings\.HasPrefix\(k, prefix\) \{' 'if false && strings.HasPrefix(k, prefix) {'
 
 # M9 runs the arm against a copy of roamd, once per shell, and each shell must convict it on its own line.
 M="$W/roamd.sh"

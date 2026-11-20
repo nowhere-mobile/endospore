@@ -179,14 +179,14 @@ func TestMediaSync_AShortReassemblyIsRefusedRatherThanWritten(t *testing.T) {
 	key := resolveDK(a.base, a.name+"#media", a.pass, nil)
 
 	// The honest fetch first, so a failure below cannot be blamed on the fixture.
-	if b, err := fetchDeferredBytes(a.base, key, m.Version, d); err != nil || int64(len(b)) != d.Size {
+	if b, err := fetchDeferredBytes(a.base, key, m.Version, d, nil); err != nil || int64(len(b)) != d.Size {
 		t.Fatalf("the unmodified fetch must succeed before the corrupted one means anything: err=%v len=%d want=%d",
 			err, len(b), d.Size)
 	}
 
 	// Now claim the file is bigger than its chunks can supply -- the shape a torn seal or a lost chunk leaves.
 	d.Size = d.Size + 4096
-	if _, err := fetchDeferredBytes(a.base, key, m.Version, d); err == nil {
+	if _, err := fetchDeferredBytes(a.base, key, m.Version, d, nil); err == nil {
 		t.Fatal("a reassembly SHORTER than the manifest claims was accepted. Written to disk that is a corrupt " +
 			"photo, and the next walk seals it over the good copy in the account head -- a transient fetch " +
 			"fault becoming permanent loss for every device on the account.")

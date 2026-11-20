@@ -193,8 +193,9 @@ export NOWHERE_CARRY_ESSENTIAL_MEDIA="${NOWHERE_CARRY_ESSENTIAL_MEDIA:-1}"
 export NOWHERE_SEQ_GUARD="${NOWHERE_SEQ_GUARD:-0}"
 # NWP-20261202-18 (S5 of docs/media-after-gate.md §8, Q106): user media restored after the gate. The `restore`
 # this daemon runs reads it (media_after_gate.go:mediaAfterGateOn, from mediaRestorePlan); on only when exactly
-# "1". OFF by default: S7 flips this default after the lynx run. mediad exports the same flag for its lander.
-export NOWHERE_MEDIA_AFTER_GATE="${NOWHERE_MEDIA_AFTER_GATE:-0}"
+# "1". ON by default since S7's lynx run (NWP-20261116-58, docs/media-after-gate.md §8); a conf that sets it to 0
+# (the device conf or a ring conf) turns it off. mediad exports the same flag, with the same default, for its lander.
+export NOWHERE_MEDIA_AFTER_GATE="${NOWHERE_MEDIA_AFTER_GATE:-1}"
 export SSL_CERT_DIR=/system/etc/security/cacerts
 # The agent auto-discovers the device's own per-network DNS (privacy: no public-resolver leak), with a
 # public fallback only if discovery fails. Set NOWHERE_DNS=host[:port] to force a specific resolver.
@@ -212,6 +213,75 @@ export NOWHERE_BLOBCACHE="$STATE"
 # These helpers re-own restored data to the uid Android already assigned to the (untouched) top-level dir
 # it created, so we never hardcode a uid (works for any user id / appId / media domain).
 
+# od_walk PRUNE K WORD1 [WORD2 [WORD3]] ROOT [FINDARG...] (NWP-20261209-04): odrestore's counted hand-back walk, in
+# BOUNDED batches. Runs the K-word tool (`chown -h OWNER`, `chcon -h CTX`, `restorecon`, `restorecon -D`) on every
+# entry `find ROOT FINDARG...` lists, the root included, at most 256 paths a call. Returns 0 when every batch ran and
+# exited 0 and find reported no error; otherwise it logs one WARN line (statuses only, no path) and returns 2.
+#  - WHY BOUNDED. `find ... -exec sh -c '...' {} +` was the walk's form (NWP-20261202-32, NWP-20261207-05,
+#    NWP-20261208-13). Toybox find builds that batch the kernel then refuses: lynx 2026111604 logged
+#    `find: exec sh: Argument list too long` on a 30,914-entry hold, find carried on, nothing read its status, and
+#    28,425 entries stayed root-owned at bare s0 while roamd answered OK and dropped the hold (device-proof round S16,
+#    R28). Now find writes NUL-terminated names to `xargs -0 -r -n 256`, so a name holding a space or a newline is one
+#    argument, and no call is larger than 256 names.
+#  - THE ARITHMETIC. A path is at most PATH_MAX 4096 bytes with its NUL, plus an 8-byte argv pointer on arm64: 256 x
+#    4104 = 1,050,624 bytes, about half of ARG_MAX 2,097,152 on lynx (`getconf ARG_MAX`; the kernel's own limit is
+#    min(ARG_MAX, stack rlimit / 4), and Android's 8 MiB stack gives that same 2 MiB). The rest (over 1 MB) holds the
+#    environment, the batch script and the tool words. Toybox xargs also caps a call itself, at ARG_MAX minus the
+#    environment minus 4096, when -s is not given (toys/posix/xargs.c), so -s is not passed.
+#  - TOYBOX. toys/posix/xargs.c (toybox 0.8.15, master 6a0c0ef5 2026-10-06; optstring
+#    `^(process-slot-var):a:E:P#<0(null)=1optr(no-run-if-empty)n#<1(max-args)s#0[!0E]`) has -0 (NUL input, no quote or
+#    space processing), -n (a positive max of input args a call; the command's own words are not counted), -r and -s.
+#    Its waitchild() maps a child that exits 1-125 to status 123, 126 or 127 (exec failed: xexec's exit) to itself, a
+#    signal to 125 and 255 to 124, so any failed batch makes xargs non-zero. Without -r it runs the command once on an
+#    empty input, so the batch script also returns 0 at once when it is given no path. toys/posix/find.c has -print0,
+#    and sets exit status 1 on an error it reports (perror_msg).
+#  - THE COUNT. Each batch appends its own path count ("$#") to OD_LABEL_COUNT when that names a file, after the tool
+#    and whatever the tool's status (a batch that ran is progress), then exits with the tool's status. The file holds
+#    digits and newlines only. The stall clock (od_label_watched, od_extdata_watched) reads it as before.
+#  - THE STATUS. find's own status comes out through a file in $STATE (`mktemp -p`), written by find's side of the
+#    pipe, so no shell needs pipefail (mksh, bash and dash alike). An empty or non-numeric file is a failure. The file
+#    is removed before the function returns. No file -> no walk, status 2.
+#  - PRUNE = prune: every mountpoint strictly under ROOT is pruned (`-path GLOB -prune -o`), decoded and glob-escaped
+#    as relabel_restored does. Then FINDARG may only be empty or `-xdev`. The external restorecon walks take it:
+#    mediad's read-only FUSE overlays over the deferred dirs refuse a relabel (ENOTSUP, core/agent media_span.go), and
+#    an overlay's files are mediad's to serve, not ours to label. Without it a healthy restore of a deferred
+#    Android/data would fail this walk at every tap. The chown walks keep no prune: `chown -R` crossed the overlays and
+#    mediad answers that chown (NWP-20260908-19).
+#  - The tool's stderr goes to $LOG through xargs's. No WARN line names a package or a path.
+#  - Device check left to the merger: xargs is toybox like find, and each batch execs /system/bin/sh from roamd's
+#    domain, as the `-exec sh -c` form did; a lynx tap-restore must show no AVC denial for find, xargs or sh.
+od_walk() {
+  local pr="$1" k="$2" a="$3" b= c= root xd= plain=1 mp g st fs= rc
+  shift 3
+  case "$k" in 1) ;; 2) b="$1"; shift ;; 3) b="$1"; c="$2"; shift 2 ;; *) return 2 ;; esac
+  root="$1"; shift
+  if [ "$pr" = prune ]; then
+    case "$#:${1:-}" in 0:) ;; 1:-xdev) xd=1 ;; *) return 2 ;; esac
+    set --
+    [ -z "$xd" ] || set -- -xdev
+    case "$root" in *[!abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_./-]*) plain=0;; esac
+    while read -r _ _ _ _ mp _; do
+      if [ "$plain" = 1 ]; then case "$mp" in "$root"/*) ;; *) continue;; esac; fi
+      case "$mp" in *\\*) mp=$(mi_path "${mp}x"); mp=${mp%x};; esac
+      case "$mp" in "$root"/*)
+        g=$mp
+        case "$mp" in *\[*|*\**|*\?*|*\\*) g=$(print -r -- "${mp}x" | sed 's/[[*?\\]/\\&/g'); g=${g%x};; esac
+        set -- "$@" -path "$g" -prune -o;;
+      esac
+    done < /proc/self/mountinfo
+  fi
+  st=$(mktemp -p "${STATE:-/nonexistent}" 2>/dev/null) || st=
+  [ -n "$st" ] || { echo "[roamd] WARN od_walk $a: no status file -- walk not run (NWP-20261209-04)" >> "$LOG"; return 2; }
+  { find "$root" "$@" -print0 2>>"$LOG"; echo "$?" > "$st"; } \
+    | xargs -0 -r -n 256 sh -c 'k=$1; a=$2; b=$3; c=$4; shift 4; [ "$#" -gt 0 ] || exit 0; case "$k" in 1) "$a" "$@" ;; 2) "$a" "$b" "$@" ;; *) "$a" "$b" "$c" "$@" ;; esac; r=$?; [ -z "${OD_LABEL_COUNT:-}" ] || echo "$#" >> "$OD_LABEL_COUNT"; exit "$r"' od_walk "$k" "$a" "$b" "$c" 2>>"$LOG"
+  rc=$?
+  read -r fs < "$st" 2>/dev/null
+  rm -f "$st"
+  if [ "$rc" = 0 ] && [ "$fs" = 0 ]; then return 0; fi
+  echo "[roamd] WARN od_walk $a: walk FAILED (find status ${fs:-none}, xargs status $rc) (NWP-20261209-04)" >> "$LOG"
+  return 2
+}
+
 # reown_restored PKGDIR: a restore-created, ROOT-OWNED (0:0) app data dir has no owner Android assigned yet -- the
 # app isn't install-existing'd for this user. Give it the CORRECT per-user uid (userId*100000 + appId; appId =
 # field 2 of packages.list -- a plain file read, since `pm`/`cmd` from su:s0 can't capture output, DIA-56), so a
@@ -222,6 +292,10 @@ export NOWHERE_BLOBCACHE="$STATE"
 # COUNTED FORM (NWP-20261207-05): when OD_LABEL_COUNT names a file (od_label_watched), the chown runs as a find walk
 # in relabel_restored's counted form, so each batch appends its file count and a large hold's reown feeds the stall
 # clock. With OD_LABEL_COUNT unset or empty (sign-in's remap_per_pkg) it is the plain `chown -R`.
+# BOUNDED (NWP-20261209-04): the counted walk is od_walk's, at most 256 paths a chown. A walk that fails (a batch
+# that could not run or exited non-zero, an xargs or a find error) logs a WARN line and returns 2, and the `reowned
+# restored` line is not written. 1 keeps its meaning (the app id is not resolvable yet: remap_per_pkg relies on it).
+# With OD_OKDEFER set (od_label_watched's pair) the success line waits in OD_OKBUF until the whole pair succeeds.
 reown_restored() {
   local pkgdir="$1" name appid target
   name="${pkgdir##*/}"
@@ -233,14 +307,16 @@ reown_restored() {
   # toybox chown -R implies -h and never follows a link (its help text, toys/posix/chgrp.c: "-R Recurse into
   # subdirectories (implies -h)"). No -xdev, as -R has none. chown's stderr goes to OD_LABEL_LOG ($LOG).
   if [ -n "${OD_LABEL_COUNT:-}" ]; then
-    find "$pkgdir" -exec sh -c 'chown -h "$0" "$@" 2>>"$OD_LABEL_LOG"; echo "$#" >> "$OD_LABEL_COUNT"' "$target:$target" {} + 2>>"$LOG"
+    od_walk none 3 chown -h "$target:$target" "$pkgdir" \
+      || { echo "[roamd] WARN reown_restored: the chown walk FAILED -- not reowned, status 2 (NWP-20261209-04)" >> "$LOG"; return 2; }
   else
     chown -R "$target:$target" "$pkgdir" 2>> "$LOG"
   fi
   # scrub-exempt: $name here is the local PACKAGE dir basename (set above), not the profile name -- and
   # quoting it would make log_scrub redact the one path this line exists to report (the #105 trap at the
   # reap survivor lists). test-log-name-scrub.sh honours this marker; do not add one without that reason.
-  echo "[roamd] reowned restored $name -> $target (user $uid)" >> "$LOG"
+  if [ -z "${OD_OKDEFER:-}" ]; then echo "[roamd] reowned restored $name -> $target (user $uid)" >> "$LOG"; else OD_OKBUF="${OD_OKBUF:-}[roamd] reowned restored $name -> $target (user $uid)
+"; fi
   return 0
 }
 
@@ -298,8 +374,13 @@ mi_path() {
 # which runs chcon and then appends the batch's file count ("$#") to that file, whatever chcon's status: a batch that
 # ran is progress of the walk. chcon's stderr goes to OD_LABEL_LOG ($LOG). The file holds digits and newlines only.
 # od_label_watched sets both names; with OD_LABEL_COUNT unset or empty the walk is the plain `-exec chcon` one.
+# BOUNDED (NWP-20261209-04): both forms are od_walk's, at most 256 paths a chcon, counted only when OD_LABEL_COUNT
+# names a file. The listing that counts the entries has its find status checked too (a file in $STATE), so a listing
+# that failed never reads as nothing to relabel. A failed listing or walk logs a WARN line and returns 2, and the
+# `relabelled` line is not written. 1 keeps its meaning (an unexpected dir context). With OD_OKDEFER set
+# (od_label_watched's pair) the success line waits in OD_OKBUF until the whole pair succeeds.
 relabel_restored() {
-  local d="$1" ctx mp n g plain=1
+  local d="$1" ctx mp n g plain=1 st fs=
   ctx=$(stat -c '%C' "$d" 2>/dev/null)
   case "$ctx" in
     u:object_r:app_data_file:s0*|u:object_r:privapp_data_file:s0*) ;;
@@ -316,33 +397,43 @@ relabel_restored() {
       set -- "$@" -path "$g" -prune -o;;
     esac
   done < /proc/self/mountinfo
-  n=$(find "$d" -xdev "$@" ! -context "$ctx" -print 2>>"$LOG" | wc -l)
+  st=$(mktemp -p "${STATE:-/nonexistent}" 2>/dev/null) || st=
+  [ -n "$st" ] || { echo "[roamd] WARN relabel: no status file -- not relabelled, status 2 (NWP-20261209-04)" >> "$LOG"; return 2; }
+  n=$( { find "$d" -xdev "$@" ! -context "$ctx" -print 2>>"$LOG"; echo "$?" > "$st"; } | wc -l | tr -d ' ')
+  read -r fs < "$st" 2>/dev/null
+  rm -f "$st"
+  case "$fs:$n" in
+    0:[0-9]*) ;;
+    *) echo "[roamd] WARN relabel: the listing FAILED (find status ${fs:-none}) -- not relabelled, status 2 (NWP-20261209-04)" >> "$LOG"; return 2 ;;
+  esac
   # NWP-20261202-32: with OD_LABEL_COUNT set (od_label_watched), each chcon batch appends its file count there, so
-  # the label step's progress can be read; unset or empty, the walk is main's.
-  if [ -n "${OD_LABEL_COUNT:-}" ]; then
-    [ "$n" -gt 0 ] && find "$d" -xdev "$@" ! -context "$ctx" -exec sh -c 'chcon -h "$0" "$@" 2>>"$OD_LABEL_LOG"; echo "$#" >> "$OD_LABEL_COUNT"' "$ctx" {} + 2>>"$LOG"
-  else
-    [ "$n" -gt 0 ] && find "$d" -xdev "$@" ! -context "$ctx" -exec chcon -h "$ctx" {} + 2>>"$LOG"
+  # the label step's progress can be read; unset or empty, the same bounded walk runs uncounted (NWP-20261209-04).
+  if [ "$n" -gt 0 ]; then
+    od_walk none 3 chcon -h "$ctx" "$d" -xdev "$@" ! -context "$ctx" \
+      || { echo "[roamd] WARN relabel: the chcon walk FAILED -- not relabelled, status 2 (NWP-20261209-04)" >> "$LOG"; return 2; }
   fi
-  echo "[roamd] relabelled $n restored entr(ies) of ${d##*/} to the app's context (NWP-20261005-03)" >> "$LOG"
+  if [ -z "${OD_OKDEFER:-}" ]; then echo "[roamd] relabelled $n restored entr(ies) of ${d##*/} to the app's context (NWP-20261005-03)" >> "$LOG"; else OD_OKBUF="${OD_OKBUF:-}[roamd] relabelled $n restored entr(ies) of ${d##*/} to the app's context (NWP-20261005-03)
+"; fi
   return 0
 }
 
 # od_relabel VOL DST: odrestore's relabel. CE and DE app dirs take relabel_restored; the external volumes keep
-# restorecon as before -- their dirs are not app_data_file, and odrestore re-runs `restorecon -R -D` on
-# Android/data after reown_ext_appdata anyway.
+# restorecon as before -- their dirs are not app_data_file, and odrestore re-runs the `-D` relabel on
+# Android/data (od_extdata_watched) after reown_ext_appdata anyway.
 # COUNTED FORM (NWP-20261207-05): when OD_LABEL_COUNT names a file, the external restorecon runs as a find walk, each
 # batch through `sh -c`, which restorecons the batch's paths (no -R: find lists every entry, the dir itself included)
-# and appends its file count. With OD_LABEL_COUNT unset or empty it is the plain `restorecon -R`. Returns the walk's
-# status.
+# and appends its file count. ~~With OD_LABEL_COUNT unset or empty it is the plain `restorecon -R`.~~ (superseded by
+# NWP-20261209-04: unset or empty, the same walk runs uncounted; BOUNDED below.) Returns the walk's status.
+# BOUNDED (NWP-20261209-04): the walk is od_walk's, at most 256 paths a restorecon, with every mountpoint under the dir
+# pruned (mediad's read-only overlays refuse a relabel; od_walk's header), counted only when OD_LABEL_COUNT names a
+# file. No -xdev, as before: the prune is what keeps the walk out of an overlay. A failed walk logs a WARN line and
+# returns 2. od_label_watched's foreground form, the only uncounted caller, takes the same walk, so a failed relabel
+# there is 2 too and the hold is kept.
 od_relabel() {
   case "$1" in
     /data/media/*)
-      if [ -n "${OD_LABEL_COUNT:-}" ]; then
-        find "$2" -exec sh -c 'restorecon "$@" 2>>"$OD_LABEL_LOG"; echo "$#" >> "$OD_LABEL_COUNT"' restorecon {} + 2>>"$LOG"
-      else
-        restorecon -R "$2" 2>>"$LOG"
-      fi ;;
+      od_walk prune 1 restorecon "$2" \
+        || { echo "[roamd] WARN od_relabel: the restorecon walk FAILED -- status 2 (NWP-20261209-04)" >> "$LOG"; return 2; } ;;
     *) relabel_restored "$2" ;;
   esac
 }
@@ -461,8 +552,10 @@ od_label_done() {
 # OD_LABEL_COUNT naming a count file in $STATE, so each counted walk of the pair appends each batch's file count
 # there; every OD_GROW_EVERY seconds
 # (default 10) od_label_done reads the total, and only a total LARGER than the last read writes `cutoff_prog od`.
-# Then it returns the pair's own status (od_relabel's, as the foreground pair returns). When the file cannot be made,
-# the pair runs in the foreground as before.
+# Then it returns the pair's own status (THE STATUS below). When the file cannot be made, the pair runs in the
+# foreground, uncounted: the chown is then the plain `chown -R`, and the CE/DE relabel and the external restorecon walk
+# each need a status file in $STATE (od_relabel takes od_walk in both forms): either fails with 2 when it cannot
+# make one or when a batch fails, and the hold is then kept.
 #  - The 60-minute hard cap and the daemon's 150 s stall budget are unchanged: a label step that stops labelling
 #    writes no line, so it is still stopped at 150 s.
 #  - It runs in the arm's own shell, never inside $(...), so its CUTOFF_TICK increments persist for the arm's next
@@ -470,18 +563,30 @@ od_label_done() {
 #  - COUNTED (NWP-20261207-05): the whole hand-back writes to the one count file -- reown_restored's chown batches,
 #    relabel_restored's CE/DE chcon batches and od_relabel's external restorecon batches. The total only grows, so the
 #    one `cutoff_prog od` on growth covers all three walks.
-#  - STILL NOT COUNTED: the post-loop `reown_ext_appdata` + `restorecon -R -D` on Android/data, and od_served_copy's
-#    full-copy retry on an external volume. The stall clock runs through them as before.
+#  - The post-loop Android/data re-own and relabel are counted by od_extdata_watched (NWP-20261208-13), and
+#    od_served_copy's retry after a stop copies only what the destination lacks (NWP-20261208-12).
 #  - The count file holds digits only, and the progress line is `cutoff od <n>`: no line names a package or a path.
-#  - Device check left to the merger: toybox find runs `sh -c` per batch, so roamd's domain execs /system/bin/sh
-#    there (the chcon, chown and restorecon walks); a lynx tap-restore must show no AVC denial for them.
+#  - Device check left to the merger: toybox xargs runs `sh -c` per batch (od_walk, NWP-20261209-04; toybox find
+#    did before), so roamd's domain execs /system/bin/sh there (the chcon, chown and restorecon walks); a lynx
+#    tap-restore must show no AVC denial for find, xargs or sh.
+#  - THE STATUS (NWP-20261209-04): 2 when reown_restored's walk OR od_relabel's failed (reown's 2 skips the relabel),
+#    else od_relabel's status, in both forms. The pair's success lines (`reowned restored`, `relabelled`) wait in
+#    OD_OKBUF and reach $LOG only when the pair did not fail, so a chcon walk that fails after a good chown leaves no
+#    success line. The WARN lines are written at once.
 od_label_watched() {
   local vol="$1" dst="$2" every cnt= pid rc n=0 cur last=0
   every="${OD_GROW_EVERY:-10}"
   case "$every" in ''|*[!0-9]*|0*) every=10 ;; esac
   [ -n "${STATE:-}" ] && cnt=$(mktemp -p "$STATE" 2>/dev/null)
-  [ -n "$cnt" ] || { reown_restored "$dst"; od_relabel "$vol" "$dst"; return $?; }
-  ( export OD_LABEL_COUNT="$cnt" OD_LABEL_LOG="$LOG"; reown_restored "$dst"; od_relabel "$vol" "$dst" ) &
+  if [ -z "$cnt" ]; then
+    ( OD_OKDEFER=1; OD_OKBUF=; reown_restored "$dst"; r=$?
+      if [ "$r" != 2 ]; then od_relabel "$vol" "$dst"; r=$?; fi
+      [ "$r" = 2 ] || printf '%s' "$OD_OKBUF" >> "$LOG"; exit "$r" )
+    return $?
+  fi
+  ( export OD_LABEL_COUNT="$cnt" OD_LABEL_LOG="$LOG"; OD_OKDEFER=1; OD_OKBUF=; reown_restored "$dst"; r=$?
+      if [ "$r" != 2 ]; then od_relabel "$vol" "$dst"; r=$?; fi
+      [ "$r" = 2 ] || printf '%s' "$OD_OKBUF" >> "$LOG"; exit "$r" ) &
   pid=$!
   while kill -0 "$pid" 2>/dev/null; do
     sleep 1
@@ -497,12 +602,79 @@ od_label_watched() {
   return "$rc"
 }
 
-# od_served_copy SRC DST (NWP-20261121-02): odrestore's hand-back of an EXTERNAL hold when mediad serves part of
-# DST. hold_ondemand parks Android/data/<pkg> at sign-in; mediad then finds the app's deferred dir (Unity's
-# files/ContentDownload) missing, re-creates it inside DST (ensureDeferredDir), binds it to a hidden path and mounts
-# its read-only overlay over it. roamd's domain may only read `fuse` objects, so `cp -a SRC/. DST/` is refused on
-# every essential file the hold carries for that dir, the hold is kept and every tap answers ERR-NOTREADY (frankel
-# 0.5.50). #media keeps deferring Android/data (Q114), so the copy goes around the overlay instead:
+# od_extdata_watched PKG (NWP-20261208-13): odrestore's last hand-back step -- reown_ext_appdata, then the `-D` relabel
+# of the app's Android/data dir -- with a progress line for the daemon's stall clock while it still re-owns or
+# relabels files (h50 #1: "The label step gets the same rule, counted in files labelled"). Same shape as
+# od_label_watched: the pair runs in the background with OD_LABEL_COUNT naming a count file in $STATE; reown_ext_appdata's
+# chown walks and the relabel walk append each batch's file count there; every OD_GROW_EVERY seconds (default 10)
+# od_label_done reads the total, and only a total LARGER than the last read writes `cutoff_prog od`. Returns the
+# pair's status (BOUNDED below). When the file cannot be made, the pair runs in the foreground (BOUNDED below).
+#  - The 60-minute hard cap and the daemon's 150 s stall budget are unchanged: a step that stops re-owning and
+#    relabelling writes no line, so it is still stopped at 150 s.
+#  - It runs in the arm's own shell, never inside $(...), so its CUTOFF_TICK increments persist. `wait "$pid"`, never
+#    a bare wait.
+#  - The relabel walk calls `restorecon -D` per batch, never -R: find lists every entry, the dir itself included.
+#    -D stays on every call: without it toybox restorecon does not relabel app-data paths (NWP-20261020-15,
+#    test-odrestore-ext-reown.sh). reown_ext_appdata and the walk are joined by `;`, so an app id not yet resolvable
+#    still relabels, as before.
+#  - -XDEV ON THE RELABEL WALK ONLY. libselinux's selinux_android_restorecon skips every entry whose st_dev differs
+#    from the start path's unless the caller passes SELINUX_ANDROID_RESTORECON_CROSS_FILESYSTEMS, and toybox restorecon
+#    never does; so `restorecon -R -D` stopped at mediad's FUSE overlays over the deferred dirs (od_served_copy's
+#    header). `find -xdev` keeps the walk's reach the same. ~~One difference is left: find -xdev still LISTS each
+#    mountpoint once, as the mounted root (relabel_restored's header), so each overlay root takes one `restorecon -D`
+#    call, one ENOTSUP line in $LOG (core/agent media_span.go: restorecon on a mount fails so) and 1 in the count.~~
+#    (superseded by NWP-20261209-04: the walk prunes every mountpoint under the dir, so no overlay root takes a call;
+#    once the walk's status is checked, that ENOTSUP would fail every tap of an app with a served Android/data.)
+#    `restorecon -R -D` also failed on that root. reown_ext_appdata's chown walks have no -xdev: `chown -R` crossed
+#    the overlays, and the counted walks reach what it reached.
+#  - The count file holds digits only, and the progress line is `cutoff od <n>`: no line names a package or a path.
+#  - Device check left to the merger: toybox xargs runs `sh -c` per batch (od_walk, NWP-20261209-04; toybox find did
+#    before), so roamd's domain execs /system/bin/sh on Android/data (the chown and restorecon walks); a lynx
+#    tap-restore must show no AVC denial for find, xargs or sh.
+#  - BOUNDED (NWP-20261209-04): the relabel walk is od_walk's, at most 256 paths a `restorecon -D`, -xdev kept, and
+#    every mountpoint under the dir pruned, so mediad's overlay roots no longer take a restorecon (the ENOTSUP line
+#    above is gone with them). It runs only when the dir exists: find on a missing dir is an error, and an app with no
+#    Android/data must not fail its hand-back. Returns 2 when reown_ext_appdata's walks or the relabel walk failed
+#    (the arm then answers ERR-NOTREADY, so the next tap or sweep re-runs this step), else 0. reown_ext_appdata's
+#    success line waits in OD_OKBUF until the pair did not fail. When the count file cannot be made, the same pair
+#    runs in the foreground, uncounted: the chown is then the plain `chown -R`, and the relabel walk, which needs a
+#    status file in $STATE too, fails with 2.
+od_extdata_watched() {
+  local pkg="$1" d every cnt= pid rc n=0 cur last=0
+  d="/data/media/$uid/Android/data/$pkg"
+  every="${OD_GROW_EVERY:-10}"
+  case "$every" in ''|*[!0-9]*|0*) every=10 ;; esac
+  [ -n "${STATE:-}" ] && cnt=$(mktemp -p "$STATE" 2>/dev/null)
+  if [ -z "$cnt" ]; then
+    ( OD_OKDEFER=1; OD_OKBUF=; reown_ext_appdata "$pkg"; r=$?; [ "$r" = 2 ] || r=0
+      if [ -d "$d" ]; then od_walk prune 2 restorecon -D "$d" -xdev || r=2; fi
+      [ "$r" = 2 ] || printf '%s' "$OD_OKBUF" >> "$LOG"; exit "$r" )
+    return $?
+  fi
+  ( export OD_LABEL_COUNT="$cnt" OD_LABEL_LOG="$LOG"; OD_OKDEFER=1; OD_OKBUF=; reown_ext_appdata "$pkg"; r=$?; [ "$r" = 2 ] || r=0
+      if [ -d "$d" ]; then od_walk prune 2 restorecon -D "$d" -xdev || r=2; fi
+      [ "$r" = 2 ] || printf '%s' "$OD_OKBUF" >> "$LOG"; exit "$r" ) &
+  pid=$!
+  while kill -0 "$pid" 2>/dev/null; do
+    sleep 1
+    n=$((n+1))
+    [ "$n" -ge "$every" ] || continue
+    n=0
+    cur=$(od_label_done "$cnt")
+    case "$cur" in ''|*[!0-9]*) cur=0 ;; esac
+    if [ "$cur" -gt "$last" ]; then cutoff_prog od; last=$cur; fi
+  done
+  wait "$pid"; rc=$?
+  rm -f "$cnt"
+  return "$rc"
+}
+
+# od_served_copy SRC DST [MODE] (NWP-20261121-02; MODE NWP-20261208-12): odrestore's hand-back of an EXTERNAL hold when
+# mediad serves part of DST. hold_ondemand parks Android/data/<pkg> at sign-in; mediad then finds the app's deferred
+# dir (Unity's files/ContentDownload) missing, re-creates it inside DST (ensureDeferredDir), binds it to a hidden path
+# and mounts its read-only overlay over it. roamd's domain may only read `fuse` objects, so `cp -a SRC/. DST/` is
+# refused on every essential file the hold carries for that dir, the hold is kept and every tap answers ERR-NOTREADY
+# (frankel 0.5.50). #media keeps deferring Android/data (Q114), so the copy goes around the overlay instead:
 #  - an entry the overlay shows that the hidden real dir does not hold is SERVED: the store holds its bytes, as a
 #    deferred entry of the head, so it is not copied;
 #  - every other entry under a target goes into the hidden real dir, which the overlay passes through; that dir then
@@ -513,9 +685,16 @@ od_label_watched() {
 # SIGTERM, so after a SIGKILL it lists dead mounts (the seal takes liveness from the mount table too, media_seal.go).
 # Prints its commands' error lines, then `served=<k>` last. Returns 2 when no live target is DST or lies under DST/
 # (nothing done: the caller copies as before), 0 when every entry not served landed, 1 otherwise (hold kept).
+# MODE (NWP-20261208-12): `rec` (a first attempt) and `nc` (a retry) write the session's finished-copy record
+# `<inode of DST> <DST>` to $STATE/.odcopied.<uid>, the record the arm's plain copy uses (NWP-20261204-04), when
+# every copy in the loop returned 0. The record is written BEFORE the hidden-dir chown/chcon pass: od_watched counts
+# only size growth, so a stop on this path most likely lands in that pass. `nc` copies with `cp -a -n` at all three
+# sites: a file DST or the hidden dir already holds is kept, a missing one is copied. Not a skip, so "NEVER destroy
+# the only copy" holds. MODE empty or any other value: the behaviour before NWP-20261208-12, no record. No log line.
 od_served_copy() {
-  local src="$1" dst="$2" tab pairs t h mp ts hs p r full rt k=0 rc=0 skip= under anc appid own ctx
+  local src="$1" dst="$2" tab pairs t h mp ts hs p r full rt k=0 rc=0 skip= under anc appid own ctx mode="${3:-}" nf= ino
   tab=$(printf '\t')
+  case "$mode" in rec) ;; nc) nf=-n ;; *) mode= ;; esac
   pairs=
   while IFS="$tab" read -r t h; do
     case "$t" in "$dst"|"$dst"/*) ;; *) continue ;; esac
@@ -555,19 +734,23 @@ EOF
       elif { [ -e "$t/$rt" ] || [ -L "$t/$rt" ]; } && ! { [ -e "$h/$rt" ] || [ -L "$h/$rt" ]; }; then
         k=$((k+1))
       else
-        cp -a "$p" "$h/$rt" || rc=1
+        cp -a $nf "$p" "$h/$rt" || rc=1
       fi
     elif [ -n "$anc" ]; then
       [ -d "$full" ] || mkdir -p "$full" || rc=1
     elif [ -d "$p" ] && [ ! -L "$p" ]; then
-      { [ -d "$full" ] || mkdir -p "$full"; } && cp -a "$p"/. "$full"/ || rc=1
+      { [ -d "$full" ] || mkdir -p "$full"; } && cp -a $nf "$p"/. "$full"/ || rc=1
       skip=$r
     else
-      cp -a "$p" "$full" || rc=1
+      cp -a $nf "$p" "$full" || rc=1
     fi
   done <<EOF
 $(find "$src" -mindepth 1 2>&1)
 EOF
+  if [ "$rc" = 0 ] && [ -n "$mode" ] && [ -n "${STATE:-}" ]; then
+    ino=$(stat -c %i "$dst" 2>/dev/null); case "$ino" in ''|*[!0-9]*) ino= ;; esac
+    [ -n "$ino" ] && { grep -qxF -- "$ino $dst" "$STATE/.odcopied.$uid" 2>/dev/null || echo "$ino $dst" >> "$STATE/.odcopied.$uid"; }
+  fi
   while IFS="$tab" read -r t h; do
     [ -n "$h" ] || continue
     chown -R "$own" "$h" || rc=1
@@ -581,11 +764,12 @@ EOF
 }
 
 # remap_per_pkg DIR: each immediate child of DIR is a package dir Android created and owns; re-own its
-# children to that uid, dot-named ones included. cache/ and code_cache/ THEMSELVES keep their own owner and
-# per-user cache GID (installd makes them <app uid>:<cache gid> 02771), but their CONTENTS are re-owned to that
-# dir's own uid:gid -- the pair a child the app makes itself carries. The restore runs as root and never chowns, so
-# it creates entries there as 0:0 and the app would EACCES on them for the whole session: backlog row "Play install
-# fails first try: RESTORE writes Glide's cache as root, app EACCESes (#100)", NWP-20261029-07.
+# children to that uid, dot-named ones included, in one chown per package (NWP-20261210-04). cache/ and
+# code_cache/ THEMSELVES keep their own owner and per-user cache GID (installd makes them <app uid>:<cache gid>
+# 02771), but their CONTENTS are re-owned to that dir's own uid:gid -- the pair a child the app makes itself carries.
+# The restore runs as root and never chowns, so it creates entries there as 0:0 and the app would EACCES on them for
+# the whole session: backlog row "Play install fails first try: RESTORE writes Glide's cache as root, app EACCESes
+# (#100)", NWP-20261029-07.
 # Used for CE (/data/user/N) and DE (/data/user_de/N) app storage.
 remap_per_pkg() {
   # local-scope EVERYTHING: without this, `name=` in reown_restored clobbers the GLOBAL $name (the login profile),
@@ -618,7 +802,7 @@ remap_per_pkg() {
   # NWP-20261029-07 added a SECOND batched stat, of every package's cache/code_cache dir (uid, GID, path), and the
   # dot globs below: the stat count is two whatever the package count. It is taken before the package loop, so a
   # restore-created package's cache dir still reads 0 in the cache pass. $1 is not read after these two listings:
-  # the cache pass reuses the positional parameters (set --) to build its chown list.
+  # the package loop and the cache pass both reuse the positional parameters (set --) to build their chown lists.
   clisting=$(stat -c '%u %g %n' "$1"/*/cache "$1"/*/code_cache 2>/dev/null)
   [ -n "$listing" ] || return 0
   while read -r own pkg; do
@@ -629,11 +813,17 @@ remap_per_pkg() {
       reown_restored "$pkg"   # root-owned == restore-created; reown to the per-user app uid (skips if not yet in packages.list)
       continue
     fi
+    # NWP-20261210-04: ONE chown per package, not one per child. The same children are collected (the three globs,
+    # the `[ -e ]` test, the cache/code_cache skip) and the chown carries them all, as the cache pass below does: the
+    # same (owner, path) pairs, one fork per package instead of one per child. lynx 2026111604 timed the CE pass at
+    # 3803ms. $1 is not read after the two listings above, so set -- may reuse the positional parameters.
+    set --
     for sub in "$pkg"/* "$pkg"/.[!.]* "$pkg"/..?*; do
       [ -e "$sub" ] || continue
       case "${sub##*/}" in cache|code_cache) continue;; esac
-      chown -R "$own:$own" "$sub" 2>> "$LOG"
+      set -- "$@" "$sub"
     done
+    if [ "$#" -gt 0 ]; then chown -R "$own:$own" "$@" 2>> "$LOG"; fi
   done <<REMAP_EOF
 $listing
 REMAP_EOF
@@ -825,11 +1015,12 @@ od_fetch_data() {
     return 1
   fi
   # A security-key profile's keys open only with the factor the login cached. Each worker op starts without it, and an
-  # install that bypassed materializeapp reaches this fetch with nothing else having exported it.
-  [ -f "$STATE/.fido2hmac" ] && export NOWHERE_FIDO2_HMAC="$(cat "$STATE/.fido2hmac")"
+  # install that bypassed materializeapp reaches this fetch with nothing else having loaded it. Held in _fh_v and
+  # staged for the fetch below (NWP-20261205-18).
+  [ -f "$STATE/.fido2hmac" ] && _fh_v="$(cat "$STATE/.fido2hmac")"
   _t0=$(_ms)
   NOWHERE_ODFETCH_DIR="$STATE/odfetch.$uid" NOWHERE_PHASE=apps NOWHERE_OD_CANCEL="$STATE/od-cancel" \
-    "$AGENT" fetch-oddata s3 "$name" "$(pw "$pass")" "$pkg" "/data/user/$uid" "/data/user_de/$uid" >> "$LOG" 2>&1
+    NOWHERE_SE_SECRET="$(pwv "$_se_v")" NOWHERE_FIDO2_HMAC="$(pwv "$_fh_v")" "$AGENT" fetch-oddata s3 "$name" "$(pw "$pass")" "$pkg" "/data/user/$uid" "/data/user_de/$uid" >> "$LOG" 2>&1
   _rc=$?
   if [ "$_rc" != 0 ]; then
     echo "[roamd] od-fetch $pkg FAILED rc=$_rc -- left unfetched, not installed (NWP-20261130-03) $(date)" >> "$LOG"
@@ -1299,9 +1490,21 @@ ODRE_EOF
 # same pm argv in the same order. h60 #6's two count lines stay; the reap adds a removed/failed count per package (a
 # kept package is removed only when both of its calls are) and one timing line, timed from before the list is built.
 # test-reap-stale-ondemand.sh covers it.
+# NWP-20261210-07: on lynx 2026111604 (2026-11-17), 8 of a reap's 15 `pm uninstall` calls (the Auto apps and Play
+# services) named a package with no record on the phone at all (`dumpsys package` -> `Unable to find package`); each
+# cost about 0.2 s and was counted failed. So, at the first row that reaches removal, the same lazy block also reads
+# `pm list packages -a` ONCE (a package with a record in any user, installed or not: an archived placeholder is listed).
+# A row that reaches removal, after the unparked check and BEFORE the K/A classification (so h60 #6's kept count is
+# untouched), whose `package:<pkg>` line that listing does not hold makes no pm call, is not sent to the batch and counts
+# as absent. The match is in-shell and newline-anchored. A non-zero rc or an empty listing (a live phone always lists
+# system packages) leaves the set UNREAD, and every row then goes to pm as before: skipping a real record would strand a
+# label-less placeholder, a needless call costs only time. One count line, `<n> absent`, follows the removed/failed line
+# when the set was read; one WARN when a row reached removal and it was not. Both hold counts only. The reap still runs
+# where it ran: removing data is never deferred (docs/product-decisions.md, 2026-10-26), and provisionRoamedApps raises
+# the placeholders before the switch, so a retained record must be cleared first.
 reap_stale_ondemand() {
   local man="$1" uid="$2" rline rpkg rmode _vol _skipped="" _out _tmp _nl _ou _ol _lst _rd=0 _unk=0 _kp _nk=0 _ko=0 _kf=0
-  local _t0 _res _k _a _b _ok=0 _bad=0
+  local _t0 _res _k _a _b _ok=0 _bad=0 _kn="" _kr=0 _na=0
   case "$uid" in ""|*[!0-9]*) echo "[roamd] reap-stale-ondemand: no valid uid -- reaping nothing (NWP-20261125-01)" >> "$LOG"; return 0;; esac
   _t0=$(_ms)
   set --
@@ -1328,6 +1531,7 @@ reap_stale_ondemand() {
       fi
       if [ "$_rd" = 0 ]; then
         _rd=1
+        if _kn=$(timeout -k 2 20 pm list packages -a </dev/null 2>/dev/null) && [ -n "$_kn" ]; then _kn="$_nl$_kn$_nl"; _kr=1; fi
         for _ou in $(od_other_users "$uid"); do
           if _lst=$(timeout -k 2 20 pm list packages --user "$_ou" </dev/null 2>/dev/null) && [ -n "$_lst" ]; then
             _ol="$_ol$_lst$_nl"
@@ -1336,6 +1540,7 @@ reap_stale_ondemand() {
           fi
         done
       fi
+      [ "$_kr" = 1 ] && case "$_kn" in *"${_nl}package:$rpkg${_nl}"*) ;; *) _na=$((_na + 1)); continue ;; esac   # NWP-20261210-07: no record, no pm call
       _kp=$_unk
       case "$_ol" in *"${_nl}package:$rpkg${_nl}"*) _kp=1 ;; esac
       if [ "$_kp" = 1 ]; then
@@ -1360,6 +1565,8 @@ $_res
 ODRB_EOF
   fi
   echo "[roamd] reap-stale-ondemand: $_ok removed, $_bad failed (NWP-20261130-06) $(date)" >> "$LOG"
+  [ "$_kr" = 1 ] && echo "[roamd] reap-stale-ondemand: $_na absent -- no package record on the phone, no pm call (NWP-20261210-07) $(date)" >> "$LOG"
+  [ "$_rd" = 1 ] && [ "$_kr" = 0 ] && echo "[roamd] WARN reap-stale-ondemand: could not read the package list -- every package tried (NWP-20261210-07) $(date)" >> "$LOG"
   echo "[roamd] reap-stale-ondemand: $# package(s) in $(( $(_ms) - _t0 )) ms (NWP-20261130-06) $(date)" >> "$LOG"
   [ "$_nk" -gt 0 ] && echo "[roamd] reap-stale-ondemand: $_nk package(s) kept for another user, removed for user 0 and user $uid only ($_ko ok, $_kf failed) (h60 #6) $(date)" >> "$LOG"
   [ "$_unk" = 1 ] && echo "[roamd] WARN reap-stale-ondemand: could not read another user's packages -- no package removed for all users (h60 #6) $(date)" >> "$LOG"
@@ -1478,6 +1685,22 @@ reap_orphan_provisioned() {
   done
 }
 
+# gwin_add PID (NWP-20261210-09): the rolling window of grant_perms_for's pm / cmd calls. It appends PID to the
+# caller's queue _gwq (local to grant_perms_for, reached through the shell's dynamic scope) and, while 6 or more are
+# queued, waits the OLDEST and drops it. A finished job stays waitable by its pid, so this is a FIFO window under
+# bash, dash and mksh alike (`wait -n` is bash-only; mksh and dash do not have it): never more than 6 calls in
+# flight, and no batch barrier. ⚠ It is FIFO, not completion order: a slow call at the head holds back new starts
+# until it ends, so at most 5 other calls start and end inside it. A full `wait` empties the queue; its callers
+# reset _gwq after each one.
+gwin_add() {
+  local _gwp
+  _gwq="$_gwq $1"
+  set -- $_gwq
+  while [ "$#" -ge 6 ]; do wait "$1" 2>/dev/null; shift; done
+  _gwq=""
+  for _gwp in "$@"; do _gwq="$_gwq $_gwp"; done
+}
+
 # grant_perms_for UID [PKGFILTER [DECLINES [BATCH]]] (#94/#204): re-grant the captured roamed runtime perms + the "while in use"
 # appops-foreground mode (location/camera/mic) from nowhere-perms. With PKGFILTER, grant ONLY that one package's
 # perms -- used by `odrestore` after a tap materialises an on-demand app (the login grant no-op'd on its APK-less
@@ -1494,9 +1717,14 @@ reap_orphan_provisioned() {
 # BATCH (NWP-20261125-08) is a RESTORE-ODDATA list's token b<8 hex>.<i>.<n>: the list's ops share one
 # `pm list packages -3` read (the NWP-20261123-08 block below).
 grant_perms_for() {
-  local uid="$1" pkgfilter="$2" PF gpkg gperm op aop n=0 _gbg=0 _gn _gd _dcl=0 _drej=0 _dskip=0 _df _dfl _dperm _pfx NL _dok=0 _dmark
+  local uid="$1" pkgfilter="$2" PF gpkg gperm op aop n=0 _gwq="" _gn _gd _gdf _dcl=0 _drej=0 _dskip=0 _df _dfl _dperm _pfx NL _dok=0 _dmark
   local _smsf _smsapp="" _sl _dsms=0 _ws _sz
   local _grec="$STATE/.granted.$uid" _gok="$STATE/.grantok" _gfirst=0 _gskip=0 _gnofile=0
+  local _gtm=0 _gtw _gtp
+  # NWP-20261210-09: the sign-in call (no PKGFILTER) times its four phases: TIMING grant-lines, grant-list3,
+  # grant-internet and grant-declines, each once, beside the caller's grant-135 (the whole). A PKGFILTER call
+  # (odrestore, the install-heal) logs none of them.
+  [ -n "$pkgfilter" ] || _gtm=1
   GPF3_MS=0; GPF3_SRC=none   # NWP-20261202-16: the shared -3 read's time and source, read by the odrestore steps line
   # NWP-20260820-25: the per-permission `pm grant` / `cmd appops set` calls are LATENCY, not CPU -- each is a
   # `cmd` startup plus a binder round trip. Measured on lynx 2026082005: 46ms each sequential, 10ms each at
@@ -1509,7 +1737,17 @@ grant_perms_for() {
   # entirely `cmd` itself.
   #
   # Bounded to 6 in flight: enough to hide the latency, few enough not to pile work onto a single-threaded
-  # binder path during a login that is already contended.
+  # binder path during a login that is already contended. ~~The calls ran in batches of 6, each batch waiting
+  # for its slowest call before the next started, and the INTERNET default ran one `pm grant` at a time.~~
+  # (Superseded by NWP-20261210-09: every pm / cmd call here goes through one rolling window of 6, gwin_add
+  # above, with no batch barrier, and the INTERNET default joins it. The full `wait` drains stay where an
+  # ordering needs them: after the per-line loop, before the record, and after the declines pass.)
+  #
+  # One call per package or per batch is NOT possible with the same grants. AOSP's
+  # PackageManagerShellCommand.runGrantRevokePermission takes ONE package and ONE permission, or
+  # --all-permissions, which grants every runtime permission the package requests and so is not the same set;
+  # `cmd appops set` takes one op and `pm set-permission-flags` one permission. The cost per call is `cmd`
+  # itself, so the window is the lever.
   #
   # The COUNT moves to a file because each grant now runs in a subshell and `n=$((n+1))` there would be lost.
   # Appends are 2 bytes under O_APPEND, so concurrent writers cannot interleave a line. The count is
@@ -1524,6 +1762,8 @@ grant_perms_for() {
   # the -3 read, the INTERNET default, the record and the .declined marker run; the grant lines and the flags pass do
   # not. A sign-in call with no file still returns here.
   if [ ! -f "$PF" ]; then
+    # NWP-20261210-09: the sign-in's four phase timings, each once, are empty here (the return runs no phase).
+    [ "$_gtm" != 1 ] || { _gtw=$(_ms); for _gtp in grant-lines grant-list3 grant-internet grant-declines; do _tlog "$_gtp" "$_gtw"; done; }
     [ -n "$pkgfilter" ] || { echo "[roamd] GRANT -> 0 perms (no file, user $uid) $(date)" >> "$LOG"; return 0; }
     _gnofile=1
   fi
@@ -1541,6 +1781,7 @@ grant_perms_for() {
     _gskip=1
     echo "[roamd] GRANT ($pkgfilter) -> skipped: granted this session, not a first install $(date)" >> "$LOG"
   fi
+  [ "$_gtm" != 1 ] || _gtw=$(_ms)
   [ "$_gskip" = 1 ] || [ "$_gnofile" = 1 ] || while read -r gpkg gperm; do
     [ -n "$gpkg" ] && [ -n "$gperm" ] || continue
     [ -n "$pkgfilter" ] && [ "$gpkg" != "$pkgfilter" ] && continue
@@ -1559,7 +1800,7 @@ grant_perms_for() {
         case "$aop" in
           android:manage_external_storage|android:system_alert_window|android:write_settings|android:request_install_packages|android:get_usage_stats)
             { cmd appops set --user "$uid" "$gpkg" "$aop" allow </dev/null >/dev/null 2>&1 && echo x >> "$_gn"; } &
-            _gbg=$((_gbg + 1)); [ "$_gbg" -ge 6 ] && { wait; _gbg=0; };;
+            gwin_add $!;;
         esac
         continue;;
       deny:*)
@@ -1569,7 +1810,7 @@ grant_perms_for() {
         case "${gperm#deny:}" in
           android.permission.INTERNET)
             { pm revoke --user "$uid" "$gpkg" android.permission.INTERNET </dev/null >/dev/null 2>&1 && { echo x >> "$_gn"; echo "$gpkg" >> "$_gok"; }; } &
-            _gbg=$((_gbg + 1)); [ "$_gbg" -ge 6 ] && { wait; _gbg=0; };;
+            gwin_add $!;;
         esac
         continue;;
       flags:*)
@@ -1602,11 +1843,12 @@ grant_perms_for() {
     { pm grant --user "$uid" "$gpkg" "$gperm" </dev/null >/dev/null 2>&1 && { echo x >> "$_gn"; echo "$gpkg" >> "$_gok"; }
       [ -n "$op" ] && cmd appops set --user "$uid" "$gpkg" "$op" foreground </dev/null >/dev/null 2>&1
     } &
-    _gbg=$((_gbg + 1)); [ "$_gbg" -ge 6 ] && { wait; _gbg=0; }
+    gwin_add $!
   done < "$PF"
-  wait                      # drain the last partial batch before the count is read
+  wait; _gwq=""             # drain the window before the count is read
   n=$(wc -l < "$_gn" 2>/dev/null); n=${n:-0}
   rm -f "$_gn" 2>/dev/null
+  [ "$_gtm" != 1 ] || { _tlog grant-lines "$_gtw"; _gtw=$(_ms); }
   # DIA-20260813-08 (#127): the INTERNET DEFAULT. GrapheneOS default-grants INTERNET at install; the roam's
   # install-existing/materialise paths don't, so a package the capture never saw installed (its whole history
   # a placeholder at every logoff) came back with NO NETWORK -- Play Store on 2026-08-13, "you're offline" on
@@ -1668,12 +1910,21 @@ grant_perms_for() {
         || rm -f "$_gbf.$$" 2>/dev/null
     fi
   fi
+  [ "$_gtm" != 1 ] || { _tlog grant-list3 "$_gtw"; _gtw=$(_ms); }
+  # NWP-20261210-09: each default grant is a job in the same window; the count moves to a file as _gn's did, and
+  # the full `wait` below drains every grant (the per-line ones too) before the count and the record read them.
+  _gdf="$STATE/.grantdf"; ( : > "$_gdf" ) 2>/dev/null
   [ "$_gskip" = 1 ] || for dpkg in $_g3; do
     [ -n "$pkgfilter" ] && [ "$dpkg" != "$pkgfilter" ] && continue
     case "$_pfx" in *"${NL}${dpkg} android.permission.INTERNET${NL}"*) continue;; esac
     case "$_pfx" in *"${NL}${dpkg} deny:android.permission.INTERNET${NL}"*) continue;; esac
-    pm grant --user "$uid" "$dpkg" android.permission.INTERNET </dev/null >/dev/null 2>&1 && { dflt=$((dflt+1)); echo "$dpkg" >> "$_gok"; }
+    { pm grant --user "$uid" "$dpkg" android.permission.INTERNET </dev/null >/dev/null 2>&1 && { echo x >> "$_gdf"; echo "$dpkg" >> "$_gok"; }; } &
+    gwin_add $!
   done
+  wait; _gwq=""             # drain the window before the count and the record read it
+  dflt=$(wc -l < "$_gdf" 2>/dev/null); dflt=${dflt:-0}
+  rm -f "$_gdf" 2>/dev/null
+  [ "$_gtm" != 1 ] || _tlog grant-internet "$_gtw"
   # The record: the _gok packages that are whole lines of _g3, matched in-shell and newline-anchored as the _pfx tests
   # are. A failed or empty list records nothing, the safe direction: a later call runs the grant phase again.
   # ⚠ This holds only while pm lists a placeholder only with -a. If `pm list packages -3` lists an archived
@@ -1771,6 +2022,7 @@ grant_perms_for() {
   # It only ever WITHHOLDS a grant. On an APK-less placeholder pm finds no package and does nothing; the odrestore
   # call with PKGFILTER applies the line once the tap has installed the real APK (DECLINES=1, see above), as it does
   # for the grants.
+  [ "$_gtm" != 1 ] || _gtw=$(_ms)
   _dmark="$STATE/.declined.$uid"
   if [ -z "$pkgfilter" ]; then
     _dok=1
@@ -1804,7 +2056,7 @@ grant_perms_for() {
   case "$_smsapp" in *.*) ;; *) _smsapp="";; esac
   case "$_smsapp" in .*|*.|*..*|*[!A-Za-z0-9._]*) _smsapp="";; esac
   [ "${#_smsapp}" -le 255 ] || _smsapp=""
-  _gd="$STATE/.grantd"; ( : > "$_gd" ) 2>/dev/null; _gbg=0
+  _gd="$STATE/.grantd"; ( : > "$_gd" ) 2>/dev/null
   [ "$_dok" = 1 ] && while read -r gpkg gperm; do
     case "$gperm" in flags:*) ;; *) continue;; esac
     [ -n "$pkgfilter" ] && [ "$gpkg" != "$pkgfilter" ] && continue
@@ -1825,11 +2077,12 @@ grant_perms_for() {
       fi && echo x >> "$_gd"
       pm revoke --user "$uid" "$gpkg" "$_dperm" </dev/null >/dev/null 2>&1
     } &
-    _gbg=$((_gbg + 1)); [ "$_gbg" -ge 6 ] && { wait; _gbg=0; }
+    gwin_add $!
   done < "$PF"
-  wait
+  wait; _gwq=""
   _dcl=$(wc -l < "$_gd" 2>/dev/null); _dcl=${_dcl:-0}
   rm -f "$_gd" 2>/dev/null
+  [ "$_gtm" != 1 ] || _tlog grant-declines "$_gtw"
   if [ "$_gnofile" = 1 ]; then
     echo "[roamd] GRANT ($pkgfilter) -> 0 perms (no file) + $dflt INTERNET default(s) (user $uid) $(date)" >> "$LOG"
     return 0
@@ -1847,14 +2100,20 @@ grant_perms_for() {
 # Android's own emulated-storage FUSE for the live user (spike).
 # $1 = reap, $2 = the reaped uid (NWP-20261129-06): only the cleanstorage op passes them. See reap_live_other.
 stop_mediad() {
-  local i mnt _dev _rest left a j _mt _mtrc _unread _pre _prerc _n _bound _rlo
+  local i mnt _dev _rest left a j _mt _mtrc _unread _pre _prerc _n _bound _rlo _dl _c0 _c _ce _ck
   if [ "${1:-}" = reap ] && _rlo=$(reap_live_other "$2") && ! reap_media_mounted "$2"; then
     echo "[roamd] reap of user $2: a live session (user $_rlo) holds the media daemon and no media mount lies in the removed user's dirs -- mediad left running (NWP-20261129-06) $(date)" >> "$LOG"
     return 0
   fi
   setprop ctl.stop nowhere_mediad
-  i=0
-  while [ $i -lt 30 ] && [ "$(getprop init.svc.nowhere_mediad)" = "running" ]; do i=$((i+1)); sleep 0.1; done
+  i=0; _c0=$(_ms 2>/dev/null); case "$_c0" in ''|0|*[!0-9]*) _c0= ;; esac
+  while [ $i -lt 30 ]; do
+    _c=$(_ms 2>/dev/null); _ce=-1
+    case "$_c0:$_c" in :*|*:|*:0|*:*[!0-9]*) ;; *) _ce=$((_c - _c0)) ;; esac
+    [ "$_ce" -ge 0 ] || _ce=$((i * 100))
+    [ "$_ce" -lt 3000 ] && [ "$(getprop init.svc.nowhere_mediad)" = "running" ] || break
+    i=$((i+1)); sleep 0.1
+  done
   rm -f "$STATE/mediad.pid" "$STATE/mediad.req"   # never revive from a stale req; .pid is legacy (no longer written)
   # E.5x: we no longer umount here. umount(2) needs CAP_SYS_ADMIN, and on Endospore this worker runs confined as
   # endospore_priv, which deliberately does NOT hold it -- mediad has its own domain (endospore_mediad) precisely
@@ -1883,9 +2142,11 @@ stop_mediad() {
   # reports the oneshot `running` after a 20-tick (2 s) start grace: mediad died or never started, so waiting longer
   # cannot help. THE CAP IS A BUDGET, not a guess. stop_mediad writes no roam.progress, and every caller but `in`
   # runs it inside a worker op that runWorkerHeld polls for roamStallTicks (core/agent/main.go: 300 x 500 ms = 150 s
-  # with no new progress) before it answers ERR-TIMEOUT and marks the lane abandoned. Worst case here: 30 (stop) +
-  # 2 x 550 (marker) + 2 x 30 (idle) = 1190 ticks, about 119 s; the reap adds up to 20 s of reap_userdir_settle after
-  # it (139 s). Raising the cap past that turns a slow sweep into ERR-TIMEOUT plus an abandoned lane, which is worse
+  # with no new progress) before it answers ERR-TIMEOUT and marks the lane abandoned. [SUPERSEDED by NWP-20261210-26,
+  # below: a tick count is not a time. "Worst case here: 30 (stop) + 2 x 550 (marker) + 2 x 30 (idle) = 1190 ticks,
+  # about 119 s."] Worst case here, by the clock: 3 s (stop) + 2 x 55 s (marker) + 2 x 3 s (idle) = 119 s, plus the
+  # length of the last command a wait runs; the reap adds up to 20 s of reap_userdir_settle after it (139 s).
+  # Raising the cap past that turns a slow sweep into ERR-TIMEOUT plus an abandoned lane, which is worse
   # than the ERR-MEDIA-SWEEP it replaces. One caller has a tighter clock than the worker's: END-UNSAVED
   # (core/agent/end_unsaved.go) starts its sweepmedia by 45 s and must commit by 70 s, and the chooser waits 90 s. A
   # sweep this bound lets run past that fails safe there: the handler's commit check undoes the local mark and kicks
@@ -1895,6 +2156,20 @@ stop_mediad() {
   # here-document, never as a `printf '%s\n' "$_mt"` argument: the device's mksh has no printf builtin, so the
   # table goes through exec(2), and a table over 128 KB (MAX_ARG_STRLEN) fails with E2BIG, prints nothing and counts
   # 0 -- "media mounts clear" over 5000 live mounts (CI's mksh leg, NWP-20261113-03).
+  # NWP-20261210-26: every wait here is bounded and logged by the WALL CLOCK, its values unchanged in seconds. The
+  # bounds were COUNTS of ticks, and a tick is a file test, a getprop and `sleep 0.1`, so on a loaded phone a tick
+  # is longer than 0.1 s: on lynx 2026111604 (2026-11-18, 624 mounts) 550 ticks took about 97 s, roam.log said
+  # "media sweep attempt 1 waited 55.0s" while login.log said the worker op "HELD the slot 98257ms", and the 119 s
+  # budget above did not hold. Each wait now takes a start stamp from _ms and reads it once per pass: the stop and
+  # idle waits end at 3000 ms, the marker wait at _dl (_bound x 100 ms: 5000 + 500 per mount, capped at 55000), and
+  # the marker wait reads getprop only once 2000 ms have passed. The "waited" line is the measured time, printed past
+  # 5000 ms. The tick counts (30, _bound, 30) stay as a BACKSTOP: a tick takes at least 0.1 s, so the clock ends a
+  # wait first whenever it reads, and they alone end a wait whose clock reads but does not advance. A clock that
+  # cannot be read (_ms prints 0, a non-number or nothing) or that went backwards counts tick time instead, so a bad
+  # stamp never ends a wait at once and never keeps it open. The "waited" line is the tick time, ending " (ticks)",
+  # when the measured time is less than the ticks slept (no working clock reads that). A command that a wait runs (a
+  # slow getprop) can still overrun a deadline by its own length: nothing here cancels it. The retries and the guard
+  # over a surviving mount are unchanged (docs/product-decisions.md, 2026-10-28).
   _n=0
   _pre=$(cat /proc/mounts 2>>"$LOG"); _prerc=$?
   if [ "$_prerc" -eq 0 ] && [ -n "$_pre" ]; then
@@ -1906,19 +2181,29 @@ EOF_MT
   case "$_n" in ''|*[!0-9]*) _n=0 ;; esac   # never let a non-number reach [ -lt ]: mksh reads it as 0, silently
   _bound=$((50 + 5 * _n))
   [ "$_bound" -gt 550 ] && _bound=550
+  _dl=$((_bound * 100))   # the marker wait's deadline in ms of clock: 5000 + 500 per mount, capped at 55000
   a=0
   _unread=0
   while [ $a -lt 2 ]; do
     a=$((a+1))
     ( : > "$STATE/mediad.sweep" ); chmod 600 "$STATE/mediad.sweep"
     setprop ctl.start nowhere_mediad
-    i=0
-    while [ "$i" -lt "$_bound" ] && [ -f "$STATE/mediad.sweep" ]; do
-      [ "$i" -ge 20 ] && [ "$(getprop init.svc.nowhere_mediad)" != "running" ] && break
+    i=0; _c0=$(_ms 2>/dev/null); case "$_c0" in ''|0|*[!0-9]*) _c0= ;; esac
+    while [ "$i" -lt "$_bound" ]; do
+      _c=$(_ms 2>/dev/null); _ce=-1
+      case "$_c0:$_c" in :*|*:|*:0|*:*[!0-9]*) ;; *) _ce=$((_c - _c0)) ;; esac
+      [ "$_ce" -ge 0 ] || _ce=$((i * 100))
+      [ "$_ce" -ge "$_dl" ] && break
+      [ -f "$STATE/mediad.sweep" ] || break
+      [ "$_ce" -ge 2000 ] && [ "$(getprop init.svc.nowhere_mediad)" != "running" ] && break
       i=$((i+1)); sleep 0.1
     done
-    if [ "$i" -gt 50 ]; then
-      echo "[roamd] media sweep attempt $a waited $((i / 10)).$((i % 10))s for $_n mount(s) $(date)" >> "$LOG"
+    _c=$(_ms 2>/dev/null); _ce=-1; _ck=
+    case "$_c0:$_c" in :*|*:|*:0|*:*[!0-9]*) ;; *) _ce=$((_c - _c0)) ;; esac
+    # A working clock never reads less than the ticks slept: when it does (unread, stuck, backwards), log the ticks.
+    [ "$_ce" -ge $((i * 100)) ] || { _ce=$((i * 100)); _ck=" (ticks)"; }
+    if [ "$_ce" -gt 5000 ]; then
+      echo "[roamd] media sweep attempt $a waited $((_ce / 1000)).$((_ce % 1000 / 100))s for $_n mount(s)$_ck $(date)" >> "$LOG"
     fi
     _mt=$(cat /proc/mounts 2>>"$LOG"); _mtrc=$?
     if [ "$_mtrc" -eq 0 ] && [ -n "$_mt" ]; then
@@ -1937,8 +2222,14 @@ EOF_MT
     # Wait for the oneshot to go idle before re-kicking, BOUNDED -- an unbounded wait here would wedge the
     # logoff itself and hand the session to the logoff's 6-minute no-progress watchdog (logoffStallLimit,
     # core/agent/logoff_cutoff.go).
-    j=0
-    while [ $j -lt 30 ] && [ "$(getprop init.svc.nowhere_mediad)" = "running" ]; do j=$((j+1)); sleep 0.1; done
+    j=0; _c0=$(_ms 2>/dev/null); case "$_c0" in ''|0|*[!0-9]*) _c0= ;; esac
+    while [ $j -lt 30 ]; do
+      _c=$(_ms 2>/dev/null); _ce=-1
+      case "$_c0:$_c" in :*|*:|*:0|*:*[!0-9]*) ;; *) _ce=$((_c - _c0)) ;; esac
+      [ "$_ce" -ge 0 ] || _ce=$((j * 100))
+      [ "$_ce" -lt 3000 ] && [ "$(getprop init.svc.nowhere_mediad)" = "running" ] || break
+      j=$((j+1)); sleep 0.1
+    done
   done
   rm -f "$STATE/mediad.sweep"        # never leave a marker that would make the next start a no-op sweep
   if [ "$_unread" -eq 1 ]; then
@@ -1981,12 +2272,32 @@ remap_tree() {
 # light. Device-proven on lynx 2026-09-08 and fixed in the agent (NWP-20260908-19, mediafs.go Setattr), so the
 # traversal is now genuinely harmless -- but it is harmless because of that fix, not because FUSE refuses.
 # Uses the global $uid.
+# COUNTED FORM (NWP-20261208-13): when OD_LABEL_COUNT names a file (od_extdata_watched), each present dir is re-owned
+# by a find walk in reown_restored's counted form, so each batch appends its file count and a large Android/data feeds
+# the stall clock. `chown -h` on every entry find lists (the dir itself included) changes what `chown -R` changed:
+# toybox chown -R implies -h. No -xdev, as -R has none: the walk reaches the overlay submounts, as `chown -R` does
+# (the paragraphs above). chown's stderr goes to OD_LABEL_LOG ($LOG). With OD_LABEL_COUNT unset or empty
+# (restore_media_tail) the plain `chown -R` lines below run unchanged; that is why the counted branch returns on its
+# own instead of re-indenting them in an else.
+# BOUNDED (NWP-20261209-04): each counted walk is od_walk's, at most 256 paths a chown. When either walk fails the
+# function logs a WARN line and returns 2 and the `reowned ext app-data` line is not written ($appid, no longer
+# needed once $target is set, records the failure). With OD_OKDEFER set (od_extdata_watched's pair) the success line
+# waits in OD_OKBUF until the whole pair succeeds.
 reown_ext_appdata() {
   local pkg="$1" appid target
   # Exact on field 1 (NWP-20261111-11): the grep this replaced read $pkg as a regex, so a look-alike name took the data.
   appid=$(NW_PKG="$pkg" awk '$1 == ENVIRON["NW_PKG"] { print $2; exit }' /data/system/packages.list 2>/dev/null)
   case "$appid" in ''|*[!0-9]*) return 1;; esac
   target=$((uid * 100000 + appid))
+  if [ -n "${OD_LABEL_COUNT:-}" ]; then
+    appid=ok
+    if [ -d "/data/media/$uid/Android/data/$pkg" ]; then od_walk none 3 chown -h "$target:ext_data_rw" "/data/media/$uid/Android/data/$pkg" || appid=failed; fi
+    if [ -d "/data/media/$uid/Android/obb/$pkg" ]; then od_walk none 3 chown -h "$target:ext_obb_rw" "/data/media/$uid/Android/obb/$pkg" || appid=failed; fi
+    if [ "$appid" != ok ]; then echo "[roamd] WARN reown_ext_appdata: a chown walk FAILED -- not reowned, status 2 (NWP-20261209-04)" >> "$LOG"; return 2; fi
+    if [ -z "${OD_OKDEFER:-}" ]; then echo "[roamd] reowned ext app-data $pkg -> $target (user $uid)" >> "$LOG"; else OD_OKBUF="${OD_OKBUF:-}[roamd] reowned ext app-data $pkg -> $target (user $uid)
+"; fi
+    return 0
+  fi
   [ -d "/data/media/$uid/Android/data/$pkg" ] && chown -R "$target:ext_data_rw" "/data/media/$uid/Android/data/$pkg" 2>> "$LOG"
   [ -d "/data/media/$uid/Android/obb/$pkg" ]  && chown -R "$target:ext_obb_rw"  "/data/media/$uid/Android/obb/$pkg"  2>> "$LOG"
   echo "[roamd] reowned ext app-data $pkg -> $target (user $uid)" >> "$LOG"
@@ -2033,37 +2344,6 @@ relabel_launcher() {
   fi
 }
 
-# remap_media_db UID DIR (NWP-20261124-01): the CE and #de seals carry MediaProvider's own database (external.db)
-# with the ABSOLUTE /storage/emulated/<sealing user>/ path of every file, as they carry mmssms.db (#148) and
-# launcher.db (relabel_launcher above). After a sign-in as a new user id each row still names the old user: the app
-# that took a photo calls it "inaccessible", and the mount-time scan adds a second row for the real path, so every
-# media folder and album shows twice (three times after a third session). nowhere_db_fix media-remap drops the later
-# duplicates of a file (keeping its first row) and repoints the rest at this user. Called for BOTH the CE and the DE
-# dir: MediaProvider is directBootAware, so its database may sit under /data/user_de/<uid>. Run BEFORE
-# remap_per_pkg/restorecon, like relabel_launcher, so any -wal/-shm/-journal the rewrite creates as root is re-owned
-# and relabelled with the rest. Never fatal: a failed rewrite leaves the database as restored, which is today's state.
-remap_media_db() {
-  local db out rc nrem ndrop mrest nown ngen
-  for db in "$2/com.android.providers.media.module/databases/external.db" \
-            "$2/com.google.android.providers.media.module/databases/external.db"; do
-    [ -f "$db" ] || continue
-    # Loud guard, not command -v (relabel_launcher's rule): a silent no-op is how the sqlite3 repairs hid for months.
-    if [ ! -x /system/bin/nowhere_db_fix ]; then
-      echo "[roamd] media-remap SKIPPED: /system/bin/nowhere_db_fix missing on this build (user $1) (NWP-20261124-01)" >> "$LOG"
-      continue
-    fi
-    out=$(/system/bin/nowhere_db_fix media-remap "$db" "$1" </dev/null 2>> "$LOG"); rc=$?
-    if [ "$rc" = 0 ]; then
-      nrem=${out%% *}; mrest=${out#* }; ndrop=${mrest%% *}; mrest=${mrest#* }; nown=${mrest%% *}; ngen=${mrest##* }
-      if [ "$ngen" = "-" ]; then ngen="generation unchanged"; else ngen="generation $ngen"; fi
-      echo "[roamd] media-remap user $1: $nrem row(s) repointed, $ndrop stale duplicate(s) dropped, $nown row(s) given user $1, $ngen (NWP-20261129-01)" >> "$LOG"
-    else
-      echo "[roamd] media-remap user $1: FAILED rc=$rc -- left as restored (NWP-20261124-01)" >> "$LOG"
-    fi
-  done
-  return 0
-}
-
 # rescan_media UID (NWP-20261113-45): since NWP-20261202-02 MediaProvider's index is not roamed, and the provider
 # scans the new user's volume at user start, BEFORE the #media restore, so nothing indexes the restored files and the
 # Gallery shows none of them. Ask the session's chooser to call the provider's own volume scan: the call takes the
@@ -2075,49 +2355,6 @@ rescan_media() {
   _rsrc=$?
   echo "[roamd] media rescan requested from the session chooser (user $1, rc=$_rsrc) (NWP-20261113-45) $(date)" >> "$LOG"
   unset _rsrc
-}
-
-# insert_deferred_media UID USERDIR DEDIR (NWP-20261130-02; docs/product-decisions.md, 2026-11-06): on the default tier
-# MediaStore never learns that a file not yet downloaded exists, so the Gallery is empty. The #media restore leaves
-# $STATE/media.rows (core/agent/media_rows.go), and nowhere_db_fix media-insert writes one row per file straight into
-# MediaProvider's database, every column computed there. It runs after the #media restore because the mount scan ran
-# before it. The user is already running, so MediaProvider may hold the database open: this is too late for
-# remap_per_pkg/restorecon to fix a -wal/-shm/-journal the tool creates as root, so this does. Same four candidate paths
-# as remap_media_db's two calls. Never fatal: a failed insert leaves the database as restored. Counts only in the log.
-insert_deferred_media() {
-  local db out rc ni np ns ng mrest own sf found=no list="$STATE/media.rows"
-  if [ ! -s "$list" ]; then
-    echo "[roamd] media-insert user $1: no media waiting (NWP-20261130-02)" >> "$LOG"
-    return 0
-  fi
-  # Loud guard, not command -v (relabel_launcher's rule).
-  if [ ! -x /system/bin/nowhere_db_fix ]; then
-    echo "[roamd] media-insert SKIPPED: /system/bin/nowhere_db_fix missing on this build (user $1) (NWP-20261130-02)" >> "$LOG"
-    return 0
-  fi
-  for db in "$2/com.android.providers.media.module/databases/external.db" \
-            "$2/com.google.android.providers.media.module/databases/external.db" \
-            "$3/com.android.providers.media.module/databases/external.db" \
-            "$3/com.google.android.providers.media.module/databases/external.db"; do
-    [ -f "$db" ] || continue
-    found=yes
-    out=$(/system/bin/nowhere_db_fix media-insert "$db" "$1" "$list" </dev/null 2>> "$LOG"); rc=$?
-    if [ "$rc" = 0 ]; then
-      ni=${out%% *}; mrest=${out#* }; np=${mrest%% *}; mrest=${mrest#* }; ns=${mrest%% *}; ng=${mrest##* }
-      if [ "$ng" = "-" ]; then ng="generation unchanged"; else ng="generation $ng"; fi
-      echo "[roamd] media-insert user $1: $ni row(s) for media not yet downloaded, $np already listed, $ns skipped, $ng (NWP-20261130-02)" >> "$LOG"
-    else
-      echo "[roamd] media-insert user $1: FAILED rc=$rc -- left as restored (NWP-20261130-02)" >> "$LOG"
-    fi
-    own=$(stat -c '%u:%g' "$db" 2>/dev/null)
-    for sf in "$db-wal" "$db-shm" "$db-journal"; do
-      [ -e "$sf" ] || continue
-      case "$own" in ''|*[!0-9:]*) ;; *) chown "$own" "$sf" 2>> "$LOG" ;; esac
-      restorecon "$sf" 2>> "$LOG"
-    done
-  done
-  [ "$found" = yes ] || echo "[roamd] media-insert user $1: no MediaProvider database yet -- rows not written (NWP-20261130-02)" >> "$LOG"
-  return 0
 }
 
 # seed_home UID USERDIR: give a FRESH profile the edition's default page-2 home apps (E.5d). The AOSP/
@@ -2271,9 +2508,12 @@ uiderrors_floor_commit() {
 # open sees exactly one request; seven separate `sed -n Np` opens could straddle a rename and mix two of them.
 # `read` fails at EOF on a short req, which leaves the remaining variables EMPTY (as sed did); there is no `set -e`.
 op=""; name=""; pass=""; uid=""; sesec=""; skind=""; srcunit=""
+# NWP-20261205-18: the chip secret and the key hmac, held UNEXPORTED and GLOBAL (never local: a later agent call in
+# this run must see what an earlier one saw). Each agent call gets its own staged copy as a prefix assignment.
+_se_v=""; _fh_v=""
 { IFS= read -r op; IFS= read -r name; IFS= read -r pass; IFS= read -r uid; IFS= read -r sesec; IFS= read -r skind; IFS= read -r srcunit; } < "$REQ"
 # line 5 (E.3b) sesec: se_secret hex for a hardened Endospore identity; empty otherwise
-[ -n "$sesec" ] && export NOWHERE_SE_SECRET="$sesec"  # -> agent opens/seals via the `se` keyslot (docs/se-binding.md)
+[ -n "$sesec" ] && _se_v="$sesec"  # -> each agent call stages it through pwv (NWP-20261205-18); the agent opens/seals via the `se` keyslot (docs/se-binding.md)
 # line 6 (#58) skind: seal kind -- "manual" (Back up now), "logoff", "logoff-pinned" (h49 #13: a sign-out that stopped a Back up now; logoff for every logoff-only step, pinned by the agent), empty (periodic)
 # NWP-20260824-05: line 6 is overloaded by OP. For a SEAL it is the seal kind ("manual"/empty); for an "in"
 # it is the KEY MODE ("nfcfirst" = do not flip USB, answer NEEDKEY and let the gate wait for a tap; ""/"usb" =
@@ -2321,6 +2561,9 @@ rm -f "$REQ"                           # consume creds immediately -- RAM-only, 
 # because the login daemon's domain cannot ask the activity manager for them.
 # gmsexits (NWP-20261201-02) qualifies because it runs one `dumpsys activity exit-info` for an issue report, needs only
 # the uid, opens no store and writes only $RES and $LOG, so there is nothing the RW lane could be mutating.
+# mediaexits (NWP-20261208-06) qualifies because it runs two `dumpsys activity exit-info` reads, one per media module
+# name, for an issue report, needs only the uid, opens no store and writes only $RES and $LOG, so there is nothing the
+# RW lane could be mutating.
 # odblock (NWP-20261130-03) qualifies because it runs one to three `pm` commands on ONE package and writes only $RES,
 # $LOG and that package's own record ($STATE/odfetch.<uid>/blocked.<pkg>). It takes no passphrase and opens no store.
 # It is here because an installed app whose data is still in the store must stop being launchable NOW, and a seal can
@@ -2337,7 +2580,7 @@ rm -f "$REQ"                           # consume creds immediately -- RAM-only, 
 # ⚠ A PASSPHRASE ON THIS LANE IS A BUG, not a case to handle: nothing read-only needs one, and accepting one
 # would put the RO lane back in the business the pass-file namespacing above exists to keep it out of.
 # Neither credential may reach this lane: not the passphrase (line 3) and not the session's chip secret (line 5,
-# exported as NOWHERE_SE_SECRET above), which opens a tied profile's vault, #de and #sys exactly as the passphrase
+# held as _se_v above and staged per agent call), which opens a tied profile's vault, #de and #sys exactly as the passphrase
 # does (docs/se-binding.md; NWP-20261110-17).
 # NWP-20260903-09 (#147): THE CREDENTIAL LANE'S ALLOWLIST -- the same structure as the RO lane's below,
 # with the sign flipped on credentials. armcred and rekey qualify because each is a sub-second pair of
@@ -2358,7 +2601,7 @@ fi
 
 if [ "$LANE" = "ro" ]; then
   case "$op" in
-    storagebreakdown|sealdelta|uiderrors|alarmrelay|healthprobe|playrestart|gmsexits|gmsstate|vpnstate) ;;
+    storagebreakdown|sealdelta|uiderrors|alarmrelay|healthprobe|playrestart|gmsexits|mediaexits|gmsstate|vpnstate) ;;
     odblock) ;;
     *) echo "ERR-LANE" > "$RES" 2>/dev/null; chmod 600 "$RES" 2>/dev/null
        echo "[roamd] ro-lane REFUSED op=$op (not on the read-only allowlist) $(date)" >> "$LOG"
@@ -2427,6 +2670,10 @@ pw() {
   # the exact outcome the fallback exists to avoid.
   print -r -- "$1"
 }
+# NWP-20261205-18: pw for a value that may be absent. Empty in: nothing staged, nothing printed, so the agent sees an
+# EMPTY variable, which seDK and fido2HMAC read as absent. Each call stages its OWN file: the agent unlinks it at start,
+# so one process-wide export of a staged path would serve the first agent call of the run and fail every later one.
+pwv() { [ -z "$1" ] || pw "$1"; }
 
 # qn (NWP-20261008-09) renders a profile name as ONE double-quoted log token, `\` and `"` backslash-escaped, so
 # log_scrub's escape-aware quoted rule -- and the issue reporter's (report_issue.go) -- removes it whole: spaces,
@@ -2567,9 +2814,11 @@ _cause() {
 # vault's scope index (!round, core/agent/scope_index.go), so the next sign-in's restore says the last save did not
 # finish. The agent drops a benign part (sys=pending-placement) and writes nothing when none is left. Best-effort:
 # it returns 0 always and never changes the verdict. 60 s: roamStallBudget (150 s, core/agent/main.go) bounds the op.
+# It opens the vault as every other staged agent call does, so it carries the chip secret and the key hmac
+# (NWP-20261205-18): without them a chip-tied or security-key profile's record could not open its index.
 round_record() {
   local _r
-  timeout -k 5 60 "$AGENT" round-record s3 "$1" "$(pw "$2")" "$3" >> "$LOG" 2>&1; _r=$?
+  NOWHERE_SE_SECRET="$(pwv "$_se_v")" NOWHERE_FIDO2_HMAC="$(pwv "$_fh_v")" timeout -k 5 60 "$AGENT" round-record s3 "$1" "$(pw "$2")" "$3" >> "$LOG" 2>&1; _r=$?
   echo "[roamd] OUT round record: rc=$_r (h58 #1) $(date)" >> "$LOG"
   return 0
 }
@@ -2854,7 +3103,7 @@ KSDROP_EOF
     _ka=$((_ka + 1))
     _kwl=0; if [ -f "$STATE/seal.refusal-why" ]; then _kwl=$(wc -l < "$STATE/seal.refusal-why" 2>/dev/null | tr -cd '0-9'); [ -n "$_kwl" ] || _kwl=0; fi   # NWP-20261203-22: this attempt's mark
     NOWHERE_CARRY_ESSENTIAL=0 NOWHERE_CARRY_ESSENTIAL_MEDIA=0 \
-      timeout -k 5 3600 "$AGENT" push s3 "${name}#keys" "$(pw "$pass")" "$KSTAGE" >> "$LOG" 2>&1; kret=$?
+      NOWHERE_SE_SECRET="$(pwv "$_se_v")" NOWHERE_FIDO2_HMAC="$(pwv "$_fh_v")" timeout -k 5 3600 "$AGENT" push s3 "${name}#keys" "$(pw "$pass")" "$KSTAGE" >> "$LOG" 2>&1; kret=$?
     [ "$kret" = 0 ] && break
     print -r -- "[roamd] OUT $(qn "$name") #keys push attempt $_ka rc=$kret $(date)" >> "$LOG"
   done
@@ -3471,6 +3720,49 @@ hs_release() {
   echo "[roamd] hotspot user $_u ($_why): $HS_VERDICT $(date)" >> "$LOG"
 }
 # ---- NWP-20261028-10: SESSION HOTSPOT RELEASE (end) ------------------------------------------------------------------
+# ---- NWP-20261210-19: NETPOLICY WI-FI TEMPLATE RESET (begin) ---------------------------------------------------------
+# netpolicy.xml is device-wide and outside every user: a Wi-Fi data warning or limit a session sets there names its
+# network and outlives the session. Decided 2026-11-14 ("DECIDED: five answers to harvest 65 -- every recommendation
+# accepted", item G06, docs/product-decisions.md): the gate resets netpolicy's Wi-Fi templates THROUGH THE PLATFORM;
+# the owner's data limits (the mobile ones) and the per-uid background policy stay. Its timing, decided 2026-11-18
+# ("DECIDED: four answers to harvest 70 ...", item 3): roamd asks once per boot (bootsweep fix 15b) and at a reap only
+# when no other session is live (reap_live_other), because netpolicy has no per-session owner and a reset there would
+# also clear a parked session's Wi-Fi limit. Sign-out and cold lock send nothing of their own.
+# Contract (the gate's NetPolicyReceiver, user 0, no extras): the data= of the first "Broadcast completed:" line is
+# OK RESET <n> (n >= 1 Wi-Fi policies removed) | OK NONE (none present, nothing written) | ERR-NP <reason>, reason in
+# user, denied, failed, noservice. Anything else -- a failed or timed-out am, a missing receiver, a malformed reply --
+# is failed(noreply), and the caller goes on.
+#   - NEVER A FILE: roamd never opens or removes netpolicy.xml or WifiConfigStore.xml; only the platform writes them.
+#   - NO STATE: this block writes no file and keeps no retry record (the next boot asks again); it only appends ONE line
+#     to $LOG with the loc_why token and the verdict -- never the raw reply, an SSID or a name.
+NP_RECEIVER=com.nowhere.chooser/.NetPolicyReceiver
+NP_ACTION=com.nowhere.chooser.action.NETPOLICY_WIFI_RESET
+
+# np_release <why>: ask the gate to remove netpolicy's Wi-Fi-template policies. Sets NP_VERDICT to reset(<n>), none,
+# failed(<reason>) or failed(noreply).
+np_release() {
+  local _out _rc _d _n
+  _out=$(timeout -k 2 15 am broadcast --user 0 -n "$NP_RECEIVER" -a "$NP_ACTION" </dev/null 2>/dev/null)
+  _rc=$?
+  # The FIRST "Broadcast completed:" line is the reply, chosen before its data= is read: a first line without data=
+  # is no reply, whatever a later line says.
+  _d=$(printf '%s\n' "$_out" | tr -d '\r' | sed -n '/^Broadcast completed:/p' | head -n 1 | sed -n 's/^Broadcast completed:.*data="\([^"]*\)".*/\1/p')
+  [ "$_rc" -eq 0 ] || _d=""   # a timed-out or failed am's output is not a confirmed reply
+  case "$_d" in
+    "OK NONE") NP_VERDICT=none ;;
+    "OK RESET "*)
+      _n=${_d#OK RESET }
+      case "$_n" in
+        ''|*[!0-9]*) NP_VERDICT="failed(noreply)" ;;
+        *[1-9]*) NP_VERDICT="reset($_n)" ;;
+        *) NP_VERDICT="failed(noreply)" ;;   # all zeros: OK RESET promises at least one
+      esac ;;
+    "ERR-NP user"|"ERR-NP denied"|"ERR-NP failed"|"ERR-NP noservice") NP_VERDICT="failed(${_d#ERR-NP })" ;;
+    *) NP_VERDICT="failed(noreply)" ;;
+  esac
+  echo "[roamd] netpolicy wifi templates ($(loc_why "$1")): $NP_VERDICT (NWP-20261210-19) $(date)" >> "$LOG"
+}
+# ---- NWP-20261210-19: NETPOLICY WI-FI TEMPLATE RESET (end) -----------------------------------------------------------
 # ---- NWP-20261026-05: SESSION-SCOPED MOBILE DATA (begin) ------------------------------------------------------------
 # Mobile data (Settings.Global mobile_data) is a DEVICE setting, and only the gate (user 0) can change it, so a
 # signed-in profile has no Mobile data switch. Chester, 2026-10-19 (docs/product-decisions.md): it follows the
@@ -3935,6 +4227,48 @@ if [ "$op" = "dtclaim" ] || [ "$op" = "dtrelease" ]; then
   echo "$DT_VERDICT" > "$RES"; chmod 600 "$RES"; exit 0
 fi
 # ---- NWP-20261027-05: SESSION DEVICE TOGGLES (end) ------------------------------------------------------------------
+# ---- NWP-20261210-05: SESSION CLAIMS IN ONE RUN (begin) --------------------------------------------------------------
+# The three claims a session makes when it comes to the front (sign-in, offline sign-in, resume), in ONE run of this
+# worker. Each was a run of its own (locapply, mdapply, dtclaim): every run re-sources both confs, logs its own
+# `conf merge:` line and queues for the one RW slot, ahead of vpnup and grant. Backlog row "A nearly empty profile takes
+# about 85 s from submit to home; target under 60 s", cause (4). The claim rules are unchanged and stay those of the
+# three blocks above: "network location and geocoding are off by default, and on only for the profile that turns them
+# on, while it is signed in"; "a profile can turn mobile data on or off for its own session; whenever it is not in
+# front, the phone goes back to the gate's value"; "a profile can share its connection, its mobile-data switch covers
+# data roaming, and the device-wide toggles a session flips are put back when it leaves" (docs/product-decisions.md).
+# The single arms stay for the live switches (APPLY-LOCATION, APPLY-MOBILE-DATA) and for every release.
+#   req: line 2 the reason token (never a name), line 4 the uid, line 7 the parts: a comma list of loc, md, dt, each at
+#        most once and in that order. Anything else is ERR-ARGS, and nothing runs.
+#   res: ONE line, `<loc>;<md>;<dt>`, each field the single arm's verdict (a `;` or a newline in it becomes `,`), or `-`
+#        for a part not asked for. One redirect: the poller returns at the first byte it reads.
+# The daemon drops a sessclaim whose session ended under the slot (runWorkerHeld), as it drops the three single claims.
+if [ "$op" = "sessclaim" ]; then
+  case "$uid" in ''|*[!0-9]*|0?*) echo "ERR-UID" > "$RES"; chmod 600 "$RES"; exit 0;; esac
+  [ "$uid" -ge 10 ] || { echo "ERR-UID" > "$RES"; chmod 600 "$RES"; exit 0; }
+  case "$srcunit" in
+    loc|md|dt|loc,md|loc,dt|md,dt|loc,md,dt) ;;
+    *) echo "ERR-ARGS" > "$RES"; chmod 600 "$RES"; exit 0 ;;
+  esac
+  _tt=$(_ms)
+  _lv=-; _mv=-; _dv=-
+  case ",$srcunit," in *,loc,*)
+    loc_claim "$uid" "$LOC_USER_ROOT/$uid/com.nowhere.chooser/files/nowhere-prefs" "$name"
+    _lv=$(printf '%s' "$LOC_VERDICT" | tr ';\n' ',,') ;;
+  esac
+  case ",$srcunit," in *,md,*)
+    md_claim "$uid" "$LOC_USER_ROOT/$uid/com.nowhere.chooser/files/nowhere-prefs" "$name"
+    dr_claim "$uid" "$LOC_USER_ROOT/$uid/com.nowhere.chooser/files/nowhere-prefs" "$name"
+    MD_VERDICT="$MD_VERDICT data_roaming=$DR_SEEN"
+    _mv=$(printf '%s' "$MD_VERDICT" | tr ';\n' ',,') ;;
+  esac
+  case ",$srcunit," in *,dt,*)
+    dt_claim "$uid" "$name"
+    _dv=$(printf '%s' "$DT_VERDICT" | tr ';\n' ',,') ;;
+  esac
+  _tlog sessclaim "$_tt"
+  printf '%s;%s;%s\n' "$_lv" "$_mv" "$_dv" > "$RES"; chmod 600 "$RES"; exit 0
+fi
+# ---- NWP-20261210-05: SESSION CLAIMS IN ONE RUN (end) ----------------------------------------------------------------
 
 # #101 (credential-tiers P1b): re-key the LIVE session keyguard to a new passphrase, for the PROMOTE Save
 # ceremony (the user chose a different/stronger pass than the throwaway they typed at login). The confined
@@ -3975,11 +4309,11 @@ fi
 if [ "$op" = "fido2-enroll" ]; then
   [ -n "$name" ] && [ -n "$pass" ] || { echo "ERR-ARGS" > "$RES"; chmod 600 "$RES"; exit 0; }
   # Multi-key (DIA-20260704-35): adding a SECOND key needs the vault opened via the ALREADY-enrolled key's
-  # login-cached hmac (the pass slot is gone on a 2FA vault) -- export the stash so the agent's openVaultDK
-  # finds it. Harmless on a first enroll (no stash / pass slot opens).
-  [ -f "$STATE/.fido2hmac" ] && export NOWHERE_FIDO2_HMAC="$(cat "$STATE/.fido2hmac")"
+  # login-cached hmac (the pass slot is gone on a 2FA vault) -- hand the stash to the agent (_fh_v, staged per
+  # call) so its openVaultDK finds it. Harmless on a first enroll (no stash / pass slot opens).
+  [ -f "$STATE/.fido2hmac" ] && _fh_v="$(cat "$STATE/.fido2hmac")"
   usb_host on; sleep 2
-  if "$AGENT" fido2-enroll s3 "$name" "$(pw "$pass")" >> "$LOG" 2>&1; then
+  if NOWHERE_SE_SECRET="$(pwv "$_se_v")" NOWHERE_FIDO2_HMAC="$(pwv "$_fh_v")" "$AGENT" fido2-enroll s3 "$name" "$(pw "$pass")" >> "$LOG" 2>&1; then
     print -r -- "[roamd] fido2-enroll OK for $(qn "$name") $(date)" >> "$LOG"; echo "OK" > "$RES"
   else
     print -r -- "[roamd] fido2-enroll FAILED for $(qn "$name") $(date)" >> "$LOG"; echo "ERR-ENROLL" > "$RES"
@@ -3999,7 +4333,7 @@ fi
 if [ "$op" = "fido2adopt" ]; then
   [ -n "$name" ] && [ -n "$pass" ] || { echo "ERR-ARGS" > "$RES"; chmod 600 "$RES"; exit 0; }
   usb_host on; sleep 2
-  H="$("$AGENT" fido2-adopt s3 "$name" "$(pw "$pass")" "$STATE" 2>> "$LOG")"
+  H="$(NOWHERE_SE_SECRET="$(pwv "$_se_v")" NOWHERE_FIDO2_HMAC="$(pwv "$_fh_v")" "$AGENT" fido2-adopt s3 "$name" "$(pw "$pass")" "$STATE" 2>> "$LOG")"
   usb_host off
   if [ -n "$H" ]; then
     print -rn -- "$H" > "$STATE/.fido2hmac"; chmod 600 "$STATE/.fido2hmac"
@@ -4123,6 +4457,9 @@ ev_verdict() {
 DE_PARK_ROOT="$STATE/coldde"
 DE_SYS_ROOT="${DE_SYS_ROOT:-/data/system_de}"                   # overridable for test-coldlock-de-park.sh only
 DE_JAR="${DE_JAR:-/system/framework/services.jar}"
+DE_EVID="${DE_EVID:-$STATE/coldde-unpark}"                      # overridable for test-coldlock-de-park.sh only
+DE_PKG_ROOT="${DE_PKG_ROOT:-/data/system}"                      # overridable for test-coldlock-de-park.sh only
+DE_PROC_ROOT="${DE_PROC_ROOT:-/proc}"                           # overridable for test-coldlock-de-park.sh only
 _de_park_ok() {
   local _j="$DE_JAR"
   grep -a -q "onUserStopped " "$_j" 2>/dev/null || return 2                                   # control
@@ -4134,6 +4471,7 @@ _de_park_ok() {
 # "could NOT be removed", keeps the park and returns 1 (NWP-20261127-09).
 de_park() {
   local _u="$1" _src="$DE_SYS_ROOT/$1" _dst="$DE_PARK_ROOT/$1" _f _n=0 _k=0
+  rm -f "$DE_EVID" 2>/dev/null   # NWP-20261206-14: a new lock drops the last resume's figures
   [ -f "$_src/accounts_de.db" ] || { echo "[roamd] coldlock-de-park: user $_u has no accounts_de.db $(date)" >> "$LOG"; return 0; }
   _de_park_ok; case $? in
     0) : ;;
@@ -4156,6 +4494,61 @@ de_park() {
   [ "$_k" -eq 0 ] || { echo "[roamd] coldlock-de-park: user $_u -- $_k file(s) could NOT be removed from DE: the account names stay on disk (a copy is parked in RAM) $(date)" >> "$LOG"; return 1; }
   echo "[roamd] coldlock-de-park: user $_u accounts_de parked in RAM ($_n file(s)) $(date)" >> "$LOG"
 }
+# de_recreated_note <uid> (NWP-20261206-14, backlog: "During a cold lock, AccountManagerService's own handler thread
+# re-creates an EMPTY `accounts_de.db` for the stopped user"): de_unpark drops whatever DE holds before it restores the
+# park, so this records first what the AMS handler re-created during the lock -- one line to roam.log and to $DE_EVID
+# (v=1 found= after_park_s= db_bytes= wal_bytes= emails= ss_fds= pkgs_delta_s= pkgr_delta_s=; the in-session report
+# reads it). after_park_s is the db's LAST WRITE after the park, not its creation (na, not negative, when the clock
+# went back). The email-shaped strings are
+# counted, never logged or written. ss_fds reads each system_server fd dir with ONE ls -l, not a readlink per fd (it
+# holds over a thousand, and the resume waits on this op). pkgs/pkgr_delta_s: the db's mtime minus packages.xml's and
+# the user's package-restrictions.xml's (a small delta points at the package monitor). Counts, sizes and seconds only.
+# Never fails the unpark: it always returns 0.
+de_recreated_note() {
+  local _u="$1" _d="$DE_SYS_ROOT/$1" _fd=0 _ap=na _db=na _wl=na _em=na _sf=na _ps=na _pr=na _mt _t _p _l _ls _rl _wf
+  if [ -f "$_d/accounts_de.db" ]; then
+    _fd=1
+    _mt=$(stat -c %Y "$_d/accounts_de.db" 2>/dev/null); case "$_mt" in ''|*[!0-9]*) _mt="" ;; esac
+    if [ -n "$_mt" ]; then
+      _t=$(stat -c %Y "$DE_PARK_ROOT/$_u" 2>/dev/null)
+      case "$_t" in ''|*[!0-9]*) ;; *) _ap=$((_mt - _t)) ;; esac
+      _t=$(stat -c %Y "$DE_PKG_ROOT/packages.xml" 2>/dev/null)
+      case "$_t" in ''|*[!0-9]*) ;; *) _ps=$((_mt - _t)) ;; esac
+      _t=$(stat -c %Y "$DE_PKG_ROOT/users/$_u/package-restrictions.xml" 2>/dev/null)
+      case "$_t" in ''|*[!0-9]*) ;; *) _pr=$((_mt - _t)) ;; esac
+    fi
+    _db=$(stat -c %s "$_d/accounts_de.db" 2>/dev/null)
+    _wf="$_d/accounts_de.db-wal"
+    if [ -e "$_wf" ]; then _wl=$(stat -c %s "$_wf" 2>/dev/null); else _wl=0; _wf=/dev/null; fi
+    _em=$(grep -a -o -E '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+[.][A-Za-z]{2,}' "$_d/accounts_de.db" "$_wf" 2>/dev/null | wc -l)
+    _em=$(echo $_em)
+    _sf=0
+    for _p in $(pidof system_server 2>/dev/null); do
+      _ls=$(ls -l "$DE_PROC_ROOT/$_p/fd" 2>/dev/null)
+      while IFS= read -r _l; do
+        case "$_l" in *" -> $_d/accounts_de.db"*) _sf=$((_sf + 1)) ;; esac
+      done <<DEFD_EOF
+$_ls
+DEFD_EOF
+    done
+    case "$_db" in ''|*[!0-9]*) _db=na ;; esac
+    case "$_wl" in ''|*[!0-9]*) _wl=na ;; esac
+    case "$_em" in ''|*[!0-9]*) _em=na ;; esac
+    case "$_sf" in ''|*[!0-9]*) _sf=na ;; esac
+    case "$_ap" in ''|*[!0-9]*) _ap=na ;; esac   # an age: a clock set back during the lock is na, never negative
+    case "${_ps#-}" in ''|*[!0-9]*) _ps=na ;; esac
+    case "${_pr#-}" in ''|*[!0-9]*) _pr=na ;; esac
+    _rl="found=1 after_park_s=$_ap db_bytes=$_db wal_bytes=$_wl emails=$_em ss_fds=$_sf pkgs_delta_s=$_ps pkgr_delta_s=$_pr"
+    echo "[roamd] coldlock-de-unpark: user $_u re-created accounts_de.db: $_rl $(date)" >> "$LOG"
+  else
+    _rl="found=0 after_park_s=na db_bytes=na wal_bytes=na emails=na ss_fds=na pkgs_delta_s=na pkgr_delta_s=na"
+    echo "[roamd] coldlock-de-unpark: user $_u no re-created accounts_de.db $(date)" >> "$LOG"
+  fi
+  if [ -n "$DE_EVID" ]; then
+    printf 'v=1 %s\n' "$_rl" > "$DE_EVID.tmp" 2>/dev/null && mv -f "$DE_EVID.tmp" "$DE_EVID" 2>/dev/null
+  fi
+  return 0
+}
 # de_unpark <uid>: put a parked file back, owner and label as the account roam's
 # own restore does (acct_reload's chown system:system and restorecon).
 # Returns non-zero when a parked file could not be restored -- the resume must then NOT start the user, because a
@@ -4164,6 +4557,7 @@ de_unpark() {
   local _u="$1" _src="$DE_PARK_ROOT/$1" _dst="$DE_SYS_ROOT/$1" _f
   [ -d "$_src" ] || return 0
   [ -f "$_src/accounts_de.db" ] || { rm -rf "$_src"; return 0; }
+  de_recreated_note "$_u"   # NWP-20261206-14: what the AMS handler re-created during the lock, logged before the rm below drops it
   rm -f "$_dst/accounts_de.db" "$_dst/accounts_de.db-wal" "$_dst/accounts_de.db-shm" 2>>"$LOG"  # anything recreated meanwhile
   for _f in accounts_de.db accounts_de.db-wal accounts_de.db-shm; do
     [ -e "$_src/$_f" ] || continue
@@ -5780,6 +6174,125 @@ vpn_net_state() {
   return 0
 }
 
+# vpn_refusal_codes <uid> <pkg> -> prints ONE line `inst=<c> hid=<c> en=<c> stop=<c> svc=<c> tsdk=<c> usr=<u>` and
+# returns 0 (NWP-20261208-10). vpn_apply_choice calls it only when the helper answers `-> false`, so the log line
+# and the issue report say WHY Android refused the always-on apply. Each <c> is 1, 0 or - (the read did not say):
+#   inst  1 = the user's `pm list packages --user <uid>` listing (no -a: the WHAT COUNTS AS INSTALLED rule above
+#         shortcut_seal_capture) has the exact line `package:<pkg>`; 0 = the listing was read without it.
+#   hid   the `User <uid>:` line of the package's `dumpsys package` block: hidden=true 1, hidden=false 0.
+#   en    the same line: enabled=0 (default) or 1 (enabled) -> 1; 2, 3 or 4 (the disabled states) -> 0.
+#   stop  the same line: stopped=true 1, stopped=false 0.
+#   svc   1 = a VpnService of the package resolves for the user (`pm query-services`); 0 = the answer names only
+#         other packages' components, or is `No services found`.
+#   tsdk  the block's targetSdk=<n>: >= 24 -> 1, below -> 0.
+#   usr   the user's started state (`am get-started-user-state`): unlocked, locked, unlocking, booting, stopping,
+#         shutdown, notstarted, or - .
+# The formats are read from AOSP source, not from a device: PackageManagerShellCommand.runListPackages
+# (`package:<name>`) and runQueryIntentServices with --components (ComponentName.flattenToShortString, indented when
+# there are several; `No services found`); Intent.parseCommandArgs (--include-stopped-packages); Settings.dumpPackageLPr
+# (`versionCode=.. minSdk=.. targetSdk=..`, and `User <id>: ceDataInode=.. installed=.. hidden=.. suspended=..
+# stopped=.. notLaunched=.. enabled=..`); ActivityManagerShellCommand.runGetStartedUserState with UserState.toString
+# (`[UserState: id=<u>, state=<S>, lastState=<S>, switching=..]`, else `User is not started: <u>`). The causes the
+# codes separate are those of VpnManagerService.setAlwaysOnVpnPackage, Vpn.setAlwaysOnPackage,
+# Vpn.isAlwaysOnPackageSupported (not installed for the user, targetSdk below 24, no VpnService resolves) and
+# Vpn.startAlwaysOnVpn; a user with no Vpn object shows in usr. The SUPPORTS_ALWAYS_ON meta-data is NOT read: a line
+# with inst=1 svc=1 tsdk=1 leaves that meta-data and a failed start as the remaining causes.
+# A non-digit uid, or a pkg outside [A-Za-z0-9._] or with no dot, prints every code - and runs nothing. Every read is
+# bounded, goes to a pipe (never a file) and sends stderr to /dev/null, never to $LOG (see above bt_default_name).
+# ⚠ The package is compared here and never printed: only the codes leave this function.
+vpn_refusal_codes() {
+  local _u="$1"; local _p="$2"; local _r; local _w
+  local _i=-; local _h=-; local _e=-; local _s=-; local _v=-; local _k=-; local _us=-
+  case "$_u" in ''|*[!0-9]*) _p="" ;; esac
+  case "$_p" in ''|*[!A-Za-z0-9._]*) _p="" ;; *.*) ;; *) _p="" ;; esac
+  if [ -n "$_p" ]; then
+    if _r=$(timeout -k 2 20 pm list packages --user "$_u" </dev/null 2>/dev/null); then
+      _i=$(printf '%s\n' "$_r" | awk -v P="$_p" '
+        index($0, "package:") == 1 { rd = 1 }
+        $0 == "package:" P { f = 1 }
+        END { if (f) print 1; else if (rd) print 0; else print "-" }')
+    fi
+    _r=$(timeout -k 2 10 dumpsys package "$_p" </dev/null 2>/dev/null | awk -v P="$_p" -v U="$_u" '
+      { s = $0; sub(/^ */, "", s); ind = length($0) - length(s) }
+      done { next }
+      inpkg && ind <= 2 { done = 1; next }
+      !inpkg { if (ind == 2 && index(s, "Package [" P "]") == 1) inpkg = 1; next }
+      ind == 4 && s ~ /^User [0-9]+:/ {
+        n = s; sub(/^User /, "", n); sub(/:.*/, "", n)
+        if (n != U || us) next
+        us = 1; c = split(s, f, " ")
+        for (j = 3; j <= c; j++) {
+          if (f[j] == "hidden=true") h = "1"; else if (f[j] == "hidden=false") h = "0"
+          if (f[j] == "stopped=true") st = "1"; else if (f[j] == "stopped=false") st = "0"
+          if (f[j] ~ /^enabled=[01]$/) e = "1"; else if (f[j] ~ /^enabled=[234]$/) e = "0"
+        }
+        next
+      }
+      t == "" {
+        c = split(s, f, " ")
+        for (j = 1; j <= c; j++) if (f[j] ~ /^targetSdk=[0-9]+$/) { t = (substr(f[j], 11) + 0 >= 24) ? "1" : "0"; break }
+      }
+      END { printf "%s %s %s %s\n", (h == "" ? "-" : h), (e == "" ? "-" : e), (st == "" ? "-" : st), (t == "" ? "-" : t) }')
+    _h=${_r%% *}; _r=${_r#* }; _e=${_r%% *}; _r=${_r#* }; _s=${_r%% *}; _k=${_r#* }
+    _r=$(timeout -k 2 10 pm query-services --user "$_u" --components --include-stopped-packages -a android.net.VpnService </dev/null 2>/dev/null)
+    _v=$(printf '%s\n' "$_r" | awk -v P="$_p" '
+      { s = $0; sub(/^[ \t]*/, "", s) }
+      s == "No services found" { ua = 1; next }
+      s ~ /^[A-Za-z0-9._]+\/[^ \t]+$/ { ua = 1; if (index(s, P "/") == 1) f = 1 }
+      END { if (f) print 1; else if (ua) print 0; else print "-" }')
+    _r=$(timeout -k 2 10 am get-started-user-state "$_u" </dev/null 2>/dev/null)
+    _w=""
+    case "$_r" in
+      *'User is not started'*) _us=notstarted ;;
+      *', state='*) _w=${_r#*, state=} ;;
+      'State: '*) _w=${_r#State: } ;;
+    esac
+    _w=${_w%%[!A-Z_]*}
+    case "$_w" in
+      RUNNING_UNLOCKED) _us=unlocked ;; RUNNING_LOCKED) _us=locked ;; RUNNING_UNLOCKING) _us=unlocking ;;
+      BOOTING) _us=booting ;; STOPPING) _us=stopping ;; SHUTDOWN) _us=shutdown ;;
+    esac
+  fi
+  case "$_i" in 1|0) ;; *) _i=- ;; esac
+  case "$_h" in 1|0) ;; *) _h=- ;; esac
+  case "$_e" in 1|0) ;; *) _e=- ;; esac
+  case "$_s" in 1|0) ;; *) _s=- ;; esac
+  case "$_v" in 1|0) ;; *) _v=- ;; esac
+  case "$_k" in 1|0) ;; *) _k=- ;; esac
+  case "$_us" in unlocked|locked|unlocking|booting|stopping|shutdown|notstarted) ;; *) _us=- ;; esac
+  printf 'inst=%s hid=%s en=%s stop=%s svc=%s tsdk=%s usr=%s\n' "$_i" "$_h" "$_e" "$_s" "$_v" "$_k" "$_us"
+  return 0
+}
+
+# vpn_refusal_token <file>: the vpnstate token n<N>.inst<c>.hid<c>.en<c>.stop<c>.svc<c>.tsdk<c>.usr<u>.lock<l> of
+# the $STATE/.vpnwhy.<uid> record at <file>, REBUILT from its checked fields, and return 0 -- only when the file holds
+# exactly the one line vpn_apply_choice writes (`n=<N> <codes> lock=<l>` and its newline, nothing before, between or
+# after). Anything else -- a second line, a blank line, an extra field, a field outside its closed set -- prints
+# nothing and returns 1 (NWP-20261208-10). vpn_apply_choice takes the count from it; the vpnstate op the token.
+vpn_refusal_token() {
+  local _raw; local _a; local _b; local _c; local _d; local _e; local _f; local _g; local _h; local _i; local _x
+  _raw=$(cat "$1" 2>/dev/null; echo .)   # the . keeps the newlines command substitution strips
+  read -r _a _b _c _d _e _f _g _h _i _x < "$1" 2>/dev/null || return 1
+  case "$_a" in n=[1-9]|n=[1-9][0-9]|n=[1-9][0-9][0-9]) ;; *) return 1 ;; esac
+  case "$_b" in inst=1|inst=0|inst=-) ;; *) return 1 ;; esac
+  case "$_c" in hid=1|hid=0|hid=-) ;; *) return 1 ;; esac
+  case "$_d" in en=1|en=0|en=-) ;; *) return 1 ;; esac
+  case "$_e" in stop=1|stop=0|stop=-) ;; *) return 1 ;; esac
+  case "$_f" in svc=1|svc=0|svc=-) ;; *) return 1 ;; esac
+  case "$_g" in tsdk=1|tsdk=0|tsdk=-) ;; *) return 1 ;; esac
+  case "$_h" in
+    usr=unlocked|usr=locked|usr=unlocking|usr=booting|usr=stopping|usr=shutdown|usr=notstarted|usr=-) ;;
+    *) return 1 ;;
+  esac
+  case "$_i" in lock=0|lock=1) ;; *) return 1 ;; esac
+  [ -z "$_x" ] || return 1
+  [ "$_raw" = "$_a $_b $_c $_d $_e $_f $_g $_h $_i
+." ] || return 1
+  printf 'n%s.inst%s.hid%s.en%s.stop%s.svc%s.tsdk%s.usr%s.lock%s\n' "${_a#n=}" "${_b#inst=}" "${_c#hid=}" "${_d#en=}" \
+    "${_e#stop=}" "${_f#svc=}" "${_g#tsdk=}" "${_h#usr=}" "${_i#lock=}"
+  return 0
+}
+
 # vpn_choice <pick> <capture> <prefs> -> "<source> <pkg, or - for none> <lockdown 0|1>": what vpnup applies. The
 # first source holding a well-formed choice wins:
 #   pick     nowhere-vpn-pick, written by the Profile screen's VPN picker: an explicit choice made FOR the next
@@ -5901,7 +6414,7 @@ vpn_apply() {
 vpn_apply_choice() {
   local _uid="$1"; local _src="$2"; local _pkg="$3"; local _lock="$4"; local _pick="$5"
   local _ud="${VPN_USER_ROOT:-/data/user}/$_uid"; local _vf; local _jar; local _wg=""; local _mode; local _out; local _app
-  local _ld; local _pd; local _ok=no
+  local _ld; local _pd; local _ok=no; local _why=""; local _t
   _vf="$_ud/com.nowhere.chooser/files"; _jar="${NOWHERE_VPN_JAR:-/system_ext/framework/nowhere-vpnao.jar}"
   [ "$_pkg" = com.wireguard.android ] && { _wg=$(ls "$_ud/com.wireguard.android/files/"*.conf 2>/dev/null | head -1); [ -n "$_wg" ] && _wg=$(basename "$_wg" .conf); }
   if [ ! -d "$_ud/$_pkg" ] || { [ "$_pkg" = com.wireguard.android ] && [ -z "$_wg" ]; }; then
@@ -5932,7 +6445,23 @@ vpn_apply_choice() {
       [ "$_ld" != 1 ] && [ "$_pd" != "$_pkg" ] && _ok=yes
     fi
   fi
-  echo "[roamd] always-on VPN -> $_pkg (lockdown=$_lock via $_mode, from $_src) user $_uid $(date): $_out; read back app=$_app lockdown=$_ld pending=$_pd -> $_ok" >> "$LOG"
+  # NWP-20261208-10: when the helper says Android answered false, the line ends with the codes of vpn_refusal_codes,
+  # and $STATE/.vpnwhy.<uid> keeps the last of them with a count, for the vpnstate op. `tr` made println's newline a
+  # blank, so trailing blanks are stripped before the test. The record holds codes only, never the package.
+  _t=$_out
+  while :; do case "$_t" in *' '|*'	') _t=${_t%?} ;; *) break ;; esac; done
+  case "$_t" in *'-> false') _why=$(vpn_refusal_codes "$_uid" "$_pkg") ;; esac
+  echo "[roamd] always-on VPN -> $_pkg (lockdown=$_lock via $_mode, from $_src) user $_uid $(date): $_out; read back app=$_app lockdown=$_ld pending=$_pd -> $_ok${_why:+; refused: $_why lock=$_lock}" >> "$LOG"
+  [ -z "$_why" ] || ( umask 077
+    case "$_uid" in ''|*[!0-9]*) exit 0 ;; esac
+    [ -n "${STATE:-}" ] && [ -d "$STATE" ] || exit 0
+    _vwf="$STATE/.vpnwhy.$_uid"
+    _vwn=$(vpn_refusal_token "$_vwf") || _vwn=""   # a record not exactly that shape counts 0
+    _vwn=${_vwn%%.*}; _vwn=${_vwn#n}
+    case "$_vwn" in [1-9]|[1-9][0-9]|[1-9][0-9][0-9]) ;; *) _vwn=0 ;; esac
+    _vwn=$((_vwn + 1)); [ "$_vwn" -le 999 ] || _vwn=999
+    printf 'n=%s %s lock=%s\n' "$_vwn" "$_why" "$_lock" > "$_vwf.tmp" && mv -f "$_vwf.tmp" "$_vwf"
+  ) >/dev/null 2>&1
   [ "$_ok" = yes ] || { printf 'NOTREADY'; return 0; }
   if [ -n "$_wg" ]; then
     sleep 2
@@ -6891,6 +7420,67 @@ userdir_has_record() {
   [ -e "/data/system/users/$1.xml" ] || [ -e "/data/system/users/$1.xml.backup" ] || [ -e "/data/system/users/$1.xml.reservecopy" ]
 }
 
+# ssaid_census <file> (NWP-20261207-16): what SettingsProvider had pre-filled in a new user's settings_ssaid.xml,
+# for seedssaid to log before it removes the file. Prints ONE line of digits and fixed words, never a value, a
+# name or a package: the table's userkey row is a passphrase VERIFIER when the file is a reaped profile's
+# (DIA-20260815-12), and an app row's name and package say which apps that identity used.
+#   v=1 rows=<n> userkey=<n> apps=<n> distinct=<n> largest=<n>
+#     rows = <setting> tags, userkey = those named "userkey", apps = the rest, distinct = distinct values among
+#     the apps rows, largest = the largest group of apps rows sharing one value (a row with no plain value
+#     attribute counts in apps and in no group).
+#   v=1 unread=<class>, checked in this order:
+#     link     <file> is a symbolic link: never read through it (NOWHERE-144's rule)
+#     format   its first bytes are neither ABX nor < (a missing or unreadable file included)
+#     notool   ABX and no abx2xml
+#     nostate  ABX and no $STATE, or no temp in it
+#     convert  abx2xml failed or wrote no file (`abx2xml <in> <out>` needs BOTH arguments:
+#              docs/gos-package-state-roam.md §3)
+#     parse    no <settings root tag in the text: the positive control, so an empty or foreign conversion is
+#              UNREAD, never rows=0
+# The converted copy is a temp in $STATE (RAM) and is removed before this returns, on every path.
+ssaid_census() {
+  local _h _t="" _src _o
+  if [ -L "$1" ]; then echo "v=1 unread=link"; return 0; fi
+  _h=$(head -c 3 "$1" 2>/dev/null)
+  case "$_h" in
+    ABX)
+      command -v abx2xml >/dev/null 2>&1 || { echo "v=1 unread=notool"; return 0; }
+      [ -n "${STATE:-}" ] && _t=$(mktemp -p "$STATE" 2>/dev/null)
+      [ -n "$_t" ] || { echo "v=1 unread=nostate"; return 0; }
+      # The name is reserved, then freed: no output file is convert, an EMPTY one is parse.
+      rm -f "$_t" 2>/dev/null
+      if ! abx2xml "$1" "$_t" </dev/null >/dev/null 2>&1 || [ ! -f "$_t" ] || [ -L "$_t" ]; then
+        rm -f "$_t" 2>/dev/null; echo "v=1 unread=convert"; return 0
+      fi
+      _src="$_t" ;;
+    "<"*) _src="$1" ;;
+    *) echo "v=1 unread=format"; return 0 ;;
+  esac
+  # One tag per line (a break before every <, as shortcut_xml reads). awk prints only %d fields or the word parse.
+  _o=$(awk '
+    function av(s, n) { if (!match(s, "[ \t]" n "=\"[^\"]*\"")) return "\001"; return substr(s, RSTART + length(n) + 3, RLENGTH - length(n) - 4) }
+    { gsub(/</, "\n<"); k = split($0, L, "\n")
+      for (i = 1; i <= k; i++) {
+        l = L[i]
+        if (l ~ /^<settings([ \t>\/]|$)/) root = 1
+        if (l !~ /^<setting([ \t\/]|$)/) continue
+        rows++
+        if (av(l, "name") == "userkey") { uk++; continue }
+        v = av(l, "value"); if (v == "\001") continue
+        if (!(v in g)) d++
+        g[v]++; if (g[v] > big) big = g[v]
+      } }
+    END { if (!root) { print "parse"; exit }
+          printf "rows=%d userkey=%d apps=%d distinct=%d largest=%d\n", rows, uk, rows - uk, d, big }
+  ' "$_src" 2>/dev/null)
+  [ -n "$_t" ] && rm -f "$_t" 2>/dev/null
+  case "$_o" in
+    rows=*) echo "v=1 $_o" ;;
+    *) echo "v=1 unread=parse" ;;
+  esac
+  return 0
+}
+
 # userdir_census <dir>: what a users/<n> directory holds, as `files:<names> other=<count>`. Names come ONLY from
 # a fixed allowlist of framework basenames; anything else is counted, never named. UserManagerService writes an
 # app's restrictions as res_<package>.xml, so a raw listing would put a package -- which apps that identity used
@@ -7058,7 +7648,7 @@ userdir_pending_add() {
 # written by the re-check that clears the directory. Every periodic seal is a read-write-lane op and nothing
 # trims the ledger yet (Q143), so a row per retry would leave an unbounded on-disk timeline of the session's seals.
 # ⚠ READ-WRITE LANE ONLY. It is called at the top of cleanstorage and once before the top-level `case "$op"`,
-# guarded by [ "$LANE" = rw ]: the read-only lane's ops (sealdelta, storagebreakdown, uiderrors, alarmrelay, playrestart, gmsstate, gmsexits, odblock, healthprobe, vpnstate) are arms of that
+# guarded by [ "$LANE" = rw ]: the read-only lane's ops (sealdelta, storagebreakdown, uiderrors, alarmrelay, playrestart, gmsstate, gmsexits, mediaexits, odblock, healthprobe, vpnstate) are arms of that
 # same case, so an unguarded call would remove directories from the read-only lane, concurrently with the
 # read-write lane, on every SEAL-DELTA poll.
 # RESIDUAL: the triggers are the next read-write-lane op and the timer every few minutes that Q037 also names,
@@ -7487,6 +8077,7 @@ if [ "$op" = "cleanstorage" ]; then
   dt_release "$uid" reap   # NWP-20261027-05: the reap's backstop for the device toggles; another owner is left alone
   dr_release "$uid" reap   # NWP-20261028-07: the reap's backstop for data roaming; another owner is left alone
   hs_release "$uid" reap   # NWP-20261028-10: the reap's backstop for the hotspot; another session's is left alone by the gate
+  if ! reap_live_other "$uid" >/dev/null; then np_release reap; fi   # NWP-20261210-19: netpolicy's Wi-Fi templates, only with no other live session
   # NWP-20261203-02: a release that failed (the framework down mid-reap) kept its owner record. Queue the uid, so the
   # next read-write-lane op and the boot sweep run its releases again (base_retry_run).
   _bf=""
@@ -7507,8 +8098,8 @@ if [ "$op" = "cleanstorage" ]; then
   rm -f "$STATE/.cutoff.$uid" "$STATE/.cutoff.$uid".* 2>/dev/null   # NWP-20261011-04: the reaped session's cutoff record and its .new/.tmp scratch (package names) go with it
   # NWP-20261128-36: the departed session's other per-uid package records go with it, for the same reason as its
   # cutoff record; its next sign-in clears them too. The odbatch3 glob keeps the dot, so uid 10 never takes uid 100's.
-  # NWP-20261204-04: and odrestore's finished-copy record (.odcopied).
-  [ -n "${STATE:-}" ] && rm -f "$STATE/.declined.$uid" "$STATE/.granted.$uid" "$STATE/.a11ydone.$uid" "$STATE/.autofilldone.$uid" "$STATE/od-unparked.$uid" "$STATE/od-unparked.$uid.tmp" "$STATE/.odcopied.$uid" "$STATE/.odbatch3.$uid".* "$STATE/.vpndiag.$uid" 2>/dev/null   # NWP-20261128-36
+  # NWP-20261204-04: and odrestore's finished-copy record (.odcopied). NWP-20261208-10: and the last refused VPN apply.
+  [ -n "${STATE:-}" ] && rm -f "$STATE/.declined.$uid" "$STATE/.granted.$uid" "$STATE/.a11ydone.$uid" "$STATE/.autofilldone.$uid" "$STATE/od-unparked.$uid" "$STATE/od-unparked.$uid.tmp" "$STATE/.odcopied.$uid" "$STATE/.vpnwhy.$uid" "$STATE/.odbatch3.$uid".* "$STATE/.vpndiag.$uid" 2>/dev/null   # NWP-20261128-36
   # NWP-20261130-03: the session's unfetched lists and plans. After the loop above removed the user's data trees, so
   # no vault or #de seal of this uid can follow.
   [ -n "${STATE:-}" ] && rm -rf "$STATE/odfetch.$uid" 2>/dev/null
@@ -7566,7 +8157,7 @@ if [ "$op" = "cleanstorage" ]; then
     if [ -n "$_ksu" ] && [ "$_ksu" = "$uid" ]; then
       name=$(sed -n 1p "$KS_CREDS"); pass=$(sed -n 2p "$KS_CREDS")
       _kss=$(sed -n 4p "$KS_CREDS")  # NWP-20261007-12: the chip secret, so a tied #keys head opens for the push
-      [ -n "$_kss" ] && export NOWHERE_SE_SECRET="$_kss"
+      [ -n "$_kss" ] && _se_v="$_kss"
       unset _kss
     else
       # Loud on purpose: a silent defer is exactly what made #210 p2 undiagnosable. No credential and
@@ -8533,6 +9124,11 @@ if [ "$op" = "bootsweep" ]; then
     *) _hs="failed(kept)" ;;   # uid -1 is unconditional at the gate; a KEPT here means nothing was stopped
   esac
   _swept="$_swept hotspot=$_hs"
+  # --- fix 15b: netpolicy Wi-Fi templates (NWP-20261210-19) ---
+  # A Wi-Fi data warning or limit a departed session set lives in netpolicy, device-wide, after a power loss or a reboot.
+  # The gate is asked once to remove netpolicy's Wi-Fi-template policies (np_release logs its own line). It appends
+  # nothing to the result line, and a failure does not stop the sweep: the next boot asks again.
+  np_release boot
   # --- fix 16: keystore-drop (NWP-20261102-04) ---
   # A list left by a crash between `out` and the reap names a departed session's switched-off apps.
   if [ -e "$KS_DROP" ] || [ -e "$KS_DROP.new" ]; then
@@ -8553,6 +9149,47 @@ if [ "$op" = "bootsweep" ]; then
   # (Superseded by NWP-20261112-01: a landed sign-in removes only keystore-in/<its uid>, flat bundles and departed uids' dirs; a parked user's dir stays.)
   staging_boot
   _swept="$_swept staging=$STAGING_BOOT"
+  # --- fix 17b: sysinventory (NWP-20261204-24) ---
+  # docs/backlog.md "No durable-state inventory, and no test that every file under /data/nowhere + /data/system is
+  # exempt-listed or purged": ci/check-durable-state.py sees only the /data/system paths the tree names in code, so the
+  # framework stores our source never names (device_policies.xml, overlays.xml and their class) no source scan can
+  # enumerate. Only a phone can. This line names them, so the inventory can be completed from reports.
+  #  - REPORT ONLY: one ls of the directory. Nothing is removed, opened or sealed, and it appends nothing to the result
+  #    line below (which stays byte for byte), so it prints a line of its own:
+  #    `bootsweep sysinventory: entries=<n> listed=<n> unlisted=<n> masked=<n> more=<n> names=<a,b,...|->`.
+  #  - listed: a name in _si_known. _si_known MUST EQUAL the first column of the fourth table of docs/threat-model.md
+  #    section 2 (the K case of test-bootsweep-sysinventory.sh fails when they differ): a new table row means its name here.
+  #  - masked: counted, never printed. Empty, over 64 bytes, all digits (a uid or user slot), a character outside
+  #    A-Za-z0-9_.- (ls -q lists a control character as `?`), or two or more dots (package-shaped). The masks run
+  #    BEFORE the known match, so a name holding a space can never match two adjacent known names. No profile, app,
+  #    uid or path reaches the log; ls's stderr goes to /dev/null.
+  #  - unlisted: every other name; at most 40 printed (C order), the rest counted as more. unlisted = printed + more.
+  #  - unreachable when the directory does not list, never a count: the fingerprint and dropbox lesson above.
+  #  - ONE LINE PER ENTRY (`read -r` with an empty IFS), never a split on default IFS; the listing is never re-parsed.
+  #  - LIMIT: a gate report carries no roam.log, and a session report keeps only each log's last 300 lines.
+  _si_known="adservices appops device_owner.xml device_owner_2.xml dropbox graphicsstats job packages.list packages.xml sync uiderrors.txt users"
+  if ! _si_l=$(LC_ALL=C ls -1Aq "/data/system" 2>/dev/null); then
+    echo "[roamd] bootsweep sysinventory: unreachable $(date)" >> "$LOG"
+  else
+    _si_n=0; _si_k=0; _si_u=0; _si_m=0; _si_x=0; _si_c=0; _si_p=""
+    if [ -n "$_si_l" ]; then
+      while IFS= read -r _si_e; do
+        _si_n=$((_si_n + 1)); _si_b=0
+        if [ -z "$_si_e" ] || [ "${#_si_e}" -gt 64 ]; then _si_b=1; fi
+        case "$_si_e" in *[!0-9]*) ;; *) _si_b=1 ;; esac
+        case "$_si_e" in *[!A-Za-z0-9_.-]*) _si_b=1 ;; esac
+        case "$_si_e" in *.*.*) _si_b=1 ;; esac
+        if [ "$_si_b" = 1 ]; then _si_m=$((_si_m + 1)); continue; fi
+        case " $_si_known " in *" $_si_e "*) _si_k=$((_si_k + 1)); continue ;; esac
+        _si_u=$((_si_u + 1))
+        if [ "$_si_c" -lt 40 ]; then _si_p="$_si_p${_si_p:+,}$_si_e"; _si_c=$((_si_c + 1)); else _si_x=$((_si_x + 1)); fi
+      done <<SI_EOF
+$_si_l
+SI_EOF
+    fi
+    echo "[roamd] bootsweep sysinventory: entries=$_si_n listed=$_si_k unlisted=$_si_u masked=$_si_m more=$_si_x names=${_si_p:--} $(date)" >> "$LOG"
+  fi
+  unset _si_known _si_l _si_e _si_n _si_k _si_u _si_m _si_x _si_c _si_p _si_b
   # --- fix 18: siblings (NWP-20261129-44) ---
   # docs/backlog.md "Four sibling Wi-Fi/network stores nothing sweeps": the Wi-Fi siblings, the tethering netstats and
   # netpolicy are device-wide and outside every user. Stage 3's sweep waits on docs/wifi-retention-spec.md §4.8 and HW3,
@@ -8587,6 +9224,68 @@ if [ "$op" = "bootsweep" ]; then
   echo "[roamd] bootsweep siblings: softap=$_sb_soft scorecard=$_sb_card health=$_sb_hlth suggest=$_sb_sugg netstats=$_sb_nets netpolicy=$_sb_npol wifidir=$_sb_wdir $(date)" >> "$LOG"
   unset _sb_wd _sb_soft _sb_card _sb_hlth _sb_sugg _sb_nets _sb_npol _sb_wdir _sb_l _sb_c _sb_z _sb_w
   unset -f _sb_state
+  # --- fix 19: syncreg (NWP-20261204-23) ---
+  # docs/backlog.md "`/data/system/sync/accounts.xml` has no verified remover and no recorded exemption": the
+  # device-global SyncStorageEngine file keeps one authority entry per (account, authority, user) and one
+  # listenForTickles entry per user, and nobody has checked whether a departed user's entries leave it. A report with
+  # roam.log now answers it at every boot.
+  #  - REPORT ONLY: nothing is removed, rewritten or sealed. It is not a category of the result line below (it appends
+  #    nothing to that line, which stays byte for byte), so it prints a line of its own.
+  #  - THE LINE: file=<F> and six counts. F, decided in this order: unreachable (/data/system/sync does not list:
+  #    a finding, never an absence), absent (it lists and accounts.xml is not there, by a fixed-string whole-line
+  #    match), unreadable (the file cannot be read), notool (binary XML, the magic `ABX`, and no abx2xml), decodefail
+  #    (the decoded or read stream holds no <accounts root tag), else abx or text. Every F other than abx and text
+  #    prints the six counts as `-`, never 0. auth and tickles count the entries; users counts the distinct user ids;
+  #    stale_users counts the ids other than 0 with no /data/system/users/<id>.xml, and stale_auth and stale_tickles
+  #    their entries. An authority with no user attribute is user 0. secs is the whole seconds the block took.
+  #  - ABX: `command -v abx2xml` first, as the shortcut capture does, so a missing tool is its own token. abx2xml needs
+  #    BOTH arguments (`abx2xml <in> <out>`), so the out is /proc/self/fd/1 and the stream goes straight into the pipe.
+  #    Its stderr goes to /dev/null: a stack trace can carry an account name (the sync_run rule). It starts a JVM while
+  #    the boot sweep holds the read-write lane a sign-in queues behind, hence `timeout -k 2 10`, and secs shows the cost.
+  #  - NO DECODED FILE AND NO DECODED VARIABLE: account data never goes through a shell variable, roam.log or $STATE
+  #    (the rule over sync_fp). The decode or the cat feeds the reducer in one pipe, and the reducer turns each tag
+  #    at once into a name-free line: `R` for the <accounts root, `A <uid>` per authority, `T <uid>` per
+  #    listenForTickles. Only those lines reach _sr_l. Counting is by tag: line breaks and tabs fold to spaces and each
+  #    `<` starts a line, so the file's layout does not matter; one sed group per user id, no BRE alternation (the
+  #    device's grep has no `\|`).
+  #  - LIMIT: a gate report carries no roam.log and a session report keeps only each log's last 300 lines, so a report
+  #    can miss this line, as with fix 18.
+  _sr_t0=$(date +%s); case "$_sr_t0" in ''|*[!0-9]*) _sr_t0=0 ;; esac
+  _sr_d="/data/system/sync"; _sr_f="/data/system/sync/accounts.xml"
+  _sr_a=-; _sr_t=-; _sr_n=-; _sr_su=-; _sr_sa=-; _sr_st=-; _sr_l=""
+  if ! _sr_ls=$(ls -1A "$_sr_d" 2>/dev/null); then _sr_F=unreachable
+  elif [ "$(printf '%s\n' "$_sr_ls" | grep -Fcx -e accounts.xml)" = 0 ]; then _sr_F=absent
+  elif ! _sr_m=$(head -c 3 "$_sr_f" 2>/dev/null); then _sr_F=unreadable
+  else
+    if [ "$_sr_m" != ABX ]; then _sr_F=text
+    elif command -v abx2xml >/dev/null 2>&1; then _sr_F=abx
+    else _sr_F=notool; fi
+    if [ "$_sr_F" != notool ]; then
+      _sr_l=$(case "$_sr_F" in
+          (abx) timeout -k 2 10 abx2xml "$_sr_f" /proc/self/fd/1 </dev/null 2>/dev/null ;;
+          (*) cat "$_sr_f" 2>/dev/null ;;
+        esac | tr '\r\t\n<' '   \n' | sed -n \
+        -e '/^accounts$/s/.*/R/p' -e '/^accounts[^A-Za-z0-9_:.-]/s/.*/R/p' \
+        -e '/^authority /{/ user="[0-9][0-9]*"/!s/.*/A 0/p' -e 's/.* user="\([0-9][0-9]*\)".*/A \1/p' -e '}' \
+        -e '/^listenForTickles /{/ user="[0-9][0-9]*"/!s/.*/T 0/p' -e 's/.* user="\([0-9][0-9]*\)".*/T \1/p' -e '}')
+      if [ "$(printf '%s\n' "$_sr_l" | grep -cx R)" = 0 ]; then _sr_F=decodefail; fi
+    fi
+    if [ "$_sr_F" = abx ] || [ "$_sr_F" = text ]; then
+      _sr_a=$(printf '%s\n' "$_sr_l" | grep -c '^A '); _sr_t=$(printf '%s\n' "$_sr_l" | grep -c '^T ')
+      _sr_n=0; _sr_su=0; _sr_sa=0; _sr_st=0
+      for _sr_u in $(printf '%s\n' "$_sr_l" | sed -n 's/^[AT] //p' | sort -u); do
+        _sr_n=$((_sr_n + 1))
+        if [ "$_sr_u" != 0 ] && [ ! -e "/data/system/users/$_sr_u.xml" ]; then
+          _sr_su=$((_sr_su + 1))
+          _sr_c=$(printf '%s\n' "$_sr_l" | grep -cx "A $_sr_u"); _sr_sa=$((_sr_sa + ${_sr_c:-0}))
+          _sr_c=$(printf '%s\n' "$_sr_l" | grep -cx "T $_sr_u"); _sr_st=$((_sr_st + ${_sr_c:-0}))
+        fi
+      done
+    fi
+  fi
+  _sr_s=$(date +%s); case "$_sr_s" in ''|*[!0-9]*) _sr_s=$_sr_t0 ;; esac; _sr_s=$((_sr_s - _sr_t0))
+  echo "[roamd] bootsweep syncreg: file=$_sr_F auth=$_sr_a tickles=$_sr_t users=$_sr_n stale_users=$_sr_su stale_auth=$_sr_sa stale_tickles=$_sr_st secs=$_sr_s $(date)" >> "$LOG"
+  unset _sr_t0 _sr_d _sr_f _sr_ls _sr_m _sr_F _sr_l _sr_a _sr_t _sr_n _sr_su _sr_sa _sr_st _sr_u _sr_c _sr_s
   # Report what was actually removed, not that the op ran. A sweep that silently reaches nothing reads
   # exactly like one that works -- the dontaudit lesson this tree has already paid for twice.
   # Always print the full per-category result, including zeros and UNREACHABLE. A category missing from this
@@ -9770,7 +10469,7 @@ appcode_seal() {
       NOWHERE_DROP_LIST="$APPDROP_CODE" NOWHERE_GONE_LIST="$APPGONE_CODE" NOWHERE_KEEP_LIST="$APPKEEP" \
       NOWHERE_APPS_DORMANT="$_dmt" \
       NOWHERE_PUSH_STAT="$STATE/pushstat.apps" \
-      timeout -k 5 "$lim" "$AGENT" push s3 "${name}#apps" "$(pw "$pass")" "$STAGE" >> "$LOG" 2>&1; ret=$?
+      NOWHERE_SE_SECRET="$(pwv "$_se_v")" NOWHERE_FIDO2_HMAC="$(pwv "$_fh_v")" timeout -k 5 "$lim" "$AGENT" push s3 "${name}#apps" "$(pw "$pass")" "$STAGE" >> "$LOG" 2>&1; ret=$?
     [ "$ret" = 0 ] || print -r -- "[roamd] OUT $(qn "$name") #apps push try $try rc=$ret (${lim}s bound, resumable retry) $(date)" >> "$LOG"
     # h47 #1 (NWP-20261128-25): a stop asks the seal to end and .sealstop stays until the sign-out's own out op, so a retry can only stop again.
     [ "$ret" = 7 ] && break
@@ -9858,6 +10557,42 @@ acct_mark_hashes() {
       *) print -rn -- "nowhere-acct-mark-v1:$_n" | sha256sum | cut -d' ' -f1 ;;
     esac
   done
+}
+
+# NWP-20261206-22: EVIDENCE for the backlog row "An owner's own call that ends during the logoff seal is destroyed
+# with the user". A sign-out seal that lands writes ONE line: `calllog after #de: late=<n>` counts the calls that
+# ended after the #de push read the call log (stamp $2, from the `out` op). Those calls are in no seal, and the reap
+# destroys them with the user. The count can miss a call but never invents one (the contract of nowhere_db_fix
+# calllog-ended-after, NOWHERE-1899). It does NOT cover a call that ends after this check and before the reap.
+# `unread <class>` is a fixed reason, never a count: no-stamp, no-db, no-tool, copy, or query (the tool exited
+# non-zero or printed a non-integer, as an image without that subcommand does). Only a logoff seal is checked:
+# a periodic or manual seal is followed by another seal, so nothing is lost there. The live db is never opened;
+# the db and its -wal are copied into $STATE (tmpfs) first, as acct_seal does (DIA-20260802-03). No path, number,
+# name or profile goes into the line.
+calllog_late() { # <uid> <ms the #de push ended>
+  local _db="/data/user_de/$1/com.android.providers.contacts/databases/calllog.db" _st="$STATE/calllog-late" _v _n _rc
+  case "${skind:-}" in logoff|logoff-pinned) ;; *) return 0 ;; esac
+  # A case, never a numeric test: mksh arithmetic is 32-bit. 0 is what _ms echoes for a failed clock, and a 0
+  # stamp would count every call as late.
+  case "${2:-}" in
+    ''|0|*[!0-9]*) _v="unread no-stamp" ;;
+    *)
+      if [ ! -f "$_db" ]; then _v="unread no-db"
+      elif [ ! -x /system/bin/nowhere_db_fix ]; then _v="unread no-tool"
+      else
+        rm -rf "$_st"
+        if mkdir -p "$_st" 2>>"$LOG" && cp "$_db" "$_st/" 2>>"$LOG" && { [ ! -e "$_db-wal" ] || cp "$_db-wal" "$_st/" 2>>"$LOG"; }; then
+          _n=$(/system/bin/nowhere_db_fix calllog-ended-after "$_st/calllog.db" "$2" 2>>"$LOG"); _rc=$?
+          _v="unread query"
+          if [ "$_rc" = 0 ]; then case "$_n" in ''|*[!0-9]*) ;; *) _v="late=$_n" ;; esac; fi
+        else
+          _v="unread copy"
+        fi
+        rm -rf "$_st"   # the stage never outlives the check
+      fi
+      ;;
+  esac
+  echo "[roamd] calllog after #de: $_v (user $1) $(date)" >> "$LOG"
 }
 
 # ---------------------------------------------------------------------------------------------------------
@@ -10051,7 +10786,7 @@ $_sh}"
   # NWP-20260908-01: pinned OFF -- see the note in _push. The #sys stage is `ce`/`de`, not app packages.
   ACCT_PUSHED=1   # NWP-20261123-06: this seal reached the #sys push -> a sys entry in the seal split
   NOWHERE_CARRY_ESSENTIAL=0 NOWHERE_CARRY_ESSENTIAL_MEDIA=0 \
-    timeout -k 5 3600 "$AGENT" push s3 "${name}#sys" "$(pw "$pass")" "$stage" >> "$LOG" 2>&1; r=$?
+    NOWHERE_SE_SECRET="$(pwv "$_se_v")" NOWHERE_FIDO2_HMAC="$(pwv "$_fh_v")" timeout -k 5 3600 "$AGENT" push s3 "${name}#sys" "$(pw "$pass")" "$stage" >> "$LOG" 2>&1; r=$?
   rm -rf "$stage"
   print -r -- "[roamd] OUT $(qn "$name") #sys accounts push rc=$r $(date)" >> "$LOG"
   # NWP-20261104-06: only a SEALED head changes the books; rc != 0 touches nothing (the old head still stands).
@@ -10119,7 +10854,9 @@ acct_restore() {
   # the chooser's journal of unsettled sign-outs (acct_seal refuses while it is open) is as stale as the marks
   if mf=$(acct_mark_file "$uid"); then rm -f "$mf.pending" 2>>"$LOG"; fi
   rm -rf "$hold"; mkdir -p "$hold" 2>>"$LOG"
-  NOWHERE_PHASE=accounts "$AGENT" restore s3 "${name}#sys" "$(pw "$pass")" "$hold" >> "$LOG" 2>&1; _arc=$?
+  # NWP-20261210-03: _inshare is the `in` arm's per-restore share of the download budget while its lanes run; unset, the
+  # agent keeps NOWHERE_DOWNLOAD_WORKERS (or its own default, 24).
+  NOWHERE_DOWNLOAD_WORKERS="${_inshare:-${NOWHERE_DOWNLOAD_WORKERS:-}}" NOWHERE_PHASE=accounts NOWHERE_SE_SECRET="$(pwv "$_se_v")" NOWHERE_FIDO2_HMAC="$(pwv "$_fh_v")" "$AGENT" restore s3 "${name}#sys" "$(pw "$pass")" "$hold" >> "$LOG" 2>&1; _arc=$?
   if [ "$_arc" != 0 ]; then rm -rf "$hold"; [ "$_arc" = 5 ] && return 5; return 0; fi
   { [ -f "$hold/ce/accounts_ce.db" ] || [ -f "$hold/de/accounts_de.db" ]; } || { rm -rf "$hold"; return 0; }
   # DIA-20260804-08: a hold with only the DE half carries NO account -- the row lives in CE. That combination
@@ -10708,7 +11445,9 @@ keystore_fetch() {
   rm -rf "$_krd"; mkdir -p "$_krd" 2>>"$LOG" || return 0
   # DIA-20260812-05: backstop, not a stopwatch -- see the note at the #apps ladder. A truncated #keys RESTORE
   # is how an app silently loses its signed-in state after a roam, so a stopwatch here is worse than elsewhere.
-  timeout -k 5 3600 "$AGENT" restore s3 "${name}#keys" "$(pw "$pass")" "$_krd" >> "$LOG" 2>&1; _kfr=$?
+  # NWP-20261210-03: _inshare is the `in` arm's per-restore share of the download budget while its lanes run; unset, the
+  # agent keeps NOWHERE_DOWNLOAD_WORKERS (or its own default, 24).
+  NOWHERE_DOWNLOAD_WORKERS="${_inshare:-${NOWHERE_DOWNLOAD_WORKERS:-}}" NOWHERE_PHASE=keys NOWHERE_SE_SECRET="$(pwv "$_se_v")" NOWHERE_FIDO2_HMAC="$(pwv "$_fh_v")" timeout -k 5 3600 "$AGENT" restore s3 "${name}#keys" "$(pw "$pass")" "$_krd" >> "$LOG" 2>&1; _kfr=$?
   if [ "$_kfr" = 5 ]; then rm -rf "$_krd" 2>>"$LOG"; return 5; fi
   return 0
 }
@@ -10975,6 +11714,34 @@ EOT
   return 0
 }
 
+# bootwake_vpnapp <uid> <pkg> (NWP-20261205-16): prints one token, yes / no / unread. yes = <pkg> declares a
+# VpnService; no = it does not; unread = the listing said nothing usable (an empty capture, a denial, the 10 s timeout,
+# only unknown lines). One bounded read of `pm query-services --components` for android.net.VpnService, parsed as
+# bootwake_list parses: leading blanks stripped, a "<pkg>/<class>" line whose <pkg> passes cutoff_pkgok is a component
+# line, exactly "No services found" is a known empty answer, every other line is unknown. no needs at least one
+# component line or one "No services found" line. ⚠ The --components form and "No services found" (AOSP's
+# runQueryIntentServices prints it for an empty result) are read from AOSP source, not from a device.
+# Cost: one bounded pm spawn per per-package bootwake (the sweep's later restores), none at sign-in. The token never
+# carries a name (#39).
+bootwake_vpnapp() {
+  local _v _l _p _r=unread _k=no
+  _v=$(timeout -k 2 10 pm query-services --user "$1" --components --include-stopped-packages -a android.net.VpnService </dev/null 2>/dev/null)
+  # Not a pipe into the loop: a pipe runs the loop in a subshell, and _r and _k would be lost.
+  while read -r _l; do
+    [ -n "$_l" ] || continue
+    if [ "$_l" = "No services found" ]; then _k=yes; continue; fi
+    case "$_l" in *" "*|*"	"*) continue ;; ?*/?*) ;; *) continue ;; esac
+    _p=${_l%%/*}
+    cutoff_pkgok "$_p" || continue
+    _k=yes
+    [ "$_p" = "$2" ] && _r=yes
+  done <<EOT
+$_v
+EOT
+  if [ "$_r" != yes ] && [ "$_k" = yes ]; then _r=no; fi
+  echo "$_r"
+}
+
 # NWP-20261113-15: the scope tokens of the `in` arm's landing line, one per best-effort restore (#de, then #media):
 # `+<scope>` for exit 0, `-<scope>` for `skip` (the per-user dir did not exist, so nothing ran), `!<scope>(rc=<n>)`
 # for any other status. A clean sign-in prints exactly `+de +media`, byte-identical to the literal the line printed
@@ -11035,8 +11802,9 @@ case "$op" in
     _odoff=0   # NWP-20261130-03: 1 = this sign-in skips no parked app's data (the commit arm or the shipped list failed)
     # NWP-20261010-15: a session for this uid starts here, so neither carry may capture until THIS session has
     # applied it (vpn_seal_capture / sync_seal_capture). Keyed by uid, so a straggler sign-in -- always a new user --
-    # cannot clear the live session's markers.
-    rm -f "$STATE/.vpnapplied.$uid" "$STATE/.syncapplied.$uid" "$STATE/.syncfp.$uid" "$STATE/.syncbo.$uid" \
+    # cannot clear the live session's markers. NWP-20261208-10: and the last refused VPN apply (.vpnwhy), as a uid can
+    # be reused.
+    rm -f "$STATE/.vpnapplied.$uid" "$STATE/.syncapplied.$uid" "$STATE/.syncfp.$uid" "$STATE/.syncbo.$uid" "$STATE/.vpnwhy.$uid" \
       "$STATE/.syncretry.$uid" "$STATE/.vpndeferred.$uid" "$STATE/.vpnretry.$uid" 2>/dev/null
     rm -f "$STATE/.navapplied.$uid" "$STATE/.aodapplied.$uid" 2>/dev/null   # NWP-20261108-17: nav/AOD likewise
     rm -f "$STATE/.a11yapplied.$uid" 2>/dev/null   # NWP-20261108-15: same reason, for a11y_seal_capture
@@ -11081,7 +11849,7 @@ case "$op" in
     # "anything else" are could-not-tell: reading them as "not enrolled" committed a key-enrolled profile's sign-in
     # with no key and no hmac stash, so the live session ran keyless and its cold lock wrote `nokey`.
     fido2_needed=0; _probe=""
-    "$AGENT" fido2-is-enrolled s3 "$name" "$(pw "$pass")" 2>/dev/null
+    NOWHERE_SE_SECRET="$(pwv "$_se_v")" NOWHERE_FIDO2_HMAC="$(pwv "$_fh_v")" "$AGENT" fido2-is-enrolled s3 "$name" "$(pw "$pass")" 2>/dev/null
     case $? in
       0) fido2_needed=1 ;;
       1) ;;
@@ -11120,7 +11888,7 @@ case "$op" in
       usb_host on; sleep 2
       # NWP-20260823-09: the 4th arg is the state dir -- the agent caches this session's NON-SECRET slot spec
       # there, and cold-lock carries it into the marker so a PIN resume can re-assert without the passphrase.
-      fresh_hmac="$("$AGENT" fido2-hmac s3 "$name" "$(pw "$pass")" "$STATE" 2>> "$LOG")"
+      fresh_hmac="$(NOWHERE_SE_SECRET="$(pwv "$_se_v")" NOWHERE_FIDO2_HMAC="$(pwv "$_fh_v")" "$AGENT" fido2-hmac s3 "$name" "$(pw "$pass")" "$STATE" 2>> "$LOG")"
       usb_host off
     fi
     if [ -z "$_probe" ] && { [ "$fido2_needed" = 0 ] || [ -n "$fresh_hmac" ]; }; then
@@ -11163,8 +11931,7 @@ case "$op" in
         # DIA-20260812-03 (#106): same fix as the cold-resume path above -- this is the LOGIN one. printf is
         # external on Android, so this put the second vault factor in a world-readable argv on every 2FA login.
         print -rn -- "$fresh_hmac" > "$STATE/.fido2hmac"; chmod 600 "$STATE/.fido2hmac"
-        NOWHERE_FIDO2_HMAC="$fresh_hmac"
-        export NOWHERE_FIDO2_HMAC
+        _fh_v="$fresh_hmac"
       fi
       # NWP-20260822-09: EVERY per-login reset of $STATE belongs HERE, in the COMMIT arm -- never at the top of
       # `in)`. This arm's condition IS "this login commits"; its complement is the NEEDKEY refusal below. The
@@ -11231,8 +11998,9 @@ case "$op" in
     # for this one, so it goes before the restore, not only after the install.
     rm -f "$STATE/claims.seed" 2>> "$LOG"
     # NWP-20261124-05: _ceok is set when the vault restore landed; _innet names the scope (de, sys, media, apps or keys)
-    # whose restore could not reach the store. The verdict after this chain reads both.
-    _ceok=""; _innet=""
+    # whose restore could not reach the store. The verdict after this chain reads both. _cerp is the pid of the CE
+    # reown job, empty when none runs (NWP-20261210-04).
+    _ceok=""; _innet=""; _cerp=""
     if [ -n "$_probe" ]; then
       :   # the key check could not tell: answered above, before the commit arm
     elif [ "$fido2_needed" = 1 ] && [ -z "$fresh_hmac" ]; then
@@ -11245,11 +12013,134 @@ case "$op" in
       # stash from waving a keyless straggler THROUGH the guard).
       print -r -- "[roamd] IN $(qn "$name") NEEDKEY (2FA, no key asserted) $(date)" >> "$LOG"
       echo "NEEDKEY" > "$RES"
-    elif od_shipped_prep && NOWHERE_PARK_KEEP="$(od_park_var keep)" NOWHERE_PARK_SHIPPED="$(od_park_var shipped)" NOWHERE_UNFETCHED_LIST="$(od_park_var ce)" NOWHERE_PHASE=apps NOWHERE_CLAIMS_SEED="$STATE/claims.seed" "$AGENT" restore s3 "$name" "$(pw "$pass")" "$USERDIR" >> "$LOG" 2>&1; then
+    elif od_shipped_prep && NOWHERE_PARK_KEEP="$(od_park_var keep)" NOWHERE_PARK_SHIPPED="$(od_park_var shipped)" NOWHERE_UNFETCHED_LIST="$(od_park_var ce)" NOWHERE_PHASE=apps NOWHERE_CLAIMS_SEED="$STATE/claims.seed" NOWHERE_SE_SECRET="$(pwv "$_se_v")" NOWHERE_FIDO2_HMAC="$(pwv "$_fh_v")" "$AGENT" restore s3 "$name" "$(pw "$pass")" "$USERDIR" >> "$LOG" 2>&1; then
       _ceok=1
-      _sumt=$(_ms)
+      # NWP-20261210-03 (backlog §B 'A nearly empty profile takes about 85 s from submit to home; target under 60 s',
+      # cause 1): the #media, #apps code and #keys restores run from here as three background LANES (M, A, K), beside
+      # the foreground chain (the CE reown, #de, the DE reown, #sys, the MMS remap), and are joined before the verdict.
+      # The orderings that must hold:
+      # (a) the vault restore above runs first and alone: it is the login gate, and the #139/#734 heal runs only from
+      #     the bare restore. The lanes start here, once it landed. None writes $USERDIR (#media -> /data/media/<uid>,
+      #     #apps -> user 0's .appcode, #keys -> keystore-in/<uid>.pre), so none waits for the CE reown.
+      # (b) the DE reown and restorecon follow #de; the MMS remap follows #de (it rewrites DE paths in the CE db) and
+      #     the CE reown. All stay in the foreground, in today's order. (Superseded in part by NWP-20261210-04: "the CE
+      #     reown ... stay in the foreground" -- the CE reown and relabel run as one background job, joined at its one
+      #     barrier before acct_restore, and the MMS remap follows that barrier.)
+      # (c) restore_media_tail follows #media, in lane M; the .appcode chown and restorecon follow #apps, in lane A.
+      # (d) keystore_fetch only stages keystore-in/<uid>.pre; keystore_restore still promotes it at the landing, after
+      #     ks_signin_reset.
+      # (e) acct_restore (#sys) ends before the OK, because provisionRoamedApps runs after it: unchanged, foreground.
+      # ONE DOWNLOAD BUDGET: up to four restores run at once (#de or #sys, and the three lanes), so each agent restore
+      # gets a quarter of NOWHERE_DOWNLOAD_WORKERS (24 when unset, not a number, under 4, or seven digits or more) as a
+      # prefix on its own command line, never exported. acct_restore and keystore_fetch read _inshare. The vault
+      # restore above kept the whole budget.
+      # PROGRESS: the foreground keeps NOWHERE_PROGRESS. Each lane writes $NOWHERE_PROGRESS.<lane>, so two scopes never
+      # write one file; lane M's media tail writes its own $NOWHERE_PROGRESS.T, so its "finishing" lines never replace
+      # the #media label before the join shows it. The join relays M, T, A, K in that order: the gate's bar shows each
+      # label once, in the old order. A lane's LAST step writes its status to $_inlanes/<lane>: a child's variables
+      # never reach here.
+      MEDIADIR="/data/media/$uid"
+      CHOOSER0="/data/user/0/com.nowhere.chooser/files"
+      APPCODE="$CHOOSER0/.appcode"
+      _inw=${NOWHERE_DOWNLOAD_WORKERS:-24}
+      case "$_inw" in ''|*[!0-9]*|???????*) _inw=24 ;; esac   # seven digits or more would pass mksh's 32-bit arithmetic
+      while :; do case "$_inw" in 0?*) _inw=${_inw#0} ;; *) break ;; esac; done   # 010 is ten, never octal
+      [ "$_inw" -ge 4 ] || _inw=24
+      _inshare=$(( _inw / 4 ))
+      _inlanes="$STATE/in-lanes.$$"; _mpid=""; _apid=""; _kpid=""
+      if [ -n "${NOWHERE_PROGRESS:-}" ]; then
+        for _ln in M T A K; do rm -f "$NOWHERE_PROGRESS.$_ln" "$NOWHERE_PROGRESS.$_ln.tmp" 2>> "$LOG"; done
+      fi
+      _tlanes=$(_ms)
+      rm -rf "$_inlanes" 2>> "$LOG"
+      if mkdir -m 700 "$_inlanes" 2>> "$LOG"; then
+        {   # lane M: #media -> /data/media/<uid>, and its tail on 0
+          _inpb="${NOWHERE_PROGRESS:-}"
+          NOWHERE_PROGRESS="${NOWHERE_PROGRESS:+$NOWHERE_PROGRESS.M}"
+          _mdrc=skip
+          _tt=$(_ms)
+          [ -d "$MEDIADIR" ] && { NOWHERE_DOWNLOAD_WORKERS="$_inshare" NOWHERE_PHASE=media NOWHERE_SE_SECRET="$(pwv "$_se_v")" NOWHERE_FIDO2_HMAC="$(pwv "$_fh_v")" "$AGENT" restore s3 "${name}#media" "$(pw "$pass")" "$MEDIADIR" >> "$LOG" 2>&1; _mdrc=$?; }
+          # NWP-20261202-18: the pre-gate #media restore's wall time, failed ones included. Logged HERE, before
+          # restore_media_tail, which overwrites _tt. No media dir, no restore, no line.
+          [ "$_mdrc" = skip ] || _tlog restore-media "$_tt"
+          NOWHERE_PROGRESS="${_inpb:+$_inpb.T}"   # the tail's "finishing" lines: its own file, read by the join as T
+          if [ "$_mdrc" = 0 ]; then
+            _sumt=$(_ms)
+            restore_media_tail "$MEDIADIR"
+            _ssum reown "$_sumt"
+          fi
+          echo "$_mdrc" > "$_inlanes/M"
+        } &
+        _mpid=$!
+        # App CODE restore (#200): restore the opted-in user-installed APK bytes (the name#apps scope) into the
+        # USER-0 chooser's files dir so the device-owner chooser can PackageInstaller them back for the roamed
+        # user (the su:s0 worker can't pm-install -- the device-owner wall). Root writes there, then chown+relabel
+        # to the chooser's user-0 uid so it reads its own files. An absent scope (nothing opted in) or a failed
+        # restore just leaves no .appcode → the chooser installs nothing, and the sign-in lands. The exception is
+        # exit 5, the store could not be reached (NWP-20261201-16, docs/product-decisions.md, "twenty answers to
+        # harvest 60 ...", #5): that ends the sign-in at the verdict below, which is why this lane is joined before it
+        # and not run with the landing steps. The chooser deletes .appcode after install (amnesia); we rm it first so
+        # a stale set from a prior login can't linger. (Superseded by NWP-20261210-03: "A #de, #sys or #media exit 5
+        # has already ended the sign-in, so it skips this" -- the lane runs beside them and the verdict ranks them.)
+        {   # lane A: #apps code -> user 0's .appcode
+          NOWHERE_PROGRESS="${NOWHERE_PROGRESS:+$NOWHERE_PROGRESS.A}"
+          rm -rf "$APPCODE"
+          # _tt spans the WALL of the agent invocation (fork + conf + head resolution + restore), which the
+          # agent's own key=/restore= line does NOT fully cover -- head= starts inside the process. The delta
+          # between this and the agent's head+restore sum is process start + pw() staging + rm/mkdir.
+          _tt=$(_ms)
+          # _aprc is the agent's exit status, or `skip` when it never ran (no chooser files dir, or the mkdir failed).
+          _aprc=skip
+          if [ -d "$CHOOSER0" ] && mkdir -p "$APPCODE" 2>>"$LOG"; then
+            NOWHERE_DOWNLOAD_WORKERS="$_inshare" NOWHERE_PHASE=appcode NOWHERE_SE_SECRET="$(pwv "$_se_v")" NOWHERE_FIDO2_HMAC="$(pwv "$_fh_v")" "$AGENT" restore s3 "${name}#apps" "$(pw "$pass")" "$APPCODE" >> "$LOG" 2>&1
+            _aprc=$?
+          fi
+          if [ "$_aprc" = 0 ] && [ -f "$APPCODE/manifest.tsv" ]; then
+            _tlog appcode-agent "$_tt"
+            _tt=$(_ms)
+            cuid=$(stat -c %u "$CHOOSER0" 2>/dev/null)
+            [ -n "$cuid" ] && chown -R "$cuid:$cuid" "$APPCODE" 2>>"$LOG"
+            restorecon -R -D "$APPCODE" 2>>"$LOG"
+            _tlog appcode-chown "$_tt"
+            print -r -- "[roamd] IN $(qn "$name") #apps code restored → user0 chooser $(date)" >> "$LOG"
+          else
+            _tlog appcode-agent "$_tt"   # the blank/failed arm still reports the wall -- an empty scope's cost was invisible before
+            rm -rf "$APPCODE"
+          fi
+          echo "$_aprc" > "$_inlanes/A"
+        } &
+        _apid=$!
+        # NWP-20261207-06 (h62 #6): the #keys fetch runs before the verdict, so that its exit 5 ends the sign-in as
+        # BLANK NET. It stages into keystore-in/<uid>.pre; keystore_restore promotes that at the landing, after
+        # ks_signin_reset. (Superseded by NWP-20261210-03: "An earlier exit 5 skips it" -- it runs as lane K.)
+        {   # lane K: #keys -> keystore-in/<uid>.pre
+          NOWHERE_PROGRESS="${NOWHERE_PROGRESS:+$NOWHERE_PROGRESS.K}"
+          keystore_fetch; _ksrc=$?
+          echo "$_ksrc" > "$_inlanes/K"
+        } &
+        _kpid=$!
+      else
+        # No lane dir, no lane: the foreground keeps the whole budget, and the join reads all three statuses as 1
+        # (damage), so the sign-in lands with `!media(rc=1)` and no #apps or #keys set, as a failed restore does.
+        # Lanes A and K remove the previous sign-in's staging before they restore; no lane ran, so this arm removes it
+        # here. Else the chooser would install a stale .appcode set, and keystore_restore promote a stale .pre.
+        rm -rf "$APPCODE" 2>> "$LOG"
+        if _inksd=$(ks_in_dir); then rm -rf "$_inksd.pre" 2>> "$LOG"; fi
+        _inshare=$_inw
+        echo "[roamd] IN restore lanes NOT started: no lane dir (user $uid) (NWP-20261210-03) $(date)" >> "$LOG"
+      fi
       relabel_launcher "$uid" "$USERDIR"   # rewrite home-layout serial so the launcher keeps it (see above)
-      _tt=$(_ms); remap_per_pkg "$USERDIR"; _tlog reown-ce "$_tt"
+      # NWP-20261210-04: the CE reown and relabel run as ONE background job, beside the #de restore and its tail below.
+      # It is safe because nothing in the foreground writes $USERDIR until the barrier: the #de restore writes only
+      # $DEDIR (it only READS $USERDIR, the chooser's keep list), and its tail re-owns and relabels $DEDIR. The first
+      # later step that writes $USERDIR is acct_restore: it removes the chooser's nowhere-acct-marks (acct_mark_file,
+      # under /data/user/<uid>). So the ONE barrier (`wait "$_cerp"`) sits just before acct_restore, at this branch's
+      # top level, and every path reaches it, a #de exit 5 included: the MMS remap and the verdict follow it. (#media, #apps
+      # and keystore_fetch run in the lanes started at the vault's landing, NWP-20261210-03; none writes $USERDIR, so none
+      # waits for this job.) relabel_launcher stays in the foreground BEFORE the fork: it writes launcher.db as
+      # root, and the reown must follow it. TIMING reown-ce and restorecon-ce now time the background job; TIMING
+      # reown-ce-wait is what the sign-in still waits for it, and the CE `_ssum reown` counts that wait
+      # (core/agent/signin_summary.go).
       # -D ("apply to /data/data too") is REQUIRED. toybox restorecon REFUSES to descend into app-data
       # trees without it, so `restorecon -R` on /data/user/N relabels NOTHING -- it considers the userdir
       # root and stops. Measured on lynx 2026-08-06 with a dry run: `-R` -> 7 paths, `-R -D` -> 1566.
@@ -11279,8 +12170,8 @@ case "$op" in
 #
 # The libselinux bug is fixed separately (editions/endospore/build/patches/libselinux-pkgdir-uid-aliasing.sh),
 # so -D would be safe again. It is still not re-enabled here: nothing needs it.
-      _tt=$(_ms); restorecon -R "$USERDIR" 2>> "$LOG"; _tlog restorecon-ce "$_tt"
-      _ssum reown "$_sumt"
+      ( _cett=$(_ms); remap_per_pkg "$USERDIR"; _tlog reown-ce "$_cett"; _cett=$(_ms); restorecon -R "$USERDIR" 2>> "$LOG"; _tlog restorecon-ce "$_cett" ) &
+      _cerp=$!
       # Roam completeness: also restore device-encrypted per-user app data and the shared media tree
       # (photos, downloads, files), each on its own store ref (name#de / name#media) so a fresh profile
       # simply has none yet and the restore is a harmless no-op. Best-effort: a failure here other than exit 5 does
@@ -11289,16 +12180,20 @@ case "$op" in
       # status, or `skip` when the dir is absent) for the IN line below; the tail still runs only on 0.
       DEDIR="/data/user_de/$uid"
       _derc=skip
-      [ -d "$DEDIR" ] && { NOWHERE_PHASE=secure NOWHERE_PARK_KEEP="$(od_park_var keep)" NOWHERE_PARK_SHIPPED="$(od_park_var shipped)" NOWHERE_UNFETCHED_LIST="$(od_park_var de)" "$AGENT" restore s3 "${name}#de" "$(pw "$pass")" "$DEDIR" >> "$LOG" 2>&1; _derc=$?; }
+      [ -d "$DEDIR" ] && { NOWHERE_DOWNLOAD_WORKERS="$_inshare" NOWHERE_PHASE=secure NOWHERE_PARK_KEEP="$(od_park_var keep)" NOWHERE_PARK_SHIPPED="$(od_park_var shipped)" NOWHERE_UNFETCHED_LIST="$(od_park_var de)" NOWHERE_SE_SECRET="$(pwv "$_se_v")" NOWHERE_FIDO2_HMAC="$(pwv "$_fh_v")" "$AGENT" restore s3 "${name}#de" "$(pw "$pass")" "$DEDIR" >> "$LOG" 2>&1; _derc=$?; }
       if [ "$_derc" = 0 ]; then
         _sumt=$(_ms)
         _tt=$(_ms); remap_per_pkg "$DEDIR"; _tlog reown-de "$_tt"; _tt=$(_ms); restorecon -R "$DEDIR" 2>> "$LOG"; _tlog restorecon-de "$_tt"
         _ssum reown "$_sumt"
       fi
       # NWP-20261124-05: a #de restore that could not reach the store ends the sign-in (the verdict below). The
-      # account, MMS, #media, #apps and #keys steps would spend minutes failing on the same dead network, so none of
-      # them runs.
+      # account and MMS steps would spend minutes failing on the same dead network, so neither runs. (Superseded by
+      # NWP-20261210-03: "#media, #apps and #keys ... none of them runs" -- those lanes started at the vault's landing,
+      # and the join waits for them, each bounded by its own store windows.)
       if [ "$_derc" = 5 ]; then _innet=de; fi
+      # NWP-20261210-04: the ONE barrier for the CE job above, before acct_restore (the first later writer of $USERDIR: it
+      # removes the account marks there), on every path out of this branch.
+      if [ -n "$_cerp" ]; then _sumt=$(_ms); _tt=$(_ms); wait "$_cerp" 2>/dev/null; _tlog reown-ce-wait "$_tt"; _ssum reown "$_sumt"; _cerp=""; fi
       if [ -z "$_innet" ]; then
         _sumt=$(_ms)
         acct_restore "$uid"; _acrc=$?   # #DIA-20260802-02: restore the AccountManager account rows (name#sys) BEFORE provisionRoamedApps installs the authenticator
@@ -11306,7 +12201,7 @@ case "$op" in
         # NWP-20261207-06 (h62 #6): a #sys restore that could not reach the store ends the sign-in (the verdict below).
         if [ "$_acrc" = 5 ]; then _innet=sys; fi
       fi
-      if [ -z "$_innet" ]; then   # NWP-20261207-06 (h62 #6): a #de or #sys exit 5 skips the MMS remap, #media and #apps
+      if [ -z "$_innet" ]; then   # NWP-20261207-06 (h62 #6): a #de or #sys exit 5 skips the MMS remap (superseded by NWP-20261210-03: "#media and #apps" -- lanes)
         # #148: the MMS `part._data` column stores an ABSOLUTE /data/user_de/<sealing-uid>/ path with the user
         # id baked in. The CE mmssms.db (restored with the apps phase) and the DE app_parts files (restored just
         # above) both roam to THIS user, but the paths INSIDE the db still name the OLD user -> MmsProvider.openFile
@@ -11334,64 +12229,68 @@ case "$op" in
           esac
           unset _mmsrc
         fi
-        MEDIADIR="/data/media/$uid"
-        _mdrc=skip
-        _tt=$(_ms)
-        [ -d "$MEDIADIR" ] && { NOWHERE_PHASE=media "$AGENT" restore s3 "${name}#media" "$(pw "$pass")" "$MEDIADIR" >> "$LOG" 2>&1; _mdrc=$?; }
-        # NWP-20261202-18: the pre-gate #media restore's wall time, failed ones included. Logged HERE, before
-        # restore_media_tail, which overwrites _tt. No media dir, no restore, no line.
-        [ "$_mdrc" = skip ] || _tlog restore-media "$_tt"
-        if [ "$_mdrc" = 0 ]; then
-          _sumt=$(_ms)
-          restore_media_tail "$MEDIADIR"
-          _ssum reown "$_sumt"
-          rescan_media "$uid"   # NWP-20261113-45: the provider scanned before this restore; ask it to index what landed
-        fi
-        rm -f "$STATE/media.rows" 2>> "$LOG"   # NWP-20261130-02: the session's file names, gone on every path
-        if [ "$_mdrc" = 5 ]; then _innet=media; fi
-        # App CODE restore (#200): restore the opted-in user-installed APK bytes (the name#apps scope) into the
-        # USER-0 chooser's files dir so the device-owner chooser can PackageInstaller them back for the roamed
-        # user (the su:s0 worker can't pm-install -- the device-owner wall). Root writes there, then chown+relabel
-        # to the chooser's user-0 uid so it reads its own files. An absent scope (nothing opted in) or a failed
-        # restore just leaves no .appcode → the chooser installs nothing, and the sign-in lands. The exception is
-        # exit 5, the store could not be reached (NWP-20261201-16, docs/product-decisions.md, "twenty answers to
-        # harvest 60 ...", #5): that ends the sign-in at the verdict below, which is why this block runs before it
-        # and not with the landing steps. The chooser deletes .appcode after install (amnesia); we rm it first so a
-        # stale set from a prior login can't linger. A #de, #sys or #media exit 5 has already ended the sign-in, so it
-        # skips this.
-        if [ -z "$_innet" ]; then
-          CHOOSER0="/data/user/0/com.nowhere.chooser/files"
-          APPCODE="$CHOOSER0/.appcode"
-          rm -rf "$APPCODE"
-          # _tt spans the WALL of the agent invocation (fork + conf + head resolution + restore), which the
-          # agent's own key=/restore= line does NOT fully cover -- head= starts inside the process. The delta
-          # between this and the agent's head+restore sum is process start + pw() staging + rm/mkdir.
-          _tt=$(_ms)
-          # _aprc is the agent's exit status, or `skip` when it never ran (no chooser files dir, or the mkdir failed).
-          _aprc=skip
-          if [ -d "$CHOOSER0" ] && mkdir -p "$APPCODE" 2>>"$LOG"; then
-            NOWHERE_PHASE=appcode "$AGENT" restore s3 "${name}#apps" "$(pw "$pass")" "$APPCODE" >> "$LOG" 2>&1
-            _aprc=$?
-          fi
-          if [ "$_aprc" = 0 ] && [ -f "$APPCODE/manifest.tsv" ]; then
-            _tlog appcode-agent "$_tt"
-            _tt=$(_ms)
-            cuid=$(stat -c %u "$CHOOSER0" 2>/dev/null)
-            [ -n "$cuid" ] && chown -R "$cuid:$cuid" "$APPCODE" 2>>"$LOG"
-            restorecon -R -D "$APPCODE" 2>>"$LOG"
-            _tlog appcode-chown "$_tt"
-            print -r -- "[roamd] IN $(qn "$name") #apps code restored → user0 chooser $(date)" >> "$LOG"
-          else
-            _tlog appcode-agent "$_tt"   # the blank/failed arm still reports the wall -- an empty scope's cost was invisible before
-            rm -rf "$APPCODE"
-          fi
-          if [ "$_aprc" = 5 ]; then _innet=apps; fi
-        fi
       fi
-      # NWP-20261207-06 (h62 #6): the #keys fetch runs here, before the verdict, so that its exit 5 ends the sign-in as
-      # BLANK NET. It stages into keystore-in/<uid>.pre; keystore_restore promotes that at the landing, after
-      # ks_signin_reset. An earlier exit 5 skips it.
-      if [ -z "$_innet" ]; then keystore_fetch; _ksrc=$?; if [ "$_ksrc" = 5 ]; then _innet=keys; fi; fi
+      # NWP-20261210-03: the JOIN. The foreground chain has ended. Relay the lanes' progress in the order M (#media),
+      # T (#media's tail), A, K: while a source is unfinished, its file is copied over NOWHERE_PROGRESS every 0.2 s
+      # (temp + mv -f), then the next source, never back. M is finished when the tail wrote its first line (T is not
+      # empty) or lane M ended; T, A and K when their lane ended. A lane has ended when its status file exists, or its
+      # pid is gone or a zombie (dash reaps a background job only at `wait`). DWELL: a source that showed a frame keeps it on
+      # NOWHERE_PROGRESS for at least three ticks (0.6 s) before the next one replaces it, because the login daemon
+      # reads the file every 500 ms: a lane that ended before the foreground chain would otherwise flash past unseen,
+      # and its label would never show. Each lane is then waited for by its own pid, never a bare `wait`, and its
+      # status read back. A missing or unreadable status file (a lane that died) reads as 1, never 0.
+      for _ln in M T A K; do
+        case "$_ln" in M|T) _lp="$_mpid"; _lf=M ;; A) _lp="$_apid"; _lf=A ;; *) _lp="$_kpid"; _lf=K ;; esac
+        [ -n "$_lp" ] || continue
+        _lk=-1   # ticks slept since this source's first frame was shown; -1: none shown yet
+        while :; do
+          _ld=""
+          if [ -e "$_inlanes/$_lf" ] || { [ "$_ln" = M ] && [ -n "${NOWHERE_PROGRESS:-}" ] && [ -s "$NOWHERE_PROGRESS.T" ]; } || ! kill -0 "$_lp" 2>/dev/null; then
+            _ld=1
+          else
+            _lst=""; read -r _lst 2>/dev/null < "/proc/$_lp/stat"
+            case "$_lst" in ''|*') Z '*|*') X '*) _ld=1 ;; esac
+          fi
+          if [ -n "${NOWHERE_PROGRESS:-}" ] && [ -s "$NOWHERE_PROGRESS.$_ln" ] && cp -f "$NOWHERE_PROGRESS.$_ln" "$_inlanes/relay" 2>/dev/null; then
+            mv -f "$_inlanes/relay" "$NOWHERE_PROGRESS" 2>/dev/null && [ "$_lk" -lt 0 ] && _lk=0
+          fi
+          if [ -n "$_ld" ]; then
+            [ "$_lk" -lt 0 ] && break   # nothing to show
+            [ "$_lk" -ge 3 ] && break   # shown for 0.6 s: the daemon has read it
+          fi
+          sleep 0.2
+          [ "$_lk" -ge 0 ] && _lk=$((_lk+1))
+        done
+      done
+      for _lp in "$_mpid" "$_apid" "$_kpid"; do
+        [ -n "$_lp" ] && wait "$_lp"
+      done
+      _mdrc=1; _aprc=1; _ksrc=1
+      if [ -f "$_inlanes/M" ]; then read -r _mdrc < "$_inlanes/M" || _mdrc=1; fi
+      if [ -f "$_inlanes/A" ]; then read -r _aprc < "$_inlanes/A" || _aprc=1; fi
+      if [ -f "$_inlanes/K" ]; then read -r _ksrc < "$_inlanes/K" || _ksrc=1; fi
+      case "$_mdrc" in skip|[0-9]|[0-9][0-9]|[0-9][0-9][0-9]) ;; *) _mdrc=1 ;; esac
+      case "$_aprc" in skip|[0-9]|[0-9][0-9]|[0-9][0-9][0-9]) ;; *) _aprc=1 ;; esac
+      case "$_ksrc" in [0-9]|[0-9][0-9]|[0-9][0-9][0-9]) ;; *) _ksrc=1 ;; esac
+      _tlog in-lanes "$_tlanes"
+      rm -rf "$_inlanes" 2>> "$LOG"
+      if [ -n "${NOWHERE_PROGRESS:-}" ]; then
+        for _ln in M T A K; do rm -f "$NOWHERE_PROGRESS.$_ln" "$NOWHERE_PROGRESS.$_ln.tmp" 2>> "$LOG"; done
+      fi
+      unset _inshare _ln _lp _lf _lk _ld _lst _tlanes
+      # The scope verdict's precedence, as decided: de, sys, media, apps, keys. The first restore that could not reach
+      # the store (exit 5) names _innet; the verdict below reads it. The foreground's own _innet (de or sys) only
+      # skipped its later steps; the verdict is decided here, from every status.
+      _innet=""
+      if [ "$_derc" = 5 ]; then _innet=de
+      elif [ "${_acrc:-}" = 5 ]; then _innet=sys
+      elif [ "$_mdrc" = 5 ]; then _innet=media
+      elif [ "$_aprc" = 5 ]; then _innet=apps
+      elif [ "$_ksrc" = 5 ]; then _innet=keys
+      fi
+      if [ -z "$_innet" ] && [ "$_mdrc" = 0 ]; then
+        rescan_media "$uid"   # NWP-20261113-45: the provider scanned before this restore; ask it to index what landed
+      fi
     else
       # $? is still the vault restore's status: it is the last command run, as the elif's condition. Read it
       # first, before anything else runs.
@@ -11425,6 +12324,9 @@ case "$op" in
       # NWP-20261207-06: nothing promotes keystore-in/<uid>.pre on this path. keystore_fetch removes it on its own exit 5;
       # this removal also covers a copy that a crashed earlier attempt left, so no fetched #keys bundle stays staged.
       if _kpd=$(ks_in_dir); then rm -rf "$_kpd.pre" 2>> "$LOG"; fi
+      # NWP-20261210-03: lane A may have left an #apps set for user 0's chooser; nothing installs it on this path. The
+      # lane dir is removed at the join; this covers it again.
+      rm -rf "$APPCODE" "$_inlanes" 2>> "$LOG"
       echo "BLANK NET" > "$RES"
     elif [ "$_ceok" = 1 ]; then
       # NWP-20261117-16: a refused or failed sign-in is a no-op on the live or cold-locked session (the arm's rule),
@@ -11770,7 +12672,7 @@ case "$op" in
     # stopMediad right before the LOGOFF seal.
     # #81: a fido2 2FA profile's DK is behind passphrase + key -- the push (seal) can't open the vault with
     # the passphrase alone. Reuse the login-cached hmac stash so the logoff seal opens it WITHOUT a key touch.
-    [ -f "$STATE/.fido2hmac" ] && export NOWHERE_FIDO2_HMAC="$(cat "$STATE/.fido2hmac")"
+    [ -f "$STATE/.fido2hmac" ] && _fh_v="$(cat "$STATE/.fido2hmac")"
     # DIA-20260804-04: apps the user switched OFF in "Your apps". Until now the keep-set gated only
     # appcode_seal (the APK bytes -> name#apps) while the three data pushes below took the tree WHOLESALE, so a
     # switched-off app's data stayed sealed, billed and roaming forever even though the app was never
@@ -11898,7 +12800,7 @@ case "$op" in
         NOWHERE_HELD_LIST="$HELDLIST" NOWHERE_CLAIMS_OUT="$CLAIMSOUT" \
         NOWHERE_PUSH_STAT="$STATE/pushstat.$1" \
         NOWHERE_UNFETCHED_LIST="$_unf" \
-        "$AGENT" push s3 "$2" "$(pw "$pass")" "$3" >> "$LOG" 2>&1
+        NOWHERE_SE_SECRET="$(pwv "$_se_v")" NOWHERE_FIDO2_HMAC="$(pwv "$_fh_v")" "$AGENT" push s3 "$2" "$(pw "$pass")" "$3" >> "$LOG" 2>&1
       _r=$?; _c=$(_cause "$_r")
       _k=$(_pstat "$STATE/pushstat.$1"); _split "$1=$(( $(_ms) - _t0 ))ms/${_k}KiB"   # NWP-20261123-06
       [ "$_c" = ok ] || _note "$1" "$_c"
@@ -11922,6 +12824,7 @@ case "$op" in
     }
     _push vault "$name" "$USERDIR"
     [ -d "/data/user_de/$uid" ] && _push de    "${name}#de"    "/data/user_de/$uid"
+    _de_end=""; [ -d "/data/user_de/$uid" ] && [ "$stopped" = 0 ] && _de_end=$(_ms)   # NWP-20261206-22: when the #de push finished reading the call log
     # NWP-20260908-03: the EXTERNAL mediad serves /data/media/$uid but caches under the CHOOSER’s CE dir, in
     # `.nowhere-media-ext` -- a different root AND a different basename from the CE instance. So the deletion
     # tombstones for this scope live at a path that is NOT under the tree being sealed, and the agent cannot
@@ -12082,6 +12985,8 @@ case "$op" in
       # session is genuinely saved. But if #sys or #apps did not seal, say which and why, as a SUFFIX. The verb
       # stays OK so every existing reader keeps working (the daemon now prefix-matches; see handleLogout), and
       # a reader that ignores the suffix behaves exactly as it did before.
+      # NWP-20261206-22: only a seal whose data scopes landed reaches the reap, so only it can lose the call.
+      calllog_late "$uid" "$_de_end"
       if [ -n "$parts" ]; then
         print -r -- "[roamd] OUT $(qn "$name") (user $uid) +de +media -- PARTIAL: $parts $(date)" >> "$LOG"
         _ssplit
@@ -12322,6 +13227,37 @@ EOF_MT
     echo "[roamd] freemedia user $uid freed ${freed}B $(date)" >> "$LOG"
     echo "OK $freed" > "$RES"
     ;;
+  freemediakeys)
+    # NWP-20261207-14 (h51 #4): "Free on this phone" for ONE top-level folder row. The login daemon, the only side that
+    # can open the #media head, lists the cache keys of that folder's on-demand files in $STATE/freemedia.keys (one per
+    # line, 0600, the sealdelta.idx handoff); only those entries go. Same two caches and same entry rule as freemedia
+    # (a top-level regular file named exactly 64 lowercase hex), so the same set is kept by construction: `.deleted`,
+    # `.fetch-*`, a `.part`/`.have` pair and `.under/` (the user's real files) are never named by `$CACHE/<64 hex>`,
+    # and parked app data (`.nowhere-odhold`) is not in either dir. A line that is not exactly 64 lowercase hex is
+    # skipped and never used in a path. No list -> ERR-NOKEYS and nothing deleted (never the all-cache purge).
+    KEYS="$STATE/freemedia.keys"
+    if [ ! -f "$KEYS" ]; then
+      echo "[roamd] freemediakeys user $uid: no key list $(date)" >> "$LOG"
+      echo "ERR-NOKEYS" > "$RES"
+    else
+      freed=0; n=0
+      while IFS= read -r key || [ -n "$key" ]; do
+        [ "${#key}" -eq 64 ] || continue
+        case "$key" in *[!0-9a-f]*) continue;; esac
+        n=$((n + 1))
+        for CACHE in "$USERDIR/com.nowhere.chooser/files/.nowhere-media" \
+                     "$USERDIR/com.nowhere.chooser/files/.nowhere-media-ext"; do
+          f="$CACHE/$key"
+          [ -f "$f" ] && [ ! -L "$f" ] || continue
+          sz=$(stat -c %s "$f" 2>/dev/null); case "$sz" in ''|*[!0-9]*) sz=0;; esac
+          rm -f "$f" 2>> "$LOG" && freed=$((freed + sz))
+        done
+      done < "$KEYS"
+      rm -f "$KEYS"
+      echo "[roamd] freemediakeys user $uid freed ${freed}B of $n listed $(date)" >> "$LOG"
+      echo "OK $freed" > "$RES"
+    fi
+    ;;
   sealdelta)
     # #145 S5 (NWP-20260901-29): "changed since the last save" -- a stat-only walk of the three data
     # scopes with the daemon-dumped deferred index ($STATE/sealdelta.idx) for the exact half. Runs HERE
@@ -12425,6 +13361,32 @@ EOF_MT
     unset _geh
     exit 0
     ;;
+  mediaexits)
+    # NWP-20261208-06: why this session's media service (MediaProvider) exited, for REPORT-ISSUE (the framework's
+    # ApplicationExitInfo). The gmsexits arm above, with one dumpsys per media module name: the AOSP module
+    # (GrapheneOS) and the Google one. The rc line carries the first non-zero exit status of the two. The agent keeps
+    # this user's records of those two processes and only their words and digits (parseExitInfo), so $RES and the log
+    # line carry counts and fixed words, never a description. dumpsys's stderr goes to /dev/null, never $LOG (the
+    # gmsexits arm says why).
+    # ⚠ RENAME INTO $RES, never write in place, and read the log line's reply from $RES.part BEFORE the mv: the uiderrors
+    # arm above says why for both.
+    { printf 'nowhere-now=%s %s\n' "$(date +%s)" "$(date '+%Y-%m-%d %H:%M:%S')"
+      dumpsys activity exit-info com.android.providers.media.module </dev/null 2>/dev/null
+      _mxa=$?
+      dumpsys activity exit-info com.google.android.providers.media.module </dev/null 2>/dev/null
+      _mxb=$?
+      [ "$_mxa" != 0 ] || _mxa=$_mxb
+      printf '\nnowhere-dump-rc=%s\n' "$_mxa"
+    } | "$AGENT" mediaexits "$uid" > "$RES.part" 2>>"$LOG" \
+      || echo "ERR-READ the agent exited non-zero" > "$RES.part"
+    [ -s "$RES.part" ] || echo "ERR-READ the agent printed nothing" > "$RES.part"
+    chmod 600 "$RES.part" 2>>"$LOG"
+    _mxh=$(head -n 1 "$RES.part" 2>/dev/null | cut -c1-160)
+    mv -f "$RES.part" "$RES" 2>>"$LOG"
+    echo "[roamd] mediaexits -> $_mxh $(date)" >> "$LOG"
+    unset _mxh
+    exit 0
+    ;;
   healthprobe)
     # NWP-20261201-08: one read of the process table for the login daemon's health checks; why it is here and on the
     # RO lane is above the allowlist. The agent reduces the dump to numbers and one state token, so no app name reaches $RES.
@@ -12453,10 +13415,13 @@ EOF_MT
     #   pend  nowhere_vpn_lockdown_pending names that same app: 1, else 0 (empty included); - unreadable
     # A read is unreadable when `settings` exits non-zero, WHATEVER it printed: a failed read never yields a 1 or a 0.
     #   net   the app's INTERNET grant (GrapheneOS's Network permission): 1, 0, - (no app, or the dump does not say)
+    #   refused  NWP-20261208-10: $STATE/.vpnwhy.<uid>, the last always-on apply Android refused this session and the
+    #         count (vpn_apply_choice): none = no record; - = a bad uid, or a record not exactly that shape; else
+    #         n<N>.inst<c>.hid<c>.en<c>.stop<c>.svc<c>.tsdk<c>.usr<u>.lock<l>, REBUILT from the checked fields, never copied.
     # ⚠ PRIVACY: the package is compared HERE and never printed, logged or sent; it lives only in _vsapp. ⚠ settings
     # and dumpsys stderr go to /dev/null, NEVER to $LOG (see above bt_default_name). ⚠ RENAME INTO $RES, and read the
     # log line's reply from $RES.part BEFORE the mv, as the uiderrors arm does.
-    _vsa=-; _vsl=-; _vsp=-; _vsn=-; _vsapp=""; _vsv=""
+    _vsa=-; _vsl=-; _vsp=-; _vsn=-; _vsr=-; _vsapp=""; _vsv=""
     case "$uid" in
       ''|*[!0-9]*) ;;
       *)
@@ -12477,14 +13442,19 @@ EOF_MT
         fi
         [ "$_vsa" = 1 ] && _vsn=$(vpn_net_state "$uid" "$_vsapp")
         case "$_vsn" in 1|0) ;; *) _vsn=- ;; esac
+        _vsr=none
+        if [ -e "$STATE/.vpnwhy.$uid" ]; then
+          # vpn_refusal_token checks the WHOLE file: one line, every field in its closed set, nothing else.
+          _vsr=$(vpn_refusal_token "$STATE/.vpnwhy.$uid") || _vsr=-
+        fi
         ;;
     esac
-    printf 'VPNSTATE app=%s lock=%s pend=%s net=%s\n' "$_vsa" "$_vsl" "$_vsp" "$_vsn" > "$RES.part"
+    printf 'VPNSTATE app=%s lock=%s pend=%s net=%s refused=%s\n' "$_vsa" "$_vsl" "$_vsp" "$_vsn" "$_vsr" > "$RES.part"
     chmod 600 "$RES.part" 2>>"$LOG"
     _vsh=$(head -n 1 "$RES.part" 2>/dev/null | cut -c1-160)
     mv -f "$RES.part" "$RES" 2>>"$LOG"
     echo "[roamd] vpnstate user $uid -> $_vsh $(date)" >> "$LOG"
-    unset _vsa _vsl _vsp _vsn _vsapp _vsv _vsh
+    unset _vsa _vsl _vsp _vsn _vsr _vsapp _vsv _vsh
     exit 0
     ;;
   materializeapp)
@@ -12500,10 +13470,10 @@ EOF_MT
     # NWP-20261014-20: the Android package grammar (pkgname_ok, the same check as validPkgName in pkgname.go).
     pkgname_ok "$pkg" || { echo "[roamd] materializeapp bad pkg $(date)" >> "$LOG"; echo "ERR-PKG" > "$RES"; chmod 600 "$RES"; exit 0; }
     # A FIDO2-2FA identity DROPPED its pass-only vault slot at enrollment, so name#apps opens only via the fido2
-    # keyslot -- which needs the login-cached hmac in env (the `out` and
-    # `fido2-enroll` ops export it the same way). Without
+    # keyslot -- which needs the login-cached hmac (the `out` and
+    # `fido2-enroll` ops hold it in _fh_v the same way, staged per agent call). Without
     # this the restore-app resolveKey fails for a key-enrolled profile with no SE and the tap can never install.
-    [ -f "$STATE/.fido2hmac" ] && export NOWHERE_FIDO2_HMAC="$(cat "$STATE/.fido2hmac")"
+    [ -f "$STATE/.fido2hmac" ] && _fh_v="$(cat "$STATE/.fido2hmac")"
     CHOOSERU="$USERDIR/com.nowhere.chooser/files"   # $USERDIR=/data/user/$uid -- the ROAMED user (the receiver)
     APPCODE="$CHOOSERU/.appcode"
     rm -rf "$APPCODE/$pkg"                 # clear any stale set for THIS pkg; leave sibling in-flight apps alone
@@ -12523,7 +13493,7 @@ EOF_MT
     # leaves nothing: the failure branch below removes the partial set. $STATE is the tmpfs, so the marker never
     # outlives a power-off. The env assignment is inline, not exported: only restore-app reads it.
     if [ -d "$CHOOSERU" ] && mkdir -p "$APPCODE" 2>>"$LOG" \
-       && NOWHERE_PHASE=apps NOWHERE_OD_CANCEL="$STATE/od-cancel" "$AGENT" restore-app s3 "${name}#apps" "$(pw "$pass")" "$pkg" "$APPCODE" >> "$LOG" 2>&1 \
+       && NOWHERE_PHASE=apps NOWHERE_OD_CANCEL="$STATE/od-cancel" NOWHERE_SE_SECRET="$(pwv "$_se_v")" NOWHERE_FIDO2_HMAC="$(pwv "$_fh_v")" "$AGENT" restore-app s3 "${name}#apps" "$(pw "$pass")" "$pkg" "$APPCODE" >> "$LOG" 2>&1 \
        && [ -d "$APPCODE/$pkg" ]; then
       cuid=$(stat -c %u "$CHOOSERU" 2>/dev/null)
       [ -n "$cuid" ] && chown -R "$cuid:$cuid" "$APPCODE" 2>>"$LOG"
@@ -12595,9 +13565,14 @@ EOF_MT
     # timings go to $STATE/grant-timing at its end, for the issue report (core/agent/grant_timing.go). Remove the last
     # grant's file first, so a grant cut off before its end leaves no earlier session's figures.
     if [ -n "${STATE:-}" ]; then rm -f "$STATE/grant-timing" 2>/dev/null; fi
+    # NWP-20261210-06: and the last flagged grant's VPN answer (below), so the agent never reads an earlier one.
+    if [ -n "${STATE:-}" ]; then rm -f "$STATE/.grantvpn.$uid" 2>/dev/null; fi
     # NWP-20261202-34: also drop the last session's odrestore du timings (od_watched): an app's data size is a fact
     # about the profile, so a report must never carry an earlier session's sizes.
     if [ -n "${STATE:-}" ]; then rm -f "$STATE/od-grow-timing" 2>/dev/null; fi
+    # NWP-20261206-14: also drop the last cold-lock resume's re-created accounts_de.db figures (de_recreated_note):
+    # a new sign-in is a new session, so a report must not carry an earlier session's resume.
+    if [ -n "${STATE:-}" ]; then rm -f "$STATE/coldde-unpark" 2>/dev/null; fi
     _gt0=$(_ms)
     # #46: pin launcher3 as THIS roamed user's HOME. Runs HERE (not in the roam-in op) because the chooser
     # triggers `grant` as its LAST login step -- AFTER provisionRoamedApps's install-existing, which re-resolves
@@ -12679,6 +13654,16 @@ EOF_MT
              > "$STATE/grant-timing.tmp" 2>/dev/null && mv -f "$STATE/grant-timing.tmp" "$STATE/grant-timing" 2>/dev/null
          fi ;;
     esac
+    # NWP-20261210-06 (backlog: A nearly empty profile takes about 85 s from submit to home, cause (6)): a grant the
+    # sign-in flagged (line 7 = vpn) runs the sign-in's first always-on VPN apply here, last, so no vpnup run queues
+    # ahead of the grant. Its answer (vpn_apply's token: first line, at most 40 chars of a safe set) goes to the RAM
+    # tmpfs $STATE/.grantvpn.<uid> by a temp file and a rename, BEFORE the reply; the reply stays OK.
+    if [ "${srcunit:-}" = vpn ] && [ -n "${STATE:-}" ]; then
+      _tt=$(_ms); _gv=$(vpn_apply "$uid"); _tlog grant-vpn "$_tt"
+      _gv=$(printf '%s\n' "$_gv" | head -n 1 | tr -cd 'A-Za-z0-9 _-' | cut -c 1-40)
+      printf '%s\n' "$_gv" > "$STATE/.grantvpn.$uid.tmp" 2>/dev/null \
+        && mv -f "$STATE/.grantvpn.$uid.tmp" "$STATE/.grantvpn.$uid" 2>/dev/null
+    fi
     echo "OK" > "$RES"
     ;;
   seedssaid)
@@ -12697,6 +13682,10 @@ EOF_MT
     # h49 #7 (NWP-20261119-20): roamd's own time for a staging attempt is logged on its own line below, a number and
     # the uid only, so a sign-in's seed-ssaid can be split into roamd's time and the agent's poll.
     _ss_t0=$(_ms)
+    # NWP-20261207-16: $STATE/ssaid-prefill holds the census of the table SettingsProvider pre-filled (below). It
+    # is removed first, so a sign-in refused here (ERR-KEY, ERR-NOUSER, ERR-STALE) leaves no older session's fact.
+    [ -n "${STATE:-}" ] && rm -f "$STATE/ssaid-prefill" 2>/dev/null
+    _sc=
     _uk="$sesec"
     case "$_uk" in
       [0-9A-Fa-f]*) ;;
@@ -12740,9 +13729,14 @@ EOF_MT
     # user with this same (recycled) id makes SettingsProvider load a userkey from disk, so generateUserKeyLocked
     # is never called and the seed below is never consumed. This user has not started yet -- it cannot have
     # legitimate ssaid state -- so the file is stale by construction. Remove it.
+    # NWP-20261207-16: count it first. After a flash or an OTA, SettingsProvider's upgrade step may pre-fill it for
+    # the bundled apps with one shared value (the backlog row "On a boot after a flash or an OTA, the bundled apps of
+    # every sign-in share one ANDROID_ID"). ssaid_census prints counts and fixed classes only, never a value.
     _stale="/data/system/users/$uid/settings_ssaid.xml"
     # The guard takes -L too: -e follows a link, so a dangling link would skip the rm and be refused below.
     if [ -e "$_stale" ] || [ -L "$_stale" ]; then
+      _sc=$(ssaid_census "$_stale")
+      echo "[roamd] seedssaid stale table user $uid: ${_sc#v=1 } (NWP-20261207-16) $(date)" >> "$LOG"
       echo "[roamd] seedssaid removing stale ssaid from a recycled user id $uid $(date)" >> "$LOG"
       rm -f "$_stale" 2>>"$LOG"
     fi
@@ -12753,6 +13747,13 @@ EOF_MT
     if [ -e "$_stale" ] || [ -L "$_stale" ]; then
       echo "[roamd] seedssaid user $uid: the stale settings_ssaid.xml could NOT be removed -- NOT staging (the framework would load the old key) (NWP-20261127-10) $(date)" >> "$LOG"
       echo "ERR-STALE" > "$RES"; chmod 600 "$RES"; exit 0
+    fi
+    # NWP-20261207-16: the census for the session's issue report (core/agent/ssaid_prefill.go), `v=1 none` when
+    # there was no stale file. Temp + mv, so the reader never sees half a line.
+    [ -n "$_sc" ] || _sc="v=1 none"
+    if [ -n "${STATE:-}" ]; then
+      { echo "$_sc" > "$STATE/ssaid-prefill.tmp" && mv -f "$STATE/ssaid-prefill.tmp" "$STATE/ssaid-prefill"; } 2>/dev/null \
+        || rm -f "$STATE/ssaid-prefill.tmp" 2>/dev/null
     fi
     _dst="/data/system/users/$uid/nowhere-ssaid-seed"
     _tmp="$_dst.tmp"   # same dir => same fs + same SELinux context, so the rename is atomic and label-safe
@@ -12941,11 +13942,21 @@ EOF_MT
         # NWP-20261121-02: on an external volume a live mediad overlay inside $dst refuses every write under it (Q114
         # keeps Android/data deferred), so od_served_copy copies around the entries it serves. Only when mediad has
         # published media-unders: with none, or none live under $dst (rc 2), the plain copy below runs as before.
-        _odsc=2; _odsk=
+        # NWP-20261208-12: the arm reads the session record (NWP-20261204-04, below) with $dst's current inode. A match
+        # passes MODE `nc` (copy with `cp -a -n`), else `rec`. od_served_copy writes the record before its hidden-dir
+        # chown/chcon pass, where a stop on this path most likely lands. The `(ext)` line is written after the call and
+        # only when the served path ran (rc not 2): with rc 2 the plain path logs its own line from the same record, so
+        # one attempt never logs two lines. _odin stays set, so the line goes once the hold is gone.
+        _odsc=2; _odsk=; _odin=; _odmd=
         case "$vol" in
           /data/media/*)
             if [ -n "${STATE:-}" ] && [ -s "$STATE/media-unders" ]; then
-              _ce=$(od_watched "$dst" od_served_copy "$src" "$dst"); _odsc=$?
+              _odmd=rec; _odin=$(stat -c %i "$dst" 2>/dev/null); case "$_odin" in ''|*[!0-9]*) _odin= ;; esac
+              [ -n "$_odin" ] && grep -qxF -- "$_odin $dst" "$STATE/.odcopied.$uid" 2>/dev/null && _odmd=nc
+              _ce=$(od_watched "$dst" od_served_copy "$src" "$dst" "$_odmd"); _odsc=$?
+              if [ "$_odmd" = nc ] && [ "$_odsc" != 2 ]; then
+                echo "[roamd] odrestore: copy already finished this session on this volume (ext) -- copying only what the destination lacks (NWP-20261208-12) $(date)" >> "$LOG"
+              fi
               case "$_ce" in *served=*) _odsk=${_ce##*served=}; _ce=${_ce%served=*}; _ce=${_ce%?};; esac
               case "$_odsc:$_odsk" in 2:*) _odsk= ;; *:|*:*[!0-9]*) _odsk=0 ;; esac
             fi ;;
@@ -12962,9 +13973,11 @@ EOF_MT
         # so "NEVER destroy the only copy" holds whatever the inode says. If the handset's toybox refuses -n, the copy
         # fails, the hold is KEPT and the reply refuses: the safe direction. No record, an other inode, an unreadable
         # inode or an unset $STATE: the plain `cp -a` as before. A failed copy writes and removes no line. The line
-        # goes once the hold is gone. od_served_copy's path (an external volume with live mediad unders) is NOT
-        # changed: its retry still copies in full. The reap and the `in` op clear the record (a uid can be reused).
-        _odpl=; _odin=; [ "$_odsc" = 2 ] && _odpl=1
+        # goes once the hold is gone. ~~od_served_copy's path (an external volume with live mediad unders) is NOT
+        # changed: its retry still copies in full.~~ (superseded by NWP-20261208-12: od_served_copy writes the same
+        # record before its hidden-dir pass, and its retry copies with `cp -a -n`.) The reap and the `in` op clear the
+        # record (a uid can be reused).
+        _odpl=; [ "$_odsc" = 2 ] && _odpl=1
         if [ "$_odpl" = 1 ] && [ -n "${STATE:-}" ]; then
           _odin=$(stat -c %i "$dst" 2>/dev/null); case "$_odin" in ''|*[!0-9]*) _odin= ;; esac
           if [ -n "$_odin" ] && grep -qxF -- "$_odin $dst" "$STATE/.odcopied.$uid" 2>/dev/null; then
@@ -12987,6 +14000,14 @@ EOF_MT
           # recovers it. A stop at any later point leaves an app-owned $dst with the hold, or a finished $dst.
           # NWP-20261202-32: od_label_watched runs both and writes a progress line while the relabel still labels files.
           od_label_watched "$vol" "$dst"
+          # NWP-20261209-04: a hand-back walk that failed (od_label_watched's 2: a chown, chcon or restorecon batch that
+          # could not run or exited non-zero, an xargs or a find error) KEEPS the hold and its .odcopied record, so the
+          # retry copies with -n over what landed and runs the hand-back again; the reply is ERR-NOTREADY (odkept).
+          if [ "$?" = 2 ]; then
+            echo "[roamd] WARN odrestore $pkg ($vol) hand-back FAILED -- hold KEPT, NOT counted as restored (NWP-20261209-04) $(date)" >> "$LOG"
+            odkept=$((odkept+1))
+            continue
+          fi
           rm -rf "$src" 2>/dev/null
           [ -e "$src" ] && echo "[roamd] WARN odrestore $pkg ($vol) could not remove all of the hold after the merge -- the rest is left in place (NWP-20261109-09) $(date)" >> "$LOG"
           if [ ! -e "$src" ] && [ -n "$_odin" ] && [ -f "$STATE/.odcopied.$uid" ] && _odrt=$(mktemp -p "$STATE" 2>/dev/null); then
@@ -13091,7 +14112,13 @@ EOF_MT
     # blanket-media_rw'd by remap_tree BEFORE the on-demand appId existed, so the app can't read its own files
     # (il2cpp/unity.ver etc. -> EACCES -> "not enough storage to install required resources"). installApks has now
     # landed the stable appId, so this resolves + fixes it. Independent of $odsrc (that tracks only the CE/DE hold).
-    reown_ext_appdata "$pkg"; restorecon -R -D "/data/media/$uid/Android/data/$pkg" 2>>"$LOG"
+    # NWP-20261208-13: od_extdata_watched runs the re-own and the -D relabel and writes a progress line while they
+    # still re-own or relabel files, so a large Android/data is not given up on at 150 s.
+    od_extdata_watched "$pkg"
+    # NWP-20261209-04: the external holds are merged by now, so a failed walk here has no hold to keep: it answers
+    # ERR-NOTREADY whatever the volumes did (OK NOSRC included), and the next tap or sweep re-runs this step.
+    _odxf=$?
+    [ "$_odxf" = 2 ] && echo "[roamd] WARN odrestore $pkg Android/data hand-back FAILED -- ERR-NOTREADY so the next tap or sweep re-runs it (NWP-20261209-04) $(date)" >> "$LOG"
     _odt9=$(_ms 2>/dev/null)
     # group-materialize (DIA-20260802): if this is the account authenticator AND the grant op DEFERRED its reload
     # (on-demand group member), fire the #sys account reload NOW -- its APK + authenticator are installed and its
@@ -13163,7 +14190,10 @@ EOF_MT
     # that will not lift keeps its record and answers ERR-NOTREADY, so the next sweep or tap retries the unblock.
     # NWP-20261130-03: the pending marker goes before the OK reply: the chooser asks OD-DATA-PENDING as soon as it reads
     # OK, and lifts its suspension only on NO.
-    if [ "$odsrc" = 0 ]; then
+    # NWP-20261209-04: a failed Android/data walk answers ERR-NOTREADY first: no unblock, no pending clear.
+    if [ "$_odxf" = 2 ]; then
+      echo "ERR-NOTREADY" > "$RES"
+    elif [ "$odsrc" = 0 ]; then
       if od_unblock_app "$pkg"; then od_pending_clear "$pkg"; echo "OK NOSRC" > "$RES"; else echo "ERR-NOTREADY" > "$RES"; fi
     elif [ "$odkept" -gt 0 ]; then
       echo "[roamd] odrestore $pkg -> hold(s) kept on $odkept volume(s) -- ERR-NOTREADY so the next sweep or tap retries the restore (NWP-20260922-09, NWP-20261013-22) $(date)" >> "$LOG"
@@ -13467,6 +14497,7 @@ EOF_MT
               echo "$_p"
             done; } > "$_bf"
           _bcand=$(grep -c . "$_bf" 2>/dev/null); _bcand=${_bcand:-0}
+          _bcn=$(tr '\n' ' ' < "$_bf" 2>/dev/null)   # the candidate names, for the read-back below (NWP-20261210-16)
           while IFS= read -r _p; do case "$_bst" in *" $_p "*) echo "$_p" ;; esac; done < "$_bf" > "$_bf.u"
           # NWP-20261202-35: the boot pass writes one token per send to $_bf.out (cutoff_run). The file is made empty
           # here, under umask 077, so it is 0600 before the first send. A subshell: a failed redirect on : must not end
@@ -13479,14 +14510,74 @@ EOF_MT
           _bkl=$([ -f "$_bf.out" ] && grep -cxF 'L+' "$_bf.out" 2>/dev/null); case "$_bkl" in ""|*[!0-9]*) _bkl="?" ;; esac
           _bkb=$([ -f "$_bf.out" ] && grep -cxF 'B+' "$_bf.out" 2>/dev/null); case "$_bkb" in ""|*[!0-9]*) _bkb="?" ;; esac
           rm -f "$_bf" "$_bf.u" "$_bf.form" "$_bf.out"   # the scratch goes at the end too
+          # NWP-20261210-16: read the stopped flags back once both passes are done (cutoff_run ends in `wait`). This is
+          # evidence for the backlog row's handset proof, not a gate: nothing but the log line reads these counts. It
+          # comes before the reply: a running roamd makes init ignore the daemon's next ctl.start (#83). <a> + <c> is
+          # the candidate count; <c> also counts a candidate missing from the listing. A package that declares no boot
+          # receiver may read stopped=false legitimately (the chooser's Wake for notifications unstop,
+          # UnarchiveService.wakeRestored, or the user opened it), so <t> below <n> is not an error. Counts only (#39).
+          # The cost: one more `pm list packages` capture, bounded at 20 s by cutoff_list's timeout, held inside the
+          # worker before the reply.
+          _brb=$(cutoff_list "$uid")
+          _bwrb="; after the pass the stopped read-back was unreadable (NWP-20261210-16)"
+          case "$_brb" in
+            *"package:"*)
+              _brf=" $(printf '%s\n' "$_brb" | cutoff_filter " " " " false | tr '\n' ' ')"
+              _brt=" $(printf '%s\n' "$_brb" | cutoff_filter " " " " true | tr '\n' ' ')"
+              _bra=0; _brc=0; _brn=0; _brtn=0
+              # The splits are unquoted: every name passed cutoff_pkgok, so it holds no blank and no glob character.
+              for _p in $_bcn; do
+                case "$_brf" in *" $_p "*) _bra=$((_bra + 1)) ;; *) _brc=$((_brc + 1)) ;; esac
+              done
+              _bdl=" $(printf '%s\n' "$_blist" | tr '\n' ' ')"
+              if [ -z "$srcunit" ]; then   # the all-package pass: the packages that declare no boot receiver
+                for _p in $(printf '%s\n' "$_call" | cutoff_filter " " " " true) $(printf '%s\n' "$_call" | cutoff_filter " " " " false); do
+                  case "$_bdl$_bfixed" in *" $_p "*) continue ;; esac
+                  _brn=$((_brn + 1))
+                  case "$_brt" in *" $_p "*) _brtn=$((_brtn + 1)) ;; esac
+                done
+              fi
+              _brok=1
+              for _bx in "$_bra" "$_brc" "$_bcand" "$_brn" "$_brtn"; do   # each on its own: mksh reads a non-number as 0
+                case "$_bx" in ""|*[!0-9]*) _brok=0 ;; esac
+              done
+              if [ "$_brok" = 1 ] && [ -z "$srcunit" ]; then
+                _bwrb="; after the pass $_bra of $_bcand read stopped=false, $_brc still stopped, $_brtn of $_brn declaring none still stopped (NWP-20261210-16)"
+              elif [ "$_brok" = 1 ]; then
+                _bwrb="; after the pass $_bra of $_bcand read stopped=false, $_brc still stopped (NWP-20261210-16)"
+              fi
+              ;;
+          esac
           # NWP-20261130-04: this package's restore has landed, so a deferred always-on VPN that names it is applied now,
           # not at the next seal. Outside the receiver loop: a VPN app with no boot receiver needs it too. Before the
           # reply: the daemon's next op can start at the reply's first byte. The sign-in's all-package pass applies nothing.
           [ -z "$srcunit" ] || vpn_deferred_retry "$uid" "$srcunit"
+          # NWP-20261205-16: the Tailscale row's CLOSES WHEN forks on two facts: does the VPN app declare a boot
+          # receiver, and is it the profile's always-on VPN. A per-package bootwake for a VPN app logs both, as fixed
+          # tokens and never a name (#39); a package that is not a VPN app logs nothing. The receiver fact is from
+          # $_blist (declares one, before every filter). The always-on read comes after vpn_deferred_retry, so a
+          # deferred apply that just landed counts. Before the reply, as vpn_deferred_retry. The all-package pass skips it.
+          if [ -n "$srcunit" ]; then
+            _bvpn=$(bootwake_vpnapp "$uid" "$srcunit")
+            case "$_bvpn" in
+              yes)
+                _bvr=no
+                for _bvp in $_blist; do [ "$_bvp" = "$srcunit" ] && _bvr=yes; done
+                if [ "$_bvr" = no ]; then case "$_bfp:$_bfn:$_bfo" in *[!0?:]*) ;; *) _bvr=unread ;; esac; fi
+                _baov=$(settings get --user "$uid" secure always_on_vpn_app </dev/null 2>/dev/null)
+                if [ "$_baov" = "$srcunit" ]; then _bva=this
+                elif [ "$_baov" = null ]; then _bva=none
+                elif cutoff_pkgok "$_baov"; then _bva=another
+                else _bva=unread; fi
+                echo "[roamd] bootwake user $uid: one package is a VPN app: boot receiver $_bvr, always-on VPN $_bva (NWP-20261205-16) $(date)" >> "$LOG" ;;
+              unread)
+                echo "[roamd] bootwake user $uid: one package: VPN check unread (NWP-20261205-16) $(date)" >> "$LOG" ;;
+            esac
+          fi
           echo "BOOTWAKE $_bsent $_bdecl" > "$RES"
           if [ -n "$srcunit" ]; then _bwho="one package: boot broadcasts sent to $_bsent of $_bcand"
           else _bwho="boot broadcasts sent to $_bsent of $_bcand package(s)"; fi
-          echo "[roamd] bootwake user $uid: $_bwho ($_bun unstopped first, $_bheld skipped with parked data, $_bdecl declare a boot receiver) (NWP-20261114-01); pm listed $_bfp component line(s), $_bfn no-receivers line(s), $_bfo other line(s) (NWP-20261128-37); sends finished: LOCKED_BOOT_COMPLETED $_bkl of $_bsent, BOOT_COMPLETED $_bkb of $_bsent (NWP-20261202-35) $(date)" >> "$LOG"
+          echo "[roamd] bootwake user $uid: $_bwho ($_bun unstopped first, $_bheld skipped with parked data, $_bdecl declare a boot receiver) (NWP-20261114-01); pm listed $_bfp component line(s), $_bfn no-receivers line(s), $_bfo other line(s) (NWP-20261128-37); sends finished: LOCKED_BOOT_COMPLETED $_bkl of $_bsent, BOOT_COMPLETED $_bkb of $_bsent (NWP-20261202-35)$_bwrb $(date)" >> "$LOG"
           ;;
         *)
           echo "ERR-LIST" > "$RES"
@@ -13494,7 +14585,7 @@ EOF_MT
           ;;
       esac
     fi
-    unset _bf _call _bfixed _bst _blist _bdecl _bheld _bh _bv _p _bcand _bun _bsent _bwho _bfp _bfn _bfo _bfx _bkl _bkb
+    unset _bf _call _bfixed _bst _blist _bdecl _bheld _bh _bv _p _bcand _bun _bsent _bwho _bfp _bfn _bfo _bfx _bkl _bkb _bvpn _bvr _bvp _baov _bva _bcn _brb _bwrb _brf _brt _bra _brc _brn _brtn _bdl _brok _bx
     ;;
   *) echo "ERR-OP" > "$RES" ;;
 esac

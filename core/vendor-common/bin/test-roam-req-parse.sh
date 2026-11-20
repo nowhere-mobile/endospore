@@ -9,7 +9,8 @@
 #   - all seven values land, verbatim (a pass with a backslash, leading spaces and a `$` survives untouched, and a
 #     pass ending in one backslash neither eats the newline nor swallows the uid after it);
 #   - a short request leaves the missing trailing fields EMPTY, as sed did, and a last line with no newline lands;
-#   - the exports that key on those fields still run after their variables are set;
+#   - the exports that key on those fields still run after their variables are set, and line 5 (the chip secret) is
+#     held in the unexported _se_v, never exported: each agent call stages its own copy (NWP-20261205-18);
 #   - the req (it holds the passphrase) is removed once parsed;
 #   - a rename over $REQ between two reads cannot mix two requests: `read` and `sed` are wrapped so the FIRST call
 #     swaps a second request in, and every value must still come from the first.
@@ -77,8 +78,8 @@ suite(){
       [ -n "$quiet" ] || { printf '        got:  %s\n' "${got//$'\n'/|}"; printf '        want: %s\n' "${exp//$'\n'/|}"; }
     fi
   }
-  # parse <dir> [swap] -> runs the block under "$sh" against <dir>/roam.req and prints the seven fields, keymode and
-  # the three exports, one per line. With "swap", the first `read` or `sed` call renames <dir>/next.req over
+  # parse <dir> [swap] -> runs the block under "$sh" against <dir>/roam.req and prints the seven fields, keymode,
+  # the three exports and _se_v, one per line. With "swap", the first `read` or `sed` call renames <dir>/next.req over
   # roam.req -- the daemon publishing the NEXT request while this worker is mid-parse. The wrappers are POSIX:
   # `command read` / `command sed` reach the shadowed builtin/utility in bash, dash and mksh alike (no `builtin`, no
   # `local`), and `swaprc` is a name the block never uses.
@@ -96,7 +97,7 @@ EOF
       printf '%s\n' "$BLOCK"
       cat <<'EOF'
 printf '%s\n' "$op" "$name" "$pass" "$uid" "$sesec" "$skind" "$srcunit" "$keymode" \
-  "${NOWHERE_SE_SECRET-<unset>}" "${NOWHERE_SEAL_KIND-<unset>}" "${NOWHERE_UNIT_SRC-<unset>}"
+  "${NOWHERE_SE_SECRET-<unset>}" "${NOWHERE_SEAL_KIND-<unset>}" "${NOWHERE_UNIT_SRC-<unset>}" "${_se_v-<unset>}"
 EOF
     } > "$d/runner.sh"
     "$sh" "$d/runner.sh" 2>"$d/stderr"
@@ -108,7 +109,7 @@ EOF
     printf '%s\n' in profile-a 'passphrase-a' 10 abc123 nfcfirst unit-src-7 > "$T/roam.req"
     got=$(parse "$T")
     want "a full in request parses all seven fields" "$got" \
-      in profile-a passphrase-a 10 abc123 nfcfirst unit-src-7 nfcfirst abc123 '<unset>' unit-src-7
+      in profile-a passphrase-a 10 abc123 nfcfirst unit-src-7 nfcfirst '<unset>' '<unset>' unit-src-7 abc123
     [ ! -e "$T/roam.req" ] && ok "the req is removed once parsed" || no "the req (it holds the passphrase) was left behind"
     [ ! -s "$T/stderr" ] && ok "a full request parses with nothing on stderr" \
       || no "a full request parses with nothing on stderr (got '$(cat "$T/stderr")')"
@@ -117,7 +118,7 @@ EOF
     printf '%s\n' out profile-a '' 10 '' manual '' > "$T/roam.req"
     got=$(parse "$T")
     want "a manual seal exports NOWHERE_SEAL_KIND and no keymode" "$got" \
-      out profile-a '' 10 '' manual '' '' '<unset>' manual '<unset>'
+      out profile-a '' 10 '' manual '' '' '<unset>' manual '<unset>' ''
 
     say "== [$sh] a passphrase is taken byte for byte =="
     T=$(mktemp -d -p "$W")
@@ -133,21 +134,21 @@ EOF
     printf '%s\n' in profile-a 'tail\' 10 '' '' '' > "$T/roam.req"
     got=$(parse "$T")
     want "a pass ending in one backslash comes back verbatim and the uid after it stays its own" "$got" \
-      in profile-a 'tail\' 10 '' '' '' '' '<unset>' '<unset>' '<unset>'
+      in profile-a 'tail\' 10 '' '' '' '' '<unset>' '<unset>' '<unset>' ''
 
     say "== [$sh] a short request leaves the missing fields empty =="
     T=$(mktemp -d -p "$W")
     printf '%s\n' in profile-a passphrase-a 10 > "$T/roam.req"
     got=$(parse "$T")
     want "a 4-line request leaves sesec/skind/srcunit empty and exports nothing" "$got" \
-      in profile-a passphrase-a 10 '' '' '' '' '<unset>' '<unset>' '<unset>'
+      in profile-a passphrase-a 10 '' '' '' '' '<unset>' '<unset>' '<unset>' ''
     [ ! -e "$T/roam.req" ] && ok "a short req is removed too" || no "a short req was left behind"
 
     T=$(mktemp -d -p "$W")
     printf 'in\nprofile-a\npassphrase-a\n10\n\n\nunit-src-7' > "$T/roam.req"
     got=$(parse "$T")
     want "a last line with no trailing newline still lands" "$got" \
-      in profile-a passphrase-a 10 '' '' unit-src-7 '' '<unset>' '<unset>' unit-src-7
+      in profile-a passphrase-a 10 '' '' unit-src-7 '' '<unset>' '<unset>' unit-src-7 ''
 
     say "== [$sh] no request: ERR-NOREQ, nothing parsed =="
     T=$(mktemp -d -p "$W")
@@ -163,7 +164,7 @@ EOF
     [ ! -e "$T/next.req" ] && ok "the swap fired (control: the next request was renamed in mid-parse)" \
       || no "the swap never fired under $sh -- the parse made no read/sed call, so this case proves nothing"
     want "every field comes from the request that was open, none from the one renamed in" "$got" \
-      in profile-a passphrase-a 10 sesec-a nfcfirst unit-a nfcfirst sesec-a '<unset>' unit-a
+      in profile-a passphrase-a 10 sesec-a nfcfirst unit-a nfcfirst '<unset>' '<unset>' unit-a sesec-a
   done
 
   say ""

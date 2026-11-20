@@ -111,6 +111,7 @@ stat(){
 chown(){ echo "chown $*" >> "$T/calls"; }
 chmod(){ echo "chmod $*" >> "$T/calls"; command chmod "$@"; }
 restorecon(){ echo "restorecon $*" >> "$T/calls"; }
+calllog_late(){ :; }
 am(){
   echo "am $*" >> "$T/calls"
   [ -f "$L" ] && cp "$L" "$T/am-list" && command stat -c %a "$L" > "$T/am-mode"

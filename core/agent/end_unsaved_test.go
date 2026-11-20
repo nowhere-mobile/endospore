@@ -751,7 +751,11 @@ func TestEndUnsaved_TheTimeBudgetIsCheckedBeforeEachIrreversibleStep(t *testing.
 				endUnsavedCommitBy, endUnsavedDeadline)
 		}
 		prof := chooserCode(t, "ProfileActivity.java")
-		if !strings.Contains(prof, "s.setSoTimeout(90000);") || !strings.Contains(prof, `sendDaemon("END-UNSAVED\n")`) {
+		// NWP-20261210-14: sendDaemon's cap comes from DaemonReadCap; END-UNSAVED must keep LONG_MS (90 s).
+		long, quick := chooserDaemonReadCap(t)
+		if !strings.Contains(chooserMethodBody(t, prof, "private String sendDaemon(String msg) {"),
+			"setSoTimeout(DaemonReadCap.forRequest(msg))") || long != 90000 || quick["END-UNSAVED"] ||
+			!strings.Contains(prof, `sendDaemon("END-UNSAVED\n")`) {
 			t.Error("the chooser no longer reads END-UNSAVED through sendDaemon's 90 s timeout")
 		}
 	})

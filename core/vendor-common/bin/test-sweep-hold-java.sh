@@ -6,7 +6,7 @@
 #   H1  each sweepAuto loop checks SweepHold.held() before its restoreOnly* / materializeAndInstall call. The materialise
 #       one takes the rest off the queue (qDrop(SignOutGate.rest(work, i))) and sets `cut = true`. The busy wait ends too.
 #   H2  the held, non-by-hand return sits after the remembered-tap loop and before pendingAutoApps, AUTO-SWEEP 1,
-#       Sweep.begin and qEnqueue(work).
+#       Sweep.begin and qEnqueue(queued).
 #   H3  a by-hand start clears the hold before `sw.start()`.
 #   H4  sweepAuto has one early-return held branch and one materialise held branch, and neither names a keep writer.
 #   H5  SweepHold.java exists, imports nothing and names no storage. Its three callers name it. No code line of the five
@@ -165,12 +165,12 @@ sources() {
       exit 1 unless $c =~ /left > 0 && !SignOutGate\.begun\(\) && !SweepHold\.held\(\); left -= 1000L/;
       exit 0;' <<<"$sweep" || bad=1
 
-  pin H2 "the held, non-by-hand return sits after the remembered-tap loop and before pendingAutoApps, AUTO-SWEEP 1, Sweep.begin and qEnqueue(work)" '
+  pin H2 "the held, non-by-hand return sits after the remembered-tap loop and before pendingAutoApps, AUTO-SWEEP 1, Sweep.begin and qEnqueue(queued)" '
       $c =~ /if \(!byHand && SweepHold\.held\(\)\) \{[^}]*\breturn;\s*\}/ or exit 1;
       my $p = $-[0];
       my $t = index($c, "for (int k = 0; k < remembered.size()"); exit 1 if $t < 0 || $t > $p;
       my $b = index($c, "if (tapLaneBusy) {"); exit 1 if $b < 0 || $b > $p;
-      for my $w ("pendingAutoApps(", q{"AUTO-SWEEP\n1\n"}, "LandingLine.Sweep.begin(", "qEnqueue(work);") {
+      for my $w ("pendingAutoApps(", q{"AUTO-SWEEP\n1\n"}, "LandingLine.Sweep.begin(", "qEnqueue(queued);") {
         my $i = index($c, $w); exit 1 if $i < 0 || $i < $p;
       }
       exit 0;' <<<"$sweep" || bad=1
@@ -243,7 +243,7 @@ $svc" || bad=1
         exit 1 unless $hold =~ /stopBtn\.setOnClickListener\(v -> tapStop\(\)\);/;
         exit 1 unless $ren =~ /LandingLine\.heldLine\(paused, LandingLine\.Sweep\.stopped\(sweep\), got, pkgs\.length\)/;
         exit 1 unless $ren =~ /pauseBtn\.setText\(paused \? LandingLine\.RESUME : LandingLine\.PAUSE\);/;
-        exit 1 unless $ren =~ /setHoldButton\(pauseBtn, !ended\);\s*setHoldButton\(stopBtn, !ended && !paused\);/;
+        exit 1 unless $ren =~ /setHoldButton\(pauseBtn, !ended && !waiting\);\s*setHoldButton\(stopBtn, !ended && !paused && !waiting\);/;
         exit 1 unless $ren =~ /holdLine\.setText\(line != null \? line : LandingLine\.KEEP\);\s*return;/;
         exit 1 unless $ren =~ /headline\.setText\(LandingLine\.headline\(got, pkgs\.length\)\);\s*if \(line != null\) headline\.setText\(line\);/;
         my $n = () = $f =~ /^\s*addHoldRow\(card\);/mg; exit 1 unless $n == 2;
@@ -362,7 +362,7 @@ mut "M33 the Your apps row reads a pause as INSTALL" HoldRow.java 's/(State\.PAU
 mut "M34 the Your apps row reads a stop as PAUSED" HoldRow.java 's/(State\.STOPPED\) return )INSTALL;/$1PAUSED;/' H12 || fails=$((fails+1))
 mut "M35 a stopped card says the paused line" "$L" 's/return stopped \? STOPPED_LINE : null;/return stopped ? PAUSED_LINE : null;/' "W2 a stopped card" || fails=$((fails+1))
 mut "M36 a card with every app landed keeps the held line" "$L" 's/^[ \t]*if \(landed == total\) return null;\n//m' "W3 a paused card with every app landed" || fails=$((fails+1))
-mut "M37 begin keeps paused" "$L" 's/(done = false;\n\s*)paused = false;\n/$1/' "S6 begin after a pause resets paused" || fails=$((fails+1))
+mut "M37 begin keeps paused" "$L" 's/(done = false;\n\s*waiting = false;\n\s*)paused = false;\n/$1/' "S6 begin after a pause resets paused" || fails=$((fails+1))
 mut "M38 stop does not end the card" "$L" 's/(stopped = true;\n\s*paused = false;\n\s*)done = true;/$1done = false;/' "S4 done is true after stop" || fails=$((fails+1))
 mut "M39 clear keeps STOPPED" "$H" 's/(static void clear\(\) \{\n\s*synchronized \(LOCK\) \{\n\s*if \(state == State\.PAUSED\) resumedCard = card;\n\s*)state = State\.NONE;\n/$1/' "T4 clear resets STOPPED" || fails=$((fails+1))
 mut "M40 pause overrides a stop" "$H" 's/^[ \t]*if \(state == State\.STOPPED\) return;\n//m' "T3 pause from STOPPED changes nothing" || fails=$((fails+1))

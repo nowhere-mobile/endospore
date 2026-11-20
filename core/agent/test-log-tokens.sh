@@ -43,5 +43,5 @@ mut 'T1 logVal keeps "' logtoken.go "c == '\"' \\|\\| " ''
 mut "T2 logVal prints an empty value without its - placeholder" logtoken.go 'return "\[-\]"' 'return "[]"'
 mut "T3 ifaceTok prints every interface bare" logtoken.go 'if sysIfaceRe\.MatchString\(s\) \{' 'if true {'
 mut "T4 the cutoff line back on %q" logoff_cutoff.go 'cutoff %s in %dms(.*?)uid, logVal\(r\), ' 'cutoff %q in %dms\1uid, r, '
-mut "T5 GRANT-PERMS back on the uid in the name slot" main.go 'triggerRoamWorker\(dest, "grant", grantNameArg\(dest, uid\), ' 'triggerRoamWorker(dest, "grant", uid, '
+mut "T5 GRANT-PERMS back on the uid in the name slot" main.go 'grantWorker\(dest, "grant", grantNameArg\(dest, uid\), ' 'grantWorker(dest, "grant", uid, '
 [ "$fails" -eq 0 ] && echo "== all mutations convicted" || { echo "== $fails mutation(s) not convicted"; exit 1; }

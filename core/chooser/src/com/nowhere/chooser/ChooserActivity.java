@@ -84,6 +84,7 @@ public class ChooserActivity extends Activity {
     private android.os.Handler strengthHandler;        // #79: debounce the CHECK-PASSPHRASE round-trip
     private Runnable strengthCheck;
     private TextView result;
+    private TextView installLine; // NWP-20261208-25: "Installing <app> (<i> of <n>)" under the status line during Finishing up
     private volatile long lastSealTs = 0; // "last active" unix ts streamed by the daemon on a returning login (DIA-20260625-05)
     private TextView toggle; // the create-profile / sign-in mode switch (locked during restore)
     private TextView gear; // top-right Settings gear; accent-tinted when an OS update is available (DIA-20260618-04)
@@ -134,6 +135,8 @@ public class ChooserActivity extends Activity {
     // Reset on each fresh gate appearance (onResume) so a post-logoff gate is keyboard-free again.
     private boolean gateUserTyping = false;
     private volatile boolean sawRestoreProgress = false; // #70/#75: the restore emitted progress -> the creds were accepted, so a later failure is a connection issue, not a wrong cred
+    private String restoreBarLabel; // NWP-20261208-30: the label the restore bar last showed (UI thread only; null = none yet this sign-in)
+    private int restoreBarPct;      // NWP-20261208-30: the percent it showed under that label, so the bar never goes back within it
     // P4 (DIA-20260625-13): resumable cold-lock. When the daemon reports a cold-locked session (GET-COLDLOCK),
     // the gate fronts a "Welcome back <name>" prompt -- passphrase only, name known -- that RESUMES the user
     // (verify CE in place -> switch in, no re-download) instead of a fresh restore. resumeAlt drops back to the
@@ -699,6 +702,16 @@ public class ChooserActivity extends Activity {
         resLp.topMargin = dp(18);
         ll.addView(result, resLp);
 
+        // NWP-20261208-25: during Finishing up, the Installed app being installed and the count, under the status line.
+        installLine = new TextView(this);
+        installLine.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        installLine.setTextColor(MUTED);
+        installLine.setGravity(Gravity.CENTER);
+        installLine.setVisibility(View.GONE);
+        LinearLayout.LayoutParams ilLp = new LinearLayout.LayoutParams(WRAP, WRAP);
+        ilLp.topMargin = dp(6);
+        ll.addView(installLine, ilLp);
+
         // #81 item 5 / #114: the locked key-wait state (NEEDKEY) shows a "Retry" (primary) + "Cancel" (secondary)
         // directly UNDER the "use your key" message (which shows in `result`), not down with the footer links.
         // An NFC key auto-detects (the armed reader catches a tap and re-runs the login), but a USB-C key has NO
@@ -1066,10 +1079,13 @@ public class ChooserActivity extends Activity {
         Intent it = getIntent();
         String ep = it.getStringExtra("profile");
         String epw = it.getStringExtra("pass");
-        if (ep != null && epw != null) {
+        // NWP-20261205-09 (h57 #8): only a debuggable build honours the extras; a denied or empty read is not one.
+        if (HarnessExtras.honour(sysProp("ro.debuggable", "0"), ep, epw)) {
             profileField.setText(ep);
             passField.setText(epw);
             unlock(ep, epw);
+        } else if (ep != null || epw != null) {
+            android.util.Log.i("NowhereChooser", "headless sign-in extras ignored: not a debuggable build (h57 #8)");
         }
         // Boot with NO keyboard (DIA-20260706: "want the full screen, not a keyboard eating half the page").
         // Give focus to the scroll container instead of the profile field -- posted, because a requestFocus in
@@ -1095,7 +1111,7 @@ public class ChooserActivity extends Activity {
         passField.setOnTouchListener(gateTouch);
         ensureReapWatcher(this); // user-0 only: poll the daemon for no-reboot teardown. #141: also started from
                                  // NowhereApp.onCreate so a process restart with no gate Activity still has it.
-        startMediaRingPoller(); // #128: user-0 only: ~1s relay of media download progress to the launcher icon ring
+        startMediaRingPoller(this); // #128: user-0 only: ~1s relay of media download progress to the launcher icon ring
         PrivateDnsWatch.start(this); // NWP-20261122-07: user-0 only: the blocked-encrypted-DNS prompt (h49 #2, h50 #4)
         startSyncStatusWatcher(); // user-0 only: surface a "not backed up" notification when periodic seals fail
         ensureDefaultSmsRole(); // #135 B3: become user-0's default SMS app so SMS_DELIVER comes to us (idempotent)
@@ -1189,7 +1205,7 @@ public class ChooserActivity extends Activity {
                 // the disable-keyguard-features policy in res/xml/device_admin.xml; without it the call throws
                 // SecurityException and this catch swallows it. It disables Settings' fingerprint/face entry while
                 // nothing is enrolled; it does not stop an enrolment activity launched directly. An enrolment made
-                // before this landed stays; its removal is a separate slice (decided 2026-10-25). The device owner
+                // before this landed stays; GateBiometricRemove below removes it (h45 #1). The device owner
                 // sets it on user 0 only, so a roamed session's own enrolment is untouched: an inference that the
                 // backlog row asks a device to confirm.
                 try {
@@ -1201,6 +1217,10 @@ public class ChooserActivity extends Activity {
                 } catch (Throwable t) {
                     android.util.Log.w("NowhereChooser", "NWP-20261114-12 keyguard biometrics off (DO)", t);
                 }
+                // NWP-20261208-20 (h45 #1, docs/product-decisions.md 2026-10-25): remove a fingerprint or face already
+                // enrolled in user 0, the gate, at each gate start, with the hidden FingerprintManager / FaceManager
+                // removeAll(int, RemovalCallback) (else remove per template); Owner settings says so once.
+                GateBiometricRemove.runAsync(this, "start");
             }
         } catch (Throwable t) {
             android.util.Log.w("NowhereChooser", "clearAffiliationIds", t);
@@ -1216,10 +1236,13 @@ public class ChooserActivity extends Activity {
         setIntent(intent);
         String ep = intent.getStringExtra("profile");
         String epw = intent.getStringExtra("pass");
-        if (ep != null && epw != null) {
+        // NWP-20261205-09 (h57 #8): only a debuggable build honours the extras; a denied or empty read is not one.
+        if (HarnessExtras.honour(sysProp("ro.debuggable", "0"), ep, epw)) {
             profileField.setText(ep);
             passField.setText(epw);
             unlock(ep, epw);
+        } else if (ep != null || epw != null) {
+            android.util.Log.i("NowhereChooser", "headless sign-in extras ignored: not a debuggable build (h57 #8)");
         }
     }
 
@@ -2336,6 +2359,9 @@ public class ChooserActivity extends Activity {
             android.util.Log.i("NowhereChooser", "lockGate(" + lock + ") owner=" + owner);
             if (owner) {
                 if (lock) {
+                    // NWP-20261210-21 (#12): Emergency information is read-only at the gate -- its two editors are
+                    // disabled in user 0 before the kiosk locks; the card itself stays reachable from the dialer.
+                    applyEmergencyEditGate(false);
                     dpm.setLockTaskPackages(new android.content.ComponentName(this, AdminReceiver.class),
                             new String[]{getPackageName(), "com.android.phone", "com.android.emergency"}); // emergency dialer + info card at the locked gate
                     // Show the status-bar system info (Wi-Fi/signal/battery/clock) in the kiosk, so a user can
@@ -2424,6 +2450,31 @@ public class ChooserActivity extends Activity {
         }
     }
 
+    /** NWP-20261210-21 (#12, docs/product-decisions.md 2026-11-02): set the platform EmergencyInfo app's two editors in
+     *  user 0 to EmergencyEditGate.wanted(ownerStoodDown) -- DISABLED whenever the gate locks the kiosk, DEFAULT only
+     *  while owner mode stands it down. A component is written only on a transition. Each component has its own catch:
+     *  a phone without the package, or a refused write, counts as failed, never a crash and never a skipped lock. One
+     *  log line per call, counts only. */
+    private void applyEmergencyEditGate(boolean ownerStoodDown) {
+        int changed = 0, kept = 0, failed = 0;
+        final int wanted = EmergencyEditGate.wanted(ownerStoodDown);
+        for (String cls : EmergencyEditGate.EDITORS) {
+            try {
+                final android.content.pm.PackageManager pm = getPackageManager();
+                final android.content.ComponentName cn = new android.content.ComponentName(EmergencyEditGate.PKG, cls);
+                if (EmergencyEditGate.needsWrite(pm.getComponentEnabledSetting(cn), wanted)) {
+                    pm.setComponentEnabledSetting(cn, wanted, EmergencyEditGate.flags(wanted));
+                    changed++;
+                } else {
+                    kept++;
+                }
+            } catch (Throwable t) {
+                failed++;
+            }
+        }
+        android.util.Log.i("NowhereChooser", EmergencyEditGate.line(ownerStoodDown, changed, kept, failed));
+    }
+
     // #136 owner mode (A2): STAND DOWN the kiosk so the device owner can use user-0 Settings. Transactional --
     // write the persistent marker + set the flag BEFORE any un-lock, so a crash before Settings foregrounds is
     // reconciled to a LOCKED kiosk at next boot. Then stop Lock Task and launch Settings (HOME stays == the gate,
@@ -2446,6 +2497,7 @@ public class ChooserActivity extends Activity {
         wantLocked = false;
         lockHandler.removeCallbacks(lockRetry);
         lockGate(false);           // stopLockTask + re-enable the status bar
+        applyEmergencyEditGate(true); // NWP-20261210-21 (#12): the owner edits Emergency information from System settings
         try {
             startActivity(target.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK));
         } catch (Throwable t) {
@@ -4957,6 +5009,14 @@ public class ChooserActivity extends Activity {
                 try { Thread.sleep(1000); } catch (InterruptedException ie) { return; }
             }
             if (!landed) return; // switch never landed -> nothing to sweep for
+            // NWP-20261119-35: NO start of UnarchiveService before the 15 s. NWP-20261208-23 started it here, as the home
+            // screen lands, to show the landing card in its waiting state; that is the moment the session's SMS role
+            // moves from this chooser to the messaging app, and Android kills the session chooser for the revoked SMS
+            // permissions. On husky 0.5.59 (2026-11-19) the kill landed 38 ms after the start and left the service
+            // half-restarted ("Restarting service that is not needed"): the sweep this kick sends 15 s later, and every
+            // "Install pending apps now", were swallowed until a lock force-stopped it. The waiting arm in
+            // UnarchiveService has no sender until it is moved out of that window (backlog §B row).
+            // The 15 s (f83e4a1b6): the PIN arm lands before the sweep's MATERIALIZE-APP ops; the presence snapshot assumes it.
             try { Thread.sleep(15000); } catch (InterruptedException ie) { return; } // after login I/O + the PIN arm
             try {
                 android.content.Intent sw = new android.content.Intent(appCtx, UnarchiveService.class)
@@ -5564,9 +5624,10 @@ public class ChooserActivity extends Activity {
                 // followed by four more provisioning steps that include a NETWORK round trip'): the bar said
                 // done while prep/provision/prefs/home-role still ran -- the
                 // user watched a full bar do nothing, which is the "feels stuck" shape #113 exists to prevent.
-                // Honest edge: "Finishing up…" holds at 95 while the four steps run, and 100 is painted only
-                // when they are done, immediately before the switch. Same words, truthful number.
-                runOnUiThread(() -> { progressBar.setProgress(95); result.setTextColor(ACCENT); result.setText("Finishing up…"); });
+                // Honest edge: the status line reads "Finishing up… — <N>%", the Installed apps' installs move the
+                // bar 95..99 (installRoamedAppCode, NWP-20261208-25), and 100 is painted only when every step is
+                // done, immediately before the switch.
+                runOnUiThread(() -> { progressBar.setProgress(95); result.setTextColor(ACCENT); result.setText(FinishingProgress.status(95)); });
                 mirrorCreate("Finishing up…", 95); // NWP-20260820-30
                 prepRoamedUser(uid); // land clean: re-enable the quiesced apps + keep the setup wizard off
                 ensureSessionScreenTimeout(uid); // NWP-20261113-13 (Q073): a new session starts at 1 min, before its prefs
@@ -5579,6 +5640,7 @@ public class ChooserActivity extends Activity {
                                            // roamed user lands on it, not the "Use Launcher as Home" resolver
                 if (isCreate && playAtCreate != null) sendPlayAtCreate(uid, playAtCreate); // NWP-20261124-09: before switch-in
                 runOnUiThread(() -> progressBar.setProgress(100)); // D7: NOW the login work is actually done
+                runOnUiThread(() -> { result.setText(FinishingProgress.status(100)); if (installLine != null) installLine.setVisibility(View.GONE); }); // NWP-20261208-25
                 mirrorCreate("Finishing up…", 100);
                 // Drop the kiosk, switch into the roamed user, finish -- all on the UI thread, in order.
                 sessionLive = true; // a session is now live -> the reap watcher polls fast for a quick logoff (DIA-20260618-07)
@@ -5819,6 +5881,7 @@ public class ChooserActivity extends Activity {
             progressBar.setVisibility(View.VISIBLE);
             result.setTextColor(ACCENT);
             result.setText("Logging in " + name + "…");
+            if (installLine != null) installLine.setVisibility(View.GONE); // NWP-20261208-25: no stale install line
             // D6 (NWP-20260823-03, inventory duplicate: 'two different verbs describe the same operation
             // simultaneously'): on a CREATE the creating screen is up, and this mirror used to write
             // "Logging in <name>…" directly under the "Creating your space…" title -- two verbs, one op, and
@@ -5987,6 +6050,7 @@ public class ChooserActivity extends Activity {
             if (awaitKeyRetry != null) awaitKeyRetry.setVisibility(View.GONE);
             lockGateForm(false);
             result.setText("");
+            if (installLine != null) installLine.setVisibility(View.GONE); // NWP-20261208-25
         });
     }
 
@@ -6569,7 +6633,7 @@ public class ChooserActivity extends Activity {
         // system settings", which described ONE of the five rows behind the passphrase (System settings) as
         // though it were all of them. It is the whole owner surface: SIM-to-profile binding, what the lock
         // screen reveals about a caller, system settings, the support channel, and leaving Nowhere entirely.
-        sub.setText("Unlocks Owner settings — SIM lines, what the lock screen shows, system settings, and leaving Nowhere. It's separate from any profile passphrase, and there's no recovery: if you forget it, only a factory reset clears it."
+        sub.setText("Unlocks Owner settings — SIM lines, what the lock screen shows, system settings, and leaving nowhere. It's separate from any profile passphrase, and there's no recovery: if you forget it, only a factory reset clears it."
                 + " Required — it's what stops someone else becoming this phone's owner.");
         sub.setTextColor(MUTED); sub.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13); sub.setGravity(Gravity.CENTER); sub.setLineSpacing(dp(3), 1f);
         LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(MATCH, WRAP); slp.topMargin = dp(10); slp.bottomMargin = dp(24);
@@ -6728,6 +6792,7 @@ public class ChooserActivity extends Activity {
         LinearLayout ll = ownerColumn("Owner settings");
         LinearLayout.LayoutParams top = new LinearLayout.LayoutParams(MATCH, WRAP); top.topMargin = dp(24);
         GateLockToken.addNotice(this, ll, MUTED); // NWP-20261118-04: the user-0 screen lock notice, if any
+        GateBiometricRemove.addNotice(this, ll, MUTED); // NWP-20261208-20: the user-0 fingerprint / face notice, if any
         ll.addView(settingsRow("SIM lines", "Bind a SIM to the profile(s) it belongs to", v -> setContentView(buildBindingScreen())), top);
         // NWP-20261001-04 (Chester, 2026-10-01): the unassigned-line Inbox + Compose and the lock-screen notice
         // settings sit under ONE "Messages & calls" entry (buildMessagesCallsMenu) rather than three top-level rows.
@@ -6761,7 +6826,7 @@ public class ChooserActivity extends Activity {
         // no owner secret is the Stage-0 mandatory-passphrase P0, not a case to design around here.
         ll.addView(settingsRow("Report a device issue", "Update, setup or sign-in problems — sent anonymously to support",
                 v -> setContentView(buildReportScreen())), new LinearLayout.LayoutParams(MATCH, WRAP));
-        ll.addView(settingsRow("Leave Nowhere", "Go back to the stock Android this phone shipped with", v -> setContentView(buildLeaveScreen())), new LinearLayout.LayoutParams(MATCH, WRAP));
+        ll.addView(settingsRow("Leave nowhere", "Go back to the stock Android this phone shipped with", v -> setContentView(buildLeaveScreen())), new LinearLayout.LayoutParams(MATCH, WRAP));
         ll.addView(ownerBack("Back to gate", v -> { ownerSessionPass = null; setContentView(gateView); }), new LinearLayout.LayoutParams(MATCH, WRAP));
         return ownerScroll(ll);
     }
@@ -6933,18 +6998,16 @@ public class ChooserActivity extends Activity {
 
         final Button send = accentButton("Send report");
         ll.addView(send, new LinearLayout.LayoutParams(MATCH, WRAP));
-        send.setOnClickListener(v -> new android.app.AlertDialog.Builder(this)
-                .setTitle("Send report?")
-                .setMessage("Scrubbed device diagnostics will be sent to support. Nothing identifies you. Continue?")
-                .setNegativeButton("Cancel", (d, w) -> {})
-                .setPositiveButton("Send", (d, w) -> {
+        // NWP-20261208-21: the ask is a routine sheet (LineReportPresetSheets.gateSendReport): slot 0 "Send" sends, slot 1
+        // "Not now" only closes it.
+        send.setOnClickListener(v -> SheetDialog.confirm(this, LineReportPresetSheets.gateSendReport(), new Runnable[] { () -> {
                     send.setEnabled(false); msg.setTextColor(MUTED); StatusLine.busy(msg, "Sending…");
                     final String noteText = note.getText().toString();
                     new Thread(() -> {
                         final String reply = sendDaemon("REPORT-ISSUE\n" + gateReportJson(noteText, false) + "\n").trim();
                         runOnUiThread(() -> { send.setEnabled(true); renderGateReportResult(reply, noteText, msg, root); });
                     }).start();
-                }).show());
+                }, null }, null));
 
         LinearLayout.LayoutParams mlp = new LinearLayout.LayoutParams(MATCH, WRAP); mlp.topMargin = dp(12);
         ll.addView(msg, mlp);
@@ -6967,6 +7030,7 @@ public class ChooserActivity extends Activity {
             st.put("android_sdk", String.valueOf(android.os.Build.VERSION.SDK_INT)); // string: the daemon decodes Status as map[string]string, and a JSON number poisons the (deliberately swallowed) unmarshal
             st.put("context", "gate");
             GateNoticeEvidence.put(this, st); // NWP-20261204-12, row "After a sign-out the gate can show a missed call from inside the session, and a location icon": the gate's own notices, the missed-call delegation and the location grant, counts and fixed classes only
+            GateStrayCrashes.put(this, st); // NWP-20261210-24, row "Stray broadcasts wake providers ...": counts and fixed codes only (Q121)
             try { st.put("chooser_version", getPackageManager().getPackageInfo(getPackageName(), 0).versionName); } catch (Exception ignore) {}
             o.put("status", st);
             return o.toString();
@@ -7097,7 +7161,7 @@ public class ChooserActivity extends Activity {
      *  never requires the 7-tap Build-number ritual or a forum search -- an exit people can find and finish
      *  without help is part of the promise that their data, not the phone, is what they own. */
     private View buildLeaveScreen() {
-        LinearLayout ll = ownerColumn("Leave Nowhere");
+        LinearLayout ll = ownerColumn("Leave nowhere");
 
         TextView intro = new TextView(this);
         // NWP-20261010-02: the last sentence promised the export page "for as long as your plan runs". An export on the
@@ -7113,7 +7177,7 @@ public class ChooserActivity extends Activity {
         ll.addView(intro, ip);
 
         TextView steps = new TextView(this);
-        steps.setText("1 · Tap the button below, then switch ON “OEM unlocking” (near the top of Developer options; it asks for your confirmation).\n\n2 · On a computer, open  beta.nowhere.mobile/leave  and follow it: it removes Nowhere’s signing key, then Google’s own tool reinstalls stock Android and locks the phone again.\n\nLeaving wipes this phone — that is part of the process, and by design nothing on it is the only copy.");
+        steps.setText("1 · Tap the button below, then switch ON “OEM unlocking” (near the top of Developer options; it asks for your confirmation).\n\n2 · On a computer, open  beta.nowhere.mobile/leave  and follow it: it removes nowhere’s signing key, then Google’s own tool reinstalls stock Android and locks the phone again.\n\nLeaving wipes this phone — that is part of the process, and by design nothing on it is the only copy.");
         steps.setTextColor(MUTED);
         steps.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
         LinearLayout.LayoutParams sp = new LinearLayout.LayoutParams(MATCH, WRAP);
@@ -8407,7 +8471,7 @@ public class ChooserActivity extends Activity {
         int total = activeEmbedded + inactiveEmbedded;
         if (total == 0) return null;
         String held = (total == 1 ? "This phone holds 1 eSIM profile" : "This phone holds " + total + " eSIM profiles") + ", " + inactiveEmbedded + " switched off";
-        return held + ". An eSIM is kept on the phone itself, so it stays through sign-out and power-off. Nowhere never deletes one.";
+        return held + ". An eSIM is kept on the phone itself, so it stays through sign-out and power-off. nowhere never deletes one.";
     }
 
     // Parse GET-BINDINGS ("OK\n" then "sub|iccid|label_b64|visibility|n" lines) into {subId, iccid, "n bound · vis"}
@@ -8683,12 +8747,10 @@ public class ChooserActivity extends Activity {
             final String iccid = iccidF.getText().toString().trim();
             if (iccid.isEmpty()) { msg.setTextColor(MUTED); StatusLine.error(msg, "enter the SIM's ICCID first"); return; }
             final boolean owned = ownerSessionPass != null;
-            new android.app.AlertDialog.Builder(this)
-                    .setTitle("Unbind this line?")
-                    .setMessage("Every profile is removed from this SIM, and any texts or calls for it that have not "
-                            + "reached a profile yet are deleted.")
-                    .setPositiveButton("Unbind", (d, w) -> {
-                        if (!OwnerLanding.lands(owned, ownerSessionPass != null)) return; // NWP-20261129-12: owner mode ended while the dialog was open: do nothing
+            // NWP-20261208-21: the ask is a red sheet (LineReportPresetSheets.unbindLine): slot 0 "Unbind" unbinds, slot 1
+            // "Keep the bindings" only closes it.
+            SheetDialog.confirm(this, LineReportPresetSheets.unbindLine(), new Runnable[] { () -> {
+                        if (!OwnerLanding.lands(owned, ownerSessionPass != null)) return; // NWP-20261129-12: owner mode ended while the sheet was open: do nothing
                         new Thread(() -> {
                             final String r = sendDaemon("DELETE-BINDING\n" + iccid + "\n\n");
                             // NWP-20260924-08 (Chester, 2026-09-24: "unbind all should clear it"): the line's gate notices go
@@ -8710,9 +8772,7 @@ public class ChooserActivity extends Activity {
                             // once SEAL-TEL has replied and released the lock the unbind then took. Sweep once more.
                             if (ok) { try { Thread.sleep(2000); } catch (InterruptedException ignore) {} cancelTelNotices(labels); }
                         }).start();
-                    })
-                    .setNegativeButton("Cancel", null)
-                    .show();
+                    }, null }, null);
         });
         LinearLayout.LayoutParams ulp = new LinearLayout.LayoutParams(MATCH, WRAP); ulp.topMargin = dp(16); ll.addView(unbind, ulp);
         // NWP-20261105-05 (Q103, decided 2026-10-20): clear this line's gate notices without a sign-in, deleting nothing,
@@ -9776,6 +9836,9 @@ public class ChooserActivity extends Activity {
             StatusLine.busy(msg, "disconnecting…");
             new Thread(() -> {
                 final String r = forgetWifi();
+                // NWP-20261205-17 (Q027): read at once, so the trace describes the moment of the Forget
+                final boolean ok = r.startsWith("OK");
+                final int inFlight = WifiForgetTrace.inFlight();
                 runOnUiThread(() -> {
                     forget.setEnabled(true);
                     if (r.startsWith("OK")) {
@@ -9789,6 +9852,8 @@ public class ChooserActivity extends Activity {
                         StatusLine.error(msg, "couldn't forget the network");
                     }
                 });
+                // NWP-20261205-17 (Q027): after the user-visible work, a verb and a count of adopt runs in flight
+                GateTrace.ev(WifiForgetTrace.forgetVerb(ok, inFlight), "n", WifiForgetTrace.clampCount(inFlight));
             }).start();
         });
 
@@ -9830,9 +9895,22 @@ public class ChooserActivity extends Activity {
             android.net.wifi.WifiManager wm = (android.net.wifi.WifiManager)
                     getApplicationContext().getSystemService(WIFI_SERVICE);
             if (wm == null) return "ERR no wifi service";
-            return WifiForget.run(new WifiForget.Ops() {
+            // NWP-20261205-17 (Q027): the SSID of the network WifiForget removes, looked up by the id it removes
+            // through the device owner's configured-network list (getSSID is location-gated). RAM only.
+            final String[] removedSsid = new String[1];
+            final WifiForgetTrace.SsidLookup ssidOf = netId -> {
+                java.util.List<android.net.wifi.WifiConfiguration> cfgs = wm.getConfiguredNetworks();
+                if (cfgs == null) return null;
+                for (android.net.wifi.WifiConfiguration c : cfgs) {
+                    if (c.networkId == netId && c.SSID != null) return c.SSID.replaceAll("^\"|\"$", ""); // quoted UTF-8
+                }
+                return null;
+            };
+            final String r = WifiForget.run(new WifiForget.Ops() {
                 @Override public int connectedNetId() { return wm.getConnectionInfo().getNetworkId(); }
-                @Override public boolean remove(int netId) { return wm.removeNetwork(netId); }
+                @Override public boolean remove(int netId) {
+                    return WifiForgetTrace.removeAndLookup(netId, id -> wm.removeNetwork(id), ssidOf, removedSsid);
+                }
                 @Override public void disconnect() {
                     try {
                         wm.disconnect();
@@ -9842,6 +9920,8 @@ public class ChooserActivity extends Activity {
                     }
                 }
             });
+            if (r.startsWith("OK") && removedSsid[0] != null) WifiForgetTrace.forgot(removedSsid[0]);
+            return r;
         } catch (Throwable t) {
             android.util.Log.w("NowhereChooser", "forgetWifi", t);
             return "ERR " + (t.getMessage() == null ? "failed" : t.getMessage());
@@ -9922,6 +10002,8 @@ public class ChooserActivity extends Activity {
             if (results == null) return out;
             java.util.Collections.sort(results, (a, b) -> Integer.compare(b.level, a.level)); // strongest first
             java.util.LinkedHashMap<String, String[]> best = new java.util.LinkedHashMap<>();
+            // NWP-20261207-15: the strongest result's advertised security per SSID, for the next join's gate.log line
+            java.util.HashMap<String, Integer> ap = new java.util.HashMap<>();
             for (android.net.wifi.ScanResult r : results) {
                 String ssid = r.SSID;
                 if (ssid == null || ssid.trim().isEmpty() || best.containsKey(ssid)) continue;
@@ -9929,7 +10011,9 @@ public class ChooserActivity extends Activity {
                         || r.capabilities.contains("WEP") || r.capabilities.contains("PSK")
                         || r.capabilities.contains("SAE"));
                 best.put(ssid, new String[]{ssid, secured ? "1" : "0"});
+                ap.put(ssid, WifiJoinTrace.apClass(r.capabilities));
             }
+            WifiJoinTrace.rememberScan(ap); // replaced whole, also when empty; RAM only (WifiJoinTrace)
             out.addAll(best.values());
         } catch (Throwable e) {
             android.util.Log.w("NowhereChooser", "wifi scan", e);
@@ -9980,10 +10064,14 @@ public class ChooserActivity extends Activity {
      *  index into GateMacMode.LABELS -- a new private address each connection (default), the same private address
      *  for this network, or the phone's factory MAC. */
     private String connectWifi(String ssid, String pw, String identity, boolean ttls, boolean hidden, int macSel) {
+        boolean reused = false; // NWP-20261207-15: addNetwork refused and findNet found a saved entry
         try {
             android.net.wifi.WifiManager wm = (android.net.wifi.WifiManager)
                     getApplicationContext().getSystemService(WIFI_SERVICE);
-            if (wm == null) return "ERR no Wi-Fi service on this device";
+            if (wm == null) {
+                traceJoin(WifiJoinTrace.NOWIFI, reused, pw, identity, ssid);
+                return "ERR no Wi-Fi service on this device";
+            }
             if (!wm.isWifiEnabled()) {
                 wm.setWifiEnabled(true); // device owner may toggle wifi
                 for (int i = 0; i < 12 && !wm.isWifiEnabled(); i++) {
@@ -10039,9 +10127,12 @@ public class ChooserActivity extends Activity {
                 // Re-push the full config (incl. the chosen MAC mode + password) onto the existing entry so a
                 // MAC switch on an already-saved network actually sticks -- addNetwork returned -1 precisely
                 // because it exists, so we'd otherwise keep its old randomization setting.
-                if (netId >= 0) { cfg.networkId = netId; try { wm.updateNetwork(cfg); } catch (Throwable ignore) {} }
+                if (netId >= 0) { reused = true; cfg.networkId = netId; try { wm.updateNetwork(cfg); } catch (Throwable ignore) {} }
             }
-            if (netId < 0) return "ERR couldn't add that network — try again";
+            if (netId < 0) {
+                traceJoin(WifiJoinTrace.ADDFAIL, reused, pw, identity, ssid);
+                return "ERR couldn't add that network — try again";
+            }
             wm.disconnect();
             wm.enableNetwork(netId, true);
             wm.reconnect();
@@ -10057,6 +10148,7 @@ public class ChooserActivity extends Activity {
                         associated = true; // wifi is the active network -> good enough to try a login
                         if (nc.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_VALIDATED)
                                 || nc.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET)) {
+                            traceJoin(WifiJoinTrace.OK, reused, pw, identity, ssid);
                             return "OK";
                         }
                     }
@@ -10064,12 +10156,21 @@ public class ChooserActivity extends Activity {
             }
             // Associated but not yet validated within the window -> still likely usable; let the user proceed
             // (the login/daemon is the real reachability test). Only a never-associated network is a hard error.
-            if (associated) return "OK";
+            if (associated) { traceJoin(WifiJoinTrace.ASSOC, reused, pw, identity, ssid); return "OK"; }
+            traceJoin(WifiJoinTrace.NOASSOC, reused, pw, identity, ssid);
             return "ERR couldn't join that network — check the name and password";
         } catch (Throwable e) {
             android.util.Log.w("NowhereChooser", "wifi connect", e);
+            traceJoin(WifiJoinTrace.ERR, reused, pw, identity, ssid);
             return "ERR Wi-Fi connect failed (" + e.getClass().getSimpleName() + ")";
         }
+    }
+
+    /** NWP-20261207-15: one gate.log line per gate join -- the outcome verb and WifiJoinTrace.code, never the SSID. */
+    private void traceJoin(String verb, boolean reused, String pw, String identity, String ssid) {
+        try {
+            GateTrace.ev(verb, WifiJoinTrace.KEY, WifiJoinTrace.code(reused, WifiNetMatch.joinSec(pw, identity), ssid));
+        } catch (Throwable ignore) {}
     }
 
     /** netId of an already-saved network with this SSID AND security type (docs/wifi-retention-spec.md §5 F2,
@@ -10144,6 +10245,7 @@ public class ChooserActivity extends Activity {
             os.flush();
             BufferedReader br = new BufferedReader(new InputStreamReader(s.getInputStream(), "UTF-8"));
             lastSealTs = 0;
+            runOnUiThread(() -> { restoreBarLabel = null; restoreBarPct = 0; }); // NWP-20261208-30: one bar reset per sign-in
             String line, verdict = "";
             while ((line = br.readLine()) != null) {
                 line = line.trim();
@@ -10165,7 +10267,8 @@ public class ChooserActivity extends Activity {
         }
     }
 
-    /** Drive the bar from a "<phase> <done> <total>" progress line. */
+    /** Drive the bar from a "<phase> <done> <total>" progress line. NWP-20261208-30: within one label the bar never goes
+     *  back (RestorePhase.hold), so a scope's tail that restarts its count continues that scope's bar. */
     private void onRestoreProgress(String s) {
         sawRestoreProgress = true; // #70/#75: any progress means the creds were accepted + the restore started
         String[] p = s.split("\\s+");
@@ -10176,15 +10279,21 @@ public class ChooserActivity extends Activity {
         catch (NumberFormatException e) { return; }
         final int pct = t > 0 ? (int) (100L * d / t) : 0;
         runOnUiThread(() -> {
+            // NWP-20261208-30: one bar per label. The hold keys on the restoring label; each creating label maps one to one
+            // onto it, so the same held value serves the mirror.
+            String lbl = RestorePhase.label(phase, false);
+            int shown = RestorePhase.hold(restoreBarLabel, restoreBarPct, lbl, pct);
+            restoreBarLabel = lbl;
+            restoreBarPct = shown;
             progressBar.setVisibility(View.VISIBLE);
-            progressBar.setProgress(pct);
+            progressBar.setProgress(shown);
             result.setTextColor(ACCENT);
-            result.setText(RestorePhase.label(phase, false) + " — " + pct + "%");
+            result.setText(RestorePhase.label(phase, false) + " — " + shown + "%");
             // NWP-20261027-11: mirrorCreate paints only while the creating screen is up, and that screen is up only
             // after a create's recovery-code screen -- a create's first sign-in restores the vault it just wrote, so
             // its text says "Setting up". A login that auto-migrates a legacy profile reaches showRecoveryCode only
             // after its restore finished, so its restore progress is never mirrored.
-            mirrorCreate(RestorePhase.label(phase, true) + " — " + pct + "%", pct); // NWP-20260820-30
+            mirrorCreate(RestorePhase.label(phase, true) + " — " + shown + "%", shown); // NWP-20260820-30
         });
     }
 
@@ -10197,7 +10306,7 @@ public class ChooserActivity extends Activity {
         LocalSocket s = DaemonSocket.connect(); // #77: bounded connect
         if (s == null) return "";
         try {
-            s.setSoTimeout(90000); // the cap sendDaemon gave the one-line read
+            s.setSoTimeout(DaemonReadCap.forRequest(msg)); // CREATE / CREATE-CODE: LONG_MS, the cap sendDaemon gives them
             OutputStream os = s.getOutputStream();
             os.write(msg.getBytes("UTF-8"));
             os.flush();
@@ -10358,8 +10467,8 @@ public class ChooserActivity extends Activity {
     // Settings, Owner settings, a locked phone); Profile › Help reads HelpPages, the session's set.
     // NWP-20261130-11 (chosen 2026-11-06, NWP-20261105-27): the "?" opens the combo screen, GateHelpScreen, and its tiles
     // open those pages. STATIC text, the same for everyone, reveals nothing about any profile, so blind login holds. A
-    // setContentView swap and dialogs, so it stays inside Lock-Task: no activity, no link. Like Settings, it holds no
-    // typed secret, so a screen-off leaves it open.
+    // setContentView swap, its topics opening in place (NWP-20261208-26), so it stays inside Lock-Task: no activity, no
+    // link. Like Settings, it holds no typed secret, so a screen-off leaves it open.
     private void showGateHelp() {
         runOnUiThread(() -> setContentView(GateHelpScreen.home(this, GatePalette.active(), gateHelpNav())));
     }
@@ -10368,27 +10477,7 @@ public class ChooserActivity extends Activity {
         return new GateHelpScreen.Nav() {
             @Override public void show(View v) { setContentView(v); }
             @Override public void close() { setContentView(gateView); }
-            @Override public void openTile(int i) {
-                showGateHelpPage(GateHelpHome.tileTitle(i), GateHelpHome.tileBody(i), GateHelpHome.alsoLabel(i),
-                        GateHelpHome.tileAlso(i));
-            }
-            @Override public void openForgot() {
-                showGateHelpPage(GateHelpHome.FORGOT_TITLE, GateHelpHome.forgotBody(), null, -1);
-            }
         };
-    }
-
-    /** A Help page, over the combo screen. alsoLabel, when not null, names a button that opens GateHelpPages page alsoPage. */
-    private void showGateHelpPage(String title, String body, String alsoLabel, int alsoPage) {
-        android.app.AlertDialog.Builder b = new android.app.AlertDialog.Builder(this)
-                .setTitle(title)
-                .setMessage(body + "\n\n" + GateHelpPages.moreLine())
-                .setNegativeButton(GateHelpHome.BACK, (d, w) -> d.dismiss());
-        if (alsoLabel != null) {
-            b.setNeutralButton(alsoLabel, (d, w) ->
-                    showGateHelpPage(GateHelpPages.TITLES[alsoPage], GateHelpPages.body(alsoPage), null, -1));
-        }
-        b.show();
     }
 
     // #113: whether the multi-device "Restore from another device" gate link is shown. Off until #91 ships;
@@ -10413,7 +10502,7 @@ public class ChooserActivity extends Activity {
 
     /** Send one line-framed request to the root daemon over the AF_UNIX socket; return its reply line. */
     private String sendDaemon(String msg) {
-        return DaemonSocket.roundTrip(msg, 90000); // #77 bounded connect; roam restore/seal does S3 I/O -> long read cap
+        return DaemonSocket.roundTrip(msg, DaemonReadCap.forRequest(msg)); // #77 bounded connect; read cap by verb
     }
 
     /** #158: should this session's outbound telephony be BLOCKED (i.e. it is NOT a bound owner of a SIM)? The
@@ -11469,6 +11558,8 @@ public class ChooserActivity extends Activity {
             int mediaShownForUid = -1;  // media-loading notice (#90), tracked independently
             int landedUid = -1;          // NWP-20261114-34: the session the landed count below belongs to (-1 = none)
             String landedSeen = "0";     // NWP-20261114-34: mediad's landed count last seen for that session
+            String rescanHeld = null;    // NWP-20261208-09: the landed count whose rescan waits behind the Auto sweep (null = none)
+            long rescanHeldSince = -1;   // NWP-20261208-09: elapsedRealtime when that wait began (-1 = none)
             int offlineShownForUid = -1; // offline-session notice (#49), tracked independently
             int dropShownForUid = -1;    // net-drop notice: STORED session that lost the network mid-use
             int offTicks = 0;            // NWP-20260822-24: consecutive stored-and-offline ticks (the debounce)
@@ -11503,7 +11594,8 @@ public class ChooserActivity extends Activity {
                     if (shownForUid >= 0) { cancelBackupNotice(app, shownForUid); shownForUid = -1; }
                     if (storShownForUid >= 0) { cancelStorageNotice(app, storShownForUid); storShownForUid = -1; }
                     if (mediaShownForUid >= 0) { cancelMediaNotice(app, mediaShownForUid); mediaShownForUid = -1; }
-                    landedUid = -1; // NWP-20261114-34: the next session starts again from "0"
+                    landedUid = -1; rescanHeld = null; rescanHeldSince = -1; // NWP-20261114-34, NWP-20261208-09: from "0", none held
+                    sRescanMeteredUid.set(-1); // NWP-20261208-19: a held landing ask does not outlive its session
                     if (offlineShownForUid >= 0) { cancelOfflineNotice(app, offlineShownForUid); cancelReconnectNotice(app, offlineShownForUid); offlineShownForUid = -1; }
                     if (dropShownForUid >= 0) { cancelDropNotice(app, dropShownForUid); dropShownForUid = -1; }
                     if (backNowShownForUid >= 0) { idleTrace("backnow cancel gate user=" + backNowShownForUid); cancelBackNowNotice(app, backNowShownForUid); backNowShownForUid = -1; }
@@ -11599,11 +11691,34 @@ public class ChooserActivity extends Activity {
                 // provider scanned at user start and once more right after the sign-in restore (NWP-20261113-45).
                 // mediad counts those runs in media.landed; a changed, non-zero count starts the session's rescan,
                 // which must run inside the session (scan_volume takes the user from the caller's uid).
-                if (uid != landedUid) { landedUid = uid; landedSeen = "0"; }
+                if (uid != landedUid) { landedUid = uid; landedSeen = "0"; rescanHeld = null; rescanHeldSince = -1; }
                 String landedReply = pollDaemon("GET-MEDIA-LANDED\n");
-                if (MediaStatus.rescanAfterLanding(landedSeen, landedReply)) requestMediaRescan(app, uid, MediaStatus.landed(landedReply));
+                // NWP-20261208-09: a landing during the Auto sweep waits. The scan would open every deferred file
+                // through mediad's overlay and fetch it beside the sweep's installs; the files already local are in
+                // the Gallery from roamd's sign-in rescan. GET-SWEEP is lock-free; NONE or a failed read runs it now.
+                boolean rescanHoldBegan = false;
+                if (MediaStatus.rescanAfterLanding(landedSeen, landedReply)) {
+                    rescanHeld = MediaStatus.landed(landedReply);
+                    if (rescanHeldSince < 0) { rescanHeldSince = android.os.SystemClock.elapsedRealtime(); rescanHoldBegan = true; }
+                }
+                if (rescanHeld != null) {
+                    long heldMs = android.os.SystemClock.elapsedRealtime() - rescanHeldSince;
+                    String sw = pollDaemon("GET-SWEEP\n");
+                    if (MediaStatus.holdRescanForSweep(sw, heldMs, MediaStatus.RESCAN_SWEEP_CAP_MS)) {
+                        if (rescanHoldBegan) android.util.Log.i("NowhereChooser", "media rescan held behind the Auto sweep"
+                                + " (landed " + rescanHeld + ") (NWP-20261208-09)");
+                    } else {
+                        requestMediaRescan(app, uid, rescanHeld);
+                        if (heldMs >= 1000) android.util.Log.i("NowhereChooser", "media rescan ran after " + (heldMs / 1000)
+                                + " s behind the Auto sweep"
+                                + (heldMs >= MediaStatus.RESCAN_SWEEP_CAP_MS ? ", released by the 60-minute cap" : "")
+                                + " (NWP-20261208-09)");
+                        rescanHeld = null; rescanHeldSince = -1;
+                    }
+                }
                 String landedNow = MediaStatus.landed(landedReply);
                 if (landedNow != null) landedSeen = landedNow;
+                retryHeldRescan(app, uid); // NWP-20261208-19: a landing asked on a metered network, re-asked once unmetered
                 // #110: a damaged verdict is sticky for the session -- post the alert ONCE (re-posting every
                 // 5s would re-buzz a heads-up), pointing at the snapshot-restore remedy (#58). Dismissible;
                 // no cancel path (the damage doesn't heal mid-session).
@@ -11628,7 +11743,7 @@ public class ChooserActivity extends Activity {
                 // swap the quiet "offline" notice for a separate ALERTING "back online" prompt.
                 String off = pollDaemon("GET-OFFLINE\n").trim();
                 if (off.startsWith("1")) {
-                    if (hasInternetCtx(app)) {
+                    if (hasValidatedInternetCtx(app)) { // NWP-20261210-27: VALIDATED, not just INTERNET: a network with no upstream must not say "Back online"
                         cancelOfflineNotice(app, uid);
                         postReconnectNotice(app, uid);
                     } else {
@@ -11648,7 +11763,7 @@ public class ChooserActivity extends Activity {
                 // changes we warn about). Skipped for started-offline sessions (off=="1"; the #49 block owns those).
                 // Checked every 5s tick for promptness. (gap: mid-session Wi-Fi loss, DIA-20260713.)
                 if (!off.startsWith("1")) {
-                    boolean online = hasInternetCtx(app);
+                    boolean online = hasValidatedInternetCtx(app); // NWP-20261210-27: VALIDATED, not just INTERNET: a network with no upstream must not say "Back online"
                     boolean stored = pollDaemon("GET-SESSION-TYPE\n").trim().startsWith("STORED");
                     if (stored && !online) {                        // dropped mid-session?
                         // NWP-20260822-24: DEBOUNCE THE RAISE -- the other half of the row NWP-20260822-15 fixed.
@@ -12170,6 +12285,8 @@ public class ChooserActivity extends Activity {
                     .setContentText(OtaUpdate.noticeText(s))
                     .setStyle(new android.app.Notification.BigTextStyle().bigText(OtaUpdate.noticeBig(s, auto, tz, loc)))
                     .setShowWhen(false);
+            // NWP-20261208-32: a tap opens Profile at its Update card, on every channel (made on uc: UpdateNoticeTap).
+            b.setContentIntent(UpdateNoticeTap.pending(uc));
             if (mand) {
                 b.setOngoing(true)                // not swipeable where the platform honours it
                  .setOnlyAlertOnce(!alert)        // an update of the shown notice sounds only when alert says so
@@ -12534,6 +12651,28 @@ public class ChooserActivity extends Activity {
         }
     }
 
+    /** NWP-20261210-27 (backlog row 'A network that is connected but has no internet makes a session say "Back
+     *  online"'): the active network has internet AND is VALIDATED, the exact test of {@link #hasValidatedInternet}. A
+     *  captive portal or a hotspot with no upstream carries NET_CAPABILITY_INTERNET only, so the session watcher must
+     *  not read it as online and post "Back online". This is the static twin of hasValidatedInternet for the watcher
+     *  thread, with the failure posture of {@link #hasInternetCtx}: no ConnectivityManager, no network, or a throw is
+     *  false (the drop arm's 3-tick debounce absorbs a transient). */
+    static boolean hasValidatedInternetCtx(Context ctx) {
+        try {
+            android.net.ConnectivityManager cm =
+                    (android.net.ConnectivityManager) ctx.getSystemService(Context.CONNECTIVITY_SERVICE);
+            if (cm == null) return false;
+            android.net.Network nw = cm.getActiveNetwork();
+            if (nw == null) return false;
+            android.net.NetworkCapabilities nc = cm.getNetworkCapabilities(nw);
+            return nc != null
+                    && nc.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                    && nc.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_VALIDATED);
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
     /** NWP-20261201-05: the active network has internet and is NOT_METERED, on any transport (Ethernet counts, a metered
      *  hotspot does not): what "Only on Wi-Fi" means for the periodic save. Not {@link #onWifiCtx}, which tests the Wi-Fi
      *  transport on purpose. Static for the watcher thread, mirrors {@link #hasInternetCtx}. */
@@ -12772,12 +12911,14 @@ public class ChooserActivity extends Activity {
      *  to that user's launcher when the value changes, so the ring animates smoothly. NWP-20261128-19: it also
      *  re-sends an unchanged value every MediaRingRelay.RESEND_MS. The launcher listens only while it is resumed, so
      *  a clear sent while an app was in front was lost and the launcher's static map kept the ring with no notice.
-     *  User-0 only (the device owner relays cross-user). */
-    private void startMediaRingPoller() {
+     *  User-0 only (the device owner relays cross-user). NWP-20261204-25: started at process birth from NowhereApp
+     *  (same reason as ensureReapWatcher, #141) and from the gate's onCreate; idempotent (user-0 guard + a started
+     *  flag). */
+    static void startMediaRingPoller(Context ctx) {
         if (android.os.UserHandle.myUserId() != 0) return;
         if (mediaRingStarted) return;
         mediaRingStarted = true;
-        final Context app = getApplicationContext();
+        final Context app = ctx.getApplicationContext();
         Thread t = new Thread(() -> {
             final MediaRingRelay relay = new MediaRingRelay();
             while (true) {
@@ -13134,16 +13275,37 @@ public class ChooserActivity extends Activity {
     /** NWP-20261114-34: start the session's media rescan (CredentialService rescanmedia, which calls MediaProvider's
      *  scan_volume as the session's user) after mediad reported newly landed files. startServiceAsUser, the proven
      *  cross-user start; it returns null when the user is not up, which is logged and left to the next landing or
-     *  sign-in. */
+     *  sign-in. NWP-20261208-19: the ask carries ScanNetHold.EXTRA_LANDED, so the session may hold it for an unmetered
+     *  network; an ask sent on a metered network is remembered in sRescanMeteredUid for retryHeldRescan. */
     private static void requestMediaRescan(Context app, int uid, String count) {
         try {
+            if (!unmeteredCtx(app)) sRescanMeteredUid.set(uid); // NWP-20261208-19: the session may hold this ask
             android.content.ComponentName cn = app.startServiceAsUser(
-                    new android.content.Intent(app, CredentialService.class).putExtra("rescanmedia", true),
+                    new android.content.Intent(app, CredentialService.class).putExtra(ScanNetHold.EXTRA_LANDED, true).putExtra("rescanmedia", true),
                     android.os.UserHandle.of(uid));
             android.util.Log.i("NowhereChooser", "media rescan requested after background landing " + count
                     + " (user " + uid + ", " + (cn != null ? "started" : "not started") + ") (NWP-20261114-34)");
         } catch (Throwable t) {
             android.util.Log.w("NowhereChooser", "media rescan request failed (user " + uid + ") (NWP-20261114-34)", t);
+        }
+    }
+
+    /** NWP-20261208-19: the session whose landing ask went out on a metered network (-1 = none). */
+    static final java.util.concurrent.atomic.AtomicInteger sRescanMeteredUid = new java.util.concurrent.atomic.AtomicInteger(-1);
+
+    /** NWP-20261208-19: re-ask the live session's rescan once, when its landing ask went out on a metered network and
+     *  the gate's network is now unmetered. The mark is cleared before the start, so a start that fails waits for the
+     *  next landing. The session answers SKIP when its switch is off (the first ask already ran). */
+    private static void retryHeldRescan(Context app, int uid) {
+        if (!ScanNetHold.retryNow(sRescanMeteredUid.get(), uid, unmeteredCtx(app))) return;
+        sRescanMeteredUid.set(-1);
+        try {
+            app.startServiceAsUser(new android.content.Intent(app, CredentialService.class)
+                    .putExtra(ScanNetHold.EXTRA_LANDED, true).putExtra(ScanNetHold.EXTRA_RETRY, true)
+                    .putExtra("rescanmedia", true), android.os.UserHandle.of(uid));
+            android.util.Log.i("NowhereChooser", "media rescan re-asked on an unmetered network (user " + uid + ") (NWP-20261208-19)");
+        } catch (Throwable t) {
+            android.util.Log.w("NowhereChooser", "media rescan re-ask failed (user " + uid + ") (NWP-20261208-19)", t);
         }
     }
 
@@ -13874,10 +14036,18 @@ public class ChooserActivity extends Activity {
 
     void maybeMirrorWifi() {
         new Thread(() -> {
+            boolean adopting = false;
             try {
                 java.util.List<String> lines = DaemonSocket.roundTripLinesRaw("GET-WIFI-MIRROR\n", 30000);
                 java.util.List<String[]> ents = WifiMirrorLine.parseReply(lines);
                 if (ents.isEmpty()) return;
+                // NWP-20261205-17 (Q027): name the collected queue, and whether a session is parked (cold-locked).
+                // An UNKNOWN probe reads not parked.
+                boolean parked = false;
+                try {
+                    parked = RerunReapRule.kindOf(pollDaemon("GET-COLDLOCK\n")) == RerunReapRule.COLD;
+                } catch (Throwable ignore) {}
+                GateTrace.ev(WifiForgetTrace.collectVerb(parked), "n", WifiForgetTrace.clampCount(ents.size()));
                 android.net.wifi.WifiManager wm = (android.net.wifi.WifiManager)
                         getApplicationContext().getSystemService(WIFI_SERVICE);
                 if (wm == null) return;
@@ -13892,9 +14062,12 @@ public class ChooserActivity extends Activity {
                 // "our" adopted network with it (adopted id=3 at :16, gone from list-networks after the reap).
                 // Once the session user is fully removed, a re-add creates a genuinely user-0-owned config
                 // that nothing sweeps. The waits also cover a slow removeUser.
+                WifiForgetTrace.adoptStarted(); // NWP-20261205-17: a Forget from now on is mid-adopt (Q027 path 1)
+                adopting = true;
                 for (int pass = 0; pass < 3; pass++) {
                     if (pass > 0) Thread.sleep(pass == 1 ? 8000 : 15000);
                     int added = 0, present = 0, failed = 0; // NWP-20261020-31: this pass's record for login.log
+                    java.util.ArrayList<String> addedSsids = new java.util.ArrayList<>(); // NWP-20261205-17, RAM only
                     for (String[] e : ents) {
                         // SSID alone, not findNet's (SSID, security type): a mirror line carries no security type (an
                         // EAP network mirrors with an empty PSK, so it would read "open"), and an (SSID, sec) match
@@ -13920,6 +14093,7 @@ public class ChooserActivity extends Activity {
                         if (id >= 0) {
                             wm.enableNetwork(id, false); // save as known -- never force a switch
                             added++;
+                            addedSsids.add(e[0]);
                             android.util.Log.i("NowhereChooser", "wifi-mirror: adopted \"" + e[0]
                                     + "\" for user 0 (id=" + id + ", pass=" + pass + ")");
                         } else {
@@ -13937,9 +14111,14 @@ public class ChooserActivity extends Activity {
                     } catch (Throwable t) {
                         android.util.Log.w("NowhereChooser", "wifi-mirror: WIFI-ADOPT pass " + pass, t);
                     }
+                    // NWP-20261205-17 (Q027): this pass re-added a network the gate forgot -- a verb and a count, never which
+                    int readd = WifiForgetTrace.readdCount(addedSsids);
+                    if (readd > 0) GateTrace.ev(WifiForgetTrace.readdVerb(pass), "n", WifiForgetTrace.clampCount(readd));
                 }
             } catch (Throwable t) {
                 android.util.Log.w("NowhereChooser", "maybeMirrorWifi", t);
+            } finally {
+                if (adopting) WifiForgetTrace.adoptFinished();
             }
         }, "nowhere-wifi-adopt").start();
     }
@@ -14254,7 +14433,23 @@ public class ChooserActivity extends Activity {
         } catch (Throwable t) {
             android.util.Log.w("NowhereChooser", "od-unparked unreadable, raising every deferred row", t);
         }
-        int ok = 0, tot = 0;
+        // NWP-20261208-25: n = the rows the loop below hands to installApkSet: parsed, not deferred, and with at least
+        // one listed APK on disk. Finishing up counts them as "Installing <app> (<i> of <n>)".
+        int cnt = 0;
+        try (java.io.BufferedReader pre = new java.io.BufferedReader(new java.io.FileReader(man))) {
+            String l;
+            while ((l = pre.readLine()) != null) {
+                AppCodeManifest.Row r = AppCodeManifest.parseRow(l, ProfileActivity::defaultGroupFor);
+                if (r == null || r.deferred) continue;
+                for (String a : r.apks) {
+                    if (new java.io.File(new java.io.File(dir, r.pkg), a).isFile()) { cnt++; break; }
+                }
+            }
+        } catch (Throwable t) {
+            cnt = 0;
+        }
+        final int n = cnt;
+        int ok = 0, tot = 0, at = 0;
         // NWP-20261127-08: one outcome per deferred row, sent to login.log after the loop as counts only, so a
         // report tells a missing _meta from a refused install (logcat, which carries the package, a report does not).
         final PlaceholderTally tally = new PlaceholderTally();
@@ -14312,6 +14507,17 @@ public class ChooserActivity extends Activity {
                             if (a.isFile()) apks.add(a);
                         }
                         if (apks.isEmpty()) { tot--; continue; }
+                        // NWP-20261208-25: show this app and the count before its install; the label is on screen only.
+                        at++;
+                        java.io.File labelApk = apks.get(0);
+                        for (java.io.File f : apks) if ("base.apk".equals(f.getName())) { labelApk = f; break; }
+                        final int p = FinishingProgress.pct(at - 1, n);
+                        final String il = FinishingProgress.line(appLabelOf(labelApk, pkg), at, n);
+                        runOnUiThread(() -> {
+                            progressBar.setProgress(p);
+                            result.setText(FinishingProgress.status(p));
+                            if (installLine != null) { installLine.setText(il); installLine.setVisibility(View.VISIBLE); }
+                        });
                         if (installApkSet(pkg, apks, uid)) {
                             installExistingFor(pkg, uid);
                             // DIA-20260801: the worker parked this app's restored CE/DE data in .nowhere-odhold at
@@ -14336,6 +14542,11 @@ public class ChooserActivity extends Activity {
         } catch (Throwable t) {
             android.util.Log.w("NowhereChooser", "installRoamedAppCode", t);
         } finally {
+            if (n > 0) runOnUiThread(() -> { // NWP-20261208-25: every install is done; 100 stays with the switch (D7)
+                progressBar.setProgress(FinishingProgress.pct(n, n));
+                result.setText(FinishingProgress.status(FinishingProgress.pct(n, n)));
+                if (installLine != null) installLine.setVisibility(View.GONE);
+            });
             rmTree(dir); // amnesia + reclaim: no roamed APK bytes persist in user-0 storage
         }
         android.util.Log.i("NowhereChooser", "restored " + ok + "/" + tot + " roamed app code -> user " + uid);
@@ -14348,6 +14559,23 @@ public class ChooserActivity extends Activity {
             }
         }
         return od;
+    }
+
+    /** NWP-20261208-25: the label "Installing <app> (<i> of <n>)" shows for one Installed app, read from its APK on disk.
+     *  On screen only, never logged. No label, or any failure, is the package name. */
+    private String appLabelOf(java.io.File apk, String pkg) {
+        try {
+            String path = apk.getPath();
+            android.content.pm.PackageManager pm = getPackageManager();
+            android.content.pm.PackageInfo pi = pm.getPackageArchiveInfo(path, 0);
+            if (pi == null || pi.applicationInfo == null) return pkg;
+            pi.applicationInfo.sourceDir = path;
+            pi.applicationInfo.publicSourceDir = path;
+            CharSequence l = pm.getApplicationLabel(pi.applicationInfo);
+            return l == null || l.toString().trim().isEmpty() ? pkg : l.toString();
+        } catch (Throwable t) {
+            return pkg;
+        }
     }
 
     /** Install one package (base + every split) for the ROAMED user, blocking on the commit result (we run off

@@ -99,7 +99,7 @@ func sprscPlainVault(t *testing.T, base, scoped, pass string, gen uint64) string
 func TestSealPruneScopeScope(t *testing.T) {
 	for p, want := range map[string]bool{
 		"a": true, "a#de": true, "a#sys": true, "a#keys": true, "a#apps": true,
-		"a#media": false, "a#wallet": false, "a#dex": false, "a#": false, "a#de#x": false,
+		"a#media": true, "a#wallet": false, "a#dex": false, "a#": false, "a#de#x": false,
 	} {
 		if got := relGenScope(p); got != want {
 			t.Errorf("relGenScope(%q) = %v, want %v", p, got, want)
@@ -107,10 +107,13 @@ func TestSealPruneScopeScope(t *testing.T) {
 	}
 }
 
-func TestSealPruneScopeOffByDefault(t *testing.T) {
-	if scopeReleaseOn {
-		t.Fatal("scopeReleaseOn is true at package init: the scope release must ship off")
+func TestSealPruneScopeOnByDefault(t *testing.T) {
+	if !scopeReleaseOn {
+		t.Fatal("scopeReleaseOn is false at package init: the scope release ships on since NWP-20261116-56")
 	}
+	old := scopeReleaseOn
+	scopeReleaseOn = false
+	t.Cleanup(func() { scopeReleaseOn = old })
 	t.Setenv("GATEWAY_URL", "http://127.0.0.1:1")
 	t.Setenv("S3_ACCESS_KEY", "")
 	t.Setenv("NOWHERE_MULTIDEVICE", "")
@@ -216,34 +219,13 @@ func TestSealPruneScopeVaultFrees(t *testing.T) {
 	}
 }
 
-func TestSealPruneScopeMediaNotYet(t *testing.T) {
-	r := sprelSetup(t, "sprsc-media", "the media scope keeps its chunks", 3*cdcMax)
-	sprscOn(t)
-	scoped := r.name + "#media"
-	sprscVault(t, r, scoped)
-	for i := 0; i < 4; i++ {
-		sprscSeal(t, r, scoped, true)
-	}
-	before, _ := snapDelHead(t, r.base, scoped, r.pass)
-	sprelPrune(t)
-	logs := sprscSeal(t, r, scoped, false)
-	after, _ := snapDelHead(t, r.base, scoped, r.pass)
-	if len(after.History) >= len(before.History)+1 {
-		t.Fatalf("fixture: the pruning seal dropped nothing (%d -> %d snapshots)\n%s", len(before.History), len(after.History), logs)
-	}
-	if n := r.releases(); n != 0 {
-		t.Errorf("%d /release request(s) for a #media seal: #media is a later slice\n%s", n, logs)
-	}
-	if after.ReleaseGen != before.ReleaseGen {
-		t.Errorf("#media head generation %d -> %d", before.ReleaseGen, after.ReleaseGen)
-	}
-}
-
 func TestSealPruneScopeBareShapedNothing(t *testing.T) {
 	r := sprelSetup(t, "sprsc-bare", "a bare-shaped scope keeps its chunks", 4096)
 	sprscOn(t)
 	scoped := r.name + "#sys"
-	if err := relGenRecord(r.cache, relGenHeadKey(r.base, r.name, r.pass), 2); err != nil {
+	// The bare head's real generation: since NWP-20261208-15 a bare-shaped scope push checks the bare record.
+	bv, _ := snapDelHead(t, r.base, r.name, r.pass)
+	if err := relGenRecord(r.cache, relGenHeadKey(r.base, r.name, r.pass), bv.ReleaseGen); err != nil {
 		t.Fatal(err)
 	}
 	before, _ := os.ReadFile(relGenPath(r.cache))

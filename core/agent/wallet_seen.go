@@ -22,6 +22,8 @@ import (
 // token's message is hashed, so the file holds no spendable token. A pending claim code (Wallet.PendingClaims,
 // NWP-20261125-05) is one more key, "c:"+hex(sha256(code)), never the code itself, so the file holds nothing spendable.
 // A recorded purchase's random id (Wallet.PlanID, PlanSpec.ID, h60 #14) is one more key, "p:"+id; the id spends nothing.
+// An unusable-claim notice (Wallet.UnusableClaims, NWP-20261208-03) is its own key, "u:"+hex(sha256(code)) (the entry
+// itself, unusableClaimKey), never the code.
 // It lives beside the wallet in the session's tmpfs and nowhere else: it is not sealed, never roams, and goes with the
 // wallet (removeWallet, dropWalletIfUnchanged) and with the power-off wipe, so a new session starts with none and
 // publishes by the unread-set rule.
@@ -88,9 +90,9 @@ func walletTokenKeys(w *Wallet) []string {
 	return keys
 }
 
-// walletSeenKeys lists every seen-set key of w: its tokens' (walletTokenKeys), one per pending claim code and one per
-// purchase id (the plan's and the queue's), so a purchase this session held is never resurrected. A separate helper so
-// walletTokenKeys stays tokens only.
+// walletSeenKeys lists every seen-set key of w: its tokens' (walletTokenKeys), one per pending claim code, one per
+// unusable-claim notice (NWP-20261208-03) and one per purchase id (the plan's and the queue's), so a purchase or a
+// notice this session held is never resurrected. A separate helper so walletTokenKeys stays tokens only.
 func walletSeenKeys(w *Wallet) []string {
 	keys := walletTokenKeys(w)
 	if w == nil {
@@ -99,6 +101,7 @@ func walletSeenKeys(w *Wallet) []string {
 	for _, c := range w.PendingClaims {
 		keys = append(keys, pendingClaimSeenKey(c))
 	}
+	keys = append(keys, w.UnusableClaims...)
 	if w.PlanID != "" {
 		keys = append(keys, "p:"+w.PlanID)
 	}
@@ -114,6 +117,13 @@ func walletSeenKeys(w *Wallet) []string {
 func pendingClaimSeenKey(code string) string {
 	sum := sha256.Sum256([]byte(code))
 	return "c:" + hex.EncodeToString(sum[:])
+}
+
+// unusableClaimKey keys the notice of an unusable claim code (Wallet.UnusableClaims, NWP-20261208-03) by its hash.
+// Never the code. The "u:" prefix keeps it apart from the same code's pendingClaimSeenKey.
+func unusableClaimKey(code string) string {
+	sum := sha256.Sum256([]byte(code))
+	return "u:" + hex.EncodeToString(sum[:])
 }
 
 // blindSeenKey keys a blind token by the hash of its signed message. Not by its signature: the signature is what

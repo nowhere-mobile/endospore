@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# test-media-nochange.sh [--mutate] -- runs the no-change #media push tests (NWP-20261123-04); --mutate re-runs them
-# with media_nochange.go or main.go broken in turn, restoring both files on exit. Each mutant must be CONVICTED by a
-# `--- FAIL`; one that fails to apply, or fails to compile, counts as a failure.
+# test-media-nochange.sh [--mutate] -- runs the no-change #media push tests (NWP-20261123-04, NWP-20261204-22);
+# --mutate re-runs them with media_nochange.go or main.go broken in turn, restoring both files on exit. Each mutant must
+# be CONVICTED by a `--- FAIL`; one that fails to apply, or fails to compile, counts as a failure.
 set -uo pipefail
 cd "$(dirname "$0")"
 . ./suite-report.sh
@@ -40,10 +40,13 @@ PY
   conv "$1"
 }
 mut "M1 the digest without mtime" media_nochange.go '\n\td\.i64\(info\.ModTime\(\)\.UnixNano\(\)\)\n' '\n'
-mut "M2 the stored-head check dropped" media_nochange.go '\t\tcase in\.head == "" \|\| rh != in\.head:[^\n]*\n\t\t\treturn false\n' ''
-mut "M3 the tombstone check dropped" media_nochange.go '\t\tcase !mediaTombstonesEmpty\(in\.src\):[^\n]*\n\t\t\treturn false\n' ''
-mut "M3b a tombstones file of blank lines accepted" media_nochange.go 'case err != nil, !fi\.Mode\(\)\.IsRegular\(\), fi\.Size\(\) != 0:' 'case err != nil, !fi.Mode().IsRegular():'
-mut "M3c a tombstones path it cannot inspect accepted" media_nochange.go 'case err != nil, !fi\.Mode\(\)\.IsRegular\(\), fi\.Size\(\) != 0:' 'case err == nil && fi.Mode().IsRegular() && fi.Size() != 0:'
+mut "M2 the stored-head check dropped" media_nochange.go '\t\tcase in\.head == "" \|\| rh != in\.head:[^\n]*\n\t\t\treturn "head-moved"\n' ''
+# NWP-20261204-22: the tombstones are in the record's digest (mediaTombstonesKey); the old empty-only arm is gone.
+# M3 is convicted by TestMediaNoChange_ATombstoneTakesTheFullPath, M3b by TestMediaNoChange_TombstonesKeyFields,
+# M3c by TestMediaNoChange_AnUninspectableTombstonePathTakesTheFullPath.
+mut "M3 the tombstones key left out of the no-change digest" media_nochange.go '\td\.str\(walk\)\n\td\.str\(key\)\n' '\td.str(walk)\n'
+mut "M3b the tombstones key ignores content" media_nochange.go '\n\t\td\.h\.Write\(b\)\n' '\n'
+mut "M3c a tombstones path it cannot inspect read as empty" media_nochange.go '\t\tcase err != nil, !fi\.Mode\(\)\.IsRegular\(\):\n\t\t\treturn "", false\n' '\t\tcase err != nil, !fi.Mode().IsRegular():\n\t\t\tcontinue\n'
 mut "M4 the record committed before the head PUT lands" main.go 'mnoFlushed := !capMode\(\)' 'mnoFlushed := true'
 mut "M5 the record names the manifest, not a vault scope's committed head" main.go '\n\t\tcommittedHead = vh\n' '\n'
 [ "$fails" -eq 0 ] && echo "== all mutations convicted" || { echo "== $fails mutation(s) not convicted"; exit 1; }

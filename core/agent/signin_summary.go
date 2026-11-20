@@ -16,6 +16,9 @@ package main
 //	    (scope=media only) ... user_files=<n> user_bytes=<n> other_files=<n> other_bytes=<n>, or ... indexed=0   signinSummaryAppend
 //	v=1 parked apps=<n> ce_kib=<n> de_kib=<n>, or v=1 parked apps=<n> size=unknown   od_parked_report (roamd)
 //	v=1 phase=<in|reap|reown|acct> ms=<n>                                            _ssum (roamd)
+//	v=1 appsindex pkgs=<n>                                                           signinSummaryAppendApps
+//	v=1 appsseal stored=<n> dormant=<n> adopted=<n> carried=<n> dropped=<n> published=<n> lost=<n> vanished=<n>
+//	    guard=<none|passed|refused>                                                  signinSummaryAppendApps (apps_seal_evidence.go)
 //
 // The scope line's fields are mandatory: the file is on the tmpfs, so the image that reads it is the image that wrote it.
 //
@@ -44,8 +47,25 @@ package main
 //	signin_parked_de_kib     "<n>" their DE size (likewise)
 //	signin_in_ms             "<n>" this roamd run from its start to the `in` arm's OK reply (no key on a sign-in that did not land)
 //	signin_reap_ms           "<n>" reap_retry_run and userdir_recheck before the arm, plus reap_stale_ondemand and reap_orphan_provisioned
-//	signin_reown_ms          "<n>" the reown and relabel of the CE and #de trees and the #media tail, added
+//	signin_reown_ms          "<n>" the wait for the CE reown and relabel (a background job beside the #de restore, so only the wait counts, NWP-20261210-04), the #de tree's reown and relabel and the #media tail, added
 //	signin_acct_ms           "<n>" acct_restore, which holds the #sys restore
+//	signin_apps_index_pkgs   "<n>" the restored #apps head's app-index lines (the placeholders the sign-in can raise)
+//
+// NWP-20261208-01 (backlog: "P1: On-demand apps that are not on the phone at a sign-out are dropped from the `#apps`
+// code list, ..."): the lastseal keys describe the last #apps seal of THIS profile on THIS handset since boot. The
+// record sits in the state tmpfs, which is wiped at power-off, so a sign-in after a reboot has no lastseal keys,
+// never zeros. A seal refused before its carry block leaves no record either.
+//
+//	lastseal_apps_stored     "<n>" the app-index lines of the head that seal read
+//	lastseal_apps_dormant    "<n>" the dormant lines roamd offered (NOWHERE_APPS_DORMANT; 0 when it offered none)
+//	lastseal_apps_adopted    "<n>" the dormant packages adopted over a head with no line for them
+//	lastseal_apps_carried    "<n>" the packages the index union carried that the handset did not stage
+//	lastseal_apps_dropped    "<n>" the packages the union dropped as deleted from the account
+//	lastseal_apps_published  "<n>" the app-index lines of the head that seal built (0 when it stopped before it)
+//	lastseal_apps_lost       "<n>" the packages that kept their deferred bytes but lost their index line
+//	lastseal_apps_vanished   "<n>" the packages absent with nothing declaring their removal
+//	lastseal_apps_guard      "none" the seal stopped before the presence guard, "passed" the guard let it
+//	                         through (not proof of the upload), "refused" the guard refused it
 //
 // NWP-20261130-08 (backlog: The sign-in summary still cannot say where a fifth of op=in goes): the keys account for the op:
 //
@@ -79,8 +99,8 @@ import (
 // signinSummaryPrefix names a sign-in's file in the state tmpfs: signin-summary.<uid>.
 const signinSummaryPrefix = "signin-summary."
 
-// signinSummaryMaxBytes bounds what a report reads of the file. The thirteen lines a sign-in writes (five scopes, parked,
-// three reown, two reap and the other two phases) fit at their widest (TestSigninSummaryWidestFits).
+// signinSummaryMaxBytes bounds what a report reads of the file. The fifteen lines a sign-in writes (five scopes, parked,
+// three reown, two reap, the other two phases, appsindex and appsseal) fit at their widest (TestSigninSummaryWidestFits).
 const signinSummaryMaxBytes = 4096
 
 // signinSummaryScope is the CLOSED map from the roam worker's NOWHERE_PHASE to a scope word. Any other phase writes
@@ -93,10 +113,16 @@ var signinSummaryScope = map[string]string{
 	"accounts": "sys",
 }
 
-// signinSummaryScopeRe, signinSummaryParkedRe and signinSummaryPhaseRe are the file's only accepted line shapes.
+// signinSummaryScopeRe, signinSummaryParkedRe, signinSummaryPhaseRe, signinSummaryAppsIndexRe and
+// signinSummaryAppsSealRe are the file's only accepted line shapes.
 var signinSummaryScopeRe = regexp.MustCompile(`^v=1 scope=(vault|de|media|apps|sys) ms=([0-9]{1,12}) chunks=([0-9]{1,12}) cached=([0-9]{1,12}) fetched=([0-9]{1,12}) heal_ms=([0-9]{1,12}) store_reads=([0-9]{1,12}) cap_calls=([0-9]{1,12}) fetched_bytes=([0-9]{1,15}) wait_ms=([0-9]{1,12}) write_ms=([0-9]{1,12}) unfetched_pkgs=([0-9]{1,12}) unfetched_bytes=([0-9]{1,15}) unfetched_chunks=([0-9]{1,12})(?: user_files=([0-9]{1,12}) user_bytes=([0-9]{1,15}) other_files=([0-9]{1,12}) other_bytes=([0-9]{1,15})| (indexed=0))?$`)
 var signinSummaryParkedRe = regexp.MustCompile(`^v=1 parked apps=([0-9]{1,9})(?: ce_kib=([0-9]{1,12}) de_kib=([0-9]{1,12})| (size=unknown))$`)
 var signinSummaryPhaseRe = regexp.MustCompile(`^v=1 phase=(in|reap|reown|acct) ms=([0-9]{1,12})$`)
+var signinSummaryAppsIndexRe = regexp.MustCompile(`^v=1 appsindex pkgs=([0-9]{1,9})$`)
+var signinSummaryAppsSealRe = regexp.MustCompile(`^v=1 appsseal stored=([0-9]{1,9}) dormant=([0-9]{1,9}) adopted=([0-9]{1,9}) carried=([0-9]{1,9}) dropped=([0-9]{1,9}) published=([0-9]{1,9}) lost=([0-9]{1,9}) vanished=([0-9]{1,9}) guard=(none|passed|refused)$`)
+
+// signinSummaryAppsSealKeys are the appsseal line's keys, in the order of its fields.
+var signinSummaryAppsSealKeys = []string{"stored", "dormant", "adopted", "carried", "dropped", "published", "lost", "vanished", "guard"}
 
 // signinSummaryAppend appends this restore's summary line to NOWHERE_SIGNIN_SUMMARY, called once in the restore
 // verb's CDC branch, after its `restore:` line. restMs holds healMs, so ms takes it out and heal_ms carries it: a heal
@@ -199,6 +225,16 @@ func signinSummaryStatus(path string) map[string]string {
 			phase[m[1]] += n
 			continue
 		}
+		if m := signinSummaryAppsIndexRe.FindStringSubmatch(l); m != nil {
+			out["signin_apps_index_pkgs"] = m[1]
+			continue
+		}
+		if m := signinSummaryAppsSealRe.FindStringSubmatch(l); m != nil {
+			for i, k := range signinSummaryAppsSealKeys {
+				out["lastseal_apps_"+k] = m[i+1]
+			}
+			continue
+		}
 		return unreadable
 	}
 	if len(heal) > 0 {
@@ -215,15 +251,15 @@ func signinSummaryStatus(path string) map[string]string {
 }
 
 // mergeSigninSummary adds the summary of the session's own sign-in (uid) to an in-session report's status, after
-// buildIssueReportWith (so outside its size trim: about 3 KiB at most, the widest file's 73 keys). It deletes every
-// caller-sent signin_* key first, so only this file can set one. Never at device scope: a gate report carries no
+// buildIssueReportWith (so outside its size trim: about 3 KiB at most, the widest file's 83 keys). It deletes every
+// caller-sent signin_* and lastseal_apps_* key first, so only this file can set one. Never at device scope: a gate report carries no
 // sign-in's numbers.
 func mergeSigninSummary(status map[string]string, uid string, deviceScope bool) {
 	if deviceScope || status == nil || uid == "" || strings.Trim(uid, "0123456789") != "" {
 		return
 	}
 	for k := range status {
-		if strings.HasPrefix(k, "signin_") {
+		if strings.HasPrefix(k, "signin_") || strings.HasPrefix(k, "lastseal_apps_") {
 			delete(status, k)
 		}
 	}

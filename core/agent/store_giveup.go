@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -22,6 +23,14 @@ import (
 //
 // Each restore process of one sign-in (base, #de, #media, #apps) is its own process and so has its own window: a
 // store that dies between two scope restores can cost each later one 15 s.
+//
+// NWP-20261210-02 (backlog §B, "A large app's fetch fails on a slow link: one chunk with no data for 30 s ends the
+// whole fetch, and each retry starts again from chunk 1"): a BODY BYTE is the store answering. A restore runs
+// downloadWorkers (24) GETs at once over one link; at 2 Mbit/s each moves about 10 KB/s, so none FINISHES for longer
+// than the window, and when one of them starves and is cut the clock above read 15 s of silence while the other 23
+// were moving bytes the whole time. storeXferBody.Read now calls noteStoreBytes for every Read that returned bytes,
+// which records an answer as a finished attempt does (at most once per storeBytesNoteEvery). The 2026-10-19 rule is
+// unchanged for a dead store: no byte arrives on any connection, so nothing is noted and it still stops at 15 s.
 
 // storeGiveUpWindow is the decided number: how long the store may stay silent before the verb stops retrying.
 const storeGiveUpWindow = 15 * time.Second
@@ -80,6 +89,40 @@ func noteStoreAttemptFrom(started time.Time, err error) {
 		// outage older than that response, so the outage counts from the later of the two.
 		storeGiveUp.failingSince = laterOf(started, storeGiveUp.answeredAt)
 	}
+}
+
+// storeBytesNoteEvery throttles noteStoreBytes' answers: every body Read of every GET calls it, and the mutex is
+// taken at most this often.
+const storeBytesNoteEvery = 250 * time.Millisecond
+
+// storeXferByteAt is storeGiveUpNow().UnixNano() of the last body byte any storeXfer GET received (0 = none since the
+// last reset). retryStoreWithinGuarded reads it to tell a stall on a link that carries bytes from a dead link.
+var storeXferByteAt atomic.Int64
+
+// storeBytesNotedAt is storeGiveUpNow().UnixNano() of the last answer noteStoreBytes recorded: the throttle.
+var storeBytesNotedAt atomic.Int64
+
+// noteStoreBytes records that a store GET has just received body bytes (NWP-20261210-02). It always stamps
+// storeXferByteAt; at most once per storeBytesNoteEvery it also records an answer exactly as noteStoreAttemptFrom does
+// for a nil result. A clock that moved backwards (now before the last noted stamp) counts as due. The throttle is a
+// compare-and-swap, so of many readers due at once only one takes the mutex.
+func noteStoreBytes() {
+	now := storeGiveUpNow()
+	ns := now.UnixNano()
+	storeXferByteAt.Store(ns)
+	for {
+		last := storeBytesNotedAt.Load()
+		if ns >= last && ns-last < int64(storeBytesNoteEvery) {
+			return // noted recently enough
+		}
+		if storeBytesNotedAt.CompareAndSwap(last, ns) {
+			break
+		}
+	}
+	storeGiveUp.mu.Lock()
+	storeGiveUp.failingSince = time.Time{} // a body byte is the store answering
+	storeGiveUp.answeredAt = now
+	storeGiveUp.mu.Unlock()
 }
 
 // storeGivenUp reports whether the armed verb should stop retrying the store.

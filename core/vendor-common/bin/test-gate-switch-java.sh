@@ -9,8 +9,9 @@
 # core/chooser/tests/gate-switch/GateSwitchCases.java. The cases check each LIGHT knob meets 3:1 on bg and on fieldBg,
 # on and off differ, and the existing DARK roles are unchanged. GateSwitch.java uses android.*, so the PINS check it
 # by source: its first statement returns for a dark palette, it sets both tint lists from the switch roles, and it
-# holds no colour literal. They also check that every Switch ChooserActivity (8) and ProfileActivity (6) builds goes
-# through GateSwitch.style(..., GatePalette.active()), and that ChooserActivity holds no colour literal.
+# holds no colour literal. They also check that every Switch ChooserActivity (8) and ProfileActivity (8; the 7th is the
+# carried-access row, NWP-20261207-17, the 8th the Offline media scan-network row, NWP-20261208-19) builds goes through GateSwitch.style(..., GatePalette.active()), and that
+# ChooserActivity holds no colour literal.
 #
 # ⚠ IT FAILS WHEN THERE IS NO JAVAC, IT NEVER SKIPS. javac comes from PATH, else from the build host's JDK below.
 #
@@ -123,7 +124,7 @@ suite() {
 
   # W1/W2 every Switch the two activities build goes through GateSwitch.style(..., GatePalette.active()).
   wrapped "$act" W1 7 || fails=1
-  wrapped "$prof" W2 6 || fails=1
+  wrapped "$prof" W2 8 || fails=1
 
   # S0 GateSwitch.java exists and declares style once.
   if [ ! -f "$gs" ]; then

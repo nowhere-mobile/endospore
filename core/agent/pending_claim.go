@@ -25,6 +25,12 @@ import (
 // adds the code's hash (pendingClaimSeenKey, never the code) to Wallet.PendingClaimMisses. The next run that gets the
 // same answer for a code whose hash is there clears the code and drops the hash. A run that landed tokens and then got
 // the proving (0, nil) clears at once, as before. Clears and marks go up in one save under the held lock.
+//
+// THE NOTICE (decided 2026-11-03, h55 #1; NWP-20261208-03). A code cleared on that second empty answer with nothing
+// landed is UNUSABLE: unknown or spent. When the wallet is then on the free plan (claimNoticeFree), the same save that
+// clears it adds unusableClaimKey(code) (a hash, never the code) to Wallet.UnusableClaims, so the clear and the notice
+// reach the store in one publish and Profile can say that the code could not be used. A code cleared after tokens
+// landed WAS used, and a wallet that holds credit or any plan is not on the free plan: neither leaves a notice.
 
 // maxPendingClaimCalls bounds the drainClaim calls per code per run. A full drain takes two (the tokens, then the
 // proving 402); a code still answering tokens after this many is kept for the next run.
@@ -67,6 +73,7 @@ func drainPendingClaims(g *gatewayClient, walletPath string) (drained int, err e
 	var errs []error
 	cleared := map[string]bool{}
 	marked := map[string]bool{}
+	unusable := map[string]bool{} // cleared on the second empty answer with nothing landed: unknown or spent (h55 #1)
 	for i, code := range codes {
 		codeLanded := 0 // the tokens this run landed for this code
 		for call := 1; call <= maxPendingClaimCalls; call++ {
@@ -92,6 +99,9 @@ func drainPendingClaims(g *gatewayClient, walletPath string) (drained int, err e
 			if got == 0 {
 				if codeLanded > 0 || missed[pendingClaimSeenKey(code)] {
 					cleared[code] = true // the proving (0, nil) after tokens, or the second empty answer (h55 #1)
+					if codeLanded == 0 {
+						unusable[code] = true // the second empty answer: the code was never used here (h55 #1)
+					}
 				} else {
 					marked[code] = true // the first empty answer with nothing landed: kept once for the webhook's lag
 				}
@@ -124,9 +134,12 @@ func drainPendingClaims(g *gatewayClient, walletPath string) (drained int, err e
 		return drained, errors.Join(append(errs, lerr)...)
 	}
 	var kept []string
+	removed := map[string]bool{} // the codes this save takes out (a code another writer took out leaves no notice)
 	for _, c := range cur.PendingClaims {
 		if !cleared[c] {
 			kept = append(kept, c)
+		} else {
+			removed[c] = true
 		}
 	}
 	// The misses: the held ones plus this run's marks, each only while its code is still kept (a cleared code's hash
@@ -144,11 +157,25 @@ func drainPendingClaims(g *gatewayClient, walletPath string) (drained int, err e
 	gone := len(cur.PendingClaims) - len(kept)
 	cur.PendingClaims = kept
 	cur.PendingClaimMisses = misses
+	// The notices (h55 #1), judged on the wallet as this save leaves it, in code order. Same save as the clear.
+	notices := 0
+	if claimNoticeFree(cur) {
+		for _, c := range codes {
+			if !unusable[c] || !removed[c] {
+				continue
+			}
+			if k := unusableClaimKey(c); !slices.Contains(cur.UnusableClaims, k) {
+				cur.UnusableClaims = append(cur.UnusableClaims, k)
+				notices++
+			}
+		}
+	}
 	if serr := saveWallet(walletPath, cur); serr != nil {
 		return drained, errors.Join(append(errs, serr)...)
 	}
-	fmt.Fprintf(os.Stderr, "[agent] pending claim: %d code(s) cleared, %d marked for one retry, %d kept, %d tokens added (NWP-20261202-01)\n",
-		gone, len(marked), len(kept), drained)
+	// Counts only: never a code, never a notice's hash.
+	fmt.Fprintf(os.Stderr, "[agent] pending claim: %d code(s) cleared, %d marked for one retry, %d kept, %d tokens added, %d left a notice (NWP-20261202-01)\n",
+		gone, len(marked), len(kept), drained, notices)
 	return drained, errors.Join(errs...)
 }
 

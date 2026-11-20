@@ -87,8 +87,9 @@ NREW=$(printf '%s\n' "$FN_ROOTED" | grep -c '"\$ROOT/data/')
 # tested nothing. Comments are stripped first -- several of them quote /data paths as evidence.
 NLEFT=$(printf '%s\n' "$FN_ROOTED" | sed 's/#.*$//' | grep -c '"/data/')
 [ "${NLEFT:-0}" = 0 ] || { echo "RE-ROOT INCOMPLETE -- $NLEFT absolute /data path(s) survive in live code" >&2; exit 2; }
-# The odrestore reply block (its cases are below, with the reply harness).
-REPLY=$(awk '/^    if \[ "\$odsrc" = 0 \]; then$/{f=1} f{print} f&&/^    fi$/{exit}' "$SUT")
+# The odrestore reply block (its cases are below, with the reply harness). NWP-20261209-04 put a failed-walk arm
+# (`_odxf` = 2) first, so the block opens there; the harness runs it with a healthy walk (_odxf=0).
+REPLY=$(awk '/^    if \[ "\$_odxf" = 2 \]; then$/{f=1} f{print} f&&/^    fi$/{exit}' "$SUT")
 case "$REPLY" in
   *'OK NOSRC'*'OK $pkg'*) ;;
   *) echo "EXTRACTION FAILED -- the odrestore reply block moved in $SUT" >&2; exit 2 ;;
@@ -120,7 +121,7 @@ eq(){ [ "$2" = "$3" ] && ok "$1" || no "$1 -- got '$2', want '$3'"; }
 reply_runner(){                    # reply_runner <file> <dir> <odsrc> <odn> <odkept>
   {
     printf 'set -u\n'
-    printf "odsrc='%s'; odn='%s'; odkept='%s'; pkg=com.whatsapp; RES='%s/res'; LOG='%s/log'\n" "$3" "$4" "$5" "$2" "$2"
+    printf "_odxf=0; odsrc='%s'; odn='%s'; odkept='%s'; pkg=com.whatsapp; RES='%s/res'; LOG='%s/log'\n" "$3" "$4" "$5" "$2" "$2"
     printf 'od_unblock_app(){ return 0; }\nod_pending_clear(){ :; }\n'
     printf '%s\n' "$REPLY"
   } > "$1"

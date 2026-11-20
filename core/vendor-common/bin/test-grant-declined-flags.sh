@@ -85,6 +85,7 @@ pm() {
   esac
 }
 cmd() { echo "cmd $*" >> "$D/calls"; return 0; }
+_ms() { echo 0; }; _tlog() { :; }   # NWP-20261210-09: the sign-in call times its phases
 '
 
 # prep_fn <roamd.sh> <out> -- extract grant_perms_for and point its nowhere-perms under $TROOT. 0 ok, 2 harness error.
@@ -96,6 +97,7 @@ prep_fn() {
     echo "EXTRACTION FAILED: grant_perms_for() { ... } not found in $sut" >&2; command rm -f "$raw"; return 2
   fi
   sed 's#PF="/data/user/#PF="$TROOT/data/user/#' "$raw" > "$out"
+  sed -n '/^gwin_add() {$/,/^}$/p' "$sut" >> "$out"   # NWP-20261210-09: the window helper it calls
   command rm -f "$raw"
   if [ "$(grep -c 'PF="\$TROOT/data/user/' "$out")" != 1 ] || [ "$(grep -c '/data/user/' "$out")" != 1 ]; then
     echo "REWRITE FAILED: want exactly one PF=\"/data/user/ assignment in grant_perms_for of $sut" >&2; return 2
@@ -436,7 +438,7 @@ if [ "$MUTATE" = yes ]; then
   mutate_each 't2 the .grantok truncation is bare again' 'T2' \
     '/^grant_perms_for() {$/,/^}$/s/^  ( : > "\$_gok" ) 2>\/dev\/null$/  : > "$_gok" 2>\/dev\/null/'
   mutate_each 't3 the .grantd truncation is bare again' 'T3' \
-    '/^grant_perms_for() {$/,/^}$/s/^  _gd="\$STATE\/\.grantd"; ( : > "\$_gd" ) 2>\/dev\/null; _gbg=0$/  _gd="$STATE\/.grantd"; : > "$_gd" 2>\/dev\/null; _gbg=0/'
+    '/^grant_perms_for() {$/,/^}$/s/^  _gd="\$STATE\/\.grantd"; ( : > "\$_gd" ) 2>\/dev\/null$/  _gd="$STATE\/.grantd"; : > "$_gd" 2>\/dev\/null/'
   mutate 'm1 the per-line loop has no flags: arm (falls through to pm grant)' \
     '/^      flags:\*)$/,/^        continue;;$/d'
   mutate 'm2 the grant-withhold match is deleted' \
@@ -476,7 +478,7 @@ if [ "$MUTATE" = yes ]; then
   mutate 'X2 the withhold match loses its user-set,user-fixed form' \
     's/|\*"\${NL}\${gpkg} flags:user-set,user-fixed:\${gperm}\${NL}"\*)$/)/'
   mutate 'X3 the declined pass is not capped at 6 in flight' \
-    '/^  _gd="\$STATE\/.grantd"/,/^  done < "\$PF"$/s/\[ "\$_gbg" -ge 6 \]/[ "$_gbg" -ge 60 ]/'
+    '/^  _gd="\$STATE\/.grantd"/,/^  done < "\$PF"$/s/^    gwin_add \$!$/    :/'   # NWP-20261210-09: the cap is the window
   # NWP-20261012-08: the SMS app keeps its SMS permissions.
   mutate 's1 the SMS-role exemption is deleted' \
     '/^    if \[ "\$gpkg" = com.android.messaging \] || \[ "\$gpkg" = "\$_smsapp" \]; then$/,/^    fi$/d'

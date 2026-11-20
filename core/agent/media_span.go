@@ -33,7 +33,9 @@ import (
 // Errors rather than panics: getChunk panics on a corrupt blob (correctly -- at login that is fatal and the
 // user must know), but a mid-session sync is BEST EFFORT by design. One unreadable rel must cost that rel and
 // nothing else; the session keeps running and the next cycle tries again.
-func fetchEssSpan(base string, key []byte, m chunkManifest, r essRegion) (frag []byte, err error) {
+//
+// NWP-20261204-19: prog gets one frame per chunk fetched (media_sync_prog.go); nil writes none.
+func fetchEssSpan(base string, key []byte, m chunkManifest, r essRegion, prog *mediaSyncProg) (frag []byte, err error) {
 	if r.S < 0 || r.E > len(m.Chunks) || r.E <= r.S {
 		return nil, fmt.Errorf("span [%d,%d) is not backed by the head's %d chunk(s)", r.S, r.E, len(m.Chunks))
 	}
@@ -51,6 +53,7 @@ func fetchEssSpan(base string, key []byte, m chunkManifest, r essRegion) (frag [
 			return nil, fmt.Errorf("decompress chunk %d of span [%d,%d): %w", i, r.S, r.E, derr)
 		}
 		buf.Write(b)
+		prog.chunk()
 	}
 	return buf.Bytes(), nil
 }
@@ -70,7 +73,11 @@ func fetchEssSpan(base string, key []byte, m chunkManifest, r essRegion) (frag [
 // BEST EFFORT, ALWAYS. A failure costs that one rel and nothing else: the carry has already put the file in the
 // head, it stays there, and the next cycle tries again. Nothing here can fail a seal or a logoff. At most budget
 // bytes land in one pass (NWP-20261129-25).
-func materializeCarried(base string, key []byte, m chunkManifest, rels []string, dest string, budget int64) ([]string, int64) {
+//
+// NWP-20261204-19: each fetch plans its span's chunks on prog, and every chunk it lands writes a frame, so the
+// stall watchdog sees the sync move. nil writes nothing.
+func materializeCarried(base string, key []byte, m chunkManifest, rels []string, dest string, budget int64,
+	prog *mediaSyncProg) ([]string, int64) {
 	var wrote []string
 	var total int64
 	waiting := 0
@@ -110,7 +117,8 @@ func materializeCarried(base string, key []byte, m chunkManifest, rels []string,
 				total, rel)
 			break
 		}
-		frag, err := fetchEssSpan(base, key, m, r)
+		prog.plan(r.E - r.S)
+		frag, err := fetchEssSpan(base, key, m, r, prog)
 		if err != nil {
 			fmt.Printf("  media-sync: %q SKIPPED (%v)\n", rel, errCode(err))
 			continue

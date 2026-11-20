@@ -26,6 +26,11 @@ import android.widget.TextView;
  * background thread. A saved-state flag keeps a rotation or a recreation from sending it twice. An ERR or no answer
  * only logs: the next sign-in shows the notice again, which is the safe direction. Dismissible, not pinned: one OK
  * button, Back, or a tap outside. No log line names the phone, the time or the profile.
+ *
+ * NWP-20261208-24 (design approved 2026-11-17, NWP-20261116-48): after the parse, check() asks {@link LandingQueue}.
+ * While the Auto sweep's card is up and its sweep runs, the same words go into that card as an amber line under its
+ * headline, and the landing card records them shown once it draws them. Otherwise this card starts once the landing
+ * card has closed. A throwaway still gets NONE and returns before the queue is asked.
  */
 public class SkipNoticeActivity extends Activity {
     static final String EXTRA_PHONE = "nowhere.skipnotice.phone";
@@ -45,6 +50,18 @@ public class SkipNoticeActivity extends Activity {
             android.util.Log.i("NowhereChooser", "NONE".equals(r) ? "skip notice: none" : "skip notice: not read");
             return;
         }
+        // NWP-20261208-24: while the Auto sweep's card is up, the words go into it, and the card records them shown;
+        // else this card shows, after that card has closed when there is one.
+        if (LandingQueue.place(LandingQueue.DECIDE_MS, id -> !LandingLine.Sweep.done(id)) == LandingQueue.Place.CARD) {
+            LandingQueue.addLine(SkipNoticeCopy.words(n.phone, when(n.time)), n.time);
+            try {
+                app.sendBroadcast(new Intent(LandingNoticeActivity.ACTION_NOTICE).setPackage(app.getPackageName()));
+                android.util.Log.i("NowhereChooser", "skip notice: folded");
+            } catch (Throwable t) {
+                android.util.Log.w("NowhereChooser", "skip notice: card not told", t);
+            }
+            return;
+        }
         try {
             app.startActivity(new Intent(app, SkipNoticeActivity.class)
                     .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
@@ -54,6 +71,15 @@ public class SkipNoticeActivity extends Activity {
         } catch (Throwable t) {
             android.util.Log.w("NowhereChooser", "skip notice: card not started", t);
         }
+    }
+
+    /** The notice's time ({@code time}: unix seconds) as the words show it. The chooser runs in the session's own
+     *  Android user, so the default zone is the session's. */
+    static String when(long time) {
+        java.text.DateFormat df = java.text.DateFormat.getDateTimeInstance(
+                java.text.DateFormat.MEDIUM, java.text.DateFormat.SHORT);
+        df.setTimeZone(java.util.TimeZone.getDefault());
+        return df.format(new java.util.Date(time * 1000L));
     }
 
     @Override protected void onCreate(Bundle b) {
@@ -70,11 +96,6 @@ public class SkipNoticeActivity extends Activity {
         time = in != null ? in.getLongExtra(EXTRA_TIME, 0L) : 0L;
         if (time <= 0) { finish(); return; } // check() never sends it; nothing to say and nothing to record
         String phone = in.getStringExtra(EXTRA_PHONE);
-        // The chooser runs in the session's own Android user, so the default zone is the session's.
-        java.text.DateFormat df = java.text.DateFormat.getDateTimeInstance(
-                java.text.DateFormat.MEDIUM, java.text.DateFormat.SHORT);
-        df.setTimeZone(java.util.TimeZone.getDefault());
-        String when = df.format(new java.util.Date(time * 1000L));
 
         // The window is transparent, so the card's rounded corners show.
         getWindow().setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
@@ -89,7 +110,7 @@ public class SkipNoticeActivity extends Activity {
 
         // No title: no title words are decided, so the card shows the decided sentence and OK only.
         TextView words = new TextView(this);
-        words.setText(SkipNoticeCopy.words(phone, when));
+        words.setText(SkipNoticeCopy.words(phone, when(time)));
         words.setTextSize(17);
         words.setTextColor(look.ink);
         card.addView(words);
@@ -130,8 +151,9 @@ public class SkipNoticeActivity extends Activity {
         out.putBoolean(STATE_SHOWN_SENT, shownSent);
     }
 
-    /** Record the notice at {@code t} shown. No retry: an unrecorded notice shows again at the next sign-in. */
-    private static void markShown(long t) {
+    /** Record the notice at {@code t} shown. No retry: an unrecorded notice shows again at the next sign-in. Called from
+     *  this card's onResume, and from LandingNoticeActivity.sync() once per folded notice (NWP-20261208-24). */
+    static void markShown(long t) {
         String r = DaemonSocket.roundTrip(SkipNoticeCopy.shownRequest(t), 70000);
         android.util.Log.i("NowhereChooser", "OK".equals(r) ? "skip notice: shown recorded" : "skip notice: shown not recorded");
     }

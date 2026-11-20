@@ -101,10 +101,14 @@ public class StoreService extends Service {
             if (!StoreInstaller.IN_FLIGHT.add(pkg)) return "ERR-BUSY";
             postInstallNotice(pkg, label);
             try {
+                AddProgress.begin(pkg); // NWP-20261209-05: nApps reads this add's progress; ended in the finally
                 // NWP-20261122-14: the `progress` opt-in streams PROGRESS lines ahead of the verdict, and each one
                 // moves the notification's bar. The verdict is the first other line, read as before.
                 String s = fetchVerdict("FETCH-APP\n" + pkg + " 0 progress\n", FETCH_APP_CAP_MS,
-                        (got, total) -> postInstallNotice(pkg, label, got, total));
+                        (got, total) -> {
+                            AddProgress.update(pkg, got, total); // NWP-20261209-05: nApps reads the notification's figures
+                            postInstallNotice(pkg, label, got, total);
+                        });
                 // Report the daemon's own verdict rather than a generic failure: #140's lesson is that a
                 // screen which cannot name the cause invents one, usually an accusation aimed at the user.
                 if (s == null) return "ERR no reply";
@@ -139,6 +143,9 @@ public class StoreService extends Service {
                 StoreInstaller.dropManifestLine(StoreService.this, pkg);
                 return getAppReply(kept, overPlan, offDefault && !StoreInstaller.keepSetHas(StoreService.this, pkg), pkg);
             } finally {
+                // NWP-20261209-05: end the progress BEFORE the package is released. Released first, a second add of
+                // the same package could begin in between, and this end would erase that add's progress.
+                AddProgress.end(pkg);
                 StoreInstaller.IN_FLIGHT.remove(pkg);
                 cancelInstallNotice(pkg);
             }
@@ -177,6 +184,21 @@ public class StoreService extends Service {
                 Log.w(TAG, "materializeOwn " + pkg + ": UnarchiveService did not start", t);
                 return "ERR";
             }
+        }
+
+        // NWP-20261209-05 (decision 2026-11-17, in-app progress reopens h51 #3): nApps shows an add's progress on its
+        // own screen. Both read AddProgress only, never the daemon, and answer "" to any caller but the storefront.
+        @Override
+        public String getAddProgress(String pkg) {
+            if (!callerIsStorefront()) return "";
+            if (pkg == null || pkg.isEmpty()) return "";
+            return AddProgress.get(pkg);
+        }
+
+        @Override
+        public String getAddsInFlight() {
+            if (!callerIsStorefront()) return "";
+            return AddProgress.inFlight();
         }
     };
 

@@ -6,6 +6,11 @@
 # "Restoring your profile — 100%" over a vault that had just been written. RestorePhase.label(phase, creating) is the pure
 # label rule, run here; onRestoreProgress's two call sites (result line false, mirror true) are pinned in the source.
 #
+# NWP-20261208-30: roamd's post-media cleanup (`finishing`) reads "Restoring photos and files", the #keys restore (`keys`)
+# "Restoring your apps", and the media label says "and". RestorePhase.hold keeps one bar per label: within one label the
+# shown percent never goes back. H1 runs hold's table, H2 runs a whole sign-in through label + hold, and pins (d) and (e)
+# hold onRestoreProgress's use of the held value and roamInStreaming's reset per sign-in.
+#
 # ⚠ IT FAILS WHEN THERE IS NO JAVAC, IT NEVER SKIPS (exit 2), like the other javac suites.
 #
 #   bash test-restore-phase-java.sh            # the cases
@@ -47,14 +52,21 @@ if [ "$rc" -ne 0 ]; then echo "FAILED (rc=$rc)"; [ "$rc" -eq 1 ] && exit 1 || ex
 
 command -v perl >/dev/null 2>&1 || { echo "FAIL: --mutate needs perl, and there is none -- refusing to report" >&2; exit 1; }
 echo "== mutations (each must be CONVICTED by the cases; one that does not apply or compile is a failure)"
-mut() { # mut <label> <rp|ca> <perl-expr>
-  local d f rp ca rc; d=$(mktemp -d -p "$W"); rp="$d/RestorePhase.java"; ca="$d/ChooserActivity.java"
+mut() { # mut <label> <rp|ca> <perl-expr> [control] -- a control must SURVIVE: it changes only a comment
+  local d f rp ca rc control="${4:-}"; d=$(mktemp -d -p "$W"); rp="$d/RestorePhase.java"; ca="$d/ChooserActivity.java"
   cp "$RP" "$rp"; cp "$CA" "$ca"
   if [ "$2" = rp ]; then f="$rp"; else f="$ca"; fi
   if ! perl -0pi -e "$3" "$f"; then echo "  ERROR     $1 -- perl failed on the mutation"; rm -rf "$d"; return 1; fi
   if cmp -s "$RP" "$rp" && cmp -s "$CA" "$ca"; then echo "  INERT     $1 -- the mutation changed nothing"; rm -rf "$d"; return 1; fi
   suite "$rp" "$ca" >/dev/null 2>&1; rc=$?
   rm -rf "$d"
+  if [ "$control" = control ]; then
+    case "$rc" in
+      0) echo "  survived  $1 (control)"; return 0 ;;
+      1) echo "  CONVICTED $1 -- the control was convicted: the cases test a comment"; return 1 ;;
+      *) echo "  BROKEN    $1 -- the control did not compile or run (rc=$rc)"; return 1 ;;
+    esac
+  fi
   case "$rc" in
     0) echo "  SURVIVED  $1"; return 1 ;;
     1) echo "  convicted $1"; return 0 ;;
@@ -66,4 +78,12 @@ mut "P1 the mirror passes false" ca 's/mirrorCreate\(RestorePhase\.label\(phase,
 mut "P2 the result line passes true" ca 's/result\.setText\(RestorePhase\.label\(phase, false\)/result.setText(RestorePhase.label(phase, true)/' || fails=$((fails+1))
 mut "P3 two creating labels collapse to one" rp 's/"Setting up secure data"/"Setting up app data"/' || fails=$((fails+1))
 mut "P4 the creating default reads Restoring your profile" rp 's/creating \? "Setting up your profile"/creating ? "Restoring your profile"/' || fails=$((fails+1))
-[ "$fails" -eq 0 ] && echo "== all mutations convicted" || { echo "== $fails mutation(s) not convicted"; exit 1; }
+mut "P5 hold always returns pct (H1, H2 (iii))" rp 's/return prevLabel != null && prevLabel\.equals\(label\) && pct < prevPct \? prevPct : pct;/return pct;/' || fails=$((fails+1))
+mut "P6 hold ignores the label (H1 different label lower)" rp 's/prevLabel != null && prevLabel\.equals\(label\) && pct < prevPct/pct < prevPct/' || fails=$((fails+1))
+mut "P7 finishing falls to the default (label case finishing, H2)" rp 's/\n[ \t]*case "finishing":[^\n]*//' || fails=$((fails+1))
+mut "P8 keys falls to the default (label case keys, H2)" rp 's/\n[ \t]*case "keys":[^\n]*//' || fails=$((fails+1))
+mut "P9 the media label back to & (label case media)" rp 's/"Restoring photos and files"/"Restoring photos & files"/g' || fails=$((fails+1))
+mut "P10 the bar shows pct, not the held value ((d))" ca 's/progressBar\.setProgress\(shown\)/progressBar.setProgress(pct)/' || fails=$((fails+1))
+mut "P11 the per-sign-in reset removed ((e))" ca 's/\n[ \t]*runOnUiThread\(\(\) -> \{ restoreBarLabel = null; restoreBarPct = 0; \}\);[^\n]*//' || fails=$((fails+1))
+mut "C1 hold's javadoc reworded" rp 's/One bar per label/One bar for each label/' control || fails=$((fails+1))
+[ "$fails" -eq 0 ] && echo "== all mutations convicted, control survived" || { echo "== $fails mutation(s) not convicted"; exit 1; }

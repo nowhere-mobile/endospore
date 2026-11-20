@@ -21,6 +21,7 @@ import android.content.Intent;
  *  start a dead process, a runtime one cannot. android:persistent only keeps the USER-0 process alive, so in a
  *  roamed session the chooser can be killed and an install would then go unseen. applyDefaultsToUndecided()
  *  is the backstop, and it makes the outcome deterministic rather than probabilistic.
+ *  NWP-20261210-01 (h59 #5): data-cleared and true-uninstall events arm EXPECT-SHRINK-ANDROID; one while this session's chooser process is dead is not seen (runtime receiver).
  *
  *  ⚠ NEW INSTALLS ONLY. It fires on ACTION_PACKAGE_ADDED, so it cannot reach back and change an app already on
  *  the profile. Chester chose that explicitly: making a default retroactive would mean setting a default to Off
@@ -59,6 +60,9 @@ public class AppInstallReceiver extends BroadcastReceiver {
         final PendingResult pending = goAsync();
         WORKER.execute(() -> {
             try {
+                try {
+                    ShrinkAndroidSender.onBroadcast(context, intent); // NWP-20261210-01: FIRST, before any return below
+                } catch (Throwable ignore) {}
                 // NWP-20260904-06: THE UNINSTALL HALF. A keep line is a claim the app exists; the removal
                 // broadcast is the moment that claim stops being true, so act on it directly instead of
                 // inferring it at logoff from a session receipt.

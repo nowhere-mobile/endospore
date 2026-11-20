@@ -376,7 +376,7 @@ func enrollFido2(base, name, pass, credIDb64, saltb64, hmacHex string, uv bool, 
 	dk := unwrapDK(v, "pass", passKEK)
 	if dk == nil {
 		// Already 2FA: the pass slot is gone by design. Open via the ENROLLED key's cached hmac (env,
-		// exported by roamd from the login stash) or the SE slot, so a second key can be added
+		// handed per call by roamd from the login stash) or the SE slot, so a second key can be added
 		// mid-session with only the NEW key in the single USB-C port. The new key's ceremony returns its
 		// values without touching the env, so fido2DK still tries the enrolled key's hmac.
 		dk = openVaultDKSE(v, name, pass, se)

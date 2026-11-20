@@ -7,7 +7,7 @@
 # pure java.lang and is compiled as-is with core/chooser/tests/session-screen-timeout/SessionScreenTimeoutCases.java;
 # that directory's run.sh then PINS the wiring the cases cannot see: roamLogin's tail (sign-in and create) calls
 # ensureSessionScreenTimeout(uid) exactly once, after prepRoamedUser(uid) and before applyRoamedPrefs() (so the user's
-# own value, which the Q012 capture will apply there, wins), and the method writes NEW_SESSION_MS into THAT user's
+# own value, which the settings allowlist applies there (NWP-20261207-13), wins), and the method writes NEW_SESSION_MS into THAT user's
 # resolver (createContextAsUser), behind needsWrite, on the caller's thread, catching Throwable.
 #
 # ⚠ IT FAILS WHEN THERE IS NO JAVAC, IT NEVER SKIPS. javac comes from PATH, else from the build host's JDK below.

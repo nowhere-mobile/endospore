@@ -14,7 +14,7 @@ import java.util.Set;
 import java.util.function.Predicate;
 
 /** NWP-20261130-12: cases for SettingsRoam, run by core/vendor-common/bin/test-settings-roam.sh. With no argument it runs
- *  J1-J10 and exits 1 on a failed case. --table prints the verdict table P1 compares with the shell's. --apply and
+ *  J1-J12 and exits 1 on a failed case; J11 and J12 read the real list, whose path is the one argument. --table prints the verdict table P1 compares with the shell's. --apply and
  *  --reconcile are the Java half of the E cases: their store is the shell stub's directory, so a value crosses both
  *  halves byte for byte. */
 final class SettingsRoamCases {
@@ -232,6 +232,91 @@ final class SettingsRoamCases {
         check("J10", !SettingsRoam.tilesValid(new String(a) + "a"), "8193 characters are refused");
     }
 
+    /** J11 (NWP-20261207-13, Q073): the real list holds the screen-off timeout as a plain System row after the tiles row. */
+    private static void j11(String path) throws Exception {
+        if (path == null) {
+            check("J11", false, "no list path given");
+            return;
+        }
+        List<SettingsRoam.Row> rows = SettingsRoam.parseList(Files.readAllLines(new File(path).toPath(), StandardCharsets.UTF_8));
+        boolean all = rows.size() == 18;
+        check("J11", all && "secure".equals(rows.get(0).scope) && QS.equals(rows.get(0).key) && "tiles".equals(rows.get(0).kind)
+                && "system".equals(rows.get(1).scope) && "screen_off_timeout".equals(rows.get(1).key) && rows.get(1).kind == null,
+                "the real list parses to the tiles row, then system screen_off_timeout with no kind");
+        Fake f = new Fake();
+        f.vals.put("system screen_off_timeout", "60000");
+        SettingsRoam.Result r = SettingsRoam.apply(rows, Arrays.asList("sroam=system screen_off_timeout 300000"), f, ALL);
+        check("J11", "300000".equals(f.vals.get("system screen_off_timeout"))
+                && f.puts.equals(Arrays.asList("screen_off_timeout", SettingsRoam.APPLIED_KEY)) && r.marked,
+                "the captured timeout is put in the System scope over the 1 min default, then the marker");
+        f = new Fake();
+        f.failing.add("screen_off_timeout");
+        r = SettingsRoam.apply(rows, Arrays.asList("sroam=secure " + QS + " a,b", "sroam=system screen_off_timeout 300000"), f, ALL);
+        check("J11", "a,b".equals(f.v(QS)) && r.failed == 1 && !r.marked && f.v(SettingsRoam.APPLIED_KEY) == null,
+                "a failed timeout put withholds the marker, and the tiles row still applies");
+    }
+
+    /** J12 (NWP-20261210-23, Q012): the sixteen public Secure rows after the two first rows, each a plain value. Written
+     *  out here, not read from the list, so a row dropped from the list fails here. */
+    private static final String[][] SECURE_ROWS = {
+        {"accessibility_display_inversion_enabled", "1"},
+        {"accessibility_display_daltonizer_enabled", "1"},
+        {"accessibility_display_daltonizer", "12"},
+        {"high_text_contrast_enabled", "0"},
+        {"accessibility_captioning_enabled", "1"},
+        {"accessibility_captioning_preset", "-1"},
+        {"accessibility_captioning_font_scale", "1.5"},
+        {"night_display_auto_mode", "2"},
+        {"night_display_custom_start_time", "79200000"},
+        {"night_display_custom_end_time", "25200000"},
+        {"long_press_timeout", "600"},
+        {"show_ime_with_hard_keyboard", "1"},
+        {"spell_checker_enabled", "0"},
+        {"tts_default_rate", "150"},
+        {"tts_default_pitch", "110"},
+        {"camera_double_tap_power_gesture_disabled", "1"},
+    };
+
+    private static void j12(String path) throws Exception {
+        if (path == null) {
+            check("J12", false, "no list path given");
+            return;
+        }
+        List<SettingsRoam.Row> rows = SettingsRoam.parseList(Files.readAllLines(new File(path).toPath(), StandardCharsets.UTF_8));
+        boolean same = rows.size() == 2 + SECURE_ROWS.length;
+        for (int i = 0; same && i < SECURE_ROWS.length; i++) {
+            SettingsRoam.Row r = rows.get(2 + i);
+            same = "secure".equals(r.scope) && SECURE_ROWS[i][0].equals(r.key) && r.kind == null;
+        }
+        check("J12", same, "rows 3 to 18 are the sixteen Secure rows, in order, each with no kind");
+        List<String> lines = new ArrayList<>();
+        List<String> keys = new ArrayList<>();
+        for (String[] kv : SECURE_ROWS) {
+            lines.add("sroam=secure " + kv[0] + " " + kv[1]);
+            keys.add(kv[0]);
+        }
+        Fake f = new Fake();
+        SettingsRoam.Result res = SettingsRoam.apply(rows, lines, f, ALL);
+        boolean exact = true;
+        for (String[] kv : SECURE_ROWS) exact &= kv[1].equals(f.v(kv[0])) && !f.vals.containsKey("system " + kv[0]);
+        check("J12", exact && res.applied == SECURE_ROWS.length && res.failed == 0 && res.malformed == 0,
+                "each captured value is put in the Secure scope, byte for byte");
+        List<String> order = new ArrayList<>(keys);
+        order.add(SettingsRoam.APPLIED_KEY);
+        check("J12", f.puts.equals(order) && res.marked && "1".equals(f.v(SettingsRoam.APPLIED_KEY)),
+                "the rows are put in order, then the marker last");
+        f = new Fake();
+        f.failing.add("long_press_timeout");
+        res = SettingsRoam.apply(rows, lines, f, ALL);
+        boolean others = true;
+        for (String[] kv : SECURE_ROWS) {
+            if (!kv[0].equals("long_press_timeout")) others &= kv[1].equals(f.v(kv[0]));
+        }
+        check("J12", others && f.v("long_press_timeout") == null && res.applied == SECURE_ROWS.length - 1 && res.failed == 1
+                && !res.marked && f.v(SettingsRoam.APPLIED_KEY) == null,
+                "a failed put of one row withholds the marker, and the other fifteen rows still apply");
+    }
+
     /** The shell stub's directory as a store: <dir>/<scope>.<key>, no trailing newline. */
     private static SettingsRoam.Store dirStore(File dir) {
         return new SettingsRoam.Store() {
@@ -275,6 +360,8 @@ final class SettingsRoamCases {
             return;
         }
         j1(); j2(); j3(); j4(); j5(); j6(); j7(); j8(); j9(); j10();
+        j11(args.length == 1 ? args[0] : null);
+        j12(args.length == 1 ? args[0] : null);
         System.exit(failed == 0 ? 0 : 1);
     }
 }

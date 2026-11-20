@@ -548,3 +548,68 @@ func TestMediaAfterGateSeal_LandingDuringTheWalkIsKept(t *testing.T) {
 		t.Errorf("%s: the new span is not the stored span's chunks", rel)
 	}
 }
+
+// magVaultScope re-points f's #media scope into a scope vault over its current manifest, as a passphrase change or a
+// recovery does (buildScopeVault), and makes that vault the head b signs in to. It fails the test if the head it
+// published is not a vault, so a fixture that stopped re-pointing cannot pass by accident.
+func magVaultScope(t *testing.T, f *magFix) (manifest, vh string) {
+	t.Helper()
+	manifest = f.atLogin
+	key := deriveKey(f.profile, magPass)
+	f.a.as(func() {
+		n := capBegin()
+		capSetSession(f.profile, magPass, key)
+		vh = publishRepointVault(f.a.base, f.profile, magPass, buildScopeVault(key, f.profile, magPass, manifest))
+		capFlush(n)
+	})
+	if v, isV := parseVault(getHeadBlob(f.a.base, vh)); !isV || v.Manifest != manifest {
+		t.Fatalf("the re-pointed #media head %s is not a vault naming %s -- this fixture proves nothing", short(vh), short(manifest))
+	}
+	f.atLogin = vh
+	return manifest, vh
+}
+
+// NWP-20261119-33 (lynx 2026111901, 2026-11-19): a #media scope a passphrase change re-pointed has a VAULT head, and
+// the login roster records that head. The carry read the vault's own hash as a manifest (load=3), so under an
+// after-gate split every sign-out was refused. With the vault resolved, an unlanded background rel is carried.
+func TestMediaAfterGateSeal_VaultScopeHeadIsCarried(t *testing.T) {
+	f := magFixture(t, "magsealv")
+	magVaultScope(t, f)
+	f.signIn(t, true)
+	refused, why, out := f.sealB(t)
+	if refused != "" {
+		t.Fatalf("a seal over a re-pointed (vault) #media head was refused (why=%q) -- the carry could not read the restored head\n%s", why, out)
+	}
+	if strings.Contains(out, "could not be read (load=") {
+		t.Errorf("the carry still could not read the restored vault head:\n%s", out)
+	}
+	m := f.newHead(t)
+	for _, rel := range []string{"DCIM/bg1.jpg", "DCIM/bg2.jpg"} {
+		if _, ok := m.Ess[rel]; !ok {
+			t.Errorf("%s: an unlanded background file was dropped from the new head", rel)
+		}
+	}
+}
+
+// rosterManifest: a vault head names its manifest; a bare-shaped head, the sentinel, "" and a hash the store does not
+// hold come back unchanged, so the manifest read that follows behaves exactly as it did before (NWP-20261119-33).
+func TestRosterManifest_AVaultHeadNamesItsManifest(t *testing.T) {
+	f := magFixture(t, "magrostm")
+	bare := f.atLogin
+	f.a.as(func() {
+		if got := rosterManifest(f.a.base, bare); got != bare {
+			t.Errorf("a bare-shaped head: got %s, want the head itself %s", short(got), short(bare))
+		}
+	})
+	manifest, vh := magVaultScope(t, f)
+	f.a.as(func() {
+		if got := rosterManifest(f.a.base, vh); got != manifest {
+			t.Errorf("a vault head: got %s, want the manifest it names %s", short(got), short(manifest))
+		}
+		for _, rh := range []string{"", loginRosterNone, strings.Repeat("0", 64)} {
+			if got := rosterManifest(f.a.base, rh); got != rh {
+				t.Errorf("rosterManifest(%q) = %q, want it unchanged", rh, got)
+			}
+		}
+	})
+}

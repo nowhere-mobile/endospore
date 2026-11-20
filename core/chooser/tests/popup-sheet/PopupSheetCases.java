@@ -12,6 +12,7 @@ import com.nowhere.chooser.PopupSheet.Confirm;
 import com.nowhere.chooser.PopupSheet.Line;
 import com.nowhere.chooser.PopupSheet.Option;
 import com.nowhere.chooser.PopupSheet.Picker;
+import com.nowhere.chooser.PopupSheet.Progress;
 import com.nowhere.chooser.PopupSheet.Style;
 import com.nowhere.chooser.PopupSheet.Tone;
 
@@ -32,6 +33,11 @@ final class PopupSheetCases {
     private static Confirm conf(Tone tone, Button... buttons) {
         return new Confirm(tone, "Title", "One sentence.", Collections.singletonList(new Line("A line", null)),
                 Arrays.asList(buttons));
+    }
+
+    private static Confirm retry(boolean retry, Button... buttons) {
+        return new Confirm(Tone.WARNING, "Title", "One sentence.", Collections.singletonList(new Line("A line", null)),
+                Arrays.asList(buttons), retry);
     }
 
     private static Option opt(String name, boolean current) {
@@ -141,6 +147,46 @@ final class PopupSheetCases {
                 PopupSheet.R_WARNING_BUTTONS);
         fires("R_GOT_IT_TONE destructive", PopupSheet.violations(conf(Tone.DESTRUCTIVE, b(PopupSheet.GOT_IT, Style.OUTLINED))),
                 PopupSheet.R_GOT_IT_TONE, PopupSheet.R_DESTRUCTIVE_ORDER);
+
+        // NWP-20261208-28: a retry warning and a progress sheet.
+        check("a retry warning passes", PopupSheet.violations(retry(true, b("Try again", Style.GREEN_FILLED),
+                b(PopupSheet.NOT_NOW, Style.OUTLINED))).isEmpty());
+        fires("R_WARNING_BUTTONS retry false", PopupSheet.violations(retry(false, b("Try again", Style.GREEN_FILLED),
+                b(PopupSheet.NOT_NOW, Style.OUTLINED))), PopupSheet.R_WARNING_BUTTONS);
+        fires("R_WARNING_BUTTONS retry not Not now", PopupSheet.violations(retry(true, b("Try again", Style.GREEN_FILLED),
+                b("Later", Style.OUTLINED))), PopupSheet.R_WARNING_BUTTONS);
+        fires("R_WARNING_BUTTONS retry with a red filled", PopupSheet.violations(retry(true,
+                b("Try again", Style.GREEN_FILLED), b(PopupSheet.NOT_NOW, Style.OUTLINED), b("Drop it", Style.RED_FILLED))),
+                PopupSheet.R_WARNING_BUTTONS);
+        fires("R_WARNING_BUTTONS retry Not now first", PopupSheet.violations(retry(true,
+                b(PopupSheet.NOT_NOW, Style.OUTLINED), b("Try again", Style.GREEN_FILLED))), PopupSheet.R_WARNING_BUTTONS);
+        fires("R_ROUTINE_BUTTONS retry on a routine sheet", PopupSheet.violations(new Confirm(Tone.ROUTINE, "Title",
+                "One sentence.", null, Arrays.asList(b("Try again", Style.GREEN_FILLED), b("Risk it", Style.RED_OUTLINED)),
+                true)), PopupSheet.R_ROUTINE_BUTTONS);
+        check("5-arg Confirm has retry false", !routine().retry && !warning().retry);
+
+        check("progress valid", PopupSheet.violations(new Progress("Working…", "One sentence.", "A line")).isEmpty());
+        fires("R_PROGRESS no …", PopupSheet.violations(new Progress("Working", "One sentence.", "A line")),
+                PopupSheet.R_PROGRESS);
+        fires("R_PROGRESS three dots", PopupSheet.violations(new Progress("Working...", "One sentence.", "A line")),
+                PopupSheet.R_PROGRESS);
+        fires("R_PROGRESS null title", PopupSheet.violations(new Progress(null, "One sentence.", "A line")),
+                PopupSheet.R_PROGRESS);
+        fires("R_PROGRESS empty context", PopupSheet.violations(new Progress("Working…", "", "A line")),
+                PopupSheet.R_PROGRESS);
+        fires("R_PROGRESS null context", PopupSheet.violations(new Progress("Working…", null, "A line")),
+                PopupSheet.R_PROGRESS);
+        fires("R_PROGRESS null line", PopupSheet.violations(new Progress("Working…", "One sentence.", null)),
+                PopupSheet.R_PROGRESS);
+        fires("R_PROGRESS empty line", PopupSheet.violations(new Progress("Working…", "One sentence.", "")),
+                PopupSheet.R_PROGRESS);
+        fires("R_EMPTY progress null", PopupSheet.violations((Progress) null), PopupSheet.R_EMPTY);
+        fires("R_AMPERSAND progress title", PopupSheet.violations(new Progress("A & B…", "One sentence.", "A line")),
+                PopupSheet.R_AMPERSAND);
+        fires("R_AMPERSAND progress context", PopupSheet.violations(new Progress("Working…", "A & B.", "A line")),
+                PopupSheet.R_AMPERSAND);
+        fires("R_AMPERSAND progress line", PopupSheet.violations(new Progress("Working…", "One sentence.", "A & B")),
+                PopupSheet.R_AMPERSAND);
 
         fires("R_TWO_CURRENT", PopupSheet.violations(new Picker("T", Arrays.asList(opt("A", true), opt("B", true)))),
                 PopupSheet.R_TWO_CURRENT);

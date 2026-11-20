@@ -522,6 +522,9 @@ var opaqueAllowed = map[string][]string{
 	// The Storage screen's wallet repair: showStorage sends WalletRepairCopy.CHECK_REQUEST, "REPAIR-WALLET\nCHECK\n",
 	// and, from the dialog's positive button, CONFIRM_REQUEST, "REPAIR-WALLET\nCONFIRM\n" (NWP-20261103-06).
 	"ProfileActivity.java#showStorage": {"REPAIR-WALLET"},
+	// Profile's claim notice: showConfirm sends ClaimNoticeCopy.GET_REQUEST, "GET-CLAIM-NOTICE\n", and, from either
+	// button of the sheet, ClaimNoticeCopy.ackRequest(n), "CLAIM-NOTICE-SHOWN\n<n>\n" (NWP-20261208-04).
+	"ProfileActivity.java#showConfirm": {"GET-CLAIM-NOTICE", "CLAIM-NOTICE-SHOWN"},
 	// The logoff's inferred-orphan list: "EXPECT-SHRINK-INFERRED\n" then the package names, appended to a builder. It
 	// is in doLogoffImpl, the body doLogoff() and doLogoffForInstall() share since NWP-20261017-17.
 	"ProfileActivity.java#doLogoffImpl": {"EXPECT-SHRINK-INFERRED"},
@@ -550,6 +553,9 @@ var opaqueAllowed = map[string][]string{
 	// The #119 skip notice's card: markShown sends SkipNoticeCopy.shownRequest(time), "SKIP-NOTICE-SHOWN\n<time>\n",
 	// once the card is on screen (NWP-20261128-08).
 	"SkipNoticeActivity.java#markShown": {"SKIP-NOTICE-SHOWN"},
+	// A package Android cleared or uninstalled in a session: send sends ShrinkAndroidArm.payload(queued),
+	// "EXPECT-SHRINK-ANDROID\n<pkg> <pkg>...\n" (NWP-20261210-01).
+	"ShrinkAndroidSender.java#send": {"EXPECT-SHRINK-ANDROID"},
 }
 
 // streamReplies are literals written to a socket whose request is already open: answers to the daemon's prompts, not
@@ -662,15 +668,17 @@ func verbIn(l []string, s string) bool {
 // handleLogin has the arm: both TestDaemonVerbs and TestGatePollersNeverWaitOnTheSession then judge the verb in full.
 // MEDIA-RESTART: NWP-20261202-26 sends it from MediaFixReceiver and M12a of harvest 63 adds its arm.
 // GET-LASTSAVE: sent by NWP-20261205-02's LastSaveNoticeActivity; harvest 66's M06 gate-verb task adds its arm.
-var chooserVerbsAwaitingArm = map[string]bool{"GET-HEALTH": true, "GET-LASTSAVE": true, "MEDIA-RESTART": true}
+// GET-CLAIM-NOTICE, CLAIM-NOTICE-SHOWN: sent by NWP-20261208-04's Profile home (C04b, ProfileActivity.showConfirm);
+// C04a of harvest 69 (NOWHERE-1929) adds both arms.
+var chooserVerbsAwaitingArm = map[string]bool{"CLAIM-NOTICE-SHOWN": true, "GET-CLAIM-NOTICE": true, "GET-HEALTH": true, "GET-LASTSAVE": true, "MEDIA-RESTART": true}
 
 // senderFiles are the chooser files that touch the daemon socket. A file that starts to and is not here fails.
 var senderFiles = map[string]bool{
 	"AppInstallReceiver.java": true, "BackupNowReceiver.java": true, "ChooserActivity.java": true, "HealthFixReceiver.java": true,
 	"CredentialService.java": true, "DaemonSocket.java": true, "DiagReportJob.java": true, "DozeAppsMirror.java": true, "EmergencyWindow.java": true, "GateAlarmActivity.java": true, "GateTrace.java": true,
-	"IdleLogoffReceiver.java": true, "Ingest.java": true, "LastSaveNoticeActivity.java": true, "MediaFixReceiver.java": true, "NfcFido2.java": true, "OdDataBarrierHost.java": true, "OtaUpdate.java": true,
+	"IdleLogoffReceiver.java": true, "Ingest.java": true, "LastSaveNoticeActivity.java": true, "MediaFixReceiver.java": true, "MediaLandingNoticeActivity.java": true, "NfcFido2.java": true, "OdDataBarrierHost.java": true, "OtaUpdate.java": true,
 	"OtaTimeReceiver.java": true, "OtaWakeReceiver.java": true, "ProfileActivity.java": true, "ReloginReceiver.java": true,
-	"SkipNoticeActivity.java": true, "SmsDeliverReceiver.java": true, "StoreService.java": true, "TelArrival.java": true, "TelIngest.java": true,
+	"ShrinkAndroidSender.java": true, "SkipNoticeActivity.java": true, "SmsDeliverReceiver.java": true, "StoreService.java": true, "TelArrival.java": true, "TelIngest.java": true,
 	"UnarchiveService.java": true, "WifiMirror.java": true,
 }
 

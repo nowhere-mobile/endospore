@@ -3,7 +3,9 @@
 # real rather than grepped.
 #
 # An in-session issue report asks roamd's RO lane for the always-on VPN state of the session's user. The op answers
-# `VPNSTATE app=<c> lock=<c> pend=<c> net=<c>`, each code 1, 0 or -, and carries properties the Go tests cannot reach:
+# `VPNSTATE app=<c> lock=<c> pend=<c> net=<c> refused=<r>`, each code 1, 0 or -, and carries properties the Go tests
+# cannot reach (refused is NWP-20261208-10's; with no $STATE/.vpnwhy record it is none, and test-vpn-refusal-why.sh
+# runs its other forms):
 #   - net is the VPN app's INTERNET grant IN THIS USER: vpn_net_state reads the package's `User <uid>:` block of
 #     `dumpsys package` (GrapheneOS: INTERNET is the runtime Network permission), else its `install permissions:`
 #     block (Diaspore), else -. Another user's block must never be read.
@@ -105,7 +107,8 @@ dump(){
 # records its call.
 runcase(){
   local sh="$1" T="$2" u="${3:-10}"
-  { printf 'FIX=%s\nLOG=%s\nRES=%s\nuid=%s\n' "$T" "$T/log" "$T/roamro.res" "$u"
+  mkdir -p "$T/state"
+  { printf 'FIX=%s\nLOG=%s\nRES=%s\nSTATE=%s\nuid=%s\n' "$T" "$T/log" "$T/roamro.res" "$T/state" "$u"
     printf '%s\n' 'settings(){ echo "$*" >> "$FIX/settings.args"; [ -f "$FIX/$5" ] || return 1; cat "$FIX/$5"; [ -f "$FIX/$5.rc" ] && return "$(cat "$FIX/$5.rc")"; return 0; }' \
       'dumpsys(){ echo "$*" >> "$FIX/dumpsys.args"; [ -f "$FIX/dump" ] && cat "$FIX/dump"; return 0; }'
     printf '%s\n' "$FN" "$OP"; } > "$T/op.sh"
@@ -142,7 +145,7 @@ behaviour(){   # behaviour <shell>: every case that runs roamd code, under that 
   echo "== [$sh] net: the VPN app's INTERNET grant in THIS user =="
   T=$(mktemp -d -p "$W"); setv "$T" always_on_vpn_app "$PKG"; setv "$T" always_on_vpn_lockdown 0
   setv "$T" nowhere_vpn_lockdown_pending null; dump "$T" granted; runcase "$sh" "$T"
-  expect "$sh" "$T" "N1 granted" "VPNSTATE app=1 lock=0 pend=0 net=1"
+  expect "$sh" "$T" "N1 granted" "VPNSTATE app=1 lock=0 pend=0 net=1 refused=none"
   [ "$(cat "$T/dumpsys.args" 2>/dev/null)" = "package $PKG" ] && ok "[$sh] N1 dumpsys asked for that one package" \
     || no "[$sh] N1 dumpsys args '$(cat "$T/dumpsys.args" 2>/dev/null)'"
   rm -rf "$T"
@@ -153,53 +156,53 @@ behaviour(){   # behaviour <shell>: every case that runs roamd code, under that 
            "N7 dumpsys prints nothing:empty:-"; do
     T=$(mktemp -d -p "$W"); setv "$T" always_on_vpn_app "$PKG"; setv "$T" always_on_vpn_lockdown 0
     setv "$T" nowhere_vpn_lockdown_pending null; dump "$T" "$(echo "$v" | cut -d: -f2)"; runcase "$sh" "$T"
-    expect "$sh" "$T" "$(echo "$v" | cut -d: -f1)" "VPNSTATE app=1 lock=0 pend=0 net=$(echo "$v" | cut -d: -f3)"
+    expect "$sh" "$T" "$(echo "$v" | cut -d: -f1)" "VPNSTATE app=1 lock=0 pend=0 net=$(echo "$v" | cut -d: -f3) refused=none"
     rm -rf "$T"
   done
 
   echo "== [$sh] app, lock and pend =="
   T=$(mktemp -d -p "$W"); setv "$T" always_on_vpn_app null; setv "$T" always_on_vpn_lockdown 0
   setv "$T" nowhere_vpn_lockdown_pending null; dump "$T" granted; runcase "$sh" "$T"
-  expect "$sh" "$T" "A1 no app set" "VPNSTATE app=0 lock=0 pend=0 net=-"
+  expect "$sh" "$T" "A1 no app set" "VPNSTATE app=0 lock=0 pend=0 net=- refused=none"
   called "$T" && no "[$sh] A1 dumpsys was asked with no app set" || ok "[$sh] A1 dumpsys not asked"
   rm -rf "$T"
 
   T=$(mktemp -d -p "$W"); setv "$T" always_on_vpn_app "Error: x"; setv "$T" always_on_vpn_lockdown 1
   setv "$T" nowhere_vpn_lockdown_pending "Error: x"; dump "$T" granted; runcase "$sh" "$T"
-  expect "$sh" "$T" "A2 an app value that is not a package name" "VPNSTATE app=- lock=1 pend=0 net=-"
+  expect "$sh" "$T" "A2 an app value that is not a package name" "VPNSTATE app=- lock=1 pend=0 net=- refused=none"
   called "$T" && no "[$sh] A2 dumpsys was asked for a non-package value" || ok "[$sh] A2 dumpsys not asked"
   rm -rf "$T"
 
   T=$(mktemp -d -p "$W"); setv "$T" always_on_vpn_app nopackage; setv "$T" always_on_vpn_lockdown null
   setv "$T" nowhere_vpn_lockdown_pending null; dump "$T" granted; runcase "$sh" "$T"
-  expect "$sh" "$T" "A3 a value with no dot" "VPNSTATE app=- lock=0 pend=0 net=-"
+  expect "$sh" "$T" "A3 a value with no dot" "VPNSTATE app=- lock=0 pend=0 net=- refused=none"
   rm -rf "$T"
 
   T=$(mktemp -d -p "$W"); setv "$T" always_on_vpn_app "$PKG"; setv "$T" always_on_vpn_lockdown 1
   setv "$T" nowhere_vpn_lockdown_pending "$PKG"; dump "$T" denied; runcase "$sh" "$T"
-  expect "$sh" "$T" "L1 lockdown on, pend names the app" "VPNSTATE app=1 lock=1 pend=1 net=0"
+  expect "$sh" "$T" "L1 lockdown on, pend names the app" "VPNSTATE app=1 lock=1 pend=1 net=0 refused=none"
   rm -rf "$T"
 
   T=$(mktemp -d -p "$W"); setv "$T" always_on_vpn_app "$PKG"; setv "$T" always_on_vpn_lockdown 0
   setv "$T" nowhere_vpn_lockdown_pending "$OTHER"; dump "$T" granted; runcase "$sh" "$T"
-  expect "$sh" "$T" "P1 pend names another app" "VPNSTATE app=1 lock=0 pend=0 net=1"
+  expect "$sh" "$T" "P1 pend names another app" "VPNSTATE app=1 lock=0 pend=0 net=1 refused=none"
   rm -rf "$T"
 
   T=$(mktemp -d -p "$W"); dump "$T" granted; runcase "$sh" "$T"
-  expect "$sh" "$T" "U1 every settings read fails and prints nothing" "VPNSTATE app=- lock=- pend=- net=-"
+  expect "$sh" "$T" "U1 every settings read fails and prints nothing" "VPNSTATE app=- lock=- pend=- net=- refused=none"
   called "$T" && no "[$sh] U1 dumpsys was asked with no app read" || ok "[$sh] U1 dumpsys not asked"
   rm -rf "$T"
 
   # RF-001: a read that succeeds with an empty value is a value (none set), not a failure.
   T=$(mktemp -d -p "$W"); setv "$T" always_on_vpn_app ""; setv "$T" always_on_vpn_lockdown ""
   setv "$T" nowhere_vpn_lockdown_pending ""; dump "$T" granted; runcase "$sh" "$T"
-  expect "$sh" "$T" "E1 every settings read succeeds empty" "VPNSTATE app=0 lock=0 pend=0 net=-"
+  expect "$sh" "$T" "E1 every settings read succeeds empty" "VPNSTATE app=0 lock=0 pend=0 net=- refused=none"
   called "$T" && no "[$sh] E1 dumpsys was asked with no app set" || ok "[$sh] E1 dumpsys not asked"
   rm -rf "$T"
 
   T=$(mktemp -d -p "$W"); setv "$T" always_on_vpn_app "$PKG"; setv "$T" always_on_vpn_lockdown 1
   setv "$T" nowhere_vpn_lockdown_pending ""; dump "$T" granted; runcase "$sh" "$T"
-  expect "$sh" "$T" "E2 pend succeeds empty while an app is set" "VPNSTATE app=1 lock=1 pend=0 net=1"
+  expect "$sh" "$T" "E2 pend succeeds empty while an app is set" "VPNSTATE app=1 lock=1 pend=0 net=1 refused=none"
   rm -rf "$T"
 
   # RF-001: a read that exits non-zero is unreadable, even when what it printed looks like a valid value.
@@ -207,19 +210,19 @@ behaviour(){   # behaviour <shell>: every case that runs roamd code, under that 
   setv "$T" nowhere_vpn_lockdown_pending "$PKG"; dump "$T" granted
   for v in always_on_vpn_app always_on_vpn_lockdown nowhere_vpn_lockdown_pending; do echo 1 > "$T/$v.rc"; done
   runcase "$sh" "$T"
-  expect "$sh" "$T" "F1 every settings read exits 1 with a valid-looking value" "VPNSTATE app=- lock=- pend=- net=-"
+  expect "$sh" "$T" "F1 every settings read exits 1 with a valid-looking value" "VPNSTATE app=- lock=- pend=- net=- refused=none"
   called "$T" && no "[$sh] F1 dumpsys was asked after a failed app read" || ok "[$sh] F1 dumpsys not asked"
   rm -rf "$T"
 
   T=$(mktemp -d -p "$W"); setv "$T" always_on_vpn_app "$PKG"; setv "$T" always_on_vpn_lockdown 0
   setv "$T" nowhere_vpn_lockdown_pending "$PKG"; echo 2 > "$T/nowhere_vpn_lockdown_pending.rc"
   dump "$T" granted; runcase "$sh" "$T"
-  expect "$sh" "$T" "F2 only the pend read exits 2, printing the app" "VPNSTATE app=1 lock=0 pend=- net=1"
+  expect "$sh" "$T" "F2 only the pend read exits 2, printing the app" "VPNSTATE app=1 lock=0 pend=- net=1 refused=none"
   rm -rf "$T"
 
   T=$(mktemp -d -p "$W"); setv "$T" always_on_vpn_app "$PKG"; setv "$T" always_on_vpn_lockdown 1
   setv "$T" nowhere_vpn_lockdown_pending "$PKG"; dump "$T" granted; runcase "$sh" "$T" "1x"
-  expect "$sh" "$T" "U2 a uid that is not a number" "VPNSTATE app=- lock=- pend=- net=-" "1x"
+  expect "$sh" "$T" "U2 a uid that is not a number" "VPNSTATE app=- lock=- pend=- net=- refused=-" "1x"
   [ ! -e "$T/settings.args" ] && ok "[$sh] U2 settings not asked for a bad uid" || no "[$sh] U2 settings asked: $(cat "$T/settings.args")"
   rm -rf "$T"
 }

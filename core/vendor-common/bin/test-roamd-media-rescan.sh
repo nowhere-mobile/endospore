@@ -5,8 +5,9 @@
 #
 # rescan_media is extracted from nowhere_roamd.sh BY ANCHOR, never copied (a moved anchor stops the suite with
 # EXTRACTION FAILED, exit 2) and run in a child shell against a stub `am` that records its argv and exits a chosen
-# code. The source pins check that the sign-in calls it right after restore_media_tail, inside the restore-succeeded
-# branch, and that CredentialService answers the start with the provider's scan_volume call.
+# code. The source pins check that the sign-in calls it only when the #media restore succeeded and no scope restore
+# ended the sign-in (since NWP-20261210-03 the #media restore runs in a background lane, so the call sits after the
+# lanes' join), and that CredentialService answers the start with the provider's scan_volume call.
 #
 #   bash test-roamd-media-rescan.sh            # the cases and the source pins
 #   bash test-roamd-media-rescan.sh --mutate   # ... plus mutants, each of which must be convicted
@@ -64,10 +65,14 @@ if check "$FN"; then ok "starts CredentialService rescanmedia as the session use
 
 # --- source pins -------------------------------------------------------------------------------------------
 echo "source pins"
-# The call sits right after restore_media_tail, before the branch closes: only a restore that succeeded rescans.
-if awk '/restore_media_tail "\$MEDIADIR"$/{a=NR} a&&NR==a+1&&/_ssum reown/{b=NR} b&&NR==b+1&&/^ *rescan_media "\$uid"/{f=1} b&&NR==b+2&&f&&/^ *fi$/{print "yes"; exit}' "$ROAMD" | grep -q yes; then
-  ok "the sign-in calls rescan_media right after restore_media_tail, inside the restore-succeeded branch"
-else no "the sign-in's rescan_media call is not where the restore succeeded"; fi
+# NWP-20261210-03: the call sits in the branch taken only when the #media restore succeeded (_mdrc 0, read back at the
+# lanes' join) and no scope restore ended the sign-in (_innet empty), and nowhere else.
+RSPIN='/^ *if \[ -z "\$_innet" \] && \[ "\$_mdrc" = 0 \]; then$/{a=NR} a&&NR==a+1&&/^ *rescan_media "\$uid"/{f=1} a&&NR==a+2&&f&&/^ *fi$/{print "yes"; exit}'
+rsn=$(grep -c '^ *rescan_media "\$uid"' "$ROAMD")
+rsy=$(awk "$RSPIN" "$ROAMD")
+if [ "$rsy" = yes ] && [ "$rsn" = 1 ]; then
+  ok "the sign-in calls rescan_media once, only when the #media restore succeeded and the sign-in lands"
+else no "the sign-in's rescan_media call is not where the restore succeeded (pin=$rsy, calls=$rsn)"; fi
 if grep -q 'getBooleanExtra("rescanmedia", false)' "$CRED" && grep -q '"scan_volume"' "$CRED" \
    && grep -q 'MediaStore.VOLUME_EXTERNAL_PRIMARY, null)' "$CRED"; then
   ok "CredentialService answers rescanmedia with MediaProvider's scan_volume on external_primary"
@@ -86,7 +91,7 @@ if [ "$MUTATE" = yes ]; then
   mutant "rc-dropped"   's/_rsrc=\$?/_rsrc=0/'
   mutant "no-start"     's/^  am startservice.*$/  :/'
   srcm="$W/roamd.mut"; sed 's/^\( *\)rescan_media "\$uid".*$/\1: #/' "$ROAMD" > "$srcm"
-  if awk '/restore_media_tail "\$MEDIADIR"$/{a=NR} a&&NR==a+1&&/_ssum reown/{b=NR} b&&NR==b+1&&/^ *rescan_media "\$uid"/{print "yes"; exit}' "$srcm" | grep -q yes; then
+  if [ "$(awk "$RSPIN" "$srcm")" = yes ]; then
     no "mutant call-removed SURVIVED the source pin"; else ok "mutant call-removed convicted"; fi
 fi
 

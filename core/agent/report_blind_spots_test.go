@@ -119,7 +119,7 @@ func TestEverySectionIsReachableByTheDeleteStep(t *testing.T) {
 	// instead: ONE section, already at the 40-line halving floor, still far over the ceiling. Now the only way
 	// under is deletion, so a key absent from `order` fails here and nowhere else.
 	const lineLen = 8000
-	for _, k := range []string{"login.log", "roam.log", "mediad.log", "provision.log", "avc", "prev_boot", "anr", "uiderrors"} {
+	for _, k := range []string{"login.log", "roam.log", "mediad.log", "provision.log", "avc", "prev_boot", "anr", "uiderrors", "odhold_log"} {
 		lines := make([]string, 40)
 		for i := range lines {
 			lines[i] = strings.Repeat("x", lineLen)
@@ -143,7 +143,7 @@ func TestTrimBringsAMixedReportUnderTheCeiling(t *testing.T) {
 	for i := range big {
 		big[i] = strings.Repeat("x", 400)
 	}
-	for _, k := range []string{"login.log", "roam.log", "mediad.log", "provision.log", "avc", "prev_boot", "anr", "uiderrors"} {
+	for _, k := range []string{"login.log", "roam.log", "mediad.log", "provision.log", "avc", "prev_boot", "anr", "uiderrors", "odhold_log"} {
 		rep.Logs[k] = append([]string(nil), big...)
 	}
 	trimIssueReport(&rep)

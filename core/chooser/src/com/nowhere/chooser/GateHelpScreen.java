@@ -17,11 +17,12 @@ import android.widget.TextView;
 /**
  * The gate's Help combo screen (NWP-20261130-11; chosen by Chester on 2026-11-06, "Go with combo", NWP-20261105-27): a
  * hero card of the whole loop with "Watch the 3 steps", a three-step intro with Skip on every step, the topic tiles and
- * the "Forgot your passphrase?" card. The words are GateHelpHome's, the colours GatePalette's.
+ * the "Forgot your passphrase?" card. The words are GateHelpHome's, the colours GatePalette's. Each tile and the Forgot
+ * card opens its topic in place, under its row, as step cards (GateHelpTopic, NWP-20261208-26); a second tap closes it.
  *
  * Each screen is a view that ChooserActivity swaps in with setContentView, so Help stays inside Lock-Task. The gate's
- * onBackPressed does nothing, so each screen has its own way out. It holds no state and reads no pref, daemon reply or
- * profile name: the same static screen for everyone, so blind login holds.
+ * onBackPressed does nothing, so each screen has its own way out. It holds no state but which topic is open, in its
+ * views, and reads no pref, daemon reply or profile name: the same static screen for everyone, so blind login holds.
  */
 final class GateHelpScreen {
     private GateHelpScreen() {}
@@ -32,10 +33,72 @@ final class GateHelpScreen {
         void show(View v);
         /** Back to the sign-in screen. */
         void close();
-        /** Open the page of tile i. */
-        void openTile(int i);
-        /** Open the page of the Forgot card. */
-        void openForgot();
+    }
+
+    /**
+     * The topics of the home screen: the six tiles and the Forgot card share one open state, so at most one topic is
+     * open. Each topic has a body to open into and a chevron that turns while it is open.
+     */
+    static final class Topics {
+        /** The Forgot card's index, after the six tiles. */
+        static final int FORGOT = GateHelpHome.TILES.length;
+        private final Context c;
+        private final GateHelpArt.Roles r;
+        private final LinearLayout[] bodies = new LinearLayout[FORGOT + 1];
+        private final TextView[] chevrons = new TextView[FORGOT + 1];
+        private int open = -1;
+
+        Topics(Context c, GateHelpArt.Roles r) {
+            this.c = c;
+            this.r = r;
+        }
+
+        /** Topic i opens into body and turns chevron. Two tiles of one row share one body. */
+        void add(int i, LinearLayout body, TextView chevron) {
+            bodies[i] = body;
+            chevrons[i] = chevron;
+        }
+
+        /** A tap on topic i: it closes when it is open, else it opens and the open one closes. */
+        void tap(int i) {
+            int was = open;
+            open = GateHelpHome.toggle(open, i);
+            if (was >= 0) {
+                bodies[was].removeAllViews();
+                bodies[was].setVisibility(View.GONE);
+                chevrons[was].setRotation(GateHelpHome.chevronRotation(false));
+            }
+            if (open < 0) return;
+            LinearLayout body = bodies[i];
+            Runnable close = () -> {
+                if (open == i) tap(i);
+            };
+            String[] steps = i == FORGOT ? GateHelpHome.forgotSteps() : GateHelpHome.tileSteps(i);
+            String also = i == FORGOT ? null : GateHelpHome.alsoLine(i);
+            Runnable openAlso = () -> {
+                body.removeAllViews();
+                body.addView(GateHelpTopic.build(c, r, GateHelpPages.steps(GateHelpHome.tileAlso(i)), null, null, close),
+                        wide());
+            };
+            body.addView(GateHelpTopic.build(c, r, steps, also, also == null ? null : openAlso, close), wide());
+            body.setVisibility(View.VISIBLE);
+            chevrons[i].setRotation(GateHelpHome.chevronRotation(true));
+        }
+    }
+
+    /** A topic's chevron: the accent, hidden from TalkBack, which reads the tile or the card. */
+    static TextView chevron(Context c, GateHelpArt.Roles r, float sp) {
+        TextView t = text(c, GateHelpHome.CHEVRON, r.accent, sp, true);
+        t.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
+        return t;
+    }
+
+    /** The body a topic opens into: empty and GONE until a tap opens it. */
+    static LinearLayout body(Context c) {
+        LinearLayout b = new LinearLayout(c);
+        b.setOrientation(LinearLayout.VERTICAL);
+        b.setVisibility(View.GONE);
+        return b;
     }
 
     /** The home screen: the hero card, the tiles, the Forgot card and Back. */
@@ -78,9 +141,16 @@ final class GateHelpScreen {
         hdr.bottomMargin = dp(c, 4);
         ll.addView(topics, hdr);
         // The tiles' own margins (4dp) reach the page's edge, so the grid has no margin here.
-        ll.addView(new GateHelpTileGrid(c, r, nav), wide());
+        Topics open = new Topics(c, r);
+        ll.addView(new GateHelpTileGrid(c, r, open), wide());
 
-        ll.addView(forgotCard(c, r, nav), forgotParams(c));
+        TextView forgotChevron = chevron(c, r, 18);
+        ll.addView(forgotCard(c, r, open, forgotChevron), forgotParams(c));
+        LinearLayout forgotBody = body(c);
+        LinearLayout.LayoutParams fbp = forgotParams(c);
+        fbp.topMargin = 0;
+        ll.addView(forgotBody, fbp);
+        open.add(Topics.FORGOT, forgotBody, forgotChevron);
 
         TextView back = text(c, GateHelpHome.BACK, r.accent, 14, true);
         int bp = dp(c, 16);
@@ -150,8 +220,8 @@ final class GateHelpScreen {
         return g;
     }
 
-    /** The highlighted card: an accent edge, the key, the title and one line. */
-    private static View forgotCard(Context c, GateHelpArt.Roles r, Nav nav) {
+    /** The highlighted card: an accent edge, the key, the title, one line and the chevron. */
+    private static View forgotCard(Context c, GateHelpArt.Roles r, Topics open, TextView chevron) {
         LinearLayout row = new LinearLayout(c);
         row.setOrientation(LinearLayout.HORIZONTAL);
         row.setGravity(Gravity.CENTER_VERTICAL);
@@ -160,7 +230,7 @@ final class GateHelpScreen {
         row.setPadding(pad, pad, pad, pad);
         row.setContentDescription(GateHelpHome.forgotDescription());
         row.setFocusable(true);
-        row.setOnClickListener(v -> nav.openForgot());
+        row.setOnClickListener(v -> open.tap(Topics.FORGOT));
 
         ImageView key = new ImageView(c);
         key.setImageResource(R.drawable.ic_help_key);
@@ -181,6 +251,10 @@ final class GateHelpScreen {
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
         lp.leftMargin = dp(c, 12);
         row.addView(words, lp);
+        LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT);
+        clp.leftMargin = dp(c, 8);
+        row.addView(chevron, clp);
         return row;
     }
 

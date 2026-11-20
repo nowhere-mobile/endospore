@@ -47,8 +47,8 @@ PY
 S=seal_prune_release.go
 mut $S "P1 Dropped ignores newHist (Dropped)" 'range newHist \{' 'range []headSnap{} {'
 mut $S "P2 eligibility ignores multiDeviceEnabled (Eligible)" '!multiDeviceEnabled\(\) && ' ''
-mut $S "P3 the keep set skips kept.History (Frees)" 'keep, err := manifestKeepSet\(base, dk, kept\)' 'keep, err := manifestKeepSet(base, dk, &vault{Manifest: kept.Manifest})'
-mut $S "P4 an unreadable manifest skipped, not an error (Unreadable)" 'keep, err := manifestKeepSet\(base, dk, kept\)\n\tif err != nil \{\n\t\treturn nil, err\n\t\}' 'keep, _ := manifestKeepSet(base, dk, kept)\n\tif keep == nil {\n\t\tkeep = map[string]bool{}\n\t}'
+mut $S "P3 the keep set skips kept.History (Frees)" 'keep, err := manifestKeepSetEach\(base, dk, kept, over\)' 'keep, err := manifestKeepSetEach(base, dk, &vault{Manifest: kept.Manifest}, over)'
+mut $S "P4 an unreadable manifest skipped, not an error (Unreadable)" 'keep, err := manifestKeepSetEach\(base, dk, kept, over\)\n\tif err != nil \{\n\t\treturn nil, err\n\t\}' 'keep, _ := manifestKeepSetEach(base, dk, kept, over)\n\tif keep == nil {\n\t\tkeep = map[string]bool{}\n\t}'
 mut main.go "P5 the ReleaseGen bump removed (Frees)" 'v\.ReleaseGen\+\+\n\t\t\tspr = &sealPrunePending' 'spr = &sealPrunePending'
 mut $S "P6 the gate ignores landed (Gate)" 'return landed && !refused && !stopped' 'return !refused && !stopped'
 mut $S "P7 the eviction skipped (Frees)" 'evicted, eerr := blobCacheEvict\(cache, set\)' 'evicted, eerr := 0, error(nil)'

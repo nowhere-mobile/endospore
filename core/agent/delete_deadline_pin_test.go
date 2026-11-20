@@ -68,16 +68,69 @@ func TestDeleteDeadlineOutlastsChooserRead(t *testing.T) {
 	if !strings.Contains(java, `sendDaemon("DELETE\n"`) {
 		t.Fatal("ProfileActivity no longer sends DELETE through sendDaemon -- re-price the daemon's DELETE deadline against the new caller")
 	}
-	i := strings.Index(java, "private String sendDaemon(String msg) {")
+	// NWP-20261210-14: sendDaemon takes its read cap from DaemonReadCap by verb. DELETE (and ROLLBACK, which
+	// TestStoreVerbDeadlinesOutlastChooserRead prices against the same read) must get LONG_MS, the 90s priced here.
+	if !strings.Contains(chooserMethodBody(t, java, "private String sendDaemon(String msg) {"),
+		"setSoTimeout(DaemonReadCap.forRequest(msg))") {
+		t.Fatal("ProfileActivity.sendDaemon no longer takes its read cap from DaemonReadCap.forRequest(msg) -- " +
+			"re-price the daemon's DELETE deadline against the new read cap (#744)")
+	}
+	long, quick := chooserDaemonReadCap(t)
+	if long != chooserDeleteReadMillis {
+		t.Fatalf("DaemonReadCap.LONG_MS is %dms, the DELETE deadline was priced against %dms: "+
+			"re-check the daemon's DELETE deadline and update this pin together (#744)", long, chooserDeleteReadMillis)
+	}
+	for _, v := range []string{"DELETE", "ROLLBACK"} {
+		if quick[v] {
+			t.Errorf("DaemonReadCap.QUICK holds %s: its read is no longer the %dms its daemon deadline outlasts (#744)",
+				v, chooserDeleteReadMillis)
+		}
+	}
+}
+
+// chooserMethodBody returns the Java method whose signature line is sig, through its balanced closing brace.
+func chooserMethodBody(t *testing.T, java, sig string) string {
+	t.Helper()
+	i := strings.Index(java, sig)
 	if i < 0 {
-		t.Fatal("ProfileActivity.sendDaemon not found -- this test is stale, not the code")
+		t.Fatalf("%q not found -- this test is stale, not the code", sig)
 	}
-	m := regexp.MustCompile(`setSoTimeout\((\d+)\)`).FindStringSubmatch(java[i:])
+	depth := 0
+	for k := i + strings.Index(java[i:], "{"); k < len(java); k++ {
+		switch java[k] {
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return java[i : k+1]
+			}
+		}
+	}
+	t.Fatalf("%q has no closing brace", sig)
+	return ""
+}
+
+// chooserDaemonReadCap reads the chooser's DaemonReadCap.java (NWP-20261210-14), comments stripped: LONG_MS, and the
+// verbs of the QUICK set, which read for SHORT_MS instead.
+func chooserDaemonReadCap(t *testing.T) (longMillis int, quick map[string]bool) {
+	t.Helper()
+	src := chooserCode(t, "DaemonReadCap.java")
+	m := regexp.MustCompile(`static final int LONG_MS = (\d+);`).FindStringSubmatch(src)
 	if m == nil {
-		t.Fatal("ProfileActivity.sendDaemon sets no read timeout")
+		t.Fatal("DaemonReadCap.java declares no LONG_MS -- this test is stale, not the code")
 	}
-	if got, _ := strconv.Atoi(m[1]); got != chooserDeleteReadMillis {
-		t.Fatalf("ProfileActivity.sendDaemon reads for %dms, the DELETE deadline was priced against %dms: "+
-			"re-check the daemon's DELETE deadline and update this pin together (#744)", got, chooserDeleteReadMillis)
+	longMillis, _ = strconv.Atoi(m[1])
+	set := regexp.MustCompile(`(?s)Set<String> QUICK = [^;]*;`).FindString(src)
+	if set == "" {
+		t.Fatal("DaemonReadCap.java declares no QUICK set -- this test is stale, not the code")
 	}
+	quick = map[string]bool{}
+	for _, v := range regexp.MustCompile(`"([^"]+)"`).FindAllStringSubmatch(set, -1) {
+		quick[v[1]] = true
+	}
+	if len(quick) == 0 {
+		t.Fatal("DaemonReadCap.QUICK parsed empty -- the parse is wrong, not the code")
+	}
+	return longMillis, quick
 }

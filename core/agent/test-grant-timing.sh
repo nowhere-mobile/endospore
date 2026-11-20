@@ -15,7 +15,9 @@
 #   B  a run cut off before its end (grant_perms_for exits) leaves no earlier grant-timing file;
 #   C  an unset uid counts 0 bundles;
 #   D  the arm drops an earlier session's $STATE/od-grow-timing (od_watched's du timings, NWP-20261202-34): an app's
-#      data size is a profile fact, so a report never carries an earlier session's sizes.
+#      data size is a profile fact, so a report never carries an earlier session's sizes;
+#   E  the arm drops an earlier $STATE/coldde-unpark (de_recreated_note's figures, NWP-20261206-14): a report never
+#      carries an earlier session's resume.
 # --mutate breaks each guard in turn on a COPY (the roamd script or the Go package); each mutant must be CONVICTED
 # (the shell ones under every shell; the Go ones by a real `--- FAIL`). One that fails to apply or compile is a failure.
 set -uo pipefail
@@ -122,6 +124,14 @@ shellsuite() {
   [ ! -e "$T/state/od-grow-timing" ] && ok "D the grant arm drops the last session's od-grow-timing" \
     || no "D the earlier od-grow-timing survived: '$(cat "$T/state/od-grow-timing" 2>/dev/null)'"
 
+  # ---- E: the arm drops an earlier session's coldde-unpark (NWP-20261206-14) ----
+  T=$(mktemp -d -p "$W") || return 2
+  prep "$T" 10 ':'
+  printf 'v=1 found=1 after_park_s=9 db_bytes=9 wal_bytes=9 emails=0 ss_fds=1 pkgs_delta_s=9 pkgr_delta_s=9\n' > "$T/state/coldde-unpark"
+  "$sh_" "$T/run.sh" >/dev/null 2>&1
+  [ ! -e "$T/state/coldde-unpark" ] && ok "E the grant arm drops the last session's coldde-unpark" \
+    || no "E the earlier coldde-unpark survived: '$(cat "$T/state/coldde-unpark" 2>/dev/null)'"
+
   [ -n "$quiet" ] || printf '  [%s] (%d ok, %d failed)\n' "$sh_" "$p" "$x"
   [ "$x" = 0 ]
 }
@@ -177,4 +187,6 @@ mut "m4 the reader accepts a non-digit value" grant_timing.go 'bundles=\(\[0-9\]
 smut "m5 the top-of-arm rm removed" -e '/^    if \[ -n "\${STATE:-}" \]; then rm -f "\$STATE\/grant-timing" 2>\/dev\/null; fi$/d'
 smut "m6 the od-grow-timing rm removed (D)" \
   -e '/^    if \[ -n "\${STATE:-}" \]; then rm -f "\$STATE\/od-grow-timing" 2>\/dev\/null; fi$/d'
-[ "$fails" -eq 0 ] && echo "== all 6 mutations convicted" || { echo "== $fails mutation(s) not convicted"; exit 1; }
+smut "m7 the coldde-unpark rm removed (E)" \
+  -e '/^    if \[ -n "\${STATE:-}" \]; then rm -f "\$STATE\/coldde-unpark" 2>\/dev\/null; fi$/d'
+[ "$fails" -eq 0 ] && echo "== all 7 mutations convicted" || { echo "== $fails mutation(s) not convicted"; exit 1; }

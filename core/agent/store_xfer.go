@@ -30,12 +30,19 @@ import (
 //   - A GET ALSO ENDS AFTER storeXferStall WITH NO BYTE. The stall timer starts before Do, so it bounds connect
 //     and headers too, and every body Read that returns bytes restarts it. A PUT has no stall timer: its body is
 //     copied to the socket at once, then the store is silent until it answers, so the deadline alone bounds it.
+//     Superseded in part by NWP-20261210-02: the cut ends the ATTEMPT, not the read. Every body Read that returns
+//     bytes also calls noteStoreBytes (store_giveup.go), and retryStoreWithinGuarded retries a stalled GET past its
+//     window, at most storeStallRetries times, when a body byte arrived on any connection since that attempt began.
+//     A dead link moves no byte, so it still stops at the window.
 //   - Once headers arrive with a ContentLength, a GET's share moves from its estimate to that length.
 //
 // Residuals: an op on roamStallBudget (150 s: heal, mediad, a seal) whose chunks flow for longer than that with no
 // progress write ends at the watchdog, not at the old 60 s timeout (a seal writes progress per finished blob, so
 // 8 x 4 MiB under about 1.8 Mbit/s still reaches it); and a GET that trickles a byte every < 30 s is bounded only
-// by the deadline. capSize, export_rekey and catalog.go stay on storeHTTP; direct-S3 mode is not touched.
+// by the deadline. capSize, export_rekey and catalog.go stay on storeHTTP; direct-S3 mode is not touched. A stalled
+// chunk that is retried (NWP-20261210-02) is still bounded from above: materializeapp's worker stall watchdog
+// (roamStallBudget, 150 s without ordered progress) ends an app fetch whose head chunk is retried past it, and a
+// sign-in runs on roamInStallTicks (900 s).
 //
 // Vars so tests shrink them.
 var (
@@ -148,6 +155,7 @@ func (b *storeXferBody) Read(p []byte) (int, error) {
 	n, err := b.rc.Read(p)
 	if n > 0 && b.st != nil {
 		b.st.Reset(storeXferStall)
+		noteStoreBytes() // NWP-20261210-02: a body byte is the store answering, for the give-up clock and the retry
 	}
 	if err != nil && err != io.EOF {
 		err = storeXferErr(b.ctx, err)

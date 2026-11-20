@@ -9,6 +9,10 @@
 # its cases). Source and XML checks pin the four places that make it hold: the manifest, AdminReceiver, onCreate and
 # onNewIntent. NWP-20261113-02: with the Profile screen the session's top activity, the alias start was
 # START_DELIVERED_TO_TOP (result code=3, lynx 2026102201): it reached onNewIntent, not onCreate, and nothing signed out.
+# NWP-20261208-02: onNewIntent did not sign out a stopped Profile screen either (lynx 2026102901), so AdminReceiver's start
+# adds FLAG_ACTIVITY_CLEAR_TASK and always reaches onCreate. It starts nothing while a sign-out or a terminal Profile
+# screen is under way (AutoLogoffGate.shouldStart, SignOutGate.begun() only READ, and ProfileActivity's live-instance
+# registry AutoLogoffGate.Live): the clear would destroy that screen. Checks R2-R4 pin the receiver and P4 the registry.
 #
 # ⚠ IT FAILS WHEN THERE IS NO JAVAC, IT NEVER SKIPS.
 #
@@ -90,13 +94,90 @@ sys.exit(bad)
 PY
 }
 
-# receiver <AdminReceiver.java> -> 0 when the backstop starts the alias by name.
+# strip <file.java> -> the source without comments (AdminReceiver holds no // inside a string literal).
+strip() { perl -0pe 's{/\*.*?\*/}{}gs; s{^[ \t]*//[^\n]*\n}{}mg; s{[ \t]+//[^\n]*}{}g' "$1"; }
+
+# receiver <AdminReceiver.java> -> 0 when the backstop starts the alias by name (R); NWP-20261208-02: with NEW_TASK and
+# CLEAR_TASK (R2), only inside the shouldStart block whose underWay reads both guards (R3), and with SignOutGate only
+# READ, never raised or lowered (R4).
 receiver() {
-  local f="$1" bad=0 c
+  local f="$1" bad=0 c s set ifl ul close start
+  local wantu='            boolean underWay = SignOutGate.begun() || ProfileActivity.anySignOutUnderWay();'
+  local wanti='            if (AutoLogoffGate.shouldStart(fails, MAX_FAILED, underWay)) {'
+  local setl='.setClassName(context, "com.nowhere.chooser.AutoLogoff")'
   c=$(grep -c '"com.nowhere.chooser.AutoLogoff"' "$f")
   [ "$c" -ge 1 ] || { echo "  FAIL  (R) AdminReceiver does not name com.nowhere.chooser.AutoLogoff" >&2; bad=1; }
   c=$(grep -c 'new Intent(context, ProfileActivity.class)' "$f")
   [ "$c" -eq 0 ] || { echo "  FAIL  (R) AdminReceiver still starts ProfileActivity.class directly" >&2; bad=1; }
+  s=$(strip "$f")
+  start=$(printf '%s\n' "$s" | awk -v k="$setl" 'index($0, k) { on = 1 } on { print } on && /\);/ { exit }')
+  case "$start" in
+    *Intent.FLAG_ACTIVITY_NEW_TASK*) c=1 ;;
+    *) c=0 ;;
+  esac
+  case "$start" in
+    *Intent.FLAG_ACTIVITY_CLEAR_TASK*) ;;
+    *) c=0 ;;
+  esac
+  [ "$c" -eq 1 ] || { echo "  FAIL  (R2) AdminReceiver's .AutoLogoff start does not add FLAG_ACTIVITY_NEW_TASK and FLAG_ACTIVITY_CLEAR_TASK" >&2; bad=1; }
+  c=$(printf '%s\n' "$s" | grep -cxF -- "$wantu")
+  if [ "$c" -ne 1 ]; then
+    echo "  FAIL  (R3) want exactly one line '${wantu#"${wantu%%[! ]*}"}' in AdminReceiver, found $c" >&2; bad=1
+  else
+    c=$(printf '%s\n' "$s" | grep -cxF -- "$wanti")
+    if [ "$c" -ne 1 ]; then
+      echo "  FAIL  (R3) want exactly one line '${wanti#"${wanti%%[! ]*}"}' in AdminReceiver, found $c" >&2; bad=1
+    else
+      ul=$(printf '%s\n' "$s" | grep -nxF -- "$wantu" | cut -d: -f1)
+      ifl=$(printf '%s\n' "$s" | grep -nxF -- "$wanti" | cut -d: -f1)
+      set=$(printf '%s\n' "$s" | grep -nF -- "$setl" | head -1 | cut -d: -f1)
+      close=$(printf '%s\n' "$s" | awk -v i="$ifl" 'NR > i && /^            }/ { print NR; exit }')
+      if [ "$ul" -ge "$ifl" ]; then
+        echo "  FAIL  (R3) AdminReceiver's underWay line is not before the shouldStart line" >&2; bad=1
+      elif [ -z "$set" ] || [ -z "$close" ] || [ "$set" -le "$ifl" ] || [ "$set" -ge "$close" ]; then
+        echo "  FAIL  (R3) AdminReceiver's .AutoLogoff start is not inside the shouldStart block" >&2; bad=1
+      fi
+    fi
+  fi
+  c=$(printf '%s\n' "$s" | grep -cF -e 'SignOutGate.begin(' -e 'SignOutGate.end(')
+  [ "$c" -eq 0 ] || { echo "  FAIL  (R4) AdminReceiver raises or lowers SignOutGate (it may only read it), found $c" >&2; bad=1; }
+  c=$(printf '%s\n' "$s" | grep -cF -- 'SignOutGate.begun()')
+  [ "$c" -ge 1 ] || { echo "  FAIL  (R4) control: AdminReceiver does not read SignOutGate.begun()" >&2; bad=1; }
+  [ "$bad" -eq 0 ]
+}
+
+# live <ProfileActivity.java> -> 0 when ProfileActivity keeps its live-instance registry (P4, NWP-20261208-02): the field,
+# anySignOutUnderWay reading loggingOff, LIVE.add(this); after super.onCreate(b); and before the auto check, and
+# LIVE.remove(this); after super.onDestroy();.
+live() {
+  local f="$1" bad=0 c body a sup hon
+  c=$(grep -cxF -- '    private static final AutoLogoffGate.Live<ProfileActivity> LIVE = new AutoLogoffGate.Live<>();' "$f")
+  [ "$c" -eq 1 ] || { echo "  FAIL  (P4) ProfileActivity has no LIVE registry field (found $c)" >&2; bad=1; }
+  c=$(grep -cxF -- '    static boolean anySignOutUnderWay() { return LIVE.any(a -> a.loggingOff); }' "$f")
+  [ "$c" -eq 1 ] || { echo "  FAIL  (P4) anySignOutUnderWay does not return LIVE.any(a -> a.loggingOff) (found $c)" >&2; bad=1; }
+  body=$(awk '/^    protected void onCreate\(Bundle b\) \{$/ { on = 1 } on && $0 !~ /^[ \t]*\/\// { print } on && /^    }$/ { exit }' "$f")
+  c=$(printf '%s\n' "$body" | grep -cxF -- '        LIVE.add(this);')
+  if [ "$c" -ne 1 ]; then
+    echo "  FAIL  (P4) onCreate does not call LIVE.add(this); exactly once (found $c)" >&2; bad=1
+  else
+    a=$(printf '%s\n' "$body" | grep -nxF -- '        LIVE.add(this);' | cut -d: -f1)
+    sup=$(printf '%s\n' "$body" | grep -nxF -- '        super.onCreate(b);' | head -1 | cut -d: -f1)
+    hon=$(printf '%s\n' "$body" | grep -nF -- 'AutoLogoffGate.honoured(' | head -1 | cut -d: -f1)
+    if [ -z "$sup" ] || [ -z "$hon" ] || [ "$a" -le "$sup" ] || [ "$a" -ge "$hon" ]; then
+      echo "  FAIL  (P4) onCreate's LIVE.add(this); is not after super.onCreate(b); and before the auto check" >&2; bad=1
+    fi
+  fi
+  body=$(awk '/^    protected void onDestroy\(\) \{$/ { on = 1 } on && $0 !~ /^[ \t]*\/\// { print } on && /^    }$/ { exit }' "$f")
+  c=$(printf '%s\n' "$body" | grep -cxF -- '        LIVE.remove(this);')
+  if [ "$c" -ne 1 ]; then
+    echo "  FAIL  (P4) onDestroy does not call LIVE.remove(this); exactly once (found $c)" >&2; bad=1
+  else
+    a=$(printf '%s\n' "$body" | grep -nxF -- '        LIVE.remove(this);' | cut -d: -f1)
+    sup=$(printf '%s\n' "$body" | grep -nxF -- '        super.onDestroy();' | head -1 | cut -d: -f1)
+    if [ -z "$sup" ] || [ "$a" -le "$sup" ]; then
+      echo "  FAIL  (P4) onDestroy's LIVE.remove(this); is not after super.onDestroy();" >&2; bad=1
+    fi
+  fi
   [ "$bad" -eq 0 ]
 }
 
@@ -154,6 +235,7 @@ xmlcheck "$MANIFEST" || fail=1
 receiver "$RECEIVER" || fail=1
 oncreate "$PROFILE" || fail=1
 newintent "$PROFILE" || fail=1
+live "$PROFILE" || fail=1
 [ "$fail" -eq 0 ] || { echo "FAILED (source checks)"; exit 1; }
 echo "source checks: ok"
 [ "$MUTATE" = yes ] || exit 0
@@ -173,7 +255,7 @@ mut() { # mut <label> <perl-expr>   (mutates AutoLogoffGate.java; the cases must
     *) echo "  BROKEN    $1 -- the mutant did not compile (rc=$rc)"; return 1 ;;
   esac
 }
-mutsrc() { # mutsrc <label> <manifest|receiver|profile|newintent> <perl-expr>   (the matching source check must fail)
+mutsrc() { # mutsrc <label> <manifest|receiver|profile|newintent|live> <perl-expr>   (the matching source check must fail)
   local d c rc f; d=$(mktemp -d -p "$W") || return 1
   case "$2" in manifest) f="$MANIFEST" ;; receiver) f="$RECEIVER" ;; *) f="$PROFILE" ;; esac
   c="$d/$(basename "$f")"
@@ -184,6 +266,7 @@ mutsrc() { # mutsrc <label> <manifest|receiver|profile|newintent> <perl-expr>   
     manifest) xmlcheck "$c" >/dev/null 2>&1; rc=$? ;;
     receiver) receiver "$c" >/dev/null 2>&1; rc=$? ;;
     newintent) newintent "$c" >/dev/null 2>&1; rc=$? ;;
+    live) live "$c" >/dev/null 2>&1; rc=$? ;;
     *) oncreate "$c" >/dev/null 2>&1; rc=$? ;;
   esac
   rm -rf "$d"
@@ -202,4 +285,13 @@ mutsrc "onNewIntent without the component check" newintent 's/AutoLogoffGate\.ho
 mutsrc "onNewIntent signs out on any new intent" newintent 's/if \(AutoLogoffGate\.honoured\(intent\.[^\n]*\) \{/if (true) {/' || fails=$((fails+1))
 mutsrc "onNewIntent's honoured fed the alias constant" newintent 's/AutoLogoffGate\.honoured\(intent\.getComponent\(\) == null \? null : intent\.getComponent\(\)\.getClassName\(\),/AutoLogoffGate.honoured(AutoLogoffGate.ALIAS,/' || fails=$((fails+1))
 mutsrc "onNewIntent re-entry guard removed" newintent 's/(protected void onNewIntent\(Intent intent\) \{\n.*?)\n        if \(loggingOff\) return;\n/$1\n/s' || fails=$((fails+1))
+# NWP-20261208-02: each label names the assertion that convicts it.
+mutsrc "(R2) CLEAR_TASK removed from the L4 start" receiver 's/ \| Intent\.FLAG_ACTIVITY_CLEAR_TASK//' || fails=$((fails+1))
+mutsrc "(R3) underWay replaced by false" receiver 's/shouldStart\(fails, MAX_FAILED, underWay\)/shouldStart(fails, MAX_FAILED, false)/' || fails=$((fails+1))
+mutsrc "(R4) SignOutGate.begin() planted before the start" receiver 's/(\n            if \(AutoLogoffGate\.shouldStart)/\n            SignOutGate.begin();$1/' || fails=$((fails+1))
+mut "(G4) shouldStart drops !underWay" 's/fails >= max && !underWay/fails >= max/' || fails=$((fails+1))
+mut "(G2) shouldStart >= to >" 's/fails >= max/fails > max/' || fails=$((fails+1))
+mut "(L5) Live.any ignores its predicate" 's/if \(p\.test\(u\)\) hit = true;/hit = true;/' || fails=$((fails+1))
+mutsrc "(P4) LIVE.add deleted" live 's/\n        LIVE\.add\(this\);//' || fails=$((fails+1))
+mutsrc "(P4) anySignOutUnderWay returns false" live 's/return LIVE\.any\(a -> a\.loggingOff\);/return false;/' || fails=$((fails+1))
 [ "$fails" -eq 0 ] && echo "== all mutations convicted" || { echo "== $fails mutation(s) not convicted"; exit 1; }

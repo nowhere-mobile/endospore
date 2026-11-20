@@ -225,7 +225,7 @@ func TestMediaBgRun_R2_EndToEndHoldsNoName(t *testing.T) {
 		if !line.MatchString(got) || strings.Contains(got, "ZQX") {
 			t.Errorf("the progress file during the run: %q", got)
 		}
-		return fetchEssSpan(base, key, m, r)
+		return fetchEssSpan(base, key, m, r, nil)
 	}
 	var c landerCounts
 	captureStdout(t, func() { c = landBackground(in, m) })
@@ -592,6 +592,58 @@ func TestMediaBgRun_R5_Start(t *testing.T) {
 		t.Fatalf("the list: %q", got)
 	}
 	mlGone(t, filepath.Join(state, mediaProgressFile))
+}
+
+// R5b (NWP-20261119-33, lynx 2026111901): a #media scope a passphrase change re-pointed has a VAULT head, and sign-in
+// records that head in the roster and the marker. The lander must read the manifest the vault names; it read the
+// vault's own hash as a manifest and refused ("manifest"), so on such a profile no background file ever landed.
+func TestMediaBgRun_R5b_AVaultScopeHeadStarts(t *testing.T) {
+	mlReset(t)
+	essentialMediaEnv(t)
+	state := t.TempDir()
+	t.Setenv("NOWHERE_STATE", state)
+	t.Setenv("NOWHERE_SEAL_FULL", "")
+	t.Setenv("NOWHERE_SEAL_FORCE", "")
+	t.Setenv("NOWHERE_MEDIA_AFTER_GATE", "1")
+	mediaScopeServer.Store(nil)
+	t.Cleanup(func() { mediaScopeServer.Store(nil) })
+	const name = "mbrr5vault"
+	const rel = "DCIM/Camera/r5v.jpg"
+	a, _ := twoWriters(t, name, mlPass)
+	a.putAt(rel, mlBody(rel), time.Unix(1700000000, 0))
+	if msg := a.seal("#media"); msg != "" {
+		t.Fatalf("setup seal: %s", msg)
+	}
+	scope := name + "#media"
+	manifest := a.head("#media")
+	key := deriveKey(scope, mlPass)
+	var vh string
+	a.as(func() {
+		n := capBegin()
+		capSetSession(scope, mlPass, key)
+		vh = publishRepointVault(a.base, scope, mlPass, buildScopeVault(key, scope, mlPass, manifest))
+		capFlush(n)
+	})
+	if v, isV := parseVault(getHeadBlob(a.base, vh)); !isV || v.Manifest != manifest {
+		t.Fatalf("the re-pointed #media head %s is not a vault naming %s -- this test proves nothing", short(vh), short(manifest))
+	}
+	ref := profileRefV2(scope, mlPass)
+	dest := t.TempDir()
+	writeLoginRoster(ref, vh)
+	if err := os.MkdirAll(filepath.Dir(aftergateFile(ref)), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(aftergateFile(ref), []byte(vh), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	l := startBgLander(a.base, scope, mlPass, dest, state, nil)
+	if l == nil {
+		t.Fatal("no lander started over a re-pointed (vault) #media head -- it could not read the manifest the vault names")
+	}
+	mbrWaitClosed(t, l.done, "the run")
+	if got := mlRead(t, filepath.Join(dest, filepath.FromSlash(rel))); got != mlBody(rel) {
+		t.Fatalf("landed %q", got)
+	}
 }
 
 // R6: runMediad's order, from its source.

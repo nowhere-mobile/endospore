@@ -1,0 +1,14 @@
+// NWP-20261208-27: the USB-debugging refusal's message for a profile session, shipped as an explicit runtime resource
+// overlay of SystemUI on product.
+//
+// ⚠ NOT through PRODUCT_PACKAGE_OVERLAYS, for the reason NowhereFrameworkOverlay's Android.bp gives: GrapheneOS
+// enforces RROs, so a static overlay becomes a module named <target>__<device>__auto_generated_rro_product, and
+// adevtool already generates modules of that name from the Pixel's own overlays (NWP-20261004-01). A named module of
+// our own cannot collide.
+runtime_resource_overlay {
+    name: "NowhereSystemUIOverlay",
+    product_specific: true,
+    // SystemUI is platform-signed, so idmap's signature policy lets a platform-signed overlay cover its strings
+    // whether or not SystemUI declares them overlayable.
+    certificate: "platform",
+}

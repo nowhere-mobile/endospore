@@ -61,12 +61,13 @@ func normalizeGmsWord(s string) string {
 	return w
 }
 
-// parseGmsExits turns roamd's stdin (the nowhere-now line, the dump, the nowhere-dump-rc line) into the reply:
+// parseExitInfo turns roamd's stdin (the nowhere-now line, the dump, the nowhere-dump-rc line) into the reply:
 // `OK <kept> <dropped>` and one line per kept record, newest first, or `ERR-DUMP <why>` with fixed text. An empty
 // dump is a failed read, never "no exits": a denied dumpsys prints nothing and exits 0, so the framework's header is
 // required. A dump whose every block failed to parse is a failed read too (the always-honest rule of
 // uiderrorsSection): `dropped` reaches no report key, so it must not carry the only sign of a format change.
-func parseGmsExits(dump, uid string) string {
+// labels holds the only processes a reply may name, each with the label it is named by.
+func parseExitInfo(dump, uid string, labels map[string]string) string {
 	if uid == "" || strings.Trim(uid, "0123456789") != "" {
 		return "ERR-DUMP bad user id"
 	}
@@ -133,7 +134,7 @@ func parseGmsExits(dump, uid string) string {
 			dropped++
 			return
 		}
-		label, ok := gmsExitLabels[b.process]
+		label, ok := labels[b.process]
 		if !ok {
 			dropped++
 			return
@@ -181,6 +182,9 @@ func parseGmsExits(dump, uid string) string {
 	return b.String()
 }
 
+// parseGmsExits is parseExitInfo for the two gms processes (the lift of NWP-20261208-06; every reply as before).
+func parseGmsExits(dump, uid string) string { return parseExitInfo(dump, uid, gmsExitLabels) }
+
 // gmsExitsWait bounds how long a report waits for the worker: a wedged worker costs one honest key, never the report.
 var gmsExitsWait = 15 * time.Second
 
@@ -220,16 +224,16 @@ func gmsExitsNotCollected(reply string) string {
 	return "not-collected-malformed"
 }
 
-// mergeGmsExits adds the records to an in-session report's status, after buildIssueReportWith (so outside its size
-// trim: about 700 bytes at most). It first deletes every caller-sent gms_exit* key, at both scopes, so only this file
-// can set one; the keys skip statusValue because the fixed shape checked here is stricter than that scrub.
+// mergeExitInfo adds the records to an in-session report's status, after buildIssueReportWith (so outside its size
+// trim: about 700 bytes at most). It first deletes every caller-sent <prefix>* key, at both scopes, so only this file
+// can set one; the keys skip statusValue because the fixed shape checked here (lineRe) is stricter than that scrub.
 //
 // The session's age comes from the mtime of .roamsession and is read BEFORE the fetch: the dump is then the later
 // clock, so a record older than the session always has age_s >= the session's age and is dropped. A rewrite of the
 // marker during a session (a passphrase change, for one) only withholds more, the safe direction.
-func mergeGmsExits(status map[string]string, fetch func() string, dest string, deviceScope bool) {
+func mergeExitInfo(status map[string]string, prefix string, lineRe *regexp.Regexp, fetch func() string, dest string, deviceScope bool) {
 	for k := range status {
-		if strings.HasPrefix(k, "gms_exit") {
+		if strings.HasPrefix(k, prefix) {
 			delete(status, k)
 		}
 	}
@@ -238,14 +242,14 @@ func mergeGmsExits(status map[string]string, fetch func() string, dest string, d
 	}
 	st, err := os.Stat(filepath.Join(dest, roamSessionFile))
 	if err != nil {
-		status["gms_exits"] = "unread-session-start"
+		status[prefix+"s"] = "unread-session-start"
 		return
 	}
 	sessionAge := int64(time.Since(st.ModTime()) / time.Second)
 	reply := strings.TrimRight(strings.ReplaceAll(fetch(), "\r\n", "\n"), "\n")
 	first, rest, _ := strings.Cut(reply, "\n")
 	if !strings.HasPrefix(first, "OK") {
-		status["gms_exits"] = gmsExitsNotCollected(strings.TrimSpace(first))
+		status[prefix+"s"] = gmsExitsNotCollected(strings.TrimSpace(first))
 		return
 	}
 	head := gmsExitOKRe.FindStringSubmatch(first)
@@ -254,13 +258,13 @@ func mergeGmsExits(status map[string]string, fetch func() string, dest string, d
 		lines = strings.Split(rest, "\n")
 	}
 	if head == nil || head[1] != strconv.Itoa(len(lines)) || len(lines) > gmsExitsMaxRecords {
-		status["gms_exits"] = "not-collected-malformed"
+		status[prefix+"s"] = "not-collected-malformed"
 		return
 	}
 	n := 0
 	for _, ln := range lines {
 		value := "unparsed" // a line of another shape carries no input text
-		if m := gmsExitLineRe.FindStringSubmatch(ln); m != nil {
+		if m := lineRe.FindStringSubmatch(ln); m != nil {
 			age, perr := strconv.ParseInt(m[1], 10, 64)
 			if perr != nil || age >= sessionAge {
 				continue // an earlier session with the same user id
@@ -268,7 +272,12 @@ func mergeGmsExits(status map[string]string, fetch func() string, dest string, d
 			value = ln
 		}
 		n++
-		status["gms_exit_"+strconv.Itoa(n)] = value
+		status[prefix+"_"+strconv.Itoa(n)] = value
 	}
-	status["gms_exits"] = strconv.Itoa(n)
+	status[prefix+"s"] = strconv.Itoa(n)
+}
+
+// mergeGmsExits is mergeExitInfo for the gms_exit* keys (the lift of NWP-20261208-06; every key as before).
+func mergeGmsExits(status map[string]string, fetch func() string, dest string, deviceScope bool) {
+	mergeExitInfo(status, "gms_exit", gmsExitLineRe, fetch, dest, deviceScope)
 }

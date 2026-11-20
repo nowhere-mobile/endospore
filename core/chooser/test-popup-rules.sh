@@ -5,8 +5,8 @@
 # WHY THIS IS COMMITTED. Chester chose Design A for the popups on 2026-11-08 (docs/backlog.md, "Popups are plain dialogs:
 # the choice pickers and the confirmations move to one bottom-sheet design"). Its rules are in that row. This suite pins
 # them on every AlertDialog.Builder in ChooserActivity, ProfileActivity, PrivateDnsPromptActivity and PrivateDnsWatch. The
-# row excluded the gate Help's list. NOWHERE-1695 replaced that list with GateHelpScreen, which is no AlertDialog. The one
-# Help builder left, showGateHelpPage, has a Back button and a named "also" button, so this scan exempts no builder.
+# row excluded the gate Help's list. NOWHERE-1695 replaced that list with GateHelpScreen, which is no AlertDialog, and
+# NWP-20261208-26 opened its topics in place, so no gate Help builder is left and this scan exempts no builder.
 #
 #   R1 a button is never OK or Cancel        (setPositiveButton, setNegativeButton, setNeutralButton)
 #   R2 no "&" in a string of the builder or in a label that a constant resolves to

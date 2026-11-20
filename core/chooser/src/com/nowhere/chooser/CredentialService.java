@@ -167,7 +167,24 @@ public class CredentialService extends Service {
         // to its database. It is synchronous inside MediaProvider and can take a while on a large volume, so it
         // runs on its own thread; a timeout or an exception leaves the index as it was, which is today's state.
         // Same B4 reason as every branch here for riding THIS service rather than a new one.
+        // NWP-20261208-19: the gate's landing ask carries ScanNetHold.EXTRA_LANDED; the profile's switch (ScanNetHold.FILE,
+        // read here at each ask) holds it on a metered network, and the gate re-asks with EXTRA_RETRY once unmetered.
+        // roamd's start carries no extra and always runs: it indexes local restored files only.
         if (intent != null && intent.getBooleanExtra("rescanmedia", false)) {
+            String text = SettingsText.read(new java.io.File(getFilesDir(), ScanNetHold.FILE));
+            int d = ScanNetHold.decide(intent.getBooleanExtra(ScanNetHold.EXTRA_LANDED, false),
+                    intent.getBooleanExtra(ScanNetHold.EXTRA_RETRY, false), ScanNetHold.on(text),
+                    ChooserActivity.unmeteredCtx(this));
+            if (d == ScanNetHold.HOLD) {
+                android.util.Log.i("NowhereChooser", "media rescan held for an unmetered network (NWP-20261208-19)");
+                finishUnit();
+                return START_NOT_STICKY;
+            }
+            if (d == ScanNetHold.SKIP) {
+                android.util.Log.i("NowhereChooser", "media rescan re-ask skipped: the setting is off (NWP-20261208-19)");
+                finishUnit();
+                return START_NOT_STICKY;
+            }
             new Thread(() -> {
                 long t0 = android.os.SystemClock.elapsedRealtime();
                 try {

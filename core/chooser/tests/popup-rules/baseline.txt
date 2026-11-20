@@ -4,8 +4,3 @@
 # Format: <file> TAB <method> TAB <R1|R2|R3> TAB <label or literal> TAB <count>
 # A label is the literal's value. A backslash, a tab, a line break or an unprintable character is written as a backslash escape.
 # R1 is an OK or Cancel button. R2 is a "&". R3 is a destructive verb on the positive button.
-ChooserActivity.java	buildBindSimScreen	R1	Cancel	1
-ChooserActivity.java	buildBindSimScreen	R3	Unbind	1
-ChooserActivity.java	buildReportScreen	R1	Cancel	1
-ProfileActivity.java	presetGuard	R1	Cancel	1
-ProfileActivity.java	showLogoffFailedDialog	R1	OK	1

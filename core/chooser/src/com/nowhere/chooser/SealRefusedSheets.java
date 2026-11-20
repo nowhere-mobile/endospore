@@ -40,7 +40,7 @@ final class SealRefusedSheets {
     static PopupSheet.Confirm refused(String who, String one, boolean many, boolean restSaved) {
         return new PopupSheet.Confirm(REFUSED_TONE,
                 who + (many ? " are blocking sign-out" : " is blocking sign-out"),
-                "Nowhere couldn't read some of " + who + "'s files, so it can't save this session safely and has "
+                "nowhere couldn't read some of " + who + "'s files, so it can't save this session safely and has "
                         + "not signed you out.",
                 Arrays.asList(new PopupSheet.Line(restSaved ? REST_SAVED : REST_NOT_SAVED, null),
                         new PopupSheet.Line("You can sign out without " + one + ". If you do, " + one + (many

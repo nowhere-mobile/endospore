@@ -983,6 +983,26 @@ class DeskTest(unittest.TestCase):
         self.assertEqual(self.req("GET", "/", dict(GOOD, Host="127.0.0.1:%d" % self.port), conn=c)[0], 403)
         self.assertEqual(self.req("GET", "/", GOOD, conn=c)[0], 200)
 
+    def test_unix_forwarded_host(self):
+        # tailscale serve's unix: proxy sends Host: localhost and the tailnet name in X-Forwarded-Host (NWP-20261116-60).
+        p = sock_path(sock_dir())
+        self.start(desk.make_server(NAME, None, 900, path=p))
+
+        def c():
+            return UnixConnection(p)
+        fwd = dict(GOOD, Host="localhost")
+        fwd["X-Forwarded-Host"] = NAME
+        self.assertEqual(self.req("GET", "/", fwd, conn=c)[0], 200)
+        self.assertEqual(self.req("POST", "/api/release/%s/preflight" % BN, fwd, conn=c)[0], 200)
+        self.assertEqual(self.req("GET", "/", dict(GOOD, Host="localhost"), conn=c)[0], 403)
+        self.assertEqual(self.req("GET", "/", dict(fwd, **{"X-Forwarded-Host": "evil.example"}), conn=c)[0], 403)
+        self.assertEqual(self.req("GET", "/", GOOD, conn=c)[0], 200)
+
+    def test_tcp_ignores_forwarded_host(self):
+        fwd = dict(GOOD, Host="localhost")
+        fwd["X-Forwarded-Host"] = NAME
+        self.assertEqual(self.req("GET", "/", fwd)[0], 403)
+
     def test_systemd_unix_fd(self):
         p = sock_path(sock_dir())
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -1102,6 +1122,12 @@ MUTANTS = [
     ("U4 regular file unlinked", "if not stat.S_ISSOCK(st.st_mode) or st.st_uid != os.getuid():",
      "if st.st_uid != os.getuid():", "test_socket_path_refusals"),
     ("U5 AF_UNIX fd read as AF_INET", "if sock.family == socket.AF_UNIX:", "if False:", "test_systemd_unix_fd"),
+    ("F1 forwarded host read on a TCP Desk", 'if self.server.private and host == "localhost":',
+     'if host == "localhost":', "test_tcp_ignores_forwarded_host"),
+    ("F2 forwarded host read whatever the Host", 'if self.server.private and host == "localhost":',
+     "if self.server.private:", "test_unix_forwarded_host"),
+    ("F3 forwarded host not read", 'if self.server.private and host == "localhost":', "if False:",
+     "test_unix_forwarded_host"),
 ]
 CHILD_TIMEOUT = 120
 

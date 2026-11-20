@@ -5,10 +5,13 @@
 # that fetch-failed, install-failed or ended in error posts one notice with the count, and a tap opens Your apps; a
 # later pass that lands apps with none failing clears it. The landing card is unchanged. The words are DRAFTS for
 # Chester (mockup gate). NWP-20261207-04 (decision 2026-11-12, answer 4 (2)): the notice carries a "Try again" action
-# (draft words) that starts the sweep by hand, with the intent "Install pending apps now" sends.
+# (draft words) that starts the sweep by hand, with the intent "Install pending apps now" sends. NWP-20261208-17:
+# backlog section C, "The Auto sweep's failed-apps notice counts an app the user installed by hand while the sweep
+# ran, ..." (Chester, 0.5.58, 2026-11-17): when the pass ends, the failed apps are re-checked with hasInstalledCode,
+# and one installed meanwhile counts as landed, not failed.
 # Compiles the chooser's pure SweepFailNotice and SweepOutcome with core/chooser/tests/sweep-fail-notice ALONE and
-# EXECUTES the cases (C1-C6), then checks the REAL UnarchiveService.sweepAuto and onStartCommand over their code with
-# comments dropped (S1-S8):
+# EXECUTES the cases (C1-C8), then checks the REAL UnarchiveService.sweepAuto and onStartCommand over their code with
+# comments dropped (S1-S9):
 #   C1  hard() is true for fetch-failed, install-failed and error only, over all ten SweepOutcome.TOKENS, null and "x".
 #   C2  action(total, done, hardFailed): POST when total > 0 and hardFailed > 0; CANCEL when hardFailed == 0 and
 #       done > 0; KEEP otherwise.
@@ -17,9 +20,14 @@
 #   C5  offersRetry() is true for POST only; RETRY_REQUEST differs from NOTICE_ID, 0x0A2D and 0x0A2E; ACTION_RETRY
 #       starts with "com.nowhere.chooser.action.".
 #   C6  RETRY is "Try again".
-#   S1  `int hardFailed = 0;` once, the line after `int done = 0, failed = 0;`; the guarded increment once, directly
-#       after the done++ statement; `hardFailed++` once.
-#   S2  SweepFailNotice.action(work.size(), done, hardFailed) once, after ACTION_SWEEP_DONE and the OlderCopy end block.
+#   C7  stillMissing(failed, installed): the failed packages not installed, in input order, each once, nulls dropped;
+#       a test that throws counts the package as missing; a null list is an empty one.
+#   C8  afterRecheck(total, done, ranFailed, missing): action(total, done + (ranFailed - missing), missing); the only
+#       failure installed by hand is CANCEL.
+#   S1  `java.util.List<String> hardFailedPkgs = new ArrayList<>();` once, the line after `int done = 0, failed = 0;`;
+#       the guarded `hardFailedPkgs.add(pkg);` once, directly after the done++ statement; no `hardFailed++`.
+#   S2  SweepFailNotice.afterRecheck(work.size(), done, hardFailedPkgs.size(), hardFailed) once, after
+#       ACTION_SWEEP_DONE and the OlderCopy end block; no SweepFailNotice.action( call left in sweepAuto.
 #   S3  the POST arm notifies SweepFailNotice.NOTICE_ID with title(hardFailed, work.size()) and TEXT, a FLAG_IMMUTABLE
 #       PendingIntent that opens Your apps (LandingLine.EXTRA_OPEN = OPEN_YOUR_APPS), and setAutoCancel(true).
 #   S4  the CANCEL arm calls nm.cancel(SweepFailNotice.NOTICE_ID).
@@ -31,9 +39,12 @@
 #       holds no addAction.
 #   S8  onStartCommand compares SweepFailNotice.ACTION_RETRY with intent.getAction() once and logs the fixed line,
 #       after the extras are read and before the sweep branch.
+#   S9  SweepFailNotice.stillMissing(hardFailedPkgs, p -> hasInstalledCode(p)) once, after the OlderCopy block and
+#       before `SweepFailNotice.Act act =`; `int hardFailed = stillFailed.size();` between them; the "installed
+#       meanwhile" log line holds counts only (no pkg, `p +` or stillFailed.get).
 #
 # It needs a JDK, and it FAILS when there is none. javac/java come from PATH, then the build VM's prebuilt JDK 21.
-# --mutate re-runs it against broken copies of SweepFailNotice and UnarchiveService (M1-M17), each of which must FAIL a
+# --mutate re-runs it against broken copies of SweepFailNotice and UnarchiveService (M1-M23), each of which must FAIL a
 # named check. A mutant that does not apply (INERT) or does not compile (BROKEN) counts as a failure, never a pass.
 #
 #   bash test-sweep-fail-notice-java.sh            # the cases and the source checks
@@ -88,21 +99,24 @@ pin() {
   if perl -0e 'my $c = do { local $/; <STDIN> }; '"$3"; then echo "ok $1 $2"; else echo "FAIL $1 $2"; return 1; fi
 }
 
-# sources <root>: S1-S7 over <root>'s UnarchiveService.sweepAuto, S8 over its onStartCommand.
+# sources <root>: S1-S7 and S9 over <root>'s UnarchiveService.sweepAuto, S8 over its onStartCommand.
 sources() {
   local r=$1 sweep bad=0
   sweep=$(code "$r/$CH/UnarchiveService.java" "    private void sweepAuto(boolean byHand) {")
   if [ -z "$sweep" ]; then echo "FAIL S1 sweepAuto not found"; return 1; fi
-  pin S1 "hardFailed is declared once and counted once, directly after the done++ statement, for a NEXT step only" '
-    my $n = () = $c =~ /\bint hardFailed = 0;/g; exit 1 unless $n == 1;
-    exit 1 unless $c =~ /int done = 0, failed = 0;[ \t]*\n[ \t]*int hardFailed = 0;/;
-    my $i = () = $c =~ /if \(!ok && step == SweepBusy\.Step\.NEXT && SweepFailNotice\.hard\(end\)\) hardFailed\+\+;/g;
+  pin S1 "the failed apps are listed once, directly after the done++ statement, for a NEXT step only" '
+    my $n = () = $c =~ /\bjava\.util\.List<String> hardFailedPkgs = new ArrayList<>\(\);/g; exit 1 unless $n == 1;
+    exit 1 unless $c =~ /int done = 0, failed = 0;[ \t]*\n[ \t]*java\.util\.List<String> hardFailedPkgs = new ArrayList<>\(\);/;
+    my $i = () = $c =~ /if \(!ok && step == SweepBusy\.Step\.NEXT && SweepFailNotice\.hard\(end\)\) hardFailedPkgs\.add\(pkg\);/g;
     exit 1 unless $i == 1;
-    my $p = () = $c =~ /hardFailed\+\+/g; exit 1 unless $p == 1;
-    exit($c =~ /if \(ok\) done\+\+; else if \(step == SweepBusy\.Step\.NEXT\) failed\+\+;\s*if \(!ok && step == SweepBusy\.Step\.NEXT && SweepFailNotice\.hard\(end\)\) hardFailed\+\+;/ ? 0 : 1);' <<<"$sweep" || bad=1
-  pin S2 "the action is decided once, at the end, after ACTION_SWEEP_DONE and the older-copy line" '
-    my $n = () = $c =~ /SweepFailNotice\.action\(work\.size\(\), done, hardFailed\)/g; exit 1 unless $n == 1;
-    my $a = index($c, "SweepFailNotice.action(work.size(), done, hardFailed)");
+    my $p = () = $c =~ /hardFailedPkgs\.add\(/g; exit 1 unless $p == 1;
+    exit 1 if $c =~ /hardFailed\+\+/;
+    exit($c =~ /if \(ok\) done\+\+; else if \(step == SweepBusy\.Step\.NEXT\) failed\+\+;\s*if \(!ok && step == SweepBusy\.Step\.NEXT && SweepFailNotice\.hard\(end\)\) hardFailedPkgs\.add\(pkg\);/ ? 0 : 1);' <<<"$sweep" || bad=1
+  pin S2 "the action is decided once, at the end, after ACTION_SWEEP_DONE and the older-copy line, on the re-check" '
+    my $call = "SweepFailNotice.afterRecheck(work.size(), done, hardFailedPkgs.size(), hardFailed)";
+    my $n = () = $c =~ /\Q$call\E/g; exit 1 unless $n == 1;
+    exit 1 if index($c, "SweepFailNotice.action(") >= 0;
+    my $a = index($c, $call);
     my $o = rindex($c, "olderMetas"); my $on = index($c, "nm.notify(OlderCopy.NOTICE_ID");
     my $b = index($c, "sendBroadcast(new Intent(ACTION_SWEEP_DONE)");
     exit 1 if $o < 0 || $on < 0 || $b < 0;
@@ -155,6 +169,18 @@ sources() {
     exit 1 unless $p =~ /\} catch \(Throwable t\) \{[^}]*\}\s*\}\s*nm\.notify\(SweepFailNotice\.NOTICE_ID, b\.build\(\)\);/;
     $k =~ /else if \(nm != null && act == SweepFailNotice\.Act\.CANCEL\) \{(.*?)\n\s*\}/s or exit 1;
     exit(index($1, "addAction") < 0 ? 0 : 1);' <<<"$sweep" || bad=1
+  pin S9 "the failed apps are re-checked with hasInstalledCode after the older-copy block and before the action; the log line holds counts only" '
+    my $call = "SweepFailNotice.stillMissing(hardFailedPkgs, p -> hasInstalledCode(p))";
+    my $n = () = $c =~ /\Q$call\E/g; exit 1 unless $n == 1;
+    my $r = index($c, $call); my $act = index($c, "SweepFailNotice.Act act =");
+    my $o = rindex($c, "olderMetas"); my $on = index($c, "nm.notify(OlderCopy.NOTICE_ID");
+    exit 1 if $act < 0 || $o < 0 || $on < 0;
+    exit 1 unless $r > $o && $r > $on && $r < $act;
+    my $h = index($c, "int hardFailed = stillFailed.size();");
+    exit 1 unless $h > $r && $h < $act;
+    $c =~ /(android\.util\.Log\.i\([^;]*installed meanwhile[^;]*;)/s or exit 1;
+    exit 1 if $1 =~ /\bpkg\b|\bp \+|stillFailed\.get/;
+    exit 0;' <<<"$sweep" || bad=1
   local start
   start=$(code "$r/$CH/UnarchiveService.java" "    public int onStartCommand(Intent intent, int flags, int startId) {")
   pin S8 "onStartCommand logs a start from the notice once, a fixed line, before the sweep branch" '
@@ -205,9 +231,9 @@ mut "M2 POST only when nothing landed (the old all-failed rule)" "$S" 's/if \(to
 mut "M3 POST only when every app failed" "$S" 's/if \(total > 0 && hardFailed > 0\) return/if (total > 0 && hardFailed == total) return/' "C2 action(3, 0, 2)" || fails=$((fails+1))
 mut "M4 the CANCEL arm of action removed" "$S" 's/^[ \t]*if \(hardFailed == 0 && done > 0\) return Act\.CANCEL;\n//m' C2 || fails=$((fails+1))
 mut "M5 title swaps failed and total" "$S" 's/return failed \+ " of " \+ total/return total + " of " + failed/' "C3 title(2, 5)" || fails=$((fails+1))
-mut "M6 the increment deleted" "$U" 's/^[ \t]*if \(!ok && step == SweepBusy\.Step\.NEXT && SweepFailNotice\.hard\(end\)\) hardFailed\+\+;\n//m' S1 || fails=$((fails+1))
-mut "M7 the increment loses its NEXT guard" "$U" 's/if \(!ok && step == SweepBusy\.Step\.NEXT && SweepFailNotice\.hard/if (!ok && SweepFailNotice.hard/' S1 || fails=$((fails+1))
-mut "M8 the action call deleted" "$U" 's/SweepFailNotice\.Act act = SweepFailNotice\.action\(work\.size\(\), done, hardFailed\);/SweepFailNotice.Act act = SweepFailNotice.Act.KEEP;/' S2 || fails=$((fails+1))
+mut "M6 the add deleted" "$U" 's/^[ \t]*if \(!ok && step == SweepBusy\.Step\.NEXT && SweepFailNotice\.hard\(end\)\) hardFailedPkgs\.add\(pkg\);\n//m' S1 || fails=$((fails+1))
+mut "M7 the add loses its NEXT guard" "$U" 's/if \(!ok && step == SweepBusy\.Step\.NEXT && SweepFailNotice\.hard\(end\)\) hardFailedPkgs/if (!ok && SweepFailNotice.hard(end)) hardFailedPkgs/' S1 || fails=$((fails+1))
+mut "M8 the action call deleted" "$U" 's/SweepFailNotice\.Act act = SweepFailNotice\.afterRecheck\(work\.size\(\), done, hardFailedPkgs\.size\(\), hardFailed\);/SweepFailNotice.Act act = SweepFailNotice.Act.KEEP;/' S2 || fails=$((fails+1))
 mut "M9 notify uses OlderCopy.NOTICE_ID" "$U" 's/nm\.notify\(SweepFailNotice\.NOTICE_ID,/nm.notify(OlderCopy.NOTICE_ID,/' S3 || fails=$((fails+1))
 mut "M10 the cancel call deleted" "$U" 's/nm\.cancel\(SweepFailNotice\.NOTICE_ID\);//' S4 || fails=$((fails+1))
 mut "M11 the PendingIntent drops EXTRA_OPEN" "$U" 's/(SweepFailNotice\.Act act = .*?)\s*\.putExtra\(LandingLine\.EXTRA_OPEN, LandingLine\.OPEN_YOUR_APPS\)/$1/s' S3 || fails=$((fails+1))
@@ -217,4 +243,10 @@ mut "M14 the retry intent drops EXTRA_BY_HAND" "$U" 's/\.putExtra\(EXTRA_SWEEP, 
 mut "M15 the retry intent drops EXTRA_SWEEP" "$U" 's/\.putExtra\(EXTRA_SWEEP, true\)\.putExtra\(EXTRA_BY_HAND, true\);/.putExtra(EXTRA_BY_HAND, true);/' S6 || fails=$((fails+1))
 mut "M16 getService on FG_ID + 2 (the Stop action's PendingIntent)" "$U" 's/PendingIntent\.getForegroundService\(this,(\s*)SweepFailNotice\.RETRY_REQUEST,/PendingIntent.getService(this,$1FG_ID + 2,/' S6 || fails=$((fails+1))
 mut "M17 the action moved into the CANCEL arm" "$U" 's/\n([ \t]*)(b\.addAction\(new Notification\.Action\.Builder\(.*?\)\.build\(\)\);)(.*?nm\.cancel\(SweepFailNotice\.NOTICE_ID\);)/$3\n$1$2/s' S7 || fails=$((fails+1))
+mut "M18 stillMissing ignores the predicate" "$S" 's/if \(!in\) out\.add\(p\);/out.add(p);/' C7 || fails=$((fails+1))
+mut "M19 afterRecheck drops the healed apps" "$S" 's/return action\(total, done \+ healed, missing\);/return action(total, done, missing);/' "C8 afterRecheck(1, 0, 1, 0)" || fails=$((fails+1))
+mut "M20 afterRecheck counts ranFailed, not missing" "$S" 's/return action\(total, done \+ healed, missing\);/return action(total, done + healed, ranFailed);/' "C8 afterRecheck(3, 0, 2, 0)" || fails=$((fails+1))
+mut "M21 a throwing test counts as installed" "$S" 's/catch \(Throwable t\) \{ in = false; \}/catch (Throwable t) { in = true; }/' C7 || fails=$((fails+1))
+mut "M22 the re-check deleted" "$U" 's/SweepFailNotice\.stillMissing\(hardFailedPkgs, p -> hasInstalledCode\(p\)\)/hardFailedPkgs/' S9 || fails=$((fails+1))
+mut "M23 the act line back to action()" "$U" 's/SweepFailNotice\.afterRecheck\(work\.size\(\), done, hardFailedPkgs\.size\(\), hardFailed\)/SweepFailNotice.action(work.size(), done, hardFailed)/' S2 || fails=$((fails+1))
 [ "$fails" -eq 0 ] && echo "== all mutations convicted" || { echo "== $fails mutation(s) not convicted"; exit 1; }

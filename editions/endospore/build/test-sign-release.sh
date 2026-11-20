@@ -638,6 +638,8 @@ WRAP='900001 1 bash\n900002 900001 sleep\n'
 FOREIGN='900003 1 claude\n'
 TMUXCHAIN='900010 900011 tmux\n900011 1 sshd\n'
 UM='900020 1 systemd\n900021 900020 (sd-pam)\n'
+HELPERS='900022 900020 dbus-daemon\n900023 1 gpg-agent\n900027 900020 gpg-agent\n'
+STRAYHELPERS='900024 1 dbus-daemon\n900025 1 bash\n900026 900025 gpg-agent\n'
 awk_clean() { lacks "$1/gerr" "awk:" && lacks "$1/gerr" "syntax error" && lacks "$1/gerr" "the process-table judge failed"; }
 case_GD() {      # <S> <G> <id> <shell>
   local S="$1" G="$2" id="$3" sh="$4" up
@@ -660,6 +662,12 @@ case_GD() {      # <S> <G> <id> <shell>
          chk test "$(sed -n 's/^e //p' "$CX/pslog" 2>/dev/null)" != "$up" ;;
     GD8) gd "$S" "$G" "$sh" "$WRAP$FOREIGN" - - broken
          chk test "$GRC" = 2; chk has "$CX/gerr" "the process-table judge failed"; chk lacks "$CX/gerr" "pid " ;;
+    # NWP-20261116-61: the user manager's dbus-daemon and a daemonised (or manager-started) gpg-agent are allowed ...
+    GD9) gd "$S" "$G" "$sh" "$WRAP$UM$HELPERS" - -;        chk test "$GRC" = 0; chk lacks "$CX/gerr" "pid " ;;
+    # ... and only those: a dbus-daemon outside the user manager, and a gpg-agent under a stray shell, are named.
+    GD10) gd "$S" "$G" "$sh" "$WRAP$UM$STRAYHELPERS" - -
+         chk test "$GRC" = 1; chk has "$CX/gerr" "pid 900024 dbus-daemon"; chk has "$CX/gerr" "pid 900026 gpg-agent"
+         chk has "$CX/gerr" "pid 900025 bash"; chk test "$(grep -c '^pid ' "$CX/gerr")" = 3 ;;
   esac
 }
 
@@ -690,7 +698,7 @@ plain() {
   WHY=""; case_PF6 "$SIGN" "$GUARD"; report "PF6 normal mode prints no PREFLIGHT line"
   WHY=""; case_PF7 "$SIGN" "$GUARD"; report "PF7 --preflight-only, an unreadable process table: FAIL - session carries the guard's own words"
   for sh in $SHELLS; do
-    for c in GD1 GD2 GD3 GD4 GD5 GD6 GD6b GD7 GD8; do
+    for c in GD1 GD2 GD3 GD4 GD5 GD6 GD6b GD7 GD8 GD9 GD10; do
       WHY=""; case_GD "$SIGN" "$GUARD" "$c" "$sh"; report "$c sitting-guard under $sh"
     done
   done
@@ -745,6 +753,23 @@ convict() {      # <id> <sign-src> <guard-src>: runs the signature case and sets
     M19) case_PF2 "$S" "$G"; if [ -z "$WHY" ]; then VERDICT=SURVIVED; elif [ "$RC" = 1 ] && [ "$(pf_last "$CX/out")" = "PREFLIGHT${TAB}PASS" ]; then VERDICT=CONVICTED; else VERDICT=BROKEN; fi ;;
     M20) case_R "$S" "$G" R1; if [ -z "$WHY" ]; then VERDICT=SURVIVED; elif [ "$RC" = 1 ] && lacks "$CX/err" "REFUSING:"; then VERDICT=CONVICTED; else VERDICT=BROKEN; fi ;;
     M14) case_R "$S" "$G" KH3; if [ -z "$WHY" ]; then VERDICT=SURVIVED; elif has "$CX/err" "$PROMPT" || grep -q '^gen husky' "$CX/log"; then VERDICT=CONVICTED; else VERDICT=BROKEN; fi ;;
+    M28|M29|M30)
+        VERDICT=CONVICTED
+        for sh in $SHELLS; do
+          WHY=""; bad=""
+          case "$M" in
+            M28) case_GD "$S" "$G" GD10 "$sh"
+                 if [ -z "$WHY" ]; then bad=SURVIVED
+                 elif ! { [ "$GRC" = 1 ] && lacks "$CX/gerr" "pid 900024 dbus-daemon" && awk_clean "$CX"; }; then bad=BROKEN; fi ;;
+            M29) case_GD "$S" "$G" GD10 "$sh"
+                 if [ -z "$WHY" ]; then bad=SURVIVED
+                 elif ! { [ "$GRC" = 1 ] && lacks "$CX/gerr" "pid 900026 gpg-agent" && awk_clean "$CX"; }; then bad=BROKEN; fi ;;
+            M30) case_GD "$S" "$G" GD9 "$sh"
+                 if [ -z "$WHY" ]; then bad=SURVIVED
+                 elif ! { [ "$GRC" = 1 ] && has "$CX/gerr" "pid 900022 dbus-daemon" && awk_clean "$CX"; }; then bad=BROKEN; fi ;;
+          esac
+          [ -z "$bad" ] || { VERDICT="$bad (under $sh)"; break; }
+        done ;;
     M5|M11)
         VERDICT=CONVICTED
         for sh in $SHELLS; do
@@ -830,6 +855,12 @@ EOF
 )" '*password*defined*) ;;'
   mutant M26 sign "*'-v password'*) ;;" ''
   mutant M27 sign "*'/dev/shm/release_keys.'*) ;;" ''
+  # NWP-20261116-61: the session helpers
+  mutant M28 guard 'for (p in uppid) if (ucomm[p] == "dbus-daemon" && (uppid[p] in um)) ok[p] = 1' \
+    'for (p in uppid) if (ucomm[p] == "dbus-daemon") ok[p] = 1'
+  mutant M29 guard 'for (p in uppid) if (ucomm[p] == "gpg-agent" && (uppid[p] == 1 || (uppid[p] in um))) ok[p] = 1' \
+    'for (p in uppid) if (ucomm[p] == "gpg-agent") ok[p] = 1'
+  mutant M30 guard 'for (p in uppid) if (ucomm[p] == "dbus-daemon" && (uppid[p] in um)) ok[p] = 1' ''
 }
 
 echo "test-sign-release.sh (shells:$SHELLS)"

@@ -75,6 +75,11 @@ when nobody is logged in.
    `NOWHERE_DESK_NAME=<the build host's tailnet name>`.
    The name stays out of the repo. Add `NOWHERE_AGENT=<path>` on a second line if the agent is not at
    `/tmp/agent_host`.
+   Add `NOWHERE_OTA_STORE_CONF=<path to the store conf>` on another line: `sign-release.sh` reads the published
+   OTA marker of every ring through it, and the Desk hands the script its own environment, so without it the
+   preflight's `ota-conf` line is red (*"The build host has no store settings for the update check"*), as it
+   was at the first real signing (0.5.59, 2026-11-19, `NWP-20261119-34`). After editing the file, run
+   `systemctl --user restart nowhere-release-desk.service`; an open release survives the restart.
 4. Build the host agent once (the phone's own signature check):
    `(cd core/agent && CGO_ENABLED=0 GOOS=linux go build -o /tmp/agent_host .)`.
    Without it, the Desk refuses every signature with `agent missing`.
@@ -88,8 +93,11 @@ when nobody is logged in.
 1. Run `tailscale serve --help` and make sure that it lists a `unix:` target.
 2. Run `tailscale serve --bg --https=443 unix:/run/user/<uid of the signing user>/nowhere-release-desk.sock`.
 
-Tailscale then sends the caller's login in the `Tailscale-User-Login` header and the tailnet name in `Host`. The
-Desk refuses a request without both (403). On the Unix socket, the Desk accepts only the tailnet name in `Host`.
+Tailscale then sends the caller's login in the `Tailscale-User-Login` header. To a `unix:` target it sends
+`Host: localhost` and the tailnet name in `X-Forwarded-Host` (Tailscale 1.104.5, checked on the build host
+2026-11-17). On the Unix socket the Desk accepts the tailnet name in `Host`, or `localhost` with the tailnet name in
+`X-Forwarded-Host`; a TCP Desk never reads that header. It refuses anything else, and a request without a login, with
+403. Open the Desk at `https://<the full tailnet name>/`: the short name has no certificate.
 
 If `tailscale serve` has no `unix:` target, use the old TCP socket. In `nowhere-release-desk.socket`, replace the
 two lines `ListenStream=%t/nowhere-release-desk.sock` and `SocketMode=0600` with `ListenStream=127.0.0.1:8770`.

@@ -73,6 +73,7 @@ _TICK=0
 userdir_recheck() { :; }; reap_retry_run() { :; }; reap_retry_add() { :; }; userdir_pending_add() { :; }
 base_retry_add() { :; }; base_retry_run() { BASE_CLEARED=0; BASE_LEFT=0; }   # NWP-20261203-02
 loc_release() { :; }; md_release() { :; }; dt_release() { :; }; dr_release() { :; }; hs_release() { :; }
+np_release() { :; }; reap_live_other() { return 1; }   # NWP-20261210-19: the netpolicy reset and its guard are test-netpolicy-release.sh's
 ks_reap_clear() { :; }; stop_mediad() { :; }; log_scrub() { :; }; bt_reset() { return 0; }
 reap_pm_census() { RPC_LINE=unread; }   # NWP-20261203-01: test-reap-pm-census.sh runs the real one
 drm_wipe() { DRM_LINE=""; }   # NWP-20261203-08: the DRM store wipe is test-drm-wipe.sh's, not this suite's

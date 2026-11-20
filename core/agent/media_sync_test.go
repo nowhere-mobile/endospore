@@ -147,7 +147,7 @@ func TestMediaSync_MaterializeRefusesToOverwriteAnExistingFile(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	wrote, n := materializeCarried(a.base, key, m, []string{rel}, dest, deferredSyncBudget())
+	wrote, n := materializeCarried(a.base, key, m, []string{rel}, dest, deferredSyncBudget(), nil)
 
 	got, err := os.ReadFile(local)
 	if err != nil {

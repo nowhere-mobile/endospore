@@ -58,6 +58,7 @@ pm() {
   esac
 }
 cmd() { echo "cmd $*" >> "$D/calls"; return 0; }
+_ms() { echo 0; }; _tlog() { :; }   # NWP-20261210-09: the sign-in call times its phases
 '
 
 # prep_fn <roamd.sh> <out> -- extract grant_perms_for and point its nowhere-perms under $TROOT. 0 ok, 2 harness error.
@@ -69,6 +70,7 @@ prep_fn() {
     echo "EXTRACTION FAILED: grant_perms_for() { ... } not found in $sut" >&2; command rm -f "$raw"; return 2
   fi
   sed 's#PF="/data/user/#PF="$TROOT/data/user/#' "$raw" > "$out"
+  sed -n '/^gwin_add() {$/,/^}$/p' "$sut" >> "$out"   # NWP-20261210-09: the window helper it calls
   command rm -f "$raw"
   if [ "$(grep -c 'PF="\$TROOT/data/user/' "$out")" != 1 ] || [ "$(grep -c '/data/user/' "$out")" != 1 ]; then
     echo "REWRITE FAILED: want exactly one PF=\"/data/user/ assignment in grant_perms_for of $sut" >&2; return 2

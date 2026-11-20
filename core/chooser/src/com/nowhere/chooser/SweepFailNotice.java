@@ -37,6 +37,31 @@ final class SweepFailNotice {
         return Act.KEEP;
     }
 
+    /** NWP-20261208-17: backlog section C, "The Auto sweep's failed-apps notice counts an app the user installed by
+     *  hand while the sweep ran, ..." (Chester, 0.5.58, 2026-11-17). The packages of failed that are still not installed
+     *  when the pass ends, in input order, each once, null entries dropped. A test that throws counts the package as
+     *  missing: UnarchiveService.hasInstalledCode's own rule, the safe direction. A null list is an empty one. */
+    static java.util.List<String> stillMissing(java.util.List<String> failed,
+            java.util.function.Predicate<String> installed) {
+        java.util.LinkedHashSet<String> out = new java.util.LinkedHashSet<>();
+        if (failed == null) return new java.util.ArrayList<>(out);
+        for (String p : failed) {
+            if (p == null) continue;
+            boolean in;
+            try { in = installed.test(p); } catch (Throwable t) { in = false; }
+            if (!in) out.add(p);
+        }
+        return new java.util.ArrayList<>(out);
+    }
+
+    /** NWP-20261208-17: action() after the end-of-pass re-check. The apps that failed and were installed meanwhile
+     *  (ranFailed - missing, never below 0) count as landed, and only the missing ones count as failed. The case it
+     *  exists for: the only failure was installed by hand while the sweep ran -> CANCEL, so no notice shows. */
+    static Act afterRecheck(int total, int done, int ranFailed, int missing) {
+        int healed = Math.max(0, ranFailed - missing);
+        return action(total, done + healed, missing);
+    }
+
     /** NWP-20261207-04 (decision 2026-11-12, answer 4 (2)): the "Try again" action rides only a notice that says apps
      *  failed. */
     static boolean offersRetry(Act act) {

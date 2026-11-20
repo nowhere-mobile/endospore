@@ -116,8 +116,9 @@ S3_SECRET_KEY=__PROVISION_ME__
 #NOWHERE_CARRY_ESSENTIAL_MEDIA=0
 #
 # NOWHERE_MEDIA_AFTER_GATE -- user media restored after the gate (Q106, docs/media-after-gate.md); roamd and
-# mediad export it, OFF by default. Set it to 1 only for S7's lynx run, until S7 turns it on.
-#NOWHERE_MEDIA_AFTER_GATE=1
+# mediad export it, ON by default since S7's lynx run (NWP-20261116-58). Set it to 0 to restore every user-media
+# file before the gate, as builds before it did.
+#NOWHERE_MEDIA_AFTER_GATE=0
 
 # NOTE: there is intentionally no NOWHERE_PROFILE / NOWHERE_PASS here. Identity is the blind-login
 # chooser's job -- it hands the profile + passphrase to the daemon at login, and the sync is

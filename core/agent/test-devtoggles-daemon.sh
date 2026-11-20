@@ -32,8 +32,8 @@ PY
   else echo "  SURVIVED  $1 (rc=$mrc, no --- FAIL)"; fails=$((fails+1)); fi
   for f in "${FILES[@]}"; do cp "$W/$f.orig" "$f"; done
 }
-mut "Y1 the sign-in claim removed" main.go '\tclaimDevTogglesAsync\(dest, uid, "signin"\)[^\n]*\n' ''
-mut "Y2 the resume claim removed" main.go '\tclaimDevTogglesAsync\(dest, uid, "resume"\)[^\n]*\n' ''
+mut "Y1 the sign-in claim removed" main.go '\tclaimSessionGlobalsAsync\(dest, uid, "signin"\)[^\n]*\n' ''
+mut "Y2 the resume claim removed" main.go '\tclaimSessionGlobalsAsync\(dest, uid, "resume"\)[^\n]*\n' ''
 mut "Y3 the cold-lock release moved after the switch is published" main.go \
   '\treleaseDevTogglesAtLock\(dest, uid\)[^\n]*\n(.*?pendingLockUID = uid[^\n]*\n\tpendingReapMu\.Unlock\(\)\n)' \
   '\1\treleaseDevTogglesAtLock(dest, uid)\n'

@@ -166,7 +166,7 @@ public final class HelpCardsCases {
                 "Lock the phone");
         pathText("Profile › Report an issue › View what's sent: ",
                 new String[] {"Profile", "Report an issue", "View what's sent"}, "Read a report");
-        pathText("Sign in on any Nowhere phone", new String[0], "Sign in on any Nowhere phone");
+        pathText("Sign in on any nowhere phone", new String[0], "Sign in on any nowhere phone");
         pathText("The apps you keep come back with you.", new String[0], "The apps you keep");
         check(HelpCards.path(null).length == 0, "path(null) is not empty");
         check(HelpCards.path("Profile: x").length == 0, "path(\"Profile: x\") has a path of one part");

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# test-settings-roam.sh [--mutate] -- NWP-20261130-12 (Q012, #70): the curated settings allowlist, with one row, Secure
-# sysui_qs_tiles. Roamd captures it at seal into the sibling file nowhere-settings-roam, and the chooser replays it
+# test-settings-roam.sh [--mutate] -- NWP-20261130-12 (Q012, #70): the curated settings allowlist, with eighteen rows:
+# Secure sysui_qs_tiles, System screen_off_timeout (NWP-20261207-13, Q073) and sixteen public Secure rows with plain values
+# (NWP-20261210-23). Roamd captures them at seal into the sibling file nowhere-settings-roam, and the chooser replays them
 # through the live provider at sign-in.
 #
 # Three halves. The shell cases (S) run roamd's functions, extracted by anchor, under each shell found, with `settings`
@@ -30,6 +31,33 @@ HOST_JDK=/mnt/build/lineage/prebuilts/jdk/jdk21/linux-x86/bin
 INNER='a,custom(com.x/.Outer$Tile),b'
 # The architecture's set, 70 characters. P1 builds the expected table from it.
 SET='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_./(),-$'
+# The eighteen rows of the real list, in order, written out here (S4, S11, pin-list). Then the value S11 and E4 set for each.
+ROWS18='secure sysui_qs_tiles tiles
+system screen_off_timeout
+secure accessibility_display_inversion_enabled
+secure accessibility_display_daltonizer_enabled
+secure accessibility_display_daltonizer
+secure high_text_contrast_enabled
+secure accessibility_captioning_enabled
+secure accessibility_captioning_preset
+secure accessibility_captioning_font_scale
+secure night_display_auto_mode
+secure night_display_custom_start_time
+secure night_display_custom_end_time
+secure long_press_timeout
+secure show_ime_with_hard_keyboard
+secure spell_checker_enabled
+secure tts_default_rate
+secure tts_default_pitch
+secure camera_double_tap_power_gesture_disabled'
+VALS18='wifi,cast 300000 1 1 12 0 1 -1 1.5 2 79200000 25200000 600 1 0 150 110 1'
+# pin-deny: keys that never go on the list (identifiers, setup state, package-keyed values, the panel's own range, keys
+# with their own path), then the patterns of the same classes and of the lock, biometric, doze and emergency rows.
+DENY_KEYS='android_id user_setup_complete selected_spell_checker tts_default_synth tts_default_locale
+accessibility_shortcut_target_service accessibility_button_targets night_display_color_temperature ui_night_mode
+doze_always_on accessibility_enabled navigation_mode'
+DENY_PATTERNS='enabled_* *_component *_components location_* always_on_vpn_* *lock* *biometric* *fingerprint* *face_unlock*
+*doze* *emergency*'
 
 if command -v javac >/dev/null 2>&1 && command -v java >/dev/null 2>&1; then
   JAVAC=$(command -v javac); JAVA=$(command -v java)
@@ -159,7 +187,8 @@ shell_cases() {
   fresh; marked; setv secure.sysui_qs_tiles a; setv secure.other b
   sc sroam_seal_capture "$ud" 10
   got=$(sed 's/^10 //' "$sd/reads" | sort | tr '\n' ';')
-  eq S4 "$got" 'secure nowhere_sroam_applied;secure nowhere_sroam_tiles;secure sysui_qs_tiles;' "the real list reads its one row"
+  want=$({ printf '%s\n' "$ROWS18" | cut -d' ' -f1,2; printf 'secure nowhere_sroam_applied\nsecure nowhere_sroam_tiles\n'; } | sort | tr '\n' ';')
+  eq S4 "$got" "$want" "the real list reads its eighteen rows"
   # S4z: a list with no usable row, or no list, keeps the record.
   printf '# nothing\nglobal x\n' > "$tl"
   fresh; marked; printf 'secure sysui_qs_tiles kept\n' > "$rec"
@@ -210,10 +239,47 @@ shell_cases() {
   sc sroam_seal_capture "$ud" 10; sc sroam_surface "$ud" "$pf"
   x=$(cat "$lg")
   case "$x" in *secret*|*custom*|*com.x*|*Outer*) res S7 1 "a tile reached the log" ;; *) res S7 0 "no tile text in the log" ;; esac
-  case "$x" in *'rows=1 captured=1'*) res S7 0 "the seal logs counts" ;; *) res S7 1 "the seal logs no counts" ;; esac
+  case "$x" in *'rows=18 captured=1 '*) res S7 0 "the seal logs counts" ;; *) res S7 1 "the seal logs no counts" ;; esac
   fresh; marked; setv secure.sysui_qs_tiles 'secret tile'
   sc sroam_seal_capture "$ud" 10
   x=$(cat "$lg"); case "$x" in *secret*) res S7 1 "a refused value reached the log" ;; *) res S7 0 "a refused value stays out of the log" ;; esac
+
+  # S10: the screen-off timeout row (NWP-20261207-13, Q073), on the real list.
+  fresh; marked; setv secure.sysui_qs_tiles 'wifi,bt'; setv system.screen_off_timeout 300000
+  sc sroam_seal_capture "$ud" 10
+  eq S10 "$(cat "$rec" 2>/dev/null)" "$(printf 'secure sysui_qs_tiles wifi,bt\nsystem screen_off_timeout 300000')" \
+    "the record holds both rows, tiles first"
+  case "$(cat "$sd/reads" 2>/dev/null)" in *'10 system screen_off_timeout'*) res S10 0 "the timeout read is for the session's user" ;; *) res S10 1 "the timeout is not read for the user" ;; esac
+  x=$(cat "$lg"); case "$x" in *'rows=18 captured=2 '*) res S10 0 "the seal logs eighteen rows, two captured" ;; *) res S10 1 "the seal does not log rows=18 captured=2" ;; esac
+  fresh; marked; printf 'secure sysui_qs_tiles old\nsystem screen_off_timeout 120000\n' > "$rec"
+  sc sroam_seal_capture "$ud" 10
+  eq S10 "$(cat "$rec")" "$(printf 'secure sysui_qs_tiles old\nsystem screen_off_timeout 120000')" \
+    "a null timeout read carries its old line"
+
+  # S11: the eighteen rows of the real list (NWP-20261210-23), each set in the stub.
+  local ln i v rd
+  fresh; marked
+  set -- $VALS18; i=0; want=""
+  while IFS= read -r ln; do
+    eval "v=\${$((i+1))}"; i=$((i+1))
+    ln=${ln% tiles}; setv "$(printf '%s' "$ln" | tr ' ' .)" "$v"
+    want="$want${want:+$'\n'}$ln $v"
+  done <<EOF_ROWS
+$ROWS18
+EOF_ROWS
+  sc sroam_seal_capture "$ud" 10
+  eq S11 "$(cat "$rec" 2>/dev/null)" "$want" "every row reaches the record, one line each, in list order"
+  rd=$(grep -v '^10 ' "$sd/reads" || true)
+  [ -z "$rd" ] && [ -s "$sd/reads" ]; res S11 $? "every read is for the session's user"
+  x=$(cat "$lg")
+  case "$x" in *'rows=18 captured=18 carried=0 '*) res S11 0 "the seal logs rows=18 captured=18" ;; *) res S11 1 "the seal does not log rows=18 captured=18" ;; esac
+  case "$x" in *wifi*|*cast*|*300000*|*79200000*|*25200000*|*1.5*) res S11 1 "a value reached the log" ;; *) res S11 0 "no value text in the log" ;; esac
+  # S11n: a null row carries its old line, at its position.
+  printf '%s\n' "$want" > "$t/old"; rm -f "$sd/secure.long_press_timeout"; : > "$lg"
+  sed 's/^secure long_press_timeout 600$/secure long_press_timeout 900/' "$t/old" > "$rec"
+  sc sroam_seal_capture "$ud" 10
+  eq S11 "$(cat "$rec")" "$(sed 's/^secure long_press_timeout 600$/secure long_press_timeout 900/' "$t/old")" "a null row carries its old line"
+  x=$(cat "$lg"); case "$x" in *'rows=18 captured=17 carried=1 '*) res S11 0 "the null row counts as carried" ;; *) res S11 1 "the null row is not counted as carried" ;; esac
 
   # S9: the set table.
   got=$(LONG=$(printf '%8192s' '' | tr ' ' a) "$sh" -c '. "$1"
@@ -233,7 +299,8 @@ shell_cases() {
   rm -rf "$t"
 }
 
-# chain_cases <lib> <shell> <class dir>: E, a value with a $ in its class crosses the capture, the surface and the apply.
+# chain_cases <lib> <shell> <class dir>: E, a value with a $ in its class crosses the capture, the surface and the apply;
+# E3 the screen-off timeout; E4 a plain Secure row.
 chain_cases() {
   local lib="$1" sh="$2" cls="$3" t ud rec sd lg pf
   t=$(mktemp -d -p "$W") || return 2
@@ -265,6 +332,32 @@ chain_cases() {
   eq E2 "$(cat "$sd/secure.nowhere_sroam_tiles" 2>/dev/null)" '' "nothing waits after the landing"
   sc sroam_seal_capture "$ud" 10
   eq E2 "$(cat "$rec")" "secure sysui_qs_tiles $INNER" "a seal after the landing leaves the record unchanged"
+
+  # E3: the screen-off timeout (NWP-20261207-13, Q073) crosses the seal, the surface and the apply, over the 1 min that
+  # ensureSessionScreenTimeout writes before the apply.
+  rm -rf "$ud" "$sd"; mkdir -p "$ud/com.nowhere.chooser/files" "$sd"; : > "$pf"
+  printf 1 > "$sd/secure.nowhere_sroam_applied"; printf 'wifi,bt' > "$sd/secure.sysui_qs_tiles"
+  printf 300000 > "$sd/system.screen_off_timeout"
+  sc sroam_seal_capture "$ud" 10; sc sroam_surface "$ud" "$pf"
+  rm -rf "$sd"; mkdir -p "$sd"; printf 60000 > "$sd/system.screen_off_timeout"
+  jr --apply "$pf" "$LIST" - "$sd"
+  eq E3 "$(cat "$sd/system.screen_off_timeout" 2>/dev/null)" 300000 "the captured value replaces the session's 1 min"
+  eq E3 "$(cat "$sd/secure.nowhere_sroam_applied" 2>/dev/null)" 1 "the marker is set"
+  printf 'secure sysui_qs_tiles wifi,bt\n' > "$rec"; : > "$pf"; sc sroam_surface "$ud" "$pf"
+  rm -rf "$sd"; mkdir -p "$sd"; printf 60000 > "$sd/system.screen_off_timeout"
+  jr --apply "$pf" "$LIST" - "$sd"
+  eq E3 "$(cat "$sd/system.screen_off_timeout" 2>/dev/null)" 60000 "a record with no timeout line keeps the 1 min"
+  eq E3 "$(cat "$sd/secure.nowhere_sroam_applied" 2>/dev/null)" 1 "the marker is still set"
+
+  # E4: a plain Secure row (NWP-20261210-23) crosses the seal, the surface and the apply byte for byte.
+  rm -rf "$ud" "$sd"; mkdir -p "$ud/com.nowhere.chooser/files" "$sd"; : > "$pf"
+  printf 1 > "$sd/secure.nowhere_sroam_applied"; printf 79200000 > "$sd/secure.night_display_custom_start_time"
+  sc sroam_seal_capture "$ud" 10; sc sroam_surface "$ud" "$pf"
+  eq E4 "$(cat "$pf")" 'sroam=secure night_display_custom_start_time 79200000' "the record surfaces byte for byte"
+  rm -rf "$sd"; mkdir -p "$sd"
+  jr --apply "$pf" "$LIST" - "$sd"
+  eq E4 "$(cat "$sd/secure.night_display_custom_start_time" 2>/dev/null)" 79200000 "the put value is the captured value"
+  eq E4 "$(cat "$sd/secure.nowhere_sroam_applied" 2>/dev/null)" 1 "the marker is set"
   rm -rf "$t"
 }
 
@@ -312,8 +405,23 @@ compile_java() {
 # pins <dir of copies>: ChooserActivity.java AppInstallReceiver.java NowhereApp.java SettingsRoamLive.java SettingsRoam.java
 # settings-roam.list endospore.mk diaspore.mk. Prints `ok <id> ...` or `FAIL <id> ...`.
 pin() { if [ "$2" = 0 ]; then echo "ok $1 $3"; else echo "FAIL $1 $3"; fi; }
+# deny_rows <list>: 0 when no row is Global, names a denied key or pattern, or has kind tiles on a key but sysui_qs_tiles.
+deny_rows() {
+  local s k kd p bad=0
+  while read -r s k kd || [ -n "${s:-}" ]; do
+    case "$s" in ''|'#'*) continue ;; global) bad=1 ;; esac
+    case " $(printf '%s' "$DENY_KEYS" | tr '\n' ' ') " in *" $k "*) bad=1 ;; esac
+    set -f
+    for p in $DENY_PATTERNS; do
+      case "$k" in $p) bad=1 ;; esac
+    done
+    set +f
+    [ "$kd" != tiles ] || [ "$k" = sysui_qs_tiles ] || bad=1
+  done < "$1"
+  printf '%s' "$bad"
+}
 pins() {
-  local d="$1" x n arp
+  local d="$1" x n arp a b
   x=$(grep -A1 '^ *applyRoamedPrefs();' "$d/ChooserActivity.java" | tail -1)
   case "$x" in *'applyRoamedSettings(uid);'*) pin pin-call 0 "applyRoamedSettings(uid) follows applyRoamedPrefs()" ;; *) pin pin-call 1 "applyRoamedSettings(uid) does not follow applyRoamedPrefs()" ;; esac
   n=$(grep -cF 'SettingsRoamLive.applyAtSignIn(this, uid, roamedPrefLines);' "$d/ChooserActivity.java")
@@ -335,7 +443,16 @@ pins() {
   grep -qF 'vendor/diaspore/etc/settings-roam.list:$(TARGET_COPY_OUT_SYSTEM)/etc/nowhere/settings-roam.list' "$d/diaspore.mk"
   pin pin-mk $? "diaspore bakes the list"
   x=$(grep -vE '^[[:space:]]*(#|$)' "$d/settings-roam.list")
-  [ "$x" = 'secure sysui_qs_tiles tiles' ]; pin pin-list $? "the list holds exactly its one row"
+  [ "$x" = "$ROWS18" ]
+  pin pin-list $? "the list holds exactly its eighteen rows, tiles first, the timeout second"
+  pin pin-deny "$(deny_rows "$d/settings-roam.list")" "no Global row, no denied key, and kind tiles only on sysui_qs_tiles"
+  # The 1 min default goes in before the apply, so a captured screen-off timeout replaces it (NWP-20261207-13).
+  a=$(grep -n '^ *ensureSessionScreenTimeout(uid);' "$d/ChooserActivity.java" | cut -d: -f1)
+  b=$(grep -n '^ *applyRoamedSettings(uid);' "$d/ChooserActivity.java" | cut -d: -f1)
+  case "$a$b" in
+    *[!0-9]*|'') pin pin-order 1 "each call appears exactly once (got '$a' '$b')" ;;
+    *) [ -n "$a" ] && [ -n "$b" ] && [ "$a" -lt "$b" ]; pin pin-order $? "ensureSessionScreenTimeout(uid) runs before applyRoamedSettings(uid)" ;;
+  esac
   x=$(grep -F 'Log.' "$d/SettingsRoamLive.java" | grep -E '\+ *(waiting|value|lines|st|key)\b' || true)
   [ -z "$x" ]; pin pin-nolog $? "no Log line in SettingsRoamLive carries a value"
   x=$(grep -E 'replaceAll|replaceFirst|appendReplacement' "$d/SettingsRoam.java" || true)
@@ -370,7 +487,7 @@ if ! make_lib "$ROAMD" "$LIB"; then echo "FAIL EXTRACTION: the settings-roam fun
 OUT="$W/classes"
 if ! cj=$(compile_java "$JSUT" "$OUT"); then printf '%s\n' "$cj"; echo "FAIL J0 SettingsRoam does not compile"; exit 1; fi
 
-report "Java cases" "$("$JAVA" -Djava.io.tmpdir="$W" -cp "$OUT" com.nowhere.chooser.SettingsRoamCases 2>&1)"
+report "Java cases" "$("$JAVA" -Djava.io.tmpdir="$W" -cp "$OUT" com.nowhere.chooser.SettingsRoamCases "$LIST" 2>&1)"
 for sh in $SHELLS; do
   report "shell cases under $sh" "$(shell_cases "$LIB" "$sh" 2>&1)"
   report "chain cases under $sh" "$(chain_cases "$LIB" "$sh" "$OUT" 2>&1)"
@@ -441,7 +558,7 @@ jmut() {
   sed "$@" "$JSUT" > "$m"
   applied "$JSUT" "$m" "$label" || { rm -rf "$m" "$cls"; return; }
   if ! compile_java "$m" "$cls" >/dev/null; then echo "  ⚠ NO COMPILE  $label -- NOT a conviction"; MRC=1; rm -rf "$m" "$cls"; return; fi
-  out=$("$JAVA" -Djava.io.tmpdir="$W" -cp "$cls" com.nowhere.chooser.SettingsRoamCases 2>&1)
+  out=$("$JAVA" -Djava.io.tmpdir="$W" -cp "$cls" com.nowhere.chooser.SettingsRoamCases "$LIST" 2>&1)
   verdict "$label" "$id" "$out"
   rm -rf "$m" "$cls"
 }
@@ -454,6 +571,30 @@ pinmut() {
   applied "$PT/$file" "$d/$file" "$label" || { rm -rf "$d"; return; }
   verdict "$label" "$id" "$(pins "$d")"
   rm -rf "$d"
+}
+# listmut <label> <named case> <shell|chain> <sed args...>: a broken settings-roam.list under each shell's cases.
+listmut() {
+  local label="$1" id="$2" half="$3" m sh out=""
+  shift 3
+  m=$(mktemp -p "$W"); sed "$@" "$LIST" > "$m"
+  applied "$LIST" "$m" "$label" || { rm -f "$m"; return; }
+  for sh in $SHELLS; do
+    if [ "$half" = chain ]; then out="$out
+$(LIST="$m" chain_cases "$LIB" "$sh" "$OUT" 2>&1)"
+    else out="$out
+$(LIST="$m" shell_cases "$LIB" "$sh" 2>&1)"; fi
+  done
+  verdict "$label" "$id" "$out" $SHELLS
+  rm -f "$m"
+}
+# jlistmut <label> <named case> <sed args...>: a broken settings-roam.list under the Java cases.
+jlistmut() {
+  local label="$1" id="$2" m
+  shift 2
+  m=$(mktemp -p "$W"); sed "$@" "$LIST" > "$m"
+  applied "$LIST" "$m" "$label" || { rm -f "$m"; return; }
+  verdict "$label" "$id" "$("$JAVA" -Djava.io.tmpdir="$W" -cp "$OUT" com.nowhere.chooser.SettingsRoamCases "$m" 2>&1)"
+  rm -f "$m"
 }
 sf() { printf '/^%s() {$/,/^}$/{%s}' "$1" "$2"; }
 
@@ -494,8 +635,35 @@ pinmut "C5 the ADDED-arm call removed" pin-added AppInstallReceiver.java -e '/if
 pinmut "C6 the process-birth call removed" pin-birth NowhereApp.java -e '/SettingsRoamLive\.reconcile(this)/d'
 pinmut "C7 endospore does not bake the list" pin-mk endospore.mk -e '/settings-roam\.list/d'
 pinmut "C8 diaspore does not bake the list" pin-mk diaspore.mk -e '/settings-roam\.list/d'
-pinmut "C9 a second row on the list" pin-list settings-roam.list -e '$a secure other_row'
+pinmut "C9 a 19th row on the list" pin-list settings-roam.list -e '$a secure other_row'
 pinmut "C10 a value in a Log line" pin-nolog SettingsRoamLive.java -e 's/"settings roam: " + landed/"settings roam: " + waiting/'
+DROP='/^system screen_off_timeout$/d'
+TOSEC='s/^system screen_off_timeout$/secure screen_off_timeout/'
+pinmut "C11 the timeout row removed" pin-list settings-roam.list -e "$DROP"
+listmut "C11b the timeout row removed (shell)" S10 shell -e "$DROP"
+listmut "C11c the timeout row removed (chain)" E3 chain -e "$DROP"
+jlistmut "C11d the timeout row removed (Java)" J11 -e "$DROP"
+pinmut "C12 the timeout row's scope secure" pin-list settings-roam.list -e "$TOSEC"
+listmut "C12b the timeout row's scope secure (shell)" S10 shell -e "$TOSEC"
+pinmut "C13 the timeout row gets kind tiles" pin-list settings-roam.list -e 's/^system screen_off_timeout$/system screen_off_timeout tiles/'
+pinmut "C14 the apply moved before the session's 1 min" pin-order ChooserActivity.java \
+  -e '/^ *applyRoamedSettings(uid);/d' -e 's/^\( *\)\(ensureSessionScreenTimeout(uid);.*\)$/\1applyRoamedSettings(uid);\n\1\2/'
+pinmut "C15 the rows swapped" pin-list settings-roam.list -e '/^secure sysui_qs_tiles tiles$/{h;d}' -e '/^system screen_off_timeout$/G'
+# NWP-20261210-23: the deny set, and the sixteen Secure rows.
+pinmut "D1 a Global row appended" pin-deny settings-roam.list -e '$a global window_animation_scale'
+pinmut "D2 a package-keyed row appended" pin-deny settings-roam.list -e '$a secure selected_spell_checker'
+pinmut "D3 an identifier appended" pin-deny settings-roam.list -e '$a secure android_id'
+pinmut "D4 the panel's colour temperature appended" pin-deny settings-roam.list -e '$a secure night_display_color_temperature'
+pinmut "D5 a key with its own path appended" pin-deny settings-roam.list -e '$a secure navigation_mode'
+pinmut "D6 a second tiles row" pin-deny settings-roam.list -e 's/^secure tts_default_rate$/secure tts_default_rate tiles/'
+LPDROP='/^secure long_press_timeout$/d'
+pinmut "D7 the touch-and-hold row removed" pin-list settings-roam.list -e "$LPDROP"
+listmut "D7b the touch-and-hold row removed (shell)" S11 shell -e "$LPDROP"
+jlistmut "D7c the touch-and-hold row removed (Java)" J12 -e "$LPDROP"
+listmut "D8 the night start row removed (chain)" E4 chain -e '/^secure night_display_custom_start_time$/d'
+# J-M13 also drops the `else res.failed++;` arm after the put, or the mutant does not compile.
+jmut "J-M13 the plain-row put skipped" J12 \
+  -e '/^                else if (store\.put(row\.scope, row\.key, value)) res\.applied++;$/{s/.*/                else res.applied++;/;n;/^                else res\.failed++;$/d}'
 
 # A control that must SURVIVE: a log wording no case reads. A convicted control means the suite fails on anything.
 ctl=$(mktemp -p "$W"); ctllib=$(mktemp -p "$W")

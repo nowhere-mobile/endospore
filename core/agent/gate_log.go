@@ -25,8 +25,8 @@ package main
 // user id, no wall-clock or calendar value, no login verb or outcome, and no free-form string of any kind.
 //
 // The guarantee is STRUCTURAL, not a filter. gateLog takes a verb from a closed set and at most one key from
-// a closed set. `ms` and `fields` carry an INTEGER; `in` carries one of four fixed bucket tokens that gateLog
-// itself picks (gateInBucket). `d`, `m` and `s` (the gap since the previous line on each clock, and the
+// a closed set. `ms`, `fields`, `n` and `sec` carry an INTEGER; `in` carries one of four fixed bucket tokens
+// that gateLog itself picks (gateInBucket). `d`, `m` and `s` (the gap since the previous line on each clock, and the
 // suspend inside it) are buckets that gateLog itself picks too (gateGapBucket): no line carries an exact
 // elapsed time. Exact gaps, summed from the boot's first line, placed every line on the boot's timeline, and
 // with a report's uptime_s and created_at they gave the gate alarm's ring time back (h53 #7,
@@ -73,6 +73,11 @@ var gateLogVerbs = map[string]bool{
 	"silence-ok": true, "silence-err": true, "silence-live": true,
 	// NWP-20261028-12: a SILENCE-GATE-ALARM stash that names a user other than the session's (ERR-STALE)
 	"silence-stale": true,
+	// NWP-20261205-17 (Q027, docs/product-decisions.md, 2026-10-20): the chooser's Wi-Fi mirror evidence -- a gate
+	// Forget, a queue the gate collected and an adopt pass that re-added a network the gate forgot. Verbs and a count only
+	"wifi-forget": true, "wifi-forget-err": true, "wifi-forget-midadopt": true,
+	"wifi-collect": true, "wifi-collect-parked": true,
+	"wifi-readd": true, "wifi-readd-late": true,
 	// chooser, over GATE-TRACE
 	"armed": true, "armed-inexact": true, "armed-err": true, "cancel-login": true, "cancel-dismiss": true,
 	"consume": true, "consume-past": true, "fired": true, "fired-err": true,
@@ -88,6 +93,12 @@ var gateLogVerbs = map[string]bool{
 	"bars-light": true,
 	// NWP-20261204-07: at a gate-alarm fire, whether a roamed user was running, stopped or absent -- a relation, as ui-guard-other; never a user id or a count
 	"fired-roamed-running": true, "fired-roamed-stopped": true, "fired-roamed-none": true, "fired-roamed-err": true,
+	// NWP-20261207-15: a gate Wi-Fi join's outcome (key sec: how the gate configured it and what the AP advertised), never which network
+	"wifi-join-ok": true, "wifi-join-assoc": true, "wifi-join-noassoc": true,
+	"wifi-join-addfail": true, "wifi-join-nowifi": true, "wifi-join-err": true,
+	// NWP-20261208-08: the gate's input-stall evidence (codes from GateInputProbe.Rule), never a title, text or class name
+	"input-stall": true, "input-stall-why": true, "input-stall-win": true, "input-stall-vri": true,
+	"input-stall-focus": true, "input-stall-ime": true, "input-stall-stage": true, "input-stall-clear": true,
 	// the record of a rejection -- never the rejected text itself
 	"trace-unknown": true,
 }
@@ -102,9 +113,15 @@ var gateLogVerbs = map[string]bool{
 //	ms     milliseconds a UI surface lived, an INTEGER. A two-digit value IS the flash-and-vanish report.
 //	fields how many tab-separated fields a wire line carried (0-3), an INTEGER. Shape, not content.
 //	       For bars-light: the gate window's two light-bar bits (0, 8, 16 or 24), a property of the gate.
+//	       For input-stall-*: a fixed code from GateInputProbe.Rule.
+//	n      a count of Wi-Fi networks, 0..32, an INTEGER; never which.
+//	sec    a gate Wi-Fi join (wifi-join-*), an INTEGER of three digits: hundreds = reused a saved entry (0/1);
+//	       tens = how the gate configured it (1 open, 2 psk, 3 eap, 0 none); units = the AP's advertised
+//	       security in the gate's last scan (0 not seen, 1 open, 2 psk, 3 psk+sae, 4 sae only, 5 eap, 6 owe,
+//	       7 other). A property of the join, never which network (NWP-20261207-15).
 //
 // `d`, `m` and `s` are not caller keys: gateLog writes them on every line, as gateGapBucket tokens.
-var gateLogKeys = map[string]bool{"in": true, "ms": true, "fields": true}
+var gateLogKeys = map[string]bool{"in": true, "ms": true, "fields": true, "sec": true, "n": true}
 
 var (
 	gateLogMu sync.Mutex
@@ -140,7 +157,7 @@ func gateLogStart() {
 // Each <gap> is gateGapBucket of a whole number of seconds since the previous line: d on the boot clock, m on
 // the monotonic clock, and s the suspend between them (gateSuspendSeconds), never the seconds themselves.
 //
-// `in` is written as gateInBucket(val), never as val; `ms` and `fields` are written as the integer.
+// `in` is written as gateInBucket(val), never as val; `ms`, `fields`, `n` and `sec` are written as the integer.
 // Pass key "" to write no key. An unknown verb becomes `trace-unknown` and an unknown key is dropped -- the
 // EVENT is still recorded, because a rejected trace that vanishes is the exact failure this file exists to
 // end. Never blocks on anything but its own mutex, never returns an error, and never touches the caller's

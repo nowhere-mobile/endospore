@@ -644,6 +644,22 @@ func mergeLateRestore(stored, local *Wallet) *Wallet {
 		loMiss = local.PendingClaimMisses
 	}
 	out.PendingClaimMisses = pendingClaimMissesFor(out.PendingClaims, stMiss, loMiss)
+	// The unusable-claim notices (NWP-20261208-03): the union of both sides, stored first, deduplicated.
+	out.UnusableClaims = nil
+	var notices []string
+	if stored != nil {
+		notices = append(notices, stored.UnusableClaims...)
+	}
+	if local != nil {
+		notices = append(notices, local.UnusableClaims...)
+	}
+	haveNotice := map[string]bool{}
+	for _, k := range notices {
+		if !haveNotice[k] {
+			haveNotice[k] = true
+			out.UnusableClaims = append(out.UnusableClaims, k)
+		}
+	}
 	if local == nil {
 		return &out
 	}

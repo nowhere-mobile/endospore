@@ -34,6 +34,10 @@ unesc_mount() {
   printf '%s' "$1" | sed -e 's/\\040/ /g' -e 's/\\011/'"$(printf '\t')"'/g' -e 's/\\134/\\/g'
 }
 
+# _ms: milliseconds since the epoch, 0 when `date` gives no number (NWP-20261210-29). The same helper as roamd's,
+# where its numeric guard is written down; the sweep-only block uses it for its "sweep phases:" line.
+_ms() { local _t; _t=$(date +%s%3N 2>/dev/null); case "$_t" in ''|*[!0-9]*) echo 0;; *) echo "$_t";; esac; }
+
 # qn: a profile name as ONE escaped, double-quoted log token (NWP-20261008-09). The same helper as roamd's, where
 # the reason is written down: log_scrub redacts a quoted token whole, and a bare name after `start` kept every word
 # after the first. Written with `print -r --`, never echo, which would undo the escaping.
@@ -65,6 +69,7 @@ umount_err() {
 # NEVER touch /sys/fs/fuse/connections -- aborting it kills Android's own emulated-storage FUSE (see header).
 if [ -f "$SWEEP" ]; then
   _t0=$(date +%s)                               # NWP-20261119-05: the sweep's time goes into its summary line
+  _p0=$(_ms)                                    # NWP-20261210-29: the phase stamps, read by the "sweep phases:" line
   # ONE underlying mount appears at SEVERAL paths -- the real one under /data/media or /data/user, plus
   # Android's own views of it under /data_mirror and /mnt/pass_through. Detaching any one of them takes the
   # others with it, so by the time the loop reaches a sibling entry that mount is ALREADY GONE and umount
@@ -157,6 +162,7 @@ if [ -f "$SWEEP" ]; then
   # NWP-20261119-05: layers first, then the binds that are not layer lines (a line matching both is listed once).
   print -r -- "$_mt" | grep -e " fuse.nowheremedia " > "$SWEPT"
   print -r -- "$_mt" | grep -v -e " fuse.nowheremedia " | grep -e "/.nowhere-media[^/]*/.under/" >> "$SWEPT"
+  _p1=$(_ms)
   n_ok=0; n_gone=0; n_fail=0; n_unk=0; n_pend=0; _qbad=0
   # `< "$SWEPT"` and NOT a pipe: a piped while runs in a subshell and the counters would die with it.
   while read -r _dev mnt _rest; do
@@ -176,13 +182,14 @@ if [ -f "$SWEEP" ]; then
       fi
     fi
   done < "$SWEPT"
+  _p2=$(_ms); _pk=$((n_ok + n_pend + n_unk)); _prr=0
   if [ "$_qbad" -ne 0 ]; then
     # NWP-20261125-13: a queue write failed, so the queue is short: every queued entry is unverified.
     n_unk=$((n_unk + n_pend))
   elif [ -s "$PEND" ]; then
     # ONE re-read for every failed entry (NWP-20261119-05), the same way as the top read (status kept; failed or
     # empty = unreadable, every pending entry unverified).
-    _rr=$(cat /proc/mounts 2>>"$LOG"); _rrrc=$?
+    _rr=$(cat /proc/mounts 2>>"$LOG"); _rrrc=$?; _prr=1
     if [ "$_rrrc" -ne 0 ] || [ -z "$_rr" ]; then
       n_unk=$((n_unk + n_pend))
     else
@@ -211,6 +218,7 @@ if [ -f "$SWEEP" ]; then
       fi
     fi
   fi
+  _p3=$(_ms)
   rm -f "$SWEPT"
   rm -f "$PEND" "$PENDWHY" "$MNTSET" "$STILL"
   rm -f "$SWEEP"
@@ -218,7 +226,29 @@ if [ -f "$SWEEP" ]; then
   case "$_t0$_t1" in ''|*[!0-9]*) ;; *) [ -n "$_t0" ] && [ -n "$_t1" ] && _dt=$((_t1 - _t0)) ;; esac
   # One summary line instead of a line per mount: the counts are the diagnostic, and a non-zero n_fail is
   # the only part that should ever draw the eye. NWP-20261119-05: ` in <n>s` is the sweep's own time.
-  echo "[mediad] sweep done: $n_ok detached, $n_gone already gone, $n_fail FAILED, $n_unk unverified in ${_dt}s $(date)" >> "$LOG"
+  _pdate=$(date)
+  echo "[mediad] sweep done: $n_ok detached, $n_gone already gone, $n_fail FAILED, $n_unk unverified in ${_dt}s $_pdate" >> "$LOG"
+  # NWP-20261210-29 (S20 of the 2026-11-17 lynx proof round): the sweep costs about 0.2 s per mount, linear in the
+  # mount count ("208 detached, 416 already gone ... in 124s"), and the summary above has whole seconds for the whole
+  # sweep only. The loop also ran on well after roamd logged "media mounts clear". This line splits the sweep into
+  # its phases, in ms, so the next handset sign-out says which phase holds the cost:
+  #   - list: the list files truncated, the one top read of the table, and the two list writes;
+  #   - detach: the loop over the list. Per entry it runs unesc_mount and `umount -l`; a failed entry also runs
+  #     umount_err and the two queue writes ($PEND and $PENDWHY). "over <k> entries" counts every listed entry
+  #     (detached, queued, or unverified because its queue write failed), taken right after the loop;
+  #   - classify: the one re-read after the loop, the two grep -f calls and the SWEEP-FAILED lines. It is 0ms when
+  #     the re-read did not run (no queue, or a queue write failed).
+  # The split INSIDE the loop is deliberately not measured: a stamp per entry adds a `date` fork per entry, the very
+  # cost this line measures. Four stamps per sweep, never one per entry. A stamp that reads 0 (no clock) logs
+  # "unclocked" instead of numbers. Counts and ms only: no path, no profile, no uid. The raw stamps are compared as
+  # text, never in a numeric test (mksh arithmetic is 32 bits and a 13-digit time wraps; a difference stays right).
+  case " $_p0 $_p1 $_p2 $_p3 " in
+    *" 0 "*)
+      echo "[mediad] sweep phases: unclocked (NWP-20261210-29) $_pdate" >> "$LOG" ;;
+    *)
+      _pc=0; [ "$_prr" -eq 1 ] && _pc=$((_p3 - _p2))
+      echo "[mediad] sweep phases: list $((_p1 - _p0))ms, detach $((_p2 - _p1))ms over $_pk entries ($n_ok detached, $n_pend queued), classify ${_pc}ms (NWP-20261210-29) $_pdate" >> "$LOG" ;;
+  esac
   exit 0
 fi
 
@@ -256,8 +286,9 @@ export GATEWAY_URL NOWHERE_STATE="$STATE"
 # no deferred media. Latent until the #91 rollout flips the flag; found by the NWP-20260822-08 audit.
 export NOWHERE_MULTIDEVICE="${NOWHERE_MULTIDEVICE:-0}"
 # NWP-20261202-18 (S5 of docs/media-after-gate.md §8, Q106): user media restored after the gate. startBgLander
-# (S4b) refuses "flag off" unless this is exactly "1". OFF by default: S7 flips this default after the lynx run.
-export NOWHERE_MEDIA_AFTER_GATE="${NOWHERE_MEDIA_AFTER_GATE:-0}"
+# (S4b) refuses "flag off" unless this is exactly "1". ON by default since S7's lynx run (NWP-20261116-58); a conf
+# that sets it to 0 turns it off. roamd exports the same flag with the same default.
+export NOWHERE_MEDIA_AFTER_GATE="${NOWHERE_MEDIA_AFTER_GATE:-1}"
 export SSL_CERT_DIR=/system/etc/security/cacerts
 export NOWHERE_DNS="${NOWHERE_DNS:-}"
 # #84 P5: media fetch-cache eviction. Default is FREE-SPACE based -- keep 2 GiB free on /data (evict only under

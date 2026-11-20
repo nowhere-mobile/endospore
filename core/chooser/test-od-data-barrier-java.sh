@@ -68,8 +68,9 @@ roamd_lib() {
       [ -n "$body" ] || { echo "EXTRACTION FAILED: $fn" >&2; return 2; }
       printf '%s\n' "$body" | sed 's|/data/user/$uid/|$USERDIR/|'
     done
-    echo 'run_reply() { odsrc="$1"; odkept="$2"; pkg="$3"'
-    body=$(awk '/^    if \[ "\$odsrc" = 0 \]; then$/{f=1} f{print} f&&/^    fi$/{exit}' "$sut")
+    # NWP-20261209-04 put the failed-walk arm (_odxf = 2) first; the barrier cases run a healthy walk.
+    echo 'run_reply() { _odxf=0; odsrc="$1"; odkept="$2"; pkg="$3"'
+    body=$(awk '/^    if \[ "\$_odxf" = 2 \]; then$/{f=1} f{print} f&&/^    fi$/{exit}' "$sut")
     [ -n "$body" ] || { echo "EXTRACTION FAILED: the odrestore reply" >&2; return 2; }
     printf '%s\n' "$body"
     echo '}'

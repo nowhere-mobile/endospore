@@ -9,12 +9,13 @@
 #   A2 meteredAllowed: only a trimmed "1" is on.
 #   A3 rekick: only a no -> yes turn of one session (uid > 0, the same uid on both ticks).
 #   A4.1 sweepAuto takes (boolean byHand) and asks AutoSweepNet.mayFetch with the session's GET-PREFETCH-METERED reply, onWifiCtx
-#        and hasInternetCtx, after pendingAutoApps and before the empty check and qEnqueue(work).
+#        and hasInternetCtx, after pendingAutoApps and before the empty check and qEnqueue(queued).
 #   A4.2 a false gate clears work and returns nothing; the restore-only retry loop follows the gate block, outside it.
 #   A4.3 installPendingRow's chip starts the sweep with EXTRA_BY_HAND.
 #   A4.4 kickAutoMaterialise's sweep carries neither EXTRA_BY_HAND nor EXTRA_NET_REKICK (its sweep is the gated one).
 #   A4.5 onStartCommand reads both extras, and an EXTRA_NET_REKICK start runs sweepAutoJoined(false) and returns before
-#        snapshotAppSeen, AppHeld.refresh, the phantom reconcile and wakeRestored.
+#        snapshotAppSeen, AppHeld.refresh, the phantom reconcile and wakeRestored. Only the waiting-card arm
+#        (NWP-20261208-23), which returns and runs no sweep, may come before it.
 #   A4.6 the gate's backup watcher re-kicks through AutoSweepNet.rekick after its `net` line, starts the service in
 #        that user with EXTRA_SWEEP + EXTRA_NET_REKICK, remembers uid/net, and forgets the uid at the gate.
 #
@@ -93,9 +94,9 @@ sources() {
     else {
       my $i = index($s, $call);
       my $pend = index($s, q{pendingAutoApps(this, true, retry);});
-      my $enq = index($s, q{qEnqueue(work);});
+      my $enq = index($s, q{qEnqueue(queued);});
       my $empty = index($s, q{if (work.isEmpty() && retry.isEmpty())});
-      push @f, "A4.1 the gate does not sit after pendingAutoApps and before the empty check and qEnqueue(work)"
+      push @f, "A4.1 the gate does not sit after pendingAutoApps and before the empty check and qEnqueue(queued)"
         unless $pend >= 0 && $enq >= 0 && $empty >= 0 && $pend < $i && $i < $empty && $i < $enq;
       for my $w (q{AutoSweepNet.meteredAllowed(daemon("GET-PREFETCH-METERED\n"))},
                  q{ChooserActivity.onWifiCtx(this)}, q{ChooserActivity.hasInternetCtx(this)}) {
@@ -140,7 +141,7 @@ FAIL A4.4 the perl check did not run"
                q{final boolean netRekick = intent != null && intent.getBooleanExtra(EXTRA_NET_REKICK, false);}) {
       push @f, "A4.5 onStartCommand lacks `$w`" if index($s, $w) < 0;
     }
-    if ($s =~ /Thread sw = new Thread\(\(\) -> \{\s*if \(netRekick\) \{((?:(?!snapshotAppSeen|AppHeld\.refresh|reconcilePhantomKeepLines|wakeRestored|if \(resumeSweep\)).)*?)\breturn;\s*\}/s) {
+    if ($s =~ /Thread sw = new Thread\(\(\) -> \{\s*(?:if \(waitingStart\) \{(?:(?!if \(netRekick\)|sweepAutoJoined).)*?\breturn;\s*\}\s*)?if \(netRekick\) \{((?:(?!snapshotAppSeen|AppHeld\.refresh|reconcilePhantomKeepLines|wakeRestored|if \(resumeSweep\)).)*?)\breturn;\s*\}/s) {
       my $b = $1;
       push @f, "A4.5 the re-kick branch does not run sweepAutoJoined(false)" if index($b, q{sweepAutoJoined(false);}) < 0;
       push @f, "A4.5 the re-kick branch does not call workerDone()" if index($b, q{workerDone();}) < 0;
@@ -223,7 +224,7 @@ mut "M3 a false gate returns early, skipping the retry loop" UnarchiveService.ja
 mut "M4 rekick true on every tick while net" AutoSweepNet.java 's/return uid > 0 && uid == prevUid && !prevNet && net;/return uid > 0 && net;/' "A3 rekick(10,true,10,true)" || fails=$((fails+1))
 mut "M5 the chip's EXTRA_BY_HAND removed" ProfileActivity.java 's/\s*\.putExtra\(UnarchiveService\.EXTRA_BY_HAND, true\)//' "A4.3" || fails=$((fails+1))
 mut "M6 meteredAllowed(\"\") true" AutoSweepNet.java 's/return reply != null && "1"\.equals\(reply\.trim\(\)\);/return reply != null && (reply.trim().isEmpty() || "1".equals(reply.trim()));/' 'A2 meteredAllowed("")' || fails=$((fails+1))
-mut "M7 a re-kick start falls through to the switch-landing" UnarchiveService.java 's/(finally \{ workerDone\(\); \}\n)\s*return;\n(\s*\}\n)/$1$2/' "A4.5" || fails=$((fails+1))
+mut "M7 a re-kick start falls through to the switch-landing" UnarchiveService.java 's/(\(re-kick\)", t\); \}\n\s*finally \{ workerDone\(\); \}\n)\s*return;\n(\s*\}\n)/$1$2/' "A4.5" || fails=$((fails+1))
 mut "M8 the login kick made by hand" ChooserActivity.java 's/(\.putExtra\(UnarchiveService\.EXTRA_SWEEP, true\));(\s*if \(restoredOk)/$1.putExtra(UnarchiveService.EXTRA_BY_HAND, true);$2/' "A4.4" || fails=$((fails+1))
 mut "M9 the gate tick keeps the uid" ChooserActivity.java 's/^[ \t]*sweepNetUid = -1;[^\n]*\n//m' "A4.6" || fails=$((fails+1))
 [ "$fails" -eq 0 ] && echo "== all mutations convicted" || { echo "== $fails mutation(s) not convicted"; exit 1; }

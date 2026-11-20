@@ -178,13 +178,13 @@ func TestMaterialize_BothCallersOwnAppExtFilesAndWaitForAbsentApps(t *testing.T)
 		body string
 	}{
 		{"essential", essentialMediaEnv, func(base string, key []byte, m chunkManifest, rels []string, dest string) ([]string, int64) {
-			return materializeCarried(base, key, m, rels, dest, 1<<30)
+			return materializeCarried(base, key, m, rels, dest, 1<<30, nil)
 		}, "small app state"},
 		{"deferred", func(t *testing.T) {
 			deferredMediaEnv(t)
 			t.Setenv("NOWHERE_MEDIA_MIN", "64") // the app-private floor, so files/ defers too
 		}, func(base string, key []byte, m chunkManifest, rels []string, dest string) ([]string, int64) {
-			return materializeDeferredArrivals(base, key, m, rels, dest, 1<<30)
+			return materializeDeferredArrivals(base, key, m, rels, dest, 1<<30, nil)
 		}, strings.Repeat("app-private bulk, over the lowered floor. ", 40)},
 	}
 	for _, c := range cases {

@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -97,10 +98,11 @@ func TestGateLogGrammar(t *testing.T) {
 	gateLog("ui-create", "", 0)
 	gateLog("relay-set", "in", -17) // negative `in` is a real case: an alarm already in the past (in=past)
 	gateLog("ui-destroy", "ms", 120)
+	gateLog("wifi-collect", "n", 3)
 	gateLog("relay-set", "badkey", 9) // an unknown key is dropped, the event survives
 	b, _ := os.ReadFile(p)
 	const gap = `(none|lt10s|lt1m|lt10m|lt1h|ge1h)`
-	line := regexp.MustCompile(`^d=` + gap + ` m=` + gap + ` s=` + gap + ` [a-z-]+( (in=(past|under1h|1to12h|over12h)|(ms|fields)=-?\d+))?$`)
+	line := regexp.MustCompile(`^d=` + gap + ` m=` + gap + ` s=` + gap + ` [a-z-]+( (in=(past|under1h|1to12h|over12h)|(ms|fields|n)=-?\d+))?$`)
 	for _, l := range strings.Split(strings.TrimRight(string(b), "\n"), "\n") {
 		if !line.MatchString(l) {
 			t.Errorf("line %q does not match the closed grammar", l)
@@ -412,6 +414,109 @@ func TestGateLogRoamedVerbs(t *testing.T) {
 	for i, w := range verbs {
 		if !strings.HasSuffix(lines[i], " "+w) || strings.Contains(lines[i], "trace-unknown") {
 			t.Errorf("line %d = %q, want it to end %q -- %s is not in gateLogVerbs", i+1, lines[i], " "+w, w)
+		}
+		if !grammar.MatchString(lines[i]) {
+			t.Errorf("line %d = %q does not match the closed grammar", i+1, lines[i])
+		}
+	}
+}
+
+// TestGateLogInputStallVerbs pins NWP-20261208-08: each of the gate's eight input-stall verbs (GateInputProbe.Rule.VERBS)
+// lands through the GATE-TRACE line as itself with its integer code, never as trace-unknown, and every line matches the
+// closed grammar. The key group accepts any key in gateLogKeys, so a key another slice adds does not break this test.
+func TestGateLogInputStallVerbs(t *testing.T) {
+	p := gateLogTestFile(t)
+	verbs := []string{"input-stall", "input-stall-why", "input-stall-win", "input-stall-vri",
+		"input-stall-focus", "input-stall-ime", "input-stall-stage", "input-stall-clear"}
+	want := make([]string, len(verbs))
+	for i, w := range verbs {
+		want[i] = w + " fields=7"
+		if w == "input-stall" || w == "input-stall-clear" {
+			want[i] = w + " ms=5000"
+		}
+		v, k, n := gateTraceLine(want[i])
+		gateLog(v, k, n)
+	}
+	lines := gateLogTestLines(t, p)
+	if len(lines) != len(verbs) {
+		t.Fatalf("gate.log has %d lines, want %d:\n%s", len(lines), len(verbs), strings.Join(lines, "\n"))
+	}
+	keys := make([]string, 0, len(gateLogKeys))
+	for k := range gateLogKeys {
+		if k != "in" {
+			keys = append(keys, regexp.QuoteMeta(k))
+		}
+	}
+	sort.Strings(keys)
+	const gap = `(none|lt10s|lt1m|lt10m|lt1h|ge1h)`
+	grammar := regexp.MustCompile(`^d=` + gap + ` m=` + gap + ` s=` + gap + ` [a-z-]+( (in=(past|under1h|1to12h|over12h)|(` +
+		strings.Join(keys, "|") + `)=-?\d+))?$`)
+	for i, w := range verbs {
+		if !strings.HasSuffix(lines[i], " "+want[i]) || strings.Contains(lines[i], "trace-unknown") {
+			t.Errorf("line %d = %q, want it to end %q -- %s is not in gateLogVerbs", i+1, lines[i], " "+want[i], w)
+		}
+		if !grammar.MatchString(lines[i]) {
+			t.Errorf("line %d = %q does not match the closed grammar", i+1, lines[i])
+		}
+	}
+}
+
+// TestGateLogWifiMirrorVerbs pins NWP-20261205-17 (Q027, docs/product-decisions.md, 2026-10-20): each of the
+// chooser's seven Wi-Fi mirror verbs lands as "<verb> n=<count>", written by gateLog and through the GATE-TRACE
+// line, and a typo of one lands as trace-unknown. A line is a verb and one count, never which network.
+func TestGateLogWifiMirrorVerbs(t *testing.T) {
+	p := gateLogTestFile(t)
+	verbs := []string{"wifi-forget", "wifi-forget-err", "wifi-forget-midadopt",
+		"wifi-collect", "wifi-collect-parked", "wifi-readd", "wifi-readd-late"}
+	for _, v := range verbs {
+		gateLog(v, "n", 3)
+		tv, tk, tn := gateTraceLine(v + " n=2")
+		gateLog(tv, tk, tn)
+	}
+	tv, tk, tn := gateTraceLine("wifi-readd-lat n=1")
+	gateLog(tv, tk, tn)
+	lines := gateLogTestLines(t, p)
+	if len(lines) != 2*len(verbs)+1 {
+		t.Fatalf("gate.log has %d lines, want %d:\n%s", len(lines), 2*len(verbs)+1, strings.Join(lines, "\n"))
+	}
+	for i, v := range verbs {
+		if !strings.HasSuffix(lines[2*i], " "+v+" n=3") {
+			t.Errorf("line %d = %q, want it to end %q -- %s is not in gateLogVerbs or n is not in gateLogKeys", 2*i+1, lines[2*i], " "+v+" n=3", v)
+		}
+		if !strings.HasSuffix(lines[2*i+1], " "+v+" n=2") {
+			t.Errorf("line %d = %q, want the GATE-TRACE line to end %q -- %s", 2*i+2, lines[2*i+1], " "+v+" n=2", v)
+		}
+	}
+	last := lines[len(lines)-1]
+	if !strings.HasSuffix(last, " trace-unknown n=1") {
+		t.Errorf("last line = %q, want the typo wifi-readd-lat written as \" trace-unknown n=1\"", last)
+	}
+	b, _ := os.ReadFile(p)
+	if strings.Contains(string(b), "wifi-readd-lat ") {
+		t.Errorf("the typo wifi-readd-lat reached the file:\n%s", string(b))
+	}
+}
+
+// NWP-20261207-15: every gate Wi-Fi join verb, with its `sec` integer, reaches gate.log as itself.
+func TestGateLogWifiJoinVerbs(t *testing.T) {
+	p := gateLogTestFile(t)
+	verbs := []string{"wifi-join-ok", "wifi-join-assoc", "wifi-join-noassoc", "wifi-join-addfail", "wifi-join-nowifi", "wifi-join-err"}
+	for _, w := range verbs {
+		v, k, n := gateTraceLine(w + " sec=124")
+		gateLog(v, k, n)
+	}
+	lines := gateLogTestLines(t, p)
+	if len(lines) != len(verbs) {
+		t.Fatalf("gate.log has %d lines, want %d:\n%s", len(lines), len(verbs), strings.Join(lines, "\n"))
+	}
+	const gap = `(none|lt10s|lt1m|lt10m|lt1h|ge1h)`
+	grammar := regexp.MustCompile(`^d=` + gap + ` m=` + gap + ` s=` + gap + ` [a-z-]+( (in=(past|under1h|1to12h|over12h)|(ms|fields|sec)=-?\d+))?$`)
+	for i, w := range verbs {
+		if strings.Contains(lines[i], "trace-unknown") {
+			t.Errorf("line %d = %q -- %s is not in gateLogVerbs", i+1, lines[i], w)
+		}
+		if !strings.HasSuffix(lines[i], " "+w+" sec=124") {
+			t.Errorf("line %d = %q, want it to end %q -- %s or sec is missing from gateLogVerbs / gateLogKeys", i+1, lines[i], " "+w+" sec=124", w)
 		}
 		if !grammar.MatchString(lines[i]) {
 			t.Errorf("line %d = %q does not match the closed grammar", i+1, lines[i])

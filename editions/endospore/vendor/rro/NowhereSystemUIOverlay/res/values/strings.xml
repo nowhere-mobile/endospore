@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Endospore SystemUI string overlay (OS-tier: every Endospore device, no device-specific value).
+  Built as the NowhereSystemUIOverlay runtime overlay (see Android.bp beside this res/ for why not a static overlay).
+-->
+<resources>
+    <!--
+      NWP-20261208-27 (backlog row "When a computer asks for USB debugging during a profile session, the phone says
+      to "switch to an admin user", which Nowhere has no way to do: the only admin is user 0, reached as owner mode").
+      UsbDebuggingSecondaryUserActivity shows this message to a non-admin user when a computer that is not
+      authorized asks for USB debugging. The stock text tells the person to switch to an admin user; Nowhere has no
+      user switcher. The refusal itself stays (docs/product-decisions.md, 2026-10-20, "eighteen recommendations
+      accepted": USB debugging is reached only through owner mode, behind the owner passphrase). The words are the
+      ones Chester approved on 2026-11-17 (NWP-20261116-48), one text for a personal and a rental phone.
+
+      The title (usb_debugging_secondary_user_title) and the OK button stay stock by design. Only values/ is
+      overlaid: every other locale, the en-rGB, en-rAU, en-rCA and en-rIN variants included, keeps the stock
+      translation. Each apostrophe is escaped for aapt2.
+    -->
+    <string name="usb_debugging_secondary_user_message">The profile signed in now can\'t turn on USB debugging. Only this phone\'s owner can, in owner mode.</string>
+</resources>

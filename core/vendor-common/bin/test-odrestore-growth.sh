@@ -152,6 +152,7 @@ grant_perms_for() { :; }
 keystore_register() { :; }
 pm() { case "$*" in "list packages -U "*) echo "package:$srcunit uid:1110234" ;; esac; return 0; }
 reown_ext_appdata() { :; }
+od_extdata_watched() { reown_ext_appdata "$1"; restorecon -R -D "$ROOT/data/media/$uid/Android/data/$1" 2>>"$LOG"; }   # NWP-20261208-13: the no-count-file pair
 wait_acct_authenticator() { :; }
 acct_reload() { :; }
 sync_apply() { :; }

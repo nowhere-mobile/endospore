@@ -583,3 +583,397 @@ func readMediaNoChangeAt(d *ncDevice) (head, digest string, ok bool) {
 	defer os.Setenv("NOWHERE_BLOBCACHE", prev)
 	return readMediaNoChange(contentCacheTagFor(deriveKey(d.name+"#media", d.pass)))
 }
+
+// NWP-20261204-22: the tombstones files are part of the record's digest. A deletion the record's own seal read
+// does not block the exit; a line appended after that seal does, once.
+
+// ncTombFile writes a tombstones file holding body in a fresh temp dir and returns its path.
+func ncTombFile(t *testing.T, body string) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), ".deleted")
+	if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+// ncAppend appends one line to the tombstones file at p, as mediad's appendTombstone does.
+func ncAppend(t *testing.T, p, rel string) {
+	t.Helper()
+	f, err := os.OpenFile(p, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(rel + "\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// ncPushOK runs one push that must land and returns its output.
+func ncPushOK(t *testing.T, a *ncDevice, what string) string {
+	t.Helper()
+	out, msg := a.push(t)
+	if msg != "" {
+		t.Fatalf("%s: %s\n%s", what, msg, out)
+	}
+	return out
+}
+
+// A tombstones file the record's own seal read: the next unchanged push ends after the walk.
+func TestMediaNoChange_TombstonesSealedThenUnchangedEndsEarly(t *testing.T) {
+	ncEnv(t)
+	t.Setenv("NOWHERE_MEDIA_TOMBSTONES", ncTombFile(t, "DCIM/Camera/IMG_9999.jpg\n"))
+	_, a, _ := ncSetupOn(t, newNCStore(t), "mncT1")
+	if _, err := os.Stat(a.recordPath()); err != nil {
+		t.Fatalf("setup: the landed seal wrote no record (%v) -- this fixture proves nothing", err)
+	}
+	if out := ncPushOK(t, a, "the unchanged push"); !strings.Contains(out, ncNoChangeMark) {
+		t.Fatalf("a session whose deletion was already sealed took the full path:\n%s", out)
+	}
+}
+
+// One line appended after the record: the next push takes the full path, and the push after it ends early.
+func TestMediaNoChange_ATombstoneAppendedAfterTheRecordTakesTheFullPath(t *testing.T) {
+	ncEnv(t)
+	tomb := ncTombFile(t, "DCIM/Camera/IMG_9998.jpg\n")
+	t.Setenv("NOWHERE_MEDIA_TOMBSTONES", tomb)
+	_, a, _ := ncSetupOn(t, newNCStore(t), "mncT2")
+	ncAppend(t, tomb, "DCIM/Camera/IMG_9999.jpg")
+	if out := ncPushOK(t, a, "the push after the append"); strings.Contains(out, ncNoChangeMark) {
+		t.Fatalf("a tombstone appended after the record ended after the walk:\n%s", out)
+	}
+	if _, err := os.Stat(a.recordPath()); err != nil {
+		t.Fatalf("the full-path seal after the append wrote no record (%v)", err)
+	}
+	if out := ncPushOK(t, a, "the push after the sealed append"); !strings.Contains(out, ncNoChangeMark) {
+		t.Fatalf("the push after the append was sealed took the full path:\n%s", out)
+	}
+}
+
+// The same rule through the CE tombstones file, <src>/<mediaCacheRel>/.deleted.
+func TestMediaNoChange_TheCETombstonesFileCounts(t *testing.T) {
+	ncEnv(t)
+	s := newNCStore(t)
+	name := "mncT3"
+	pass := "nochange pass " + name
+	createVault(s.base, name, pass)
+	a := ncNewDevice(t, s, name, pass)
+	a.fixture(t)
+	tomb := filepath.Join(a.work, filepath.FromSlash(mediaCacheRel), ".deleted")
+	if err := os.MkdirAll(filepath.Dir(tomb), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(tomb, []byte("DCIM/Camera/IMG_9998.jpg\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ncPushOK(t, a, "setup seal")
+	a.login(a.head("#media"))
+	if _, err := os.Stat(a.recordPath()); err != nil {
+		t.Fatalf("setup: the landed seal wrote no record (%v) -- this fixture proves nothing", err)
+	}
+	if out := ncPushOK(t, a, "the unchanged push"); !strings.Contains(out, ncNoChangeMark) {
+		t.Fatalf("a session whose CE deletion was already sealed took the full path:\n%s", out)
+	}
+	ncAppend(t, tomb, "DCIM/Camera/IMG_9999.jpg")
+	if out := ncPushOK(t, a, "the push after the append"); strings.Contains(out, ncNoChangeMark) {
+		t.Fatalf("a CE tombstone appended after the record ended after the walk:\n%s", out)
+	}
+	if out := ncPushOK(t, a, "the push after the sealed append"); !strings.Contains(out, ncNoChangeMark) {
+		t.Fatalf("the push after the CE append was sealed took the full path:\n%s", out)
+	}
+}
+
+// The key folds content, not only lengths; absent, empty and unset are one state; a directory is a doubt.
+func TestMediaNoChange_TombstonesKeyFields(t *testing.T) {
+	src := t.TempDir()
+	t.Setenv("NOWHERE_MEDIA_TOMBSTONES", "")
+	k0, ok := mediaTombstonesKey(src)
+	if !ok || len(k0) != 64 {
+		t.Fatalf("the key of nothing: %q %v, want 64 hex and true", k0, ok)
+	}
+	p := filepath.Join(t.TempDir(), ".deleted")
+	t.Setenv("NOWHERE_MEDIA_TOMBSTONES", p)
+	if k, ok := mediaTombstonesKey(src); !ok || k != k0 {
+		t.Errorf("an absent tombstones file is not the unset state: %q %v", k, ok)
+	}
+	if err := os.WriteFile(p, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if k, ok := mediaTombstonesKey(src); !ok || k != k0 {
+		t.Errorf("an empty tombstones file is not the unset state: %q %v", k, ok)
+	}
+	if err := os.WriteFile(p, []byte("DCIM/a.jpg\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ka, ok := mediaTombstonesKey(src)
+	if !ok || ka == k0 {
+		t.Fatalf("a tombstone did not move the key: %q %v", ka, ok)
+	}
+	if err := os.WriteFile(p, []byte("DCIM/b.jpg\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if kb, ok := mediaTombstonesKey(src); !ok || kb == ka {
+		t.Errorf("same-length different content gave the same key: %q %v", kb, ok)
+	}
+	t.Setenv("NOWHERE_MEDIA_TOMBSTONES", t.TempDir())
+	if k, ok := mediaTombstonesKey(src); ok || k != "" {
+		t.Errorf("a directory at the tombstones path: %q %v, want (\"\", false)", k, ok)
+	}
+	if d := mediaNoChangeDigest(strings.Repeat("a", 64), "", false); d != "" {
+		t.Errorf("a doubtful key gave the digest %q", d)
+	}
+	if d := mediaNoChangeDigest("", k0, true); d != "" {
+		t.Errorf("an empty walk digest gave the digest %q", d)
+	}
+}
+
+// ncWhyLines returns every line of out that names a reason: a full-path line or a record-not-kept line.
+func ncWhyLines(out string) []string {
+	var ls []string
+	for _, l := range strings.Split(out, "\n") {
+		if strings.Contains(l, "(#media) full path: ") || strings.Contains(l, "no-change record not kept: ") {
+			ls = append(ls, l)
+		}
+	}
+	return ls
+}
+
+// ncWhyToken parses one reason line: its token and, for a full-path line, the tombs= count (-1 otherwise).
+func ncWhyToken(t *testing.T, l string) (string, int) {
+	t.Helper()
+	if i := strings.Index(l, "(#media) full path: "); i >= 0 {
+		var tok string
+		var n int
+		if c, err := fmt.Sscanf(l[i+len("(#media) full path: "):], "%s tombs=%d (NWP-20261204-22)", &tok, &n); c != 2 || err != nil {
+			t.Fatalf("a full-path line that does not parse: %q (%v)", l, err)
+		}
+		return tok, n
+	}
+	i := strings.Index(l, "no-change record not kept: ")
+	rest := l[i+len("no-change record not kept: "):]
+	j := strings.Index(rest, " (NWP-20261204-22)")
+	if j < 0 {
+		t.Fatalf("a record-not-kept line that does not parse: %q", l)
+	}
+	return rest[:j], -1
+}
+
+// ncInWhy reports whether tok is in the closed set.
+func ncInWhy(tok string) bool {
+	for _, w := range mediaNoChangeWhy {
+		if w == tok {
+			return true
+		}
+	}
+	return false
+}
+
+// ncCheckWhyLines checks every reason line of out: its token is in the closed set, and the line names no rel, no
+// head, no 64-hex digest and no profile name outside logProfile's quotes.
+func ncCheckWhyLines(t *testing.T, a *ncDevice, out string, rels ...string) {
+	t.Helper()
+	hexRun := func(l string) bool {
+		n := 0
+		for _, c := range l {
+			if (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') {
+				if n++; n >= 16 {
+					return true
+				}
+			} else {
+				n = 0
+			}
+		}
+		return false
+	}
+	heads := []string{a.head("#media"), a.receipt()}
+	for _, l := range ncWhyLines(out) {
+		if tok, _ := ncWhyToken(t, l); !ncInWhy(tok) {
+			t.Errorf("a reason line prints %q, which is not in mediaNoChangeWhy: %q", tok, l)
+		}
+		if strings.Contains(strings.ReplaceAll(l, fmt.Sprintf("%q", a.name), ""), a.name) {
+			t.Errorf("a reason line names the profile outside quotes: %q", l)
+		}
+		for _, h := range heads {
+			if h != "" && (strings.Contains(l, h) || strings.Contains(l, short(h))) {
+				t.Errorf("a reason line names a head: %q", l)
+			}
+		}
+		if hexRun(l) {
+			t.Errorf("a reason line holds a digest-length hex run: %q", l)
+		}
+		for _, r := range append(rels, "Documents", "DCIM", "Android/") {
+			if strings.Contains(l, r) {
+				t.Errorf("a reason line names a rel (%s): %q", r, l)
+			}
+		}
+	}
+}
+
+// ncWantFull checks that out holds exactly one reason line, the full-path line with token tok and count tombs.
+func ncWantFull(t *testing.T, a *ncDevice, out, tok string, tombs int) {
+	t.Helper()
+	ls := ncWhyLines(out)
+	if len(ls) != 1 {
+		t.Fatalf("want exactly one reason line (full path: %s tombs=%d), got %d:\n%s", tok, tombs, len(ls), out)
+	}
+	got, n := ncWhyToken(t, ls[0])
+	if got != tok || n != tombs {
+		t.Fatalf("the full-path line names %s tombs=%d, want %s tombs=%d:\n%s", got, n, tok, tombs, ls[0])
+	}
+	if strings.Contains(out, ncNoChangeMark) {
+		t.Fatalf("a push printed both the full-path line and the no-change line:\n%s", out)
+	}
+	ncCheckWhyLines(t, a, out)
+}
+
+// Each guard the fixtures reach names itself, exactly once, and no other token.
+func TestMediaNoChangeWhy_EachGuardNamesItself(t *testing.T) {
+	t.Run("no-record", func(t *testing.T) {
+		_, a, _ := ncSetup(t, "mncW1")
+		if err := os.Remove(a.recordPath()); err != nil {
+			t.Fatal(err)
+		}
+		ncWantFull(t, a, ncPushOK(t, a, "push"), "no-record", 0)
+	})
+	t.Run("head-moved", func(t *testing.T) {
+		s, a, h1 := ncSetup(t, "mncW2")
+		b := ncNewDevice(t, s, a.name, a.pass)
+		b.fixture(t)
+		b.put("Documents/from-b.txt", "written on the other handset")
+		b.login(h1)
+		ncPushOK(t, b, "the other writer's seal")
+		if a.head("#media") == h1 {
+			t.Fatal("the other writer did not move the head -- this fixture proves nothing")
+		}
+		ncWantFull(t, a, ncPushOK(t, a, "push"), "head-moved", 0)
+	})
+	t.Run("receipt-head", func(t *testing.T) {
+		_, a, h1 := ncSetup(t, "mncW3")
+		a.login(strings.Repeat("0", len(h1)))
+		ncWantFull(t, a, ncPushOK(t, a, "push"), "receipt-head", 0)
+	})
+	t.Run("digest-changed by an mtime", func(t *testing.T) {
+		_, a, _ := ncSetup(t, "mncW4")
+		p := filepath.Join(a.work, "Documents", "d1", "n007.txt")
+		mt := ncMtime.Add(107*time.Second + 500*time.Microsecond)
+		if err := os.Chtimes(p, mt, mt); err != nil {
+			t.Fatal(err)
+		}
+		ncWantFull(t, a, ncPushOK(t, a, "push"), "digest-changed", 0)
+	})
+	t.Run("digest-changed by a tombstone", func(t *testing.T) {
+		_, a, _ := ncSetup(t, "mncW5")
+		t.Setenv("NOWHERE_MEDIA_TOMBSTONES", ncTombFile(t, "DCIM/Camera/IMG_9999.jpg\n"))
+		ncWantFull(t, a, ncPushOK(t, a, "push"), "digest-changed", 1)
+	})
+	t.Run("digest-doubt", func(t *testing.T) {
+		_, a, _ := ncSetup(t, "mncW6")
+		t.Setenv("NOWHERE_MEDIA_TOMBSTONES", t.TempDir())
+		ncWantFull(t, a, ncPushOK(t, a, "push"), "digest-doubt", 0)
+	})
+	t.Run("forced-full", func(t *testing.T) {
+		ncEnv(t)
+		t.Setenv("NOWHERE_SEAL_FULL_EVERY", "2")
+		_, a, _ := ncSetupOn(t, newNCStore(t), "mncW7")
+		ncWantFull(t, a, ncPushOK(t, a, "push"), "forced-full", 0)
+	})
+	t.Run("seal-force", func(t *testing.T) {
+		_, a, _ := ncSetup(t, "mncW8")
+		t.Setenv("NOWHERE_SEAL_FORCE", "1")
+		out, _ := a.push(t)
+		ncWantFull(t, a, out, "seal-force", 0)
+	})
+}
+
+// A seal that keeps no record names why: a missed materialise, and a flush whose head PUT failed.
+func TestMediaNoChangeWhy_RecordNotKeptNamesWhy(t *testing.T) {
+	t.Run("not-landed", func(t *testing.T) {
+		s, a, h1 := ncSetup(t, "mncW9")
+		b := ncNewDevice(t, s, a.name, a.pass)
+		b.fixture(t)
+		b.login(h1)
+		ncPushOK(t, b, "B's first seal")
+		a.put("Android/data/com.example.ncapp/files/n6.bin", "an app file only A holds")
+		ncPushOK(t, a, "A's seal")
+		out := ncPushOK(t, b, "B's carry seal")
+		var nk []string
+		for _, l := range ncWhyLines(out) {
+			if strings.Contains(l, "record not kept: ") {
+				tok, _ := ncWhyToken(t, l)
+				nk = append(nk, tok)
+			}
+		}
+		if len(nk) != 1 || nk[0] != "not-landed" {
+			t.Fatalf("a missed materialise printed record-not-kept %v, want [not-landed]:\n%s", nk, out)
+		}
+		ncCheckWhyLines(t, b, out, "ncapp", "n6.bin")
+	})
+	t.Run("not-flushed", func(t *testing.T) {
+		s, a, _ := ncSetup(t, "mncW10")
+		a.putAt("Documents/d0/n000.txt", "changed so the push takes the full path", ncMtime.Add(72*time.Hour))
+		s.failRefPut.Store(true)
+		out, msg := a.push(t)
+		s.failRefPut.Store(false)
+		if msg == "" {
+			t.Fatalf("the push landed although every ref PUT failed -- this fixture proves nothing\n%s", out)
+		}
+		if n := strings.Count(out, "no-change record not kept: not-flushed (NWP-20261204-22)"); n != 1 {
+			t.Fatalf("a failed flush printed not-flushed %d time(s), want 1:\n%s", n, out)
+		}
+		ncCheckWhyLines(t, a, out)
+	})
+}
+
+// A push that ends after its walk, and the landed seal that wrote its record, print no reason line.
+func TestMediaNoChangeWhy_NoChangeLinePrintsNoReason(t *testing.T) {
+	ncEnv(t)
+	s := newNCStore(t)
+	name := "mncW11"
+	pass := "nochange pass " + name
+	createVault(s.base, name, pass)
+	a := ncNewDevice(t, s, name, pass)
+	a.fixture(t)
+	out := ncPushOK(t, a, "setup seal")
+	if ls := ncWhyLines(out); len(ls) != 1 || !strings.Contains(ls[0], "full path: no-record tombs=0") {
+		t.Fatalf("the first seal: want only `full path: no-record`, got %q\n%s", ls, out)
+	}
+	a.login(a.head("#media"))
+	out = ncPushOK(t, a, "the unchanged push")
+	if !strings.Contains(out, ncNoChangeMark) {
+		t.Fatalf("an unchanged push took the full path:\n%s", out)
+	}
+	if ls := ncWhyLines(out); len(ls) != 0 {
+		t.Fatalf("a no-change push printed a reason: %q", ls)
+	}
+}
+
+// The reason lines name no profile in clear, no rel, no head and no digest, and every token is in the closed set,
+// which has no duplicates.
+func TestMediaNoChangeWhy_TheLineNamesNothing(t *testing.T) {
+	seen := map[string]bool{}
+	for _, w := range mediaNoChangeWhy {
+		if w == "" || strings.ContainsAny(w, " \t\n%") || seen[w] {
+			t.Fatalf("mediaNoChangeWhy holds a bad or duplicate token %q", w)
+		}
+		seen[w] = true
+	}
+	_, a, _ := ncSetup(t, "mncW12")
+	tomb := ncTombFile(t, "DCIM/Camera/mncW12-gone.jpg\n")
+	t.Setenv("NOWHERE_MEDIA_TOMBSTONES", tomb)
+	out := ncPushOK(t, a, "the push after the tombstone")
+	if len(ncWhyLines(out)) == 0 {
+		t.Fatalf("the push after a tombstone printed no reason line:\n%s", out)
+	}
+	ncCheckWhyLines(t, a, out, "mncW12-gone")
+	if err := os.Remove(a.recordPath()); err != nil {
+		t.Fatal(err)
+	}
+	out = ncPushOK(t, a, "the push with no record")
+	if len(ncWhyLines(out)) == 0 {
+		t.Fatalf("the push with no record printed no reason line:\n%s", out)
+	}
+	ncCheckWhyLines(t, a, out, "mncW12-gone")
+}

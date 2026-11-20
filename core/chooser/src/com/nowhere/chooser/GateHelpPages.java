@@ -80,8 +80,8 @@ final class GateHelpPages {
             "Lock screen clock: show a dim clock while the phone is resting. Store settings: choose where profiles "
                     + "are saved. Backup: choose how often.",
             // buildOwnerMenu: settingsRow("System settings", "USB debugging, eSIM and more. ..."),
-            // settingsRow("Leave Nowhere", "Go back to the stock Android this phone shipped with")
-            "System settings: USB debugging, eSIM and more, for every profile. Leave Nowhere: go back to the stock "
+            // settingsRow("Leave nowhere", "Go back to the stock Android this phone shipped with")
+            "System settings: USB debugging, eSIM and more, for every profile. Leave nowhere: go back to the stock "
                     + "Android this phone shipped with.",
         },
         { // page 3: When the phone is locked
@@ -104,6 +104,11 @@ final class GateHelpPages {
     /** Page i: its steps, a blank line between them. An index outside the four pages throws. */
     static String body(int i) {
         return String.join("\n\n", STEPS[i]);
+    }
+
+    /** Page i's steps, a copy: the gate's topics show one a card (GateHelpTopic). An index outside the four pages throws. */
+    static String[] steps(int i) {
+        return STEPS[i].clone();
     }
 
     /** The title of the gate's Help list: the same as Profile › Help's. */

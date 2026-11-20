@@ -1,0 +1,12 @@
+# The two pins build-libwebrtc.sh builds from (NWP-20261210-12, docs/call-relay.md section 5.2 and slice R1).
+# The script reads these lines as data and never runs this file. Each value is a full 40-hex commit id.
+# To move a pin: read the new commit the same way, replace the line and say where you read it.
+#
+# WEBRTC_REV: the head of the WebRTC stable branch refs/branch-heads/8127 (Chrome milestone 158).
+#   Read 2026-11-18 with: git ls-remote https://webrtc.googlesource.com/src refs/branch-heads/8127
+#   The same commit is the "webrtc" hash of Chrome 158.0.8127.42, Stable on Android, read 2026-11-18 at
+#   https://chromiumdash.appspot.com/fetch_releases?channel=Stable&platform=Android&num=1
+WEBRTC_REV=fb1c41a93d92d4188f068f437d80ef2c4b50c3a9
+# DEPOT_TOOLS_REV: the head of depot_tools main, read 2026-11-18 with:
+#   git ls-remote https://chromium.googlesource.com/chromium/tools/depot_tools.git refs/heads/main
+DEPOT_TOOLS_REV=fed8b43f48c4f4c2ac0c34aafbf0ec07a4e600cb

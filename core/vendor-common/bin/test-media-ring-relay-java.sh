@@ -10,10 +10,16 @@
 # java.lang only) re-sends an unchanged value every RESEND_MS, the empty clear included; it is compiled here with its
 # cases. A pin over startMediaRingPoller's body requires the poller to send through the relay.
 #
+# A SECOND CAUSE (NWP-20261204-25). The poller was started only from the gate Activity's onCreate. The user-0 process is
+# android:persistent and restarts mid-session with no gate Activity (#141), so after such a restart no poller ran: the
+# reap watcher, started at process birth from NowhereApp, cleared the notice, and nothing re-sent the clear. The pins
+# now also require the user-0 guard and the started-flag guard first in startMediaRingPoller (static, takes a Context),
+# and a call from both NowhereApp.onCreate (inside a try) and ChooserActivity.onCreate.
+#
 # ⚠ IT FAILS WHEN THERE IS NO JAVAC, IT NEVER SKIPS. javac comes from PATH, else from the build host's JDK below;
 # the version is printed first so the log proves which compiler ran.
 #
-#   bash test-media-ring-relay-java.sh            # the cases and the pin
+#   bash test-media-ring-relay-java.sh            # the cases and the pins
 #   bash test-media-ring-relay-java.sh --mutate   # ... plus broken copies that must each FAIL
 set -uo pipefail
 
@@ -27,7 +33,8 @@ here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../../.." && pwd)
 SRC="$root/core/chooser/src/com/nowhere/chooser"
 SUT="$SRC/MediaRingRelay.java"
-CHOOSER="$SRC/ChooserActivity.java"
+CHOOSER="${CHOOSER:-$SRC/ChooserActivity.java}"
+NAPP="${NAPP:-$SRC/NowhereApp.java}"
 CASES="$root/core/chooser/tests/media-ring-relay/MediaRingRelayCases.java"
 HOST_JDK=/mnt/build/lineage/prebuilts/jdk/jdk21/linux-x86/bin
 
@@ -59,14 +66,26 @@ suite() {
   return 1
 }
 
+# strip <file> -> the file with comment lines blanked and trailing ` // ...` text cut, so a comment naming a call does
+# not satisfy a pin. Line numbers are kept.
+strip() { awk '{ if ($0 ~ /^[ \t]*(\/\/|\*|\/\*)/) print ""; else { sub(/[ \t]\/\/.*$/, ""); print } }' "$1"; }
+
 # pin <ChooserActivity.java> -> 0 when startMediaRingPoller sends through MediaRingRelay, 1 otherwise.
-# Comment lines are blanked and trailing ` // ...` text cut first, so a comment naming a call does not satisfy the pin.
 # The body runs from the method's signature to its closing `    }` (four spaces, the method indent).
 pin() {
-  local f="$1" body x nd nb ns bad=0
-  body=$(awk '{ if ($0 ~ /^[ \t]*(\/\/|\*|\/\*)/) print ""; else { sub(/[ \t]\/\/.*$/, ""); print } }' "$f" \
-    | awk '/private void startMediaRingPoller\(\)/ { on = 1 } on { print } on && /^    }$/ { exit }')
-  [ -n "$body" ] || { echo "  FAIL  pin: no private void startMediaRingPoller() in $f" >&2; return 1; }
+  local f="$1" body x nd nb ns nu nf nt bad=0
+  body=$(strip "$f" | awk '/static void startMediaRingPoller\(Context ctx\)/ { on = 1 } on { print } on && /^    }$/ { exit }')
+  [ -n "$body" ] || { echo "  FAIL  pin: no static void startMediaRingPoller(Context ctx) in $f" >&2; return 1; }
+  # NWP-20261204-25: two starters call it, so the user-0 guard and then the started-flag guard come before the thread.
+  nu=$(printf '%s\n' "$body" | awk 'index($0, "if (android.os.UserHandle.myUserId() != 0) return;") { print NR; exit }')
+  nf=$(printf '%s\n' "$body" | awk 'index($0, "if (mediaRingStarted) return;") { print NR; exit }')
+  nt=$(printf '%s\n' "$body" | awk 'index($0, "new Thread(") { print NR; exit }')
+  if [ -z "$nu" ] || [ -z "$nf" ] || [ -z "$nt" ]; then
+    echo "  FAIL  pin: startMediaRingPoller lacks the user-0 guard (${nu:-none}), the started-flag guard" \
+         "(${nf:-none}) or new Thread( (${nt:-none})" >&2; bad=1
+  elif ! { [ "$nu" -lt "$nf" ] && [ "$nf" -lt "$nt" ]; }; then
+    echo "  FAIL  pin: want user-0 guard ($nu) < started-flag guard ($nf) < new Thread( ($nt)" >&2; bad=1
+  fi
   for x in 'final MediaRingRelay relay = new MediaRingRelay();' 'if (uid < 0) { relay.reset(); continue; }' \
            'long now = android.os.SystemClock.elapsedRealtime();' 'if (!relay.due(prog, uid, now)) continue;' \
            'relay.sent(prog, uid, now);'; do
@@ -92,10 +111,44 @@ pin() {
   [ "$bad" -eq 0 ]
 }
 
+# pingate <ChooserActivity.java> -> 0 when the gate Activity's onCreate starts the ring poller, 1 otherwise.
+pingate() {
+  local body
+  body=$(strip "$1" | awk '/protected void onCreate\(Bundle b\) \{/ { on = 1 } on { print } on && /^    }$/ { exit }')
+  case "$body" in
+    *"startMediaRingPoller(this);"*) return 0 ;;
+    *) echo "  FAIL  pingate: ChooserActivity.onCreate does not call startMediaRingPoller(this)" >&2; return 1 ;;
+  esac
+}
+
+# pinapp <NowhereApp.java> -> 0 when NowhereApp.onCreate starts the ring poller inside its own try, 1 otherwise. A
+# restart of the persistent user-0 process during a session creates no gate Activity (#141, NWP-20261204-25).
+pinapp() {
+  local body n x
+  body=$(strip "$1" | awk '/public void onCreate\(\) \{/ { on = 1 } on { print } on && /^    }$/ { exit }')
+  x=$(printf '%s\n' "$body" | awk 'index($0, "ChooserActivity.startMediaRingPoller(this);") { k++ } END { print k + 0 }')
+  if [ "$x" -ne 1 ]; then
+    echo "  FAIL  pinapp: NowhereApp.onCreate does not start the ring poller inside a try" \
+         "(ChooserActivity.startMediaRingPoller(this); found $x time(s), want 1)" >&2; return 1
+  fi
+  n=$(printf '%s\n' "$body" | awk 'index($0, "ChooserActivity.startMediaRingPoller(this);") { print NR; exit }')
+  x=$(printf '%s\n' "$body" | awk -v n="$n" '
+    NR < n && $0 !~ /^[ \t]*$/ { prev = $0 }
+    NR == n + 1 { next1 = $0 }
+    END { print ((prev ~ /^[ \t]*try \{$/ && next1 ~ /^[ \t]*\} catch \(Throwable/) ? "yes" : "no") }')
+  [ "$x" = yes ] && return 0
+  echo "  FAIL  pinapp: NowhereApp.onCreate does not start the ring poller inside a try" >&2
+  return 1
+}
+
 echo "== $SUT"
 suite "$SUT" || { echo "FAILED"; exit 1; }
-pin "$CHOOSER" || { echo "FAILED (pin)"; exit 1; }
-echo "pin: ok"
+pbad=0
+pin "$CHOOSER" || { echo "FAILED (pin)"; pbad=1; }
+pingate "$CHOOSER" || { echo "FAILED (pingate)"; pbad=1; }
+pinapp "$NAPP" || { echo "FAILED (pinapp)"; pbad=1; }
+[ "$pbad" -eq 0 ] || exit 1
+echo "pin, pingate, pinapp: ok"
 echo "== all checks passed"
 [ "$MUTATE" = yes ] || exit 0
 
@@ -114,12 +167,24 @@ mut() { # mut <label> <perl-expr>   (mutates MediaRingRelay.java; the cases must
     *) echo "  BROKEN    $1 -- the mutant did not compile (rc=$rc)"; return 1 ;;
   esac
 }
-mutpin() { # mutpin <label> <perl-expr>   (mutates ChooserActivity.java; the pin must fail)
+mutpin() { # mutpin <label> <perl-expr>   (mutates ChooserActivity.java; pin or pingate must fail)
   local d c rc; d=$(mktemp -d -p "$W") || return 1; c="$d/ChooserActivity.java"
   cp "$CHOOSER" "$c"
   if ! perl -0pi -e "$2" "$c"; then echo "  ERROR     $1 -- perl failed on the mutation"; rm -rf "$d"; return 1; fi
   if cmp -s "$CHOOSER" "$c"; then echo "  INERT     $1 -- the mutation changed nothing"; rm -rf "$d"; return 1; fi
-  pin "$c" >/dev/null 2>&1; rc=$?
+  rc=0
+  pin "$c" >/dev/null 2>&1 || rc=1
+  pingate "$c" >/dev/null 2>&1 || rc=1
+  rm -rf "$d"
+  if [ "$rc" -eq 0 ]; then echo "  SURVIVED  $1"; return 1; fi
+  echo "  convicted $1"
+}
+mutapp() { # mutapp <label> <perl-expr>   (mutates NowhereApp.java; pinapp must fail)
+  local d c rc; d=$(mktemp -d -p "$W") || return 1; c="$d/NowhereApp.java"
+  cp "$NAPP" "$c"
+  if ! perl -0pi -e "$2" "$c"; then echo "  ERROR     $1 -- perl failed on the mutation"; rm -rf "$d"; return 1; fi
+  if cmp -s "$NAPP" "$c"; then echo "  INERT     $1 -- the mutation changed nothing"; rm -rf "$d"; return 1; fi
+  pinapp "$c" >/dev/null 2>&1; rc=$?
   rm -rf "$d"
   if [ "$rc" -eq 0 ]; then echo "  SURVIVED  $1"; return 1; fi
   echo "  convicted $1"
@@ -134,4 +199,8 @@ mut "M6 RESEND_MS stretched to a minute" 's/RESEND_MS = 10_000;/RESEND_MS = 60_0
 mutpin "M7 the poller records the send before the broadcast" 's/(\n[ ]*)(Intent mpi = new Intent\("app\.nowhere\.MEDIA_PROGRESS"\))/$1relay.sent(prog, uid, now);$1$2/; s/\n[ ]*relay\.sent\(prog, uid, now\); \/\/ a broadcast that threw[^\n]*//' || fails=$((fails+1))
 mutpin "M8 the poller never records a send" 's/\n[ ]*relay\.sent\(prog, uid, now\);[^\n]*//' || fails=$((fails+1))
 mutpin "M9 no session does not reset the relay" 's/if \(uid < 0\) \{ relay\.reset\(\); continue; \}/if (uid < 0) { continue; }/' || fails=$((fails+1))
+mutapp "M10 NowhereApp no longer starts the poller (pinapp)" 's/\n[ ]*ChooserActivity\.startMediaRingPoller\(this\);//' || fails=$((fails+1))
+mutpin "M11 the user-0 guard removed from startMediaRingPoller (pin)" 's/\n[ ]*if \(android\.os\.UserHandle\.myUserId\(\) != 0\) return;(\n[ ]*if \(mediaRingStarted\) return;)/$1/' || fails=$((fails+1))
+mutpin "M12 the started-flag guard removed (pin)" 's/\n[ ]*if \(mediaRingStarted\) return;//' || fails=$((fails+1))
+mutpin "M13 the gate's onCreate no longer starts the poller (pingate)" 's/\n[ ]*startMediaRingPoller\(this\);[^\n]*//' || fails=$((fails+1))
 [ "$fails" -eq 0 ] && echo "== all mutations convicted" || { echo "== $fails mutation(s) not convicted"; exit 1; }

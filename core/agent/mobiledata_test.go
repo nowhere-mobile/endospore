@@ -6,7 +6,6 @@ package main
 // once its session ended, a release at every end, and a verb that serves only the session in front.
 
 import (
-	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -36,21 +35,21 @@ func mdSetup(t *testing.T, reply string) *locRec {
 
 func TestMobileDataResumeClaimsAfterTheMarker(t *testing.T) {
 	l := crLock(t, crKinds[0])
-	rec := mdSetup(t, "OK APPLIED mobile_data=1")
+	rec := scSetup(t, "OK;OK;OK") // NWP-20261210-05: the claim is one part of the session's sessclaim run
 	f := &crFake{mode: "keyguard", keyguard: l.keyguard, hmacHex: l.h1}
 	crStartFake(t, l.dest, f)
 	if got := crResume(t, l.dest, l.unlock); got != "OK 10" {
 		t.Fatalf("the resume was refused (%q)", got)
 	}
 	c := rec.wait(t, "a resume")
-	if c.op != "mdapply" || c.why != "resume" || c.uid != "10" || c.live != "10" || c.coldlock {
-		t.Errorf("worker asked %+v, want mdapply/resume for user 10, recorded and no longer cold-locked", c)
+	if !strings.Contains(","+c.parts+",", ",md,") || c.why != "resume" || c.uid != "10" || c.live != "10" || c.coldlock {
+		t.Errorf("worker asked %+v, want sessclaim/resume with md for user 10, recorded and no longer cold-locked", c)
 	}
 }
 
 func TestMobileDataRefusedResumeClaimsNothing(t *testing.T) {
 	l := crLock(t, crKinds[0])
-	rec := mdSetup(t, "OK APPLIED mobile_data=1")
+	rec := scSetup(t, "OK;OK;OK") // NWP-20261210-05: the claim is one part of the session's sessclaim run
 	f := &crFake{mode: "keyguard", keyguard: l.keyguard, hmacHex: l.h1}
 	crStartFake(t, l.dest, f)
 	if got := crResume(t, l.dest, "not-the-passphrase"); got == "OK 10" {
@@ -63,18 +62,13 @@ func TestMobileDataOfflineSignInClaimsAfterTheMarker(t *testing.T) {
 	dest := t.TempDir()
 	stop := ropWorker(t, dest)
 	defer stop()
-	rec := mdSetup(t, "OK APPLIED mobile_data=1")
-	cli, srv := net.Pipe()
-	go func() { handleRoamInOffline(srv, dest, "alice", "correct horse battery", "12"); srv.Close() }()
-	buf := make([]byte, 64)
-	nr, _ := cli.Read(buf)
-	cli.Close()
-	if got := strings.TrimSpace(string(buf[:nr])); got != "OK 12" {
+	rec := scSetup(t, "OK;OK;OK") // NWP-20261210-05: the claim is one part of the session's sessclaim run
+	if got := scOffline(t, dest, "alice"); got != "OK 12" {
 		t.Fatalf("offline sign-in replied %q", got)
 	}
 	c := rec.wait(t, "an offline sign-in")
-	if c.op != "mdapply" || c.why != "offline" || c.uid != "12" || c.live != "12" {
-		t.Errorf("worker asked %+v, want mdapply/offline for user 12 with .roamsession naming it", c)
+	if !strings.Contains(","+c.parts+",", ",md,") || c.why != "offline" || c.uid != "12" || c.live != "12" {
+		t.Errorf("worker asked %+v, want sessclaim/offline with md for user 12 with .roamsession naming it", c)
 	}
 }
 
@@ -271,12 +265,17 @@ func TestMobileDataVerbServesOnlyTheSessionInFront(t *testing.T) {
 }
 
 func TestMobileDataHelpersAreInertWithoutSupport(t *testing.T) {
+	sc := scSetup(t, "OK;OK;OK")
 	rec := mdSetup(t, "OK")
 	mobileDataSupported = func() bool { return false }
+	// NWP-20261210-05: a session start makes one sessclaim run, and without support it asks for no md part.
+	claimSessionGlobalsAsync(t.TempDir(), "10", "signin")
+	if c := sc.wait(t, "a session start"); strings.Contains(","+c.parts+",", ",md,") {
+		t.Errorf("without support the sessclaim asked for parts %q", c.parts)
+	}
 	if got := claimMobileData(t.TempDir(), "10", "live"); got != "NONE" {
 		t.Errorf("claimMobileData = %q", got)
 	}
-	claimMobileDataAsync(t.TempDir(), "10", "signin")
 	releaseMobileDataAsync(t.TempDir(), "10", "signout")
 	prevW := coldLockWorker
 	asked := 0
@@ -315,7 +314,7 @@ func TestMobileDataEverySignInClaimsAfterTheMarker(t *testing.T) {
 	in := fn("func handleRoamIn(", "func handleRoamInOffline(")
 	mark := at(in, "handleRoamIn", "if err := markRoamSession(dest, name, pass, uid, seSecret); err != nil {")
 	refused := at(in, "handleRoamIn", `fmt.Fprint(conn, "ERR-UNRECORDED\n")`)
-	claim := at(in, "handleRoamIn", `claimMobileDataAsync(dest, uid, "signin")`)
+	claim := at(in, "handleRoamIn", `claimSessionGlobalsAsync(dest, uid, "signin")`)
 	throwaway := at(in, "handleRoamIn", `if head == "" {`+"\n\t\t\tmarkLocalSession(dest)")
 	if !(mark < refused && refused < claim && claim < throwaway) {
 		t.Errorf("sign-in order: marker %d, refusal %d, claim %d, throwaway branch %d", mark, refused, claim, throwaway)
@@ -323,14 +322,14 @@ func TestMobileDataEverySignInClaimsAfterTheMarker(t *testing.T) {
 	off := fn("func handleRoamInOffline(", "func handleRelogin(")
 	mark = at(off, "handleRoamInOffline", `if err := markRoamSession(dest, name, pass, uid, ""); err != nil {`)
 	refused = at(off, "handleRoamInOffline", `fmt.Fprint(conn, "ERR-UNRECORDED\n")`)
-	claim = at(off, "handleRoamInOffline", `claimMobileDataAsync(dest, uid, "offline")`)
+	claim = at(off, "handleRoamInOffline", `claimSessionGlobalsAsync(dest, uid, "offline")`)
 	if !(mark < refused && refused < claim) {
 		t.Errorf("offline order: marker %d, refusal %d, claim %d", mark, refused, claim)
 	}
 	res := fn("func handleResume(", "func purgeLocalProfileState(")
 	mark = at(res, "handleResume", "if err := markRoamSession(dest, name, pass, uid, se); err != nil {")
 	gone := at(res, "handleResume", `os.Remove(filepath.Join(dest, ".coldlock"))`)
-	claim = at(res, "handleResume", `claimMobileDataAsync(dest, uid, "resume")`)
+	claim = at(res, "handleResume", `claimSessionGlobalsAsync(dest, uid, "resume")`)
 	if !(mark < gone && gone < claim) {
 		t.Errorf("resume order: marker %d, cold-lock marker removed %d, claim %d", mark, gone, claim)
 	}

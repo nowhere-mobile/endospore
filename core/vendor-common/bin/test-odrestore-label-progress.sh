@@ -14,18 +14,21 @@
 # external volumes' restorecon are counted too; this suite stubs reown_restored and runs the CE volume only, so
 # test-odrestore-handback-progress.sh covers those two walks.
 #
-# This suite EXECUTES the real extracted mi_path, relabel_restored, od_relabel, od_label_done, od_label_watched,
-# cutoff_prog and odrestore arm under every shell found (the device's is mksh). PATH stubs `find`, `chcon` and `stat`
-# stand in for toybox; the find stub runs the REAL `sh -c` of the counted walk over batches of fake names. A wrapper
-# over od_label_done counts the reads, and the find stub releases batch i only after read i; the wrapper returns only
+# This suite EXECUTES the real extracted mi_path, od_walk, relabel_restored, od_relabel, od_label_done,
+# od_label_watched, cutoff_prog and odrestore arm under every shell found (the device's is mksh). PATH stubs `find`,
+# `xargs`, `chcon` and `stat` stand in for toybox; the walk is od_walk's `find -print0 | xargs -0 -r -n 256 sh -c`
+# (NWP-20261209-04), and the xargs stub runs its REAL batch script over batches of fake names. A wrapper over
+# od_label_done counts the reads, and the xargs stub releases batch i only after read i; the wrapper returns only
 # after that batch ended. So the batches move in lockstep with the reads (never with sleeps), and no assertion depends
 # on how many polls land in a stretch of time:
 #   L1 GROWTH: 3 batches, each after a read -> at least 3 progress lines after the volume's own line
 #   L2 NO GROWTH: the label step runs for 3 reads with no batch -> no line after the volume's own
 #   L3 ORDER and STATUS: the hold is in place at every read and when the walk starts, and gone after the label step;
 #      od_label_watched returns the relabel's status (1 for an unexpected dir context), background and foreground
-#   L4 UNSET: relabel_restored with OD_LABEL_COUNT unset or empty runs main's walk, `-exec chcon -h <ctx> {} +`
-#   L5 $STATE unwritable: the pair runs in the foreground, main's walk, no count file, no read
+#   L4 UNSET: relabel_restored with OD_LABEL_COUNT unset or empty runs the same bounded walk uncounted: od_walk's
+#      `chcon -h <ctx>` batches over the entries `find <dir> -xdev ! -context <ctx>` lists, no count file
+#   L5 $STATE unwritable: the pair runs in the foreground with no read; the relabel has no find-status file to make,
+#      so it runs no walk and fails with 2 (NWP-20261209-04), and the arm KEEPS the hold and answers ERR-NOTREADY
 #   L6 nothing is left in $STATE; no progress line or count-file line names the package or a path; the
 #      `relabelled <n> restored entr(ies)` line is unchanged
 #
@@ -67,7 +70,7 @@ arm_of() { awk -v a="  $2)" '$0 == a {f=1} f{print} f&&/^    ;;$/{exit}' "$1"; }
 nleft() { printf '%s\n' "$1" | sed -E 's/(^|[[:space:]])#.*$//' | sed 's#\$ROOT/data/##g' | grep -cE '(^|[^[:alnum:]_])/data/'; }
 
 suite() {  # suite <roamd.sh> [quiet] -> 0 all ok, 1 a case failed, 2 the harness could not run
-  local f="$1" quiet="${2:-}" p=0 x=0 ODH PKGOK ARM ARMR PROG MIP RR ODR ODRR OLD OLW n sh L R HARN="" CE D H
+  local f="$1" quiet="${2:-}" p=0 x=0 ODH PKGOK ARM ARMR PROG MIP OW RR ODR ODRR OLD OLW n sh L R HARN="" CE D H
   say() { [ -n "$quiet" ] || printf '%s\n' "$1"; }
   chk() {
     local l="$1"; shift
@@ -77,6 +80,7 @@ suite() {  # suite <roamd.sh> [quiet] -> 0 all ok, 1 a case failed, 2 the harnes
   absent() { [ ! -e "$1" ]; }
   atleast() { [ "$1" -ge "$2" ]; }
   has() { grep -qF -- "$2" "$1" 2>/dev/null; }
+  hasnot() { ! grep -qF -- "$2" "$1" 2>/dev/null; }
   clean() { [ -f "$1" ] && ! grep -qF -- "$PKG" "$1" && ! grep -qF / "$1"; }
   digits() { [ -f "$1" ] && ! grep -qv '^[0-9][0-9]*$' "$1"; }
 
@@ -85,6 +89,7 @@ suite() {  # suite <roamd.sh> [quiet] -> 0 all ok, 1 a case failed, 2 the harnes
   PROG=$(anchor_of "$f" 'cutoff_prog() {')
   PKGOK=$(anchor_of "$f" 'pkgname_ok() {')
   MIP=$(anchor_of "$f" 'mi_path() {')
+  OW=$(anchor_of "$f" 'od_walk() {')
   RR=$(anchor_of "$f" 'relabel_restored() {')
   ODR=$(anchor_of "$f" 'od_relabel() {')
   # od_label_done and od_label_watched are absent before NWP-20261202-32: define nothing, so the cases RUN against
@@ -96,14 +101,18 @@ suite() {  # suite <roamd.sh> [quiet] -> 0 all ok, 1 a case failed, 2 the harnes
   case "$ARM" in *'echo "ERR-PKG" > "$RES"'*'echo "OK NOSRC" > "$RES"'*'echo "ERR-NOTREADY" > "$RES"'*) ;; *) echo "EXTRACTION FAILED: the odrestore arm in $f" >&2; return 2 ;; esac
   case "$PROG" in *'NOWHERE_PROGRESS.tmp'*'mv -f'*) ;; *) echo "EXTRACTION FAILED: cutoff_prog in $f" >&2; return 2 ;; esac
   case "$MIP" in *'sed'*) ;; *) echo "EXTRACTION FAILED: mi_path in $f" >&2; return 2 ;; esac
-  case "$RR" in *'stat -c '\''%C'\'' "$d"'*'-exec chcon -h "$ctx" {} +'*'relabelled $n restored entr(ies)'*) ;; *) echo "EXTRACTION FAILED: relabel_restored in $f" >&2; return 2 ;; esac
-  case "$ODR" in *'/data/media/*)'*'restorecon -R "$2"'*'relabel_restored "$2"'*) ;; *) echo "EXTRACTION FAILED: od_relabel in $f" >&2; return 2 ;; esac
+  case "$OW" in *'done < /proc/self/mountinfo'*'find "$root" "$@" -print0'*'xargs -0 -r -n 256 sh -c'*) ;; *) echo "EXTRACTION FAILED: od_walk in $f" >&2; return 2 ;; esac
+  case "$RR" in *'stat -c '\''%C'\'' "$d"'*'od_walk '*'chcon'*'relabelled $n restored entr(ies)'*) ;; *) echo "EXTRACTION FAILED: relabel_restored in $f" >&2; return 2 ;; esac
+  case "$ODR" in *'/data/media/*)'*'od_walk prune 1 restorecon "$2"'*'relabel_restored "$2"'*) ;; *) echo "EXTRACTION FAILED: od_relabel in $f" >&2; return 2 ;; esac
   case "$OLD" in ''|*'done < "$1"'*) ;; *) echo "EXTRACTION FAILED: od_label_done in $f" >&2; return 2 ;; esac
   case "$OLW" in ''|*'od_relabel "$vol" "$dst"'*) ;; *) echo "EXTRACTION FAILED: od_label_watched in $f" >&2; return 2 ;; esac
   # The wrapper below counts each read: the real reader is renamed, so a call to od_label_done goes through it.
   [ -z "$OLD" ] || OLD=$(printf '%s\n' "$OLD" | sed '1s/^od_label_done() {$/od_label_done_real() {/')
   ODRR=$(printf '%s\n' "$ODR" | sed 's#^    /data/media/#    $ROOT/data/media/#')
-  for n in "$RR" "$ODRR" "$OLD" "$OLW"; do
+  # od_walk's prune reads the mount table: the case root's own (empty) one, so no host mount reaches a walk.
+  OW=$(printf '%s\n' "$OW" | sed 's#done < /proc/self/mountinfo$#done < "$ROOT/sim/mountinfo"#')
+  case "$OW" in *'done < "$ROOT/sim/mountinfo"'*) ;; *) echo "RE-ROOT FAILED: od_walk's mountinfo" >&2; return 2 ;; esac
+  for n in "$OW" "$RR" "$ODRR" "$OLD" "$OLW"; do
     [ "$(nleft "$n")" = 0 ] || { echo "RE-ROOT INCOMPLETE: a label-step function holds an absolute /data path" >&2; return 2; }
   done
   ARMR=$(printf '%s\n' "$ARM" | sed -E 's#([" |])/data/#\1$ROOT/data/#g')
@@ -118,6 +127,7 @@ suite() {  # suite <roamd.sh> [quiet] -> 0 all ok, 1 a case failed, 2 the harnes
              "$R/data/user_de/$UID_" "$R/data/media/$UID_/Android/data" "$R/data/media/$UID_/Android/obb"
     : > "$R/sim/owners"; : > "$R/sim/reads"; : > "$R/sim/batches"; : > "$R/sim/badctx"; : > "$R/sim/calls"
     : > "$R/sim/findargv"; : > "$R/sim/chcon"; : > "$R/sim/holdseen"; echo grow > "$R/sim/findmode"
+    : > "$R/sim/mountinfo"; : > "$R/sim/walkargv"
     echo "$PKG $APPID 0 /data/user/0/$PKG default:targetSdkVersion=34 none 0 1 1234" > "$R/data/system/packages.list"
     # stat: -c %C prints the app context, or a system one for a dir listed in sim/badctx; -c %u reads sim/owners.
     cat > "$R/bin/stat" <<EOF
@@ -129,23 +139,35 @@ esac
 EOF
     # chcon: records the size of each call
     printf '#!/bin/sh\necho "chcon $#" >> "%s"\n' "$R/sim/chcon" > "$R/bin/chcon"
-    # find: records its argv (tab-joined) and, for the walk's -exec, the count file it was handed. A -print walk
-    # prints NENT entries. An -exec walk that runs `sh` is the counted walk: in mode grow it runs batch i (2 names)
-    # after read i and records it in sim/batches, then waits for the read that sees the last batch; in mode flat it
-    # waits for 3 reads and labels nothing. Any other -exec runs once over NENT names. 60 s safety exit.
+    # find: records its argv (tab-joined). A -print listing prints NENT entries and exits 0. A -print0 walk (od_walk's)
+    # writes its root, NUL-terminated, for the xargs stub, and exits 0.
     cat > "$R/bin/find" <<EOF
 #!/usr/bin/env bash
 S="$R/sim"
 { for a in "\$@"; do printf '%s\t' "\$a"; done; echo; } >> "\$S/findargv"
-d="\$1"; cmd=(); ex=0; pr=0
-for a in "\$@"; do
-  if [ "\$ex" = 1 ]; then [ "\$a" = "{}" ] && ex=2 || cmd+=("\$a"); continue; fi
-  case "\$a" in -exec) [ "\$ex" = 0 ] && ex=1 ;; -print) pr=1 ;; esac
-done
+d="\$1"; pr=0; p0=0
+for a in "\$@"; do case "\$a" in -print) pr=1 ;; -print0) p0=1 ;; esac; done
 if [ "\$pr" = 1 ]; then i=0; while [ "\$i" -lt $NENT ]; do echo "\$d/e\$i"; i=\$((i+1)); done; exit 0; fi
-[ "\${#cmd[@]}" -gt 0 ] || exit 0
-echo "\${OD_LABEL_COUNT-unset}" > "\$S/countenv"
-[ -d "\$HOLD" ] && echo held > "\$S/holdatfind" || echo gone > "\$S/holdatfind"
+[ "\$p0" = 1 ] && printf '%s\0' "\$d"
+exit 0
+EOF
+    # xargs: od_walk's `xargs -0 -r -n 256 sh -c SCRIPT od_walk K W1 W2 W3`; any other argv is recorded in sim/xargsbad
+    # and fails. It reads the walk's root (the first NUL name) and drains the rest; records the walk's words (K W1 W2
+    # W3, tab-joined) in sim/walkargv, the count file it was handed in sim/countenv (`none` when unset or empty) and
+    # whether the hold is in place in sim/holdatwalk; then runs the REAL batch script per batch: in mode grow batch i
+    # (2 names) after read i, recorded in sim/batches, then it waits for the read that sees the last batch; in mode
+    # flat it waits for 3 reads and labels nothing; in mode all it runs one batch over NENT names. 60 s safety exit.
+    cat > "$R/bin/xargs" <<EOF
+#!/usr/bin/env bash
+S="$R/sim"
+if [ "\$#" -lt 10 ] || [ "\$1 \$2 \$3 \$4 \$5 \$6 \$8" != "-0 -r -n 256 sh -c od_walk" ]; then
+  { for a in "\$@"; do printf '%s\t' "\$a"; done; echo; } >> "\$S/xargsbad"; cat > /dev/null; exit 2
+fi
+shift 4; cmd=("\$@")
+d=; IFS= read -r -d '' d; cat > /dev/null
+printf '%s\t' "\${cmd[@]:4}" >> "\$S/walkargv"; echo >> "\$S/walkargv"
+echo "\${OD_LABEL_COUNT:-none}" > "\$S/countenv"
+[ -d "\$HOLD" ] && echo held > "\$S/holdatwalk" || echo gone > "\$S/holdatwalk"
 waitr() {
   local i=0
   while [ "\$(grep -c . "\$S/reads")" -lt "\$1" ]; do
@@ -153,19 +175,17 @@ waitr() {
     sleep 0.1
   done
 }
-if [ "\${cmd[0]}" = sh ]; then
-  case "\$(cat "\$S/findmode")" in
-    grow) for k in 1 2 3; do waitr "\$k" || break; "\${cmd[@]}" "\$d/b\${k}a" "\$d/b\${k}b"; echo "\$k" >> "\$S/batches"; done
-          waitr 4 ;;
-    flat) waitr 3 ;;
-  esac
-  [ -n "\${OD_LABEL_COUNT:-}" ] && [ -f "\$OD_LABEL_COUNT" ] && cat "\$OD_LABEL_COUNT" > "\$S/countseen"
-else
-  "\${cmd[@]}" \$(i=0; while [ "\$i" -lt $NENT ]; do echo "\$d/e\$i"; i=\$((i+1)); done)
-fi
-exit 0
+rc=0
+case "\$(cat "\$S/findmode")" in
+  grow) for k in 1 2 3; do waitr "\$k" || break; "\${cmd[@]}" "\$d/b\${k}a" "\$d/b\${k}b" || rc=123; echo "\$k" >> "\$S/batches"; done
+        waitr 4 ;;
+  flat) waitr 3 ;;
+  all) "\${cmd[@]}" \$(i=0; while [ "\$i" -lt $NENT ]; do echo "\$d/e\$i"; i=\$((i+1)); done) || rc=123 ;;
+esac
+[ -n "\${OD_LABEL_COUNT:-}" ] && [ -f "\$OD_LABEL_COUNT" ] && cat "\$OD_LABEL_COUNT" > "\$S/countseen"
+exit "\$rc"
 EOF
-    chmod +x "$R/bin/stat" "$R/bin/chcon" "$R/bin/find"
+    chmod +x "$R/bin/stat" "$R/bin/chcon" "$R/bin/find" "$R/bin/xargs"
   }
   # plant <vol>: a hold for $PKG on that volume and an app-owned (empty) destination
   plant() {
@@ -192,6 +212,7 @@ grant_perms_for() { :; }
 keystore_register() { :; }
 pm() { case "$*" in "list packages -U "*) echo "package:$srcunit uid:1110234" ;; esac; return 0; }
 reown_ext_appdata() { :; }
+od_extdata_watched() { reown_ext_appdata "$1"; restorecon -R -D "$ROOT/data/media/$uid/Android/data/$1" 2>>"$LOG"; }   # NWP-20261208-13: the no-count-file pair
 wait_acct_authenticator() { :; }
 acct_reload() { :; }
 sync_apply() { :; }
@@ -222,7 +243,7 @@ od_label_done() {
   echo "$t"
 }
 EOF
-      printf '%s\n' "$ODH" "$PKGOK" "$PROG" "$MIP" "$RR" "$ODRR" "$OLD" "$OLW"
+      printf '%s\n' "$ODH" "$PKGOK" "$PROG" "$MIP" "$OW" "$RR" "$ODRR" "$OLD" "$OLW"
       printf '%s\n' "$3"
     } > "$1/driver.sh"
   }
@@ -238,7 +259,7 @@ EOF
   ticks() { local l; l=$(val "$R/prog"); case "$l" in "cutoff od "*) echo $(( ${l#cutoff od } - 1 )) ;; *) echo -1 ;; esac; }
   reads() { grep -c . "$R/sim/reads"; }
   left() { ls -A "$R/state" | tr '\n' ' '; }
-  execargv() { grep -F "$(printf '\t-exec\t')" "$R/sim/findargv"; }
+  walkfind() { grep -F "$(printf '\t-print0\t')" "$R/sim/findargv"; }
   CE="user/$UID_"
   # direct <dst>: a body that calls od_label_watched on the CE volume and records its status (none when it is absent)
   direct() {
@@ -253,11 +274,12 @@ EOF
     run "$sh" "$R/state" "$ARMBODY"
     chk "$L L1 at least 3 progress lines after the volume's own" atleast "$(ticks)" 3
     chk "$L L1 the walk never hit its safety exit" absent "$R/sim/timeout"
+    chk "$L L1 the walk is xargs -0 -r -n 256 sh -c <batch script> od_walk" absent "$R/sim/xargsbad"
     chk "$L L1 the restore is logged" has "$R/roam.log" "odrestore $PKG ($R/data/$CE) restored+reowned"
     chk "$L L1 the reply is OK $PKG" eqv "$(val "$R/res")" "OK $PKG"
     chk "$L L1 the 3 batches ran chcon" eqv "$(grep -c '^chcon 4$' "$R/sim/chcon")" 3
     chk "$L L3 the hold is in place at every read" eqv "$(sort -u "$R/sim/holdseen")" held
-    chk "$L L3 the hold is in place when the walk starts" eqv "$(val "$R/sim/holdatfind")" held
+    chk "$L L3 the hold is in place when the walk starts" eqv "$(val "$R/sim/holdatwalk")" held
     chk "$L L3 reown ran on \$dst with the hold in place" has "$R/sim/calls" "reown $D held"
     chk "$L L3 the hold is gone after the label step" absent "$H"
     chk "$L L6 no count file is left in \$STATE (L1)" eqv "$(left)" ""
@@ -285,28 +307,33 @@ EOF
     run "$sh" "$R/statefile" "$(direct "$D")"
     chk "$L L3 the foreground form returns the relabel's 1" eqv "$(val "$R/sim/rc")" 1
 
-    say "== $sh L4: OD_LABEL_COUNT unset or empty -> main's walk =="
+    say "== $sh L4: OD_LABEL_COUNT unset or empty -> the same bounded walk, uncounted =="
     for n in unset empty; do
-      mkroot; mkdir -p "$R/data/$CE/$PKG"; D="$R/data/$CE/$PKG"
+      mkroot; mkdir -p "$R/data/$CE/$PKG"; D="$R/data/$CE/$PKG"; echo all > "$R/sim/findmode"
       if [ "$n" = unset ]; then
         run "$sh" "$R/state" "unset OD_LABEL_COUNT; relabel_restored '$D'"
       else
         run "$sh" "$R/state" "OD_LABEL_COUNT=; export OD_LABEL_COUNT; relabel_restored '$D'"
       fi
-      chk "$L L4 ($n) the walk is -exec chcon -h <ctx> {} +" eqv "$(execargv)" "$(printf '%s\t' "$D" -xdev ! -context "$CTX" -exec chcon -h "$CTX" {} +)"
+      chk "$L L4 ($n) the walk lists <dir> -xdev ! -context <ctx>, NUL-terminated" eqv "$(walkfind)" "$(printf '%s\t' "$D" -xdev ! -context "$CTX" -print0)"
+      chk "$L L4 ($n) each batch is chcon -h <ctx>, through xargs -0 -r -n 256" eqv "$(val "$R/sim/walkargv")$(val "$R/sim/xargsbad")" "$(printf '%s\t' 3 chcon -h "$CTX")-"
+      chk "$L L4 ($n) the walk had no count file" eqv "$(val "$R/sim/countenv")" none
       chk "$L L4 ($n) chcon ran over the entries" eqv "$(val "$R/sim/chcon")" "chcon $((NENT + 2))"
       chk "$L L4 ($n) the relabelled line is unchanged" has "$R/roam.log" "$RLOG"
     done
 
-    say "== $sh L5: \$STATE unwritable -> the pair runs in the foreground, main's walk =="
-    mkroot; plant "$CE"; D="$R/data/$CE/$PKG"; : > "$R/statefile"
+    say "== $sh L5: \$STATE unwritable -> the pair runs in the foreground; the relabel cannot run, the hold is kept =="
+    mkroot; plant "$CE"; D="$R/data/$CE/$PKG"; H="$R/data/$CE/com.nowhere.chooser/.nowhere-odhold/$PKG"; : > "$R/statefile"
     run "$sh" "$R/statefile" "$ARMBODY"
     chk "$L L5 reown ran on \$dst" has "$R/sim/calls" "reown $D held"
-    chk "$L L5 the walk is main's -exec chcon" eqv "$(execargv)" "$(printf '%s\t' "$D" -xdev ! -context "$CTX" -exec chcon -h "$CTX" {} +)"
-    chk "$L L5 the walk had no count file" eqv "$(val "$R/sim/countenv")" unset
+    chk "$L L5 no listing and no walk (no find-status file can be made)" eqv "$(val "$R/sim/findargv")" ""
     chk "$L L5 no read" eqv "$(reads)" 0
-    chk "$L L5 the restore is logged" has "$R/roam.log" "odrestore $PKG ($R/data/$CE) restored+reowned"
-    chk "$L L5 the relabelled line is unchanged" has "$R/roam.log" "$RLOG"
+    chk "$L L5 the relabel logged that it has no status file" has "$R/roam.log" "WARN relabel: no status file -- not relabelled, status 2"
+    chk "$L L5 the hand-back failure is logged" has "$R/roam.log" "odrestore $PKG ($R/data/$CE) hand-back FAILED -- hold KEPT"
+    chk "$L L5 the hold is kept" eqv "$(ls -A "$H/files" 2>/dev/null)" f.txt
+    chk "$L L5 the reply is ERR-NOTREADY" eqv "$(val "$R/res")" ERR-NOTREADY
+    chk "$L L5 no relabelled line" hasnot "$R/roam.log" "relabelled "
+    chk "$L L5 the restore is not logged as restored" hasnot "$R/roam.log" "odrestore $PKG ($R/data/$CE) restored+reowned"
   done
 
   [ -z "$HARN" ] || { echo "HARNESS ERROR:$HARN" >&2; return 2; }
@@ -345,10 +372,10 @@ mutate() {  # mutate <id> <label> <convicting assertion> <fn> <from> <to>
   if [ -n "$miss" ]; then echo "  FAIL  NOT CONVICTED by $by under:$miss: $id $label"; MF=$((MF+1)); else echo "  ok    convicted by $by: $id $label"; fi
 }
 L_TICK='    if [ "$cur" -gt "$last" ]; then cutoff_prog od; last=$cur; fi'
-L_BG='  ( export OD_LABEL_COUNT="$cnt" OD_LABEL_LOG="$LOG"; reown_restored "$dst"; od_relabel "$vol" "$dst" ) &'
+L_BG='  ( export OD_LABEL_COUNT="$cnt" OD_LABEL_LOG="$LOG"; OD_OKDEFER=1; OD_OKBUF=; reown_restored "$dst"; r=$?'
 L_WAIT='  wait "$pid"; rc=$?'
 L_RM='  rm -f "$cnt"'
-L_IF='  if [ -n "${OD_LABEL_COUNT:-}" ]; then'
+L_WALK='  if [ "$n" -gt 0 ]; then'
 # The control: replacing a line with itself must reproduce roamd byte for byte.
 c=$(mktemp -p "$W") || exit 2
 if ! xform od_label_watched "$L_TICK" "$L_TICK" > "$c" || ! cmp -s "$SUT" "$c"; then
@@ -357,10 +384,10 @@ fi
 mutate m1 "a line on every poll instead of on growth" L2 od_label_watched "$L_TICK" '    cutoff_prog od; last=$cur'
 mutate m2 "no line on growth" L1 od_label_watched "$L_TICK" '    if [ "$cur" -gt "$last" ]; then last=$cur; fi'
 mutate m3 "the count file is not exported to the walk" L1 od_label_watched "$L_BG" \
-  '  ( OD_LABEL_COUNT="$cnt" OD_LABEL_LOG="$LOG"; reown_restored "$dst"; od_relabel "$vol" "$dst" ) &'
+  '  ( OD_LABEL_COUNT="$cnt" OD_LABEL_LOG="$LOG"; OD_OKDEFER=1; OD_OKBUF=; reown_restored "$dst"; r=$?'
 mutate m4 "growth compared with -ge" L2 od_label_watched "$L_TICK" '    if [ "$cur" -ge "$last" ]; then cutoff_prog od; last=$cur; fi'
 mutate m5 "the job's status is not waited for" L3 od_label_watched "$L_WAIT" '  rc=0'
-mutate m6 "the counted walk runs with the count unset" L4 relabel_restored "$L_IF" '  if :; then'
+mutate m6 "the uncounted form runs no walk" L4 relabel_restored "$L_WALK" '  if [ -n "${OD_LABEL_COUNT:-}" ] && [ "$n" -gt 0 ]; then'
 mutate m7 "the count file is not removed" L6 od_label_watched "$L_RM" DEL
 
 echo

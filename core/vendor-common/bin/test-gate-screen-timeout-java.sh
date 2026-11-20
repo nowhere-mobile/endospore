@@ -6,7 +6,8 @@
 # wiring cases cannot see (the onCreate call and its place after the push-doze line, the guarded write of
 # Settings.System.SCREEN_OFF_TIMEOUT, the off-UI-thread Thread, and that nothing else in the chooser writes it: the only
 # other writer allowed is ensureSessionScreenTimeout, a new session's 1 min, NWP-20261113-13, which
-# test-session-screen-timeout-java.sh pins).
+# test-session-screen-timeout-java.sh pins, and the settings allowlist's generic apply (SettingsRoam, a list row, not a
+# literal; NWP-20261207-13).
 #
 # ⚠ IT FAILS WHEN THERE IS NO JAVAC, IT NEVER SKIPS. javac comes from PATH, else from the build host's JDK below.
 #
@@ -78,7 +79,8 @@ suite() {
   printf '%s' "$b" | perl -0ne 'exit(/new Thread\(\(\) -> \{.*?Settings\.System\.putInt\(.*?\}, "nowhere-gate-screen-timeout"\)\.start\(\);/s ? 0 : 1)' || {
     echo "  PIN P3 the write does not sit between new Thread(() -> { and }, \"nowhere-gate-screen-timeout\").start();" >&2; return 1; }
   # P4: no other write of the setting in the chooser sources: ChooserActivity may write it only inside
-  # ensureGateScreenTimeout (the gate's 30 s) and ensureSessionScreenTimeout (a new session's 1 min, NWP-20261113-13)
+  # ensureGateScreenTimeout (the gate's 30 s) and ensureSessionScreenTimeout (a new session's 1 min, NWP-20261113-13),
+  # and the settings allowlist's generic apply (SettingsRoam, a list row, not a literal; NWP-20261207-13)
   for src in "$dir"/*.java; do
     [ "$(basename "$src")" = ChooserActivity.java ] && continue
     if perl -0ne 'exit(/put(Int|Long|String)\s*\([^;]*(SCREEN_OFF_TIMEOUT|"screen_off_timeout")|settings put system screen_off_timeout/ ? 0 : 1)' "$src"; then

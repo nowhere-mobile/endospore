@@ -128,7 +128,7 @@ pins() {
   for a in WRITE_AND_SAVE ASK; do
     case "$a" in
       WRITE_AND_SAVE) arm=$(printf '%s\n' "$b" | awk '/case WRITE_AND_SAVE:/ { f = 1 } f { print } f && /break;/ { exit }') ;;
-      ASK) arm=$(printf '%s\n' "$b" | awk '/case ASK:/ { f = 1 } f { print } f && /\.setNegativeButton\(/ { exit }') ;;
+      ASK) arm=$(printf '%s\n' "$b" | awk '/case ASK:/ { f = 1 } f { print } f && /break;/ { exit }') ;;
     esac
     wr=$(first_line "$arm" "write.run();"); sv=$(first_line "$arm" "$GUARDED")
     if [ "$(count "$arm" "presetSaveCustom(")" -ne 1 ] || [ "$(count "$arm" "$GUARDED")" -ne 1 ] \

@@ -6,8 +6,8 @@ import java.util.List;
 import java.util.Objects;
 
 /** NWP-20261117-15: the GET-MEDIA-STATUS routing; NWP-20261202-28: the RESTORING slot, its parser, its bar and the
- *  decided title; NWP-20261207-11: the RESTORE-WAITING slot, restoreWaiting() and the decided waiting body. Exit 0
- *  when every case holds, 1 otherwise. */
+ *  decided title; NWP-20261207-11: the RESTORE-WAITING slot, restoreWaiting() and the decided waiting body;
+ *  NWP-20261208-09: holdRescanForSweep() and its cap. Exit 0 when every case holds, 1 otherwise. */
 public final class MediaStatusCases {
     private static int bad = 0;
 
@@ -85,6 +85,17 @@ public final class MediaStatusCases {
         boolean got = MediaStatus.rescanAfterLanding(seen, reply);
         if (got != want) {
             System.out.println("  FAIL  " + label + ": rescanAfterLanding(" + seen + ", " + reply + ") = " + got
+                    + ", want " + want);
+            bad++;
+        } else {
+            System.out.println("  ok    " + label);
+        }
+    }
+
+    private static void checkHold(String label, String reply, long heldMs, boolean want) {
+        boolean got = MediaStatus.holdRescanForSweep(reply, heldMs, MediaStatus.RESCAN_SWEEP_CAP_MS);
+        if (got != want) {
+            System.out.println("  FAIL  " + label + ": holdRescanForSweep(" + reply + ", " + heldMs + ") = " + got
                     + ", want " + want);
             bad++;
         } else {
@@ -184,6 +195,25 @@ public final class MediaStatusCases {
         checkRescan("L11 the restarted mediad lands (1 after 3)", "3", "1", true);
         checkRescan("L12 a failed read changes nothing", "2", "", false);
         checkRescan("L13 a second landing", "1", "2", true);
+        // H1-H10, C1 (NWP-20261208-09): holdRescanForSweep() holds the landed rescan only while GET-SWEEP says LIVE
+        // and the wait is under the cap.
+        long cap = MediaStatus.RESCAN_SWEEP_CAP_MS;
+        checkHold("H1 a live sweep", "LIVE 12", 0, true);
+        checkHold("H2 a live sweep, padded with a newline", " LIVE 12\n", 0, true);
+        checkHold("H3 no sweep", "NONE", 0, false);
+        checkHold("H4 an empty read (a timeout)", "", 0, false);
+        checkHold("H5 a null read", null, 0, false);
+        checkHold("H6 LIVE with no seconds", "LIVE", 0, false);
+        checkHold("H7 LIVE with a non-number", "LIVE x", 0, false);
+        checkHold("H8 the cap reached", "LIVE 12", cap, false);
+        checkHold("H9 one ms under the cap", "LIVE 12", cap - 1, true);
+        checkHold("H10 a negative held time", "LIVE 12", -1, false);
+        if (MediaStatus.RESCAN_SWEEP_CAP_MS != 3600000L) {
+            System.out.println("  FAIL  C1 RESCAN_SWEEP_CAP_MS = " + MediaStatus.RESCAN_SWEEP_CAP_MS + ", want 3600000");
+            bad++;
+        } else {
+            System.out.println("  ok    C1 RESCAN_SWEEP_CAP_MS is 60 minutes");
+        }
         if (bad != 0) {
             System.out.println(bad + " case(s) failed");
             System.exit(1);

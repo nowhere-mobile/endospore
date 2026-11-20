@@ -1,6 +1,7 @@
 package com.nowhere.chooser;
 
 import java.util.Arrays;
+import java.util.Collections;
 
 /**
  * NWP-20261206-06: Report an issue's two popups and Storage's Repair stored credit as PopupSheet models
@@ -9,6 +10,8 @@ import java.util.Arrays;
  * Repair stored credit is a warning: the green Not now is the safe way out and the red-outlined Repair runs the CONFIRM.
  * The context and the lines are today's AlertDialog messages, split; the tones and the arrangement are drafts for
  * Chester's mockup. Send report adds no word to today's: a new privacy claim needs counsel (docs/privacy-claims.md).
+ * NWP-20261208-28: Send report changes in place to Sending report… (a Progress), then to Report sent, to the amber
+ * Couldn't send the report with Try again (the note kept), or, when a retry cannot help, to the amber notice with Got it.
  *
  * Pure java.util so a javac suite can compile it off the build host
  * (core/vendor-common/bin/test-report-repair-sheets-java.sh).
@@ -30,6 +33,50 @@ final class ReportRepairSheets {
             + "so the credit in it can't be recovered.";
     static final String REPAIR_LINE_1 = "Repairing gives that credit up, so credit you buy from now on is saved again.";
     static final String REPAIR_LINE_2 = "Credit this phone holds now is kept.";
+
+    // NWP-20261116-48: the sending and failure words, design approved by Chester 2026-11-17 ("mock approved").
+    static final String SENDING_TITLE = "Sending report…";
+    static final String SENDING_CONTEXT = "Your device info and scrubbed diagnostics are on their way to support.";
+    static final String SENDING_LINE = "This closes by itself when support answers.";
+    static final String FAILED_TITLE = "Couldn't send the report";
+    static final String FAILED_LINE = "Your note is kept, so you don't need to type it again.";
+    static final String TRY_AGAIN = "Try again";
+
+    /** The sheet while the report is on its way: no buttons. */
+    static PopupSheet.Progress sending() {
+        return new PopupSheet.Progress(SENDING_TITLE, SENDING_CONTEXT, SENDING_LINE);
+    }
+
+    /** The daemon's REPORT-ISSUE failure reply as one sentence (the words the status line showed before NWP-20261208-28). */
+    static String failureSentence(String reply) {
+        if ("ERR-NOGW".equals(reply))          return "Support reporting isn't available on this device.";
+        if ("ERR-DISABLED".equals(reply))      return "Support isn't accepting reports right now. Try again later.";
+        if ("ERR-TOOBIG".equals(reply))        return "The report was too large to send.";
+        if ("ERR-NET".equals(reply) || reply == null || reply.isEmpty())
+                                               return "Couldn't reach support. Check your connection and try again.";
+        return "Couldn't send the report (" + reply + ").";
+    }
+
+    /** False only for a reply a second try cannot change: no gateway, reports turned off, a report too large. */
+    static boolean retryable(String reply) {
+        return !"ERR-NOGW".equals(reply) && !"ERR-DISABLED".equals(reply) && !"ERR-TOOBIG".equals(reply);
+    }
+
+    /** Amber. Retryable: slot 0 (green Try again) sends the same note again, slot 1 (outlined Not now) only closes the
+     *  sheet. Otherwise the warning notice: slot 0 (green Got it) only closes it. */
+    static PopupSheet.Confirm failed(String reply) {
+        if (retryable(reply)) {
+            return new PopupSheet.Confirm(PopupSheet.Tone.WARNING, FAILED_TITLE, failureSentence(reply),
+                    Arrays.asList(new PopupSheet.Line(FAILED_LINE, null)),
+                    Arrays.asList(
+                            new PopupSheet.Button(TRY_AGAIN, PopupSheet.Style.GREEN_FILLED),
+                            new PopupSheet.Button(PopupSheet.NOT_NOW, PopupSheet.Style.OUTLINED)),
+                    true);
+        }
+        return new PopupSheet.Confirm(PopupSheet.Tone.WARNING, FAILED_TITLE, failureSentence(reply),
+                Collections.<PopupSheet.Line>emptyList(),
+                Arrays.asList(new PopupSheet.Button(PopupSheet.GOT_IT, PopupSheet.Style.GREEN_FILLED)));
+    }
 
     /** Routine: slot 0 sends the report, slot 1 only closes the sheet. */
     static PopupSheet.Confirm sendReport() {
